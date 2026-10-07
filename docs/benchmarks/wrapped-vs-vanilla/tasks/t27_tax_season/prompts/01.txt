@@ -1,0 +1,41 @@
+Morning! Tax season is coming and my ledger is a mess, so today is going to
+be a day of cleanup and bookkeeping work on ledgerlite. I'll send a bunch of
+follow-ups over the course of it, each building on whatever you did before.
+
+First thing: the built-in categorisation rules are fine for the basics, but
+I want my OWN rules that I can add from the command line and that always
+win over the built-ins.
+
+Add a new module `ledgerlite/rulebook.py` for user rules, stored in the
+ledger JSON file under a top-level `"rules"` key as a list of objects with
+`id`, `pattern`, `category` and `priority`. CLI:
+
+- `python -m ledgerlite rules add --pattern P --category C [--priority N]
+  --store PATH` adds a rule (priority is an int, default 0) and prints
+  `Added rule ID: P -> C (priority N)`. Rule ids are 1, 2, 3... (one more
+  than the highest existing id). An empty or whitespace-only pattern is an
+  error: print `error: pattern must not be empty` to stderr and exit 2.
+- `python -m ledgerlite rules list --store PATH` prints one line per rule in
+  id order, formatted `ID: P -> C (priority N)`, or `No rules.` when there
+  are none (also when the store file doesn't exist yet).
+
+Matching: a rule matches a transaction when its pattern appears,
+case-insensitively, anywhere in the payee or the memo. When several user
+rules match one transaction, the winner is the one with the highest
+priority; if priorities tie, the rule with the LONGER pattern wins (more
+specific); if that also ties, the lower id wins. User rules always beat the
+built-in `DEFAULT_RULES`, whatever their priorities -- the built-ins are only
+consulted when no user rule matches.
+
+Wire that into `categorize` (same `Re-categorized X of Y transactions`
+output as today) and into `import` (still only touching rows that arrive
+without a category; read the user rules from the `--store` file before it
+gets overwritten, if the file exists).
+
+Important, because I'll be keeping more kinds of data in this one file all
+day: `store.save()` currently rewrites the whole JSON document with only
+`transactions`. Fix it so that saving transactions never wipes out any
+other top-level key already in the file (rules now, other things later),
+and saving rules never wipes out the transactions. `import` still replaces
+the TRANSACTIONS with the new file's rows, but everything else in the store
+must survive it.

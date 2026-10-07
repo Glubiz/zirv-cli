@@ -1,0 +1,28 @@
+Found a bug in `merge`. Yesterday I merged a statement that had TWO
+identical coffees on the same day (4.50 each, same shop -- yes, I really did
+buy two). My ledger already had ONE of those coffees from an earlier
+partial import. After the merge I still only had one coffee in the ledger:
+`merge` treated both incoming rows as duplicates of the single existing one
+and skipped both.
+
+An existing transaction should only be able to cancel out ONE incoming row.
+Please fix `merge` so that it matches incoming rows to existing transactions
+one-to-one:
+
+- go through the incoming rows in file order; each one is matched against
+  the existing (already-in-the-ledger) transactions that fit the usual
+  duplicate rules (same normalised payee case-insensitively, same signed
+  amount, within the window) and that have NOT already been matched by an
+  earlier row of this same file;
+- if several unmatched existing transactions fit, take the one whose date is
+  closest to the incoming row's date, and if two are equally close, the one
+  with the lower id;
+- a matched row is skipped as a duplicate; a row with no unmatched partner
+  left is added as new. Rows from the same file never match each other (two
+  identical rows are both new if the ledger has nothing like them), only
+  transactions that were in the ledger before this merge can absorb a row.
+
+So in my case: one coffee in the ledger plus two in the file means one
+duplicate skipped and one new coffee added, and merging the exact same file
+a second time must still add nothing. Output wording and everything else
+about `merge` stays as it is.

@@ -1,0 +1,38 @@
+Good. Next one is a big one for tax time: some of my receipts cover several
+kinds of spending at once -- a Costco run that's half groceries and half
+home-office supplies, say -- and I want to split one transaction across
+categories.
+
+Add `ledgerlite/splits.py` and two commands:
+
+- `python -m ledgerlite split ID --part CATEGORY=PERCENT [--part ...]
+  --store PATH` splits transaction ID. Percentages may be decimals
+  (`33.33`) and must add up to exactly 100; at least two `--part` options
+  are required. Parts are kept in the order given. On success print `Split
+  transaction ID into N parts`. Errors go to stderr as `error: ...` with
+  exit 2 and the store left untouched: `need at least two --part options`,
+  `percentages must sum to 100`, `bad --part 'TEXT' (expected
+  CATEGORY=PERCENT)` (for a malformed or non-positive part), and `no
+  transaction with id N`. Splitting an already-split transaction simply
+  replaces its old split.
+- `python -m ledgerlite split-show ID --store PATH` prints one line per part,
+  `CATEGORY: AMOUNT` (amount to 2 decimal places, with the transaction's
+  sign), in the order stored. For a transaction that isn't split it prints
+  `Transaction ID is not split` (exit 0). Unknown id is the same `no
+  transaction with id N` error.
+
+The money part needs care. Each part's amount is a whole number of cents and
+the parts must add up to the transaction's amount EXACTLY. Work it out like
+this: each part gets floor(|amount| in cents x percent / 100) cents; the
+cents that are left over (there will be fewer than there are parts) are handed
+out one cent each to the FIRST parts, in the order they were given. All parts
+carry the transaction's sign. For example -100.01 split 50/50 is -50.01 and
+-50.00, and -10.01 split 33.33/33.33/33.34 is -3.34, -3.34, -3.33.
+
+Storage: a split transaction gets a `"splits"` key in the JSON store, a list
+of objects `{"category": ..., "percent": ..., "amount": ...}` in part order,
+all three values strings (`percent` exactly as typed, `amount` like
+`"-50.01"`). Unsplit transactions have an empty list, and old store files
+without the key must still load (as unsplit). Give `Transaction` a matching
+`splits` field. The transaction's own `category` and `amount` stay exactly as
+they were -- splitting doesn't touch them.

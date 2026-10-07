@@ -1,0 +1,252 @@
+diff --git a/ledgerlite/cli.py b/ledgerlite/cli.py
+index b9287f4..6bccd75 100644
+--- a/ledgerlite/cli.py
++++ b/ledgerlite/cli.py
+@@ -3,17 +3,30 @@
+ from __future__ import annotations
+ 
+ import argparse
++import sys
+ from decimal import Decimal
++from pathlib import Path
+ from typing import Optional, Sequence
+ 
+ from . import report
+ from .parse import read_csv
+-from .rules import DEFAULT_RULES, categorize
++from .rulebook import add_rule, categorize_txn, load_rules, matching_rules, save_rules
+ from .store import load, save
+ 
+ DEFAULT_STORE = "ledger.json"
+ 
+ 
++def _err(message: str) -> int:
++    print(f"error: {message}", file=sys.stderr)
++    return 2
++
++
++def _add_store(parser: argparse.ArgumentParser, help_text: str = "ledger JSON file") -> None:
++    parser.add_argument(
++        "--store", default=DEFAULT_STORE, help=f"{help_text} (default: %(default)s)"
++    )
++
++
+ def _build_parser() -> argparse.ArgumentParser:
+     parser = argparse.ArgumentParser(
+         prog="ledgerlite", description="A tiny personal-finance ledger."
+@@ -47,14 +60,25 @@ def _build_parser() -> argparse.ArgumentParser:
+         "--store", default=DEFAULT_STORE, help="ledger JSON file to update (default: %(default)s)"
+     )
+ 
++    p_rules = sub.add_parser("rules", help="manage your own categorisation rules")
++    rules_sub = p_rules.add_subparsers(dest="sub", required=True)
++    p_rules_add = rules_sub.add_parser("add", help="add a categorisation rule")
++    p_rules_add.add_argument("--pattern", required=True, help="text to look for in payee or memo")
++    p_rules_add.add_argument("--category", required=True, help="category to assign")
++    p_rules_add.add_argument("--priority", type=int, default=0, help="higher wins (default: %(default)s)")
++    _add_store(p_rules_add, "ledger JSON file to update")
++    p_rules_list = rules_sub.add_parser("list", help="list your rules")
++    _add_store(p_rules_list, "ledger JSON file to read")
++
+     return parser
+ 
+ 
+ def _cmd_import(args: argparse.Namespace) -> int:
+     txns = read_csv(args.csv_path)
++    user_rules = load_rules(args.store)
+     for txn in txns:
+         if txn.category is None:
+-            txn.category = categorize(txn, DEFAULT_RULES)
++            txn.category = categorize_txn(txn, user_rules)
+     save(args.store, txns)
+     print(f"Imported {len(txns)} transactions into {args.store}")
+     return 0
+@@ -95,9 +119,10 @@ def _cmd_summary(args: argparse.Namespace) -> int:
+ 
+ def _cmd_categorize(args: argparse.Namespace) -> int:
+     txns = load(args.store)
++    user_rules = load_rules(args.store)
+     changed = 0
+     for txn in txns:
+-        new_category = categorize(txn, DEFAULT_RULES)
++        new_category = categorize_txn(txn, user_rules)
+         if new_category != txn.category:
+             txn.category = new_category
+             changed += 1
+@@ -106,18 +131,45 @@ def _cmd_categorize(args: argparse.Namespace) -> int:
+     return 0
+ 
+ 
++def _rule_line(rule) -> str:
++    return f"{rule.id}: {rule.pattern} -> {rule.category} (priority {rule.priority})"
++
++
++def _cmd_rules_add(args: argparse.Namespace) -> int:
++    if not args.pattern.strip():
++        return _err("pattern must not be empty")
++    rules = load_rules(args.store)
++    rule = add_rule(rules, args.pattern, args.category, args.priority)
++    save_rules(args.store, rules)
++    print(f"Added rule {rule.id}: {rule.pattern} -> {rule.category} (priority {rule.priority})")
++    return 0
++
++
++def _cmd_rules_list(args: argparse.Namespace) -> int:
++    rules = load_rules(args.store)
++    if not rules:
++        print("No rules.")
++        return 0
++    for rule in sorted(rules, key=lambda r: r.id):
++        print(_rule_line(rule))
++    return 0
++
++
+ _HANDLERS = {
+     "import": _cmd_import,
+     "list": _cmd_list,
+     "summary": _cmd_summary,
+     "categorize": _cmd_categorize,
++    "rules add": _cmd_rules_add,
++    "rules list": _cmd_rules_list,
+ }
+ 
+ 
+ def main(argv: Optional[Sequence[str]] = None) -> int:
+     parser = _build_parser()
+     args = parser.parse_args(argv)
+-    handler = _HANDLERS[args.command]
++    key = args.command + (f" {args.sub}" if getattr(args, "sub", None) else "")
++    handler = _HANDLERS[key]
+     return handler(args)
+ 
+ 
+diff --git a/ledgerlite/rulebook.py b/ledgerlite/rulebook.py
+new file mode 100644
+index 0000000..048656e
+--- /dev/null
++++ b/ledgerlite/rulebook.py
+@@ -0,0 +1,69 @@
++"""User-defined categorisation rules, stored in the ledger file under `rules`."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from pathlib import Path
++from typing import List, Optional, Union
++
++from .models import Transaction
++from .rules import DEFAULT_RULES, categorize
++from .store import load_section, save_section
++
++
++@dataclass
++class UserRule:
++    id: int
++    pattern: str
++    category: str
++    priority: int = 0
++
++
++def load_rules(path: Union[str, Path]) -> List[UserRule]:
++    if not Path(path).exists():
++        return []
++    return [
++        UserRule(d["id"], d["pattern"], d["category"], d.get("priority", 0))
++        for d in load_section(path, "rules", [])
++    ]
++
++
++def save_rules(path: Union[str, Path], rules: List[UserRule]) -> None:
++    save_section(
++        path,
++        "rules",
++        [
++            {"id": r.id, "pattern": r.pattern, "category": r.category, "priority": r.priority}
++            for r in rules
++        ],
++    )
++
++
++def add_rule(rules: List[UserRule], pattern: str, category: str, priority: int = 0) -> UserRule:
++    rule = UserRule(max((r.id for r in rules), default=0) + 1, pattern, category, priority)
++    rules.append(rule)
++    return rule
++
++
++def rule_matches(rule: UserRule, txn: Transaction) -> bool:
++    needle = rule.pattern.lower()
++    return needle in txn.payee.lower() or needle in txn.memo.lower()
++
++
++def _resolution_key(rule: UserRule):
++    # Highest priority first; then the longer (more specific) pattern; then
++    # the lowest id (added first).
++    return (-rule.priority, -len(rule.pattern), rule.id)
++
++
++def matching_rules(txn: Transaction, rules: List[UserRule]) -> List[UserRule]:
++    """Every user rule matching `txn`, best (winning) rule first."""
++    return sorted((r for r in rules if rule_matches(r, txn)), key=_resolution_key)
++
++
++def categorize_txn(txn: Transaction, rules: List[UserRule]) -> Optional[str]:
++    """User rules first (they always beat the built-in defaults), then defaults."""
++    matches = matching_rules(txn, rules)
++    if matches:
++        return matches[0].category
++    return categorize(txn, DEFAULT_RULES)
+diff --git a/ledgerlite/store.py b/ledgerlite/store.py
+index 16cbf26..d2adac4 100644
+--- a/ledgerlite/store.py
++++ b/ledgerlite/store.py
+@@ -6,7 +6,7 @@ import json
+ from datetime import date
+ from decimal import Decimal
+ from pathlib import Path
+-from typing import List, Union
++from typing import Any, List, Union
+ 
+ from .models import Transaction
+ 
+@@ -33,13 +33,38 @@ def _txn_from_dict(data: dict) -> Transaction:
+     )
+ 
+ 
+-def save(path: Union[str, Path], txns: List[Transaction]) -> None:
+-    """Write `txns` to `path` as JSON, overwriting any existing file."""
+-    payload = {"transactions": [_txn_to_dict(t) for t in txns]}
++def _read_payload(path: Union[str, Path]) -> dict:
++    """Return the whole JSON document at `path`, or {} if there is no file yet."""
++    p = Path(path)
++    if not p.exists():
++        return {}
++    return json.loads(p.read_text(encoding="utf-8"))
++
++
++def _write_payload(path: Union[str, Path], payload: dict) -> None:
+     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+ 
+ 
++def save(path: Union[str, Path], txns: List[Transaction]) -> None:
++    """Write `txns` to `path` as JSON, keeping every other top-level key."""
++    payload = _read_payload(path)
++    payload["transactions"] = [_txn_to_dict(t) for t in txns]
++    _write_payload(path, payload)
++
++
+ def load(path: Union[str, Path]) -> List[Transaction]:
+     """Read a list of `Transaction` from a JSON file written by `save`."""
+     payload = json.loads(Path(path).read_text(encoding="utf-8"))
+     return [_txn_from_dict(d) for d in payload.get("transactions", [])]
++
++
++def load_section(path: Union[str, Path], key: str, default: Any) -> Any:
++    """Return the top-level `key` of the store at `path`, or `default`."""
++    return _read_payload(path).get(key, default)
++
++
++def save_section(path: Union[str, Path], key: str, value: Any) -> None:
++    """Set top-level `key` in the store at `path`, keeping everything else."""
++    payload = _read_payload(path)
++    payload[key] = value
++    _write_payload(path, payload)

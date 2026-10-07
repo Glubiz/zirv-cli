@@ -1,0 +1,28 @@
+Time to actually hand my accountant something. Add `python -m ledgerlite tax
+export YEAR --format json|markdown --out FILE --store PATH [--calendar]`,
+which writes the same tax summary `tax summary` prints (same period rules,
+same figures, same category order) to FILE, and prints `Wrote tax summary
+for YEAR to FILE`. `--format` is required and must be exactly `json` or
+`markdown`.
+
+JSON: an object with `year` (a number), `start` and `end` (ISO dates of the
+period), `categories` (a list of `{"category": ..., "amount": ...}` objects
+in the on-screen order) and `total`, with every amount a string with exactly
+2 decimal places, pretty-printed with an indent of 2 and a trailing newline.
+
+Markdown, exactly this shape (one trailing newline):
+
+    # Tax summary YEAR
+
+    Period: START to END
+
+    | Category | Amount |
+    |---|---|
+    | CATEGORY | AMOUNT |
+    | **Total** | TOTAL |
+
+with one `| CATEGORY | AMOUNT |` row per category, amounts to 2 decimal
+places, START/END as ISO dates.
+
+Don't copy the summary logic into a second place -- `tax summary` and the
+export should be fed by the same code, so they can never disagree.

@@ -1,0 +1,18 @@
+Okay, now the actual tax angle. I want to flag which transactions are
+tax-deductible.
+
+- Give `Transaction` a `deductible: bool = False` field, stored in the JSON
+  store as `"deductible"` (old store files without it load as False).
+- `python -m ledgerlite tax mark ID [ID ...] --store PATH` flags those
+  transactions and prints `Marked N transactions as tax-deductible`, N being
+  the number of DISTINCT ids given (marking one that's already flagged is
+  harmless and still counts). `python -m ledgerlite tax unmark ID [ID ...]
+  --store PATH` clears the flag and prints `Unmarked N transactions`.
+  If any id doesn't exist, print `error: no transaction with id N` to stderr,
+  exit 2, and change nothing at all (not even the valid ids).
+- `python -m ledgerlite tax list --store PATH` prints the flagged
+  transactions in id order, one per line: id, ISO date, amount (as it's
+  stored, e.g. `-100.00`) and payee, separated by single spaces. If nothing
+  is flagged it prints `No tax-deductible transactions.`
+
+Splitting, normalising and the other commands should leave the flag alone.

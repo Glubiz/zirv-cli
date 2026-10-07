@@ -1,0 +1,29 @@
+I'm going to want to dig through all this data, and `list` with paging
+isn't going to cut it. Let's add a little query language. New command:
+`python -m ledgerlite search QUERY --store PATH`, where QUERY is ONE string
+(quote it in the shell) made of terms separated by whitespace; shell-style
+quotes work inside it, so `payee:"whole foods"` is a single term. A
+transaction is a hit only if it satisfies EVERY term. Terms:
+
+- `payee:TEXT` -- TEXT appears (case-insensitive) in the transaction's
+  payee as a clean merchant name, i.e. the same cleaned-up form the duplicate
+  detection compares, not the raw statement noise;
+- `category:NAME` -- the category equals NAME (case-insensitive, whole
+  name, not a substring); for a split transaction a match on ANY of its
+  parts' categories counts too;
+- `year:YYYY` -- dated in that year;
+- `tax:yes` / `tax:no` -- the tax-deductible flag;
+- `amount>N`, `amount<N`, `amount>=N`, `amount<=N` -- compare the
+  ABSOLUTE value of the amount (so `amount>40` finds a -45.67 expense and a
+  2500.00 paycheque alike);
+- a bare word (no colon) -- the word appears case-insensitively in the
+  payee or the memo.
+
+Print one line per hit in the same row format `tax list` uses (id, date,
+amount, payee), ordered by date and then id, followed by a final line `N
+matches` (always that wording, even for 1; `0 matches` for none, and an empty
+query matches everything). A term with an unknown field (`colour:red`) is
+`error: unknown search term 'colour:red'`; a bad value (`tax:maybe`,
+`year:abc`, `amount>lots`) is `error: bad value in search term 'TERM'`; both
+go to stderr with exit 2 and print nothing to stdout. Search never modifies
+the store. Put the parser in a new `ledgerlite/query.py`.

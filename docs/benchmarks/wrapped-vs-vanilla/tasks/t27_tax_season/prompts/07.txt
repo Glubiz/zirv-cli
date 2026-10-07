@@ -1,0 +1,16 @@
+Before I trust any of these numbers I want a sanity checker. Add `python -m
+ledgerlite doctor --store PATH` (logic in a new `ledgerlite/doctor.py`) that
+reads the ledger, never modifies it, and reports these problems:
+
+- `duplicate-id`: two or more transactions share the same id (report it once
+  per duplicated id, not once per row);
+- `split-mismatch`: a split transaction whose parts' amounts don't add up
+  exactly to the transaction's amount;
+- `uncategorized-deductible`: a transaction flagged tax-deductible that has
+  no category and isn't split (a split one is fine -- its parts carry the
+  categories).
+
+Output: one line per problem, `CODE id=N`, sorted by id and then by code
+(alphabetically). Then a last line, `N issues found` (always that wording,
+even for 1). If there are no problems print just `No issues found`. Exit
+code 0 when clean, 1 when it found anything.

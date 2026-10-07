@@ -1,0 +1,9 @@
+Now that receipts exist, let's make `doctor` nag me about the ones I'm
+missing. Add one more check to `doctor`, reported exactly like the other
+checks (same line format, same ordering, same summary line and exit code
+behaviour): code `missing-receipt` for any transaction that is flagged
+tax-deductible, has no receipt attached, and whose amount is 75.00 or more
+in absolute value (75.00 itself counts, 74.99 doesn't). Judge a split
+transaction by its whole amount, and don't let the sign matter.
+
+The existing checks keep working as they do today.

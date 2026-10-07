@@ -1,0 +1,31 @@
+Next: merchant names. My statements are full of noise -- `WHOLE FOODS MARKET
+#221`, `LYFT RIDE 001`, `ALDI 2044` -- and I want the same shop to look the
+same everywhere.
+
+Add `ledgerlite/merchants.py` with `normalize_payee(raw: str) -> str`. The
+canonical form is:
+
+1. collapse any run of whitespace to a single space and trim the ends;
+2. drop every token that is `#` followed only by digits (`#221`, `#4521`);
+3. then, if more than one token is left and the LAST token is made only of
+   digits and is at least 3 digits long, drop it too (`LYFT RIDE 001` ->
+   `LYFT RIDE`, but `SHELL 12` stays and so does `T-1234`);
+4. keep the original letter case (no upper- or lower-casing);
+5. if that leaves nothing at all (e.g. the payee was just `#55`), return the
+   whitespace-collapsed input unchanged.
+
+Then:
+
+- Give `Transaction` a new `raw_payee: str = ""` field and make the JSON
+  store read and write it as `raw_payee` (old store files without the key
+  must still load, as `""`).
+- `import` now normalises every row's payee. When normalisation actually
+  changes the payee, `payee` holds the clean name and `raw_payee` holds the
+  original statement text; when it doesn't change, `raw_payee` stays `""`.
+  Normalise BEFORE categorising, so categorisation sees the clean payee.
+- New command `python -m ledgerlite normalize --store PATH` that applies
+  the same normalisation to the transactions already in the store and prints
+  `Normalized N payees`, N being how many transactions' payee changed. It
+  must be safe to run twice (the second run says `Normalized 0 payees`), and
+  if a transaction already has a `raw_payee`, keep that original text
+  rather than overwriting it with the intermediate name.

@@ -1,0 +1,789 @@
+diff --git a/ledgerlite/cli.py b/ledgerlite/cli.py
+index b9287f4..a2a10ae 100644
+--- a/ledgerlite/cli.py
++++ b/ledgerlite/cli.py
+@@ -3,17 +3,36 @@
+ from __future__ import annotations
+ 
+ import argparse
++import sys
+ from decimal import Decimal
++from pathlib import Path
+ from typing import Optional, Sequence
+ 
+ from . import report
++from .dedupe import DEFAULT_WINDOW_DAYS, is_duplicate
++from .doctor import find_issues
++from .merchants import normalize_payee
+ from .parse import read_csv
+-from .rules import DEFAULT_RULES, categorize
++from .receipts import check_receipt, make_receipt
++from .rulebook import add_rule, categorize_txn, load_rules, matching_rules, save_rules
++from .splits import build_splits, parse_part
+ from .store import load, save
++from .taxes import deductible_by_category, summary_rows, tax_year_bounds
+ 
+ DEFAULT_STORE = "ledger.json"
+ 
+ 
++def _err(message: str) -> int:
++    print(f"error: {message}", file=sys.stderr)
++    return 2
++
++
++def _add_store(parser: argparse.ArgumentParser, help_text: str = "ledger JSON file") -> None:
++    parser.add_argument(
++        "--store", default=DEFAULT_STORE, help=f"{help_text} (default: %(default)s)"
++    )
++
++
+ def _build_parser() -> argparse.ArgumentParser:
+     parser = argparse.ArgumentParser(
+         prog="ledgerlite", description="A tiny personal-finance ledger."
+@@ -47,14 +66,256 @@ def _build_parser() -> argparse.ArgumentParser:
+         "--store", default=DEFAULT_STORE, help="ledger JSON file to update (default: %(default)s)"
+     )
+ 
++    p_merge = sub.add_parser("merge", help="add only the new rows of a CSV to the ledger")
++    p_merge.add_argument("csv_path", help="path to a bank-export CSV file")
++    p_merge.add_argument(
++        "--window", type=int, default=DEFAULT_WINDOW_DAYS,
++        help="days either side that still count as the same transaction (default: %(default)s)",
++    )
++    _add_store(p_merge, "ledger JSON file to update")
++
++    p_split = sub.add_parser("split", help="split a transaction across categories")
++    p_split.add_argument("id", type=int, help="transaction id")
++    p_split.add_argument(
++        "--part", action="append", default=[], metavar="CATEGORY=PERCENT",
++        help="one share of the transaction; repeat for each part",
++    )
++    _add_store(p_split, "ledger JSON file to update")
++
++    p_split_show = sub.add_parser("split-show", help="show how a transaction is split")
++    p_split_show.add_argument("id", type=int, help="transaction id")
++    _add_store(p_split_show, "ledger JSON file to read")
++
++    p_tax = sub.add_parser("tax", help="tax-deductible flags")
++    tax_sub = p_tax.add_subparsers(dest="sub", required=True)
++    for name, text in (("mark", "flag transactions as tax-deductible"),
++                       ("unmark", "clear the tax-deductible flag")):
++        p_t = tax_sub.add_parser(name, help=text)
++        p_t.add_argument("ids", nargs="+", type=int, help="transaction ids")
++        _add_store(p_t, "ledger JSON file to update")
++    p_tax_list = tax_sub.add_parser("list", help="list tax-deductible transactions")
++    _add_store(p_tax_list, "ledger JSON file to read")
++
++    p_tax_summary = tax_sub.add_parser("summary", help="deductible spending per category for a year")
++    p_tax_summary.add_argument("year", type=int, help="tax year, e.g. 2024")
++    _add_store(p_tax_summary, "ledger JSON file to read")
++
++    p_doctor = sub.add_parser("doctor", help="check the ledger for data problems")
++    _add_store(p_doctor, "ledger JSON file to read")
++
++    p_receipt = sub.add_parser("receipt", help="receipt metadata (path + checksum)")
++    receipt_sub = p_receipt.add_subparsers(dest="sub", required=True)
++    p_r_attach = receipt_sub.add_parser("attach", help="record a receipt file for a transaction")
++    p_r_attach.add_argument("id", type=int, help="transaction id")
++    p_r_attach.add_argument("path", help="path to the receipt file")
++    _add_store(p_r_attach, "ledger JSON file to update")
++    p_r_show = receipt_sub.add_parser("show", help="show a transaction's receipt")
++    p_r_show.add_argument("id", type=int, help="transaction id")
++    _add_store(p_r_show, "ledger JSON file to read")
++    p_r_verify = receipt_sub.add_parser("verify", help="re-check every recorded receipt")
++    _add_store(p_r_verify, "ledger JSON file to read")
++
++    p_normalize = sub.add_parser("normalize", help="clean up merchant names in stored transactions")
++    _add_store(p_normalize, "ledger JSON file to update")
++
++    p_rules = sub.add_parser("rules", help="manage your own categorisation rules")
++    rules_sub = p_rules.add_subparsers(dest="sub", required=True)
++    p_rules_add = rules_sub.add_parser("add", help="add a categorisation rule")
++    p_rules_add.add_argument("--pattern", required=True, help="text to look for in payee or memo")
++    p_rules_add.add_argument("--category", required=True, help="category to assign")
++    p_rules_add.add_argument("--priority", type=int, default=0, help="higher wins (default: %(default)s)")
++    _add_store(p_rules_add, "ledger JSON file to update")
++    p_rules_list = rules_sub.add_parser("list", help="list your rules")
++    _add_store(p_rules_list, "ledger JSON file to read")
++
+     return parser
+ 
+ 
+-def _cmd_import(args: argparse.Namespace) -> int:
+-    txns = read_csv(args.csv_path)
++def _normalize_txn(txn) -> bool:
++    """Normalise `txn.payee` in place, remembering the original. True if changed."""
++    normalized = normalize_payee(txn.payee)
++    if normalized == txn.payee:
++        return False
++    if not txn.raw_payee:
++        txn.raw_payee = txn.payee
++    txn.payee = normalized
++    return True
++
++
++def _find_txn(txns, txn_id: int):
++    return next((t for t in txns if t.id == txn_id), None)
++
++
++def _cmd_split(args: argparse.Namespace) -> int:
++    if len(args.part) < 2:
++        return _err("need at least two --part options")
++    parts = []
++    for text in args.part:
++        try:
++            parts.append(parse_part(text))
++        except ValueError:
++            return _err(f"bad --part {text!r} (expected CATEGORY=PERCENT)")
++    if sum(p for _, p in parts) != 100:
++        return _err("percentages must sum to 100")
++    txns = load(args.store)
++    txn = _find_txn(txns, args.id)
++    if txn is None:
++        return _err(f"no transaction with id {args.id}")
++    txn.splits = build_splits(txn.amount, parts)
++    save(args.store, txns)
++    print(f"Split transaction {txn.id} into {len(parts)} parts")
++    return 0
++
++
++def _cmd_split_show(args: argparse.Namespace) -> int:
++    txn = _find_txn(load(args.store), args.id)
++    if txn is None:
++        return _err(f"no transaction with id {args.id}")
++    if not txn.splits:
++        print(f"Transaction {txn.id} is not split")
++        return 0
++    for part in txn.splits:
++        print(f"{part['category']}: {part['amount']}")
++    return 0
++
++
++def _set_deductible(args: argparse.Namespace, value: bool) -> int:
++    txns = load(args.store)
++    chosen = []
++    for txn_id in dict.fromkeys(args.ids):
++        txn = _find_txn(txns, txn_id)
++        if txn is None:
++            return _err(f"no transaction with id {txn_id}")
++        chosen.append(txn)
++    for txn in chosen:
++        txn.deductible = value
++    save(args.store, txns)
++    verb = "Marked" if value else "Unmarked"
++    suffix = " as tax-deductible" if value else ""
++    print(f"{verb} {len(chosen)} transactions{suffix}")
++    return 0
++
++
++def _cmd_tax_mark(args: argparse.Namespace) -> int:
++    return _set_deductible(args, True)
++
++
++def _cmd_tax_unmark(args: argparse.Namespace) -> int:
++    return _set_deductible(args, False)
++
++
++def _txn_line(txn) -> str:
++    return f"{txn.id} {txn.date.isoformat()} {txn.amount} {txn.payee}"
++
++
++def _cmd_tax_list(args: argparse.Namespace) -> int:
++    rows = sorted((t for t in load(args.store) if t.deductible), key=lambda t: t.id)
++    if not rows:
++        print("No tax-deductible transactions.")
++        return 0
++    for txn in rows:
++        print(_txn_line(txn))
++    return 0
++
++
++def _cmd_tax_summary(args: argparse.Namespace) -> int:
++    start, end = tax_year_bounds(args.year)
++    totals = deductible_by_category(load(args.store), start, end)
++    for category, amount in summary_rows(totals):
++        print(f"{category}: {amount:.2f}")
++    print(f"TOTAL: {sum(totals.values(), Decimal('0')):.2f}")
++    return 0
++
++
++def _cmd_doctor(args: argparse.Namespace) -> int:
++    issues = find_issues(load(args.store))
++    for txn_id, code in issues:
++        print(f"{code} id={txn_id}")
++    if not issues:
++        print("No issues found")
++        return 0
++    print(f"{len(issues)} issues found")
++    return 1
++
++
++def _cmd_receipt_attach(args: argparse.Namespace) -> int:
++    txns = load(args.store)
++    txn = _find_txn(txns, args.id)
++    if txn is None:
++        return _err(f"no transaction with id {args.id}")
++    if not Path(args.path).is_file():
++        return _err(f"no such file: {args.path}")
++    txn.receipt = make_receipt(args.path)
++    save(args.store, txns)
++    print(f"Attached receipt to transaction {txn.id}")
++    return 0
++
++
++def _cmd_receipt_show(args: argparse.Namespace) -> int:
++    txn = _find_txn(load(args.store), args.id)
++    if txn is None:
++        return _err(f"no transaction with id {args.id}")
++    if txn.receipt is None:
++        print(f"No receipt for transaction {txn.id}")
++        return 0
++    print(f"path={txn.receipt['path']} sha256={txn.receipt['sha256']}")
++    return 0
++
++
++def _cmd_receipt_verify(args: argparse.Namespace) -> int:
++    rows = sorted((t for t in load(args.store) if t.receipt), key=lambda t: t.id)
++    if not rows:
++        print("No receipts attached.")
++        return 0
++    bad = 0
++    for txn in rows:
++        status = check_receipt(txn.receipt)
++        bad += status != "OK"
++        print(f"{status} id={txn.id}")
++    return 1 if bad else 0
++
++
++def _cmd_normalize(args: argparse.Namespace) -> int:
++    txns = load(args.store)
++    changed = sum(1 for txn in txns if _normalize_txn(txn))
++    save(args.store, txns)
++    print(f"Normalized {changed} payees")
++    return 0
++
++
++def _prepare(txns, store: str) -> None:
++    """Normalise payees, then categorise the rows that arrived uncategorised."""
++    user_rules = load_rules(store)
+     for txn in txns:
++        _normalize_txn(txn)
+         if txn.category is None:
+-            txn.category = categorize(txn, DEFAULT_RULES)
++            txn.category = categorize_txn(txn, user_rules)
++
++
++def _cmd_merge(args: argparse.Namespace) -> int:
++    if args.window < 0:
++        return _err("window must be >= 0")
++    existing = load(args.store) if Path(args.store).exists() else []
++    incoming = read_csv(args.csv_path)
++    _prepare(incoming, args.store)
++    next_id = max((t.id for t in existing), default=0) + 1
++    added = []
++    skipped = 0
++    for txn in incoming:
++        if is_duplicate(txn, existing, args.window):
++            skipped += 1
++            continue
++        txn.id = next_id
++        next_id += 1
++        added.append(txn)
++    save(args.store, existing + added)
++    print(f"Merged {len(added)} new transactions, skipped {skipped} duplicates")
++    return 0
++
++
++def _cmd_import(args: argparse.Namespace) -> int:
++    txns = read_csv(args.csv_path)
++    _prepare(txns, args.store)
+     save(args.store, txns)
+     print(f"Imported {len(txns)} transactions into {args.store}")
+     return 0
+@@ -95,9 +356,10 @@ def _cmd_summary(args: argparse.Namespace) -> int:
+ 
+ def _cmd_categorize(args: argparse.Namespace) -> int:
+     txns = load(args.store)
++    user_rules = load_rules(args.store)
+     changed = 0
+     for txn in txns:
+-        new_category = categorize(txn, DEFAULT_RULES)
++        new_category = categorize_txn(txn, user_rules)
+         if new_category != txn.category:
+             txn.category = new_category
+             changed += 1
+@@ -106,18 +368,57 @@ def _cmd_categorize(args: argparse.Namespace) -> int:
+     return 0
+ 
+ 
++def _rule_line(rule) -> str:
++    return f"{rule.id}: {rule.pattern} -> {rule.category} (priority {rule.priority})"
++
++
++def _cmd_rules_add(args: argparse.Namespace) -> int:
++    if not args.pattern.strip():
++        return _err("pattern must not be empty")
++    rules = load_rules(args.store)
++    rule = add_rule(rules, args.pattern, args.category, args.priority)
++    save_rules(args.store, rules)
++    print(f"Added rule {rule.id}: {rule.pattern} -> {rule.category} (priority {rule.priority})")
++    return 0
++
++
++def _cmd_rules_list(args: argparse.Namespace) -> int:
++    rules = load_rules(args.store)
++    if not rules:
++        print("No rules.")
++        return 0
++    for rule in sorted(rules, key=lambda r: r.id):
++        print(_rule_line(rule))
++    return 0
++
++
+ _HANDLERS = {
+     "import": _cmd_import,
+     "list": _cmd_list,
+     "summary": _cmd_summary,
+     "categorize": _cmd_categorize,
++    "merge": _cmd_merge,
++    "tax mark": _cmd_tax_mark,
++    "tax unmark": _cmd_tax_unmark,
++    "tax list": _cmd_tax_list,
++    "tax summary": _cmd_tax_summary,
++    "doctor": _cmd_doctor,
++    "receipt attach": _cmd_receipt_attach,
++    "receipt show": _cmd_receipt_show,
++    "receipt verify": _cmd_receipt_verify,
++    "split": _cmd_split,
++    "split-show": _cmd_split_show,
++    "normalize": _cmd_normalize,
++    "rules add": _cmd_rules_add,
++    "rules list": _cmd_rules_list,
+ }
+ 
+ 
+ def main(argv: Optional[Sequence[str]] = None) -> int:
+     parser = _build_parser()
+     args = parser.parse_args(argv)
+-    handler = _HANDLERS[args.command]
++    key = args.command + (f" {args.sub}" if getattr(args, "sub", None) else "")
++    handler = _HANDLERS[key]
+     return handler(args)
+ 
+ 
+diff --git a/ledgerlite/dedupe.py b/ledgerlite/dedupe.py
+new file mode 100644
+index 0000000..352cd79
+--- /dev/null
++++ b/ledgerlite/dedupe.py
+@@ -0,0 +1,28 @@
++"""Duplicate detection for incoming transactions."""
++
++from __future__ import annotations
++
++from typing import List
++
++from .merchants import normalize_payee
++from .models import Transaction
++
++DEFAULT_WINDOW_DAYS = 2
++
++
++def _same_merchant(a: Transaction, b: Transaction) -> bool:
++    return normalize_payee(a.payee).casefold() == normalize_payee(b.payee).casefold()
++
++
++def is_duplicate(
++    incoming: Transaction, existing: List[Transaction], window_days: int = DEFAULT_WINDOW_DAYS
++) -> bool:
++    """True if `existing` holds a transaction with the same normalised payee
++    (case-insensitive) and exactly the same amount, dated within
++    `window_days` days of `incoming`."""
++    return any(
++        _same_merchant(incoming, e)
++        and incoming.amount == e.amount
++        and abs((incoming.date - e.date).days) <= window_days
++        for e in existing
++    )
+diff --git a/ledgerlite/doctor.py b/ledgerlite/doctor.py
+new file mode 100644
+index 0000000..908b948
+--- /dev/null
++++ b/ledgerlite/doctor.py
+@@ -0,0 +1,23 @@
++"""Data-validation checks over a ledger."""
++
++from __future__ import annotations
++
++from collections import Counter
++from decimal import Decimal
++from typing import List, Tuple
++
++from .models import Transaction
++
++
++def find_issues(txns: List[Transaction]) -> List[Tuple[int, str]]:
++    """Return (id, code) for every problem found, sorted by id then code."""
++    issues: List[Tuple[int, str]] = []
++    for txn_id, count in Counter(t.id for t in txns).items():
++        if count > 1:
++            issues.append((txn_id, "duplicate-id"))
++    for txn in txns:
++        if txn.splits and sum(Decimal(p["amount"]) for p in txn.splits) != txn.amount:
++            issues.append((txn.id, "split-mismatch"))
++        if txn.deductible and txn.category is None and not txn.splits:
++            issues.append((txn.id, "uncategorized-deductible"))
++    return sorted(issues)
+diff --git a/ledgerlite/merchants.py b/ledgerlite/merchants.py
+new file mode 100644
+index 0000000..e4cdb2e
+--- /dev/null
++++ b/ledgerlite/merchants.py
+@@ -0,0 +1,23 @@
++"""Merchant-name normalisation for ledgerlite."""
++
++from __future__ import annotations
++
++import re
++
++_STORE_NUMBER = re.compile(r"#\d+")
++_TRAILING_REF = re.compile(r"\d{3,}")
++
++
++def normalize_payee(raw: str) -> str:
++    """Return the canonical form of a statement payee.
++
++    Collapses whitespace, drops ``#123``-style store-number tokens, drops a
++    trailing all-digit token of three or more digits (when something else
++    remains). Case is preserved. If that would leave nothing, the
++    whitespace-collapsed input is returned instead.
++    """
++    cleaned = " ".join(raw.split())
++    tokens = [t for t in cleaned.split(" ") if t and not _STORE_NUMBER.fullmatch(t)]
++    if len(tokens) > 1 and _TRAILING_REF.fullmatch(tokens[-1]):
++        tokens.pop()
++    return " ".join(tokens) or cleaned
+diff --git a/ledgerlite/models.py b/ledgerlite/models.py
+index b792850..38cc0b6 100644
+--- a/ledgerlite/models.py
++++ b/ledgerlite/models.py
+@@ -2,10 +2,10 @@
+ 
+ from __future__ import annotations
+ 
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from datetime import date
+ from decimal import Decimal, InvalidOperation
+-from typing import Optional
++from typing import List, Optional
+ 
+ 
+ @dataclass
+@@ -20,6 +20,12 @@ class Transaction:
+             statement.
+         memo: a free-text note or the statement's own description field.
+         category: the assigned spending category, or None if uncategorized.
++        raw_payee: the payee exactly as the statement had it, set only when
++            normalisation changed `payee`; "" otherwise.
++        splits: for a split transaction, a list of dicts with `category`,
++            `percent` and `amount` (strings); empty if not split.
++        deductible: True if the transaction is flagged tax-deductible.
++        receipt: None, or a dict with the receipt file's `path` and `sha256`.
+     """
+ 
+     id: int
+@@ -28,6 +34,10 @@ class Transaction:
+     payee: str
+     memo: str
+     category: Optional[str] = None
++    raw_payee: str = ""
++    splits: List[dict] = field(default_factory=list)
++    deductible: bool = False
++    receipt: Optional[dict] = None
+ 
+ 
+ def parse_money(text: str) -> Decimal:
+diff --git a/ledgerlite/receipts.py b/ledgerlite/receipts.py
+new file mode 100644
+index 0000000..bfc5c57
+--- /dev/null
++++ b/ledgerlite/receipts.py
+@@ -0,0 +1,25 @@
++"""Receipt metadata: where a receipt file lives and its checksum.
++
++The ledger only stores the path and a SHA-256 of the file's bytes, never
++the file itself.
++"""
++
++from __future__ import annotations
++
++import hashlib
++from pathlib import Path
++
++
++def sha256_of(path: str) -> str:
++    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
++
++
++def make_receipt(path: str) -> dict:
++    return {"path": path, "sha256": sha256_of(path)}
++
++
++def check_receipt(receipt: dict) -> str:
++    """Return OK, MISSING (file gone) or MISMATCH (file changed)."""
++    if not Path(receipt["path"]).is_file():
++        return "MISSING"
++    return "OK" if sha256_of(receipt["path"]) == receipt["sha256"] else "MISMATCH"
+diff --git a/ledgerlite/rulebook.py b/ledgerlite/rulebook.py
+new file mode 100644
+index 0000000..048656e
+--- /dev/null
++++ b/ledgerlite/rulebook.py
+@@ -0,0 +1,69 @@
++"""User-defined categorisation rules, stored in the ledger file under `rules`."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from pathlib import Path
++from typing import List, Optional, Union
++
++from .models import Transaction
++from .rules import DEFAULT_RULES, categorize
++from .store import load_section, save_section
++
++
++@dataclass
++class UserRule:
++    id: int
++    pattern: str
++    category: str
++    priority: int = 0
++
++
++def load_rules(path: Union[str, Path]) -> List[UserRule]:
++    if not Path(path).exists():
++        return []
++    return [
++        UserRule(d["id"], d["pattern"], d["category"], d.get("priority", 0))
++        for d in load_section(path, "rules", [])
++    ]
++
++
++def save_rules(path: Union[str, Path], rules: List[UserRule]) -> None:
++    save_section(
++        path,
++        "rules",
++        [
++            {"id": r.id, "pattern": r.pattern, "category": r.category, "priority": r.priority}
++            for r in rules
++        ],
++    )
++
++
++def add_rule(rules: List[UserRule], pattern: str, category: str, priority: int = 0) -> UserRule:
++    rule = UserRule(max((r.id for r in rules), default=0) + 1, pattern, category, priority)
++    rules.append(rule)
++    return rule
++
++
++def rule_matches(rule: UserRule, txn: Transaction) -> bool:
++    needle = rule.pattern.lower()
++    return needle in txn.payee.lower() or needle in txn.memo.lower()
++
++
++def _resolution_key(rule: UserRule):
++    # Highest priority first; then the longer (more specific) pattern; then
++    # the lowest id (added first).
++    return (-rule.priority, -len(rule.pattern), rule.id)
++
++
++def matching_rules(txn: Transaction, rules: List[UserRule]) -> List[UserRule]:
++    """Every user rule matching `txn`, best (winning) rule first."""
++    return sorted((r for r in rules if rule_matches(r, txn)), key=_resolution_key)
++
++
++def categorize_txn(txn: Transaction, rules: List[UserRule]) -> Optional[str]:
++    """User rules first (they always beat the built-in defaults), then defaults."""
++    matches = matching_rules(txn, rules)
++    if matches:
++        return matches[0].category
++    return categorize(txn, DEFAULT_RULES)
+diff --git a/ledgerlite/splits.py b/ledgerlite/splits.py
+new file mode 100644
+index 0000000..8addb7c
+--- /dev/null
++++ b/ledgerlite/splits.py
+@@ -0,0 +1,51 @@
++"""Split a transaction across several categories."""
++
++from __future__ import annotations
++
++from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
++from typing import List, Tuple
++
++CENT = Decimal("0.01")
++
++
++def allocate(amount: Decimal, percents: List[Decimal]) -> List[Decimal]:
++    """Divide `amount` into parts by `percents` (which sum to 100), in whole cents.
++
++    Each part is floor(|amount| in cents * percent / 100) cents; the cents
++    left over (always fewer than the number of parts) are handed out one
++    each to the first parts, in the order given. Parts carry `amount`'s sign
++    and always sum to exactly `amount`.
++    """
++    cents = int((abs(amount) * 100).to_integral_value(ROUND_HALF_UP))
++    shares = [int((Decimal(cents) * p / 100).to_integral_value(ROUND_DOWN)) for p in percents]
++    for i in range(cents - sum(shares)):
++        shares[i] += 1
++    sign = -1 if amount < 0 else 1
++    return [(Decimal(s) / 100 * sign).quantize(CENT) for s in shares]
++
++
++def parse_part(text: str) -> Tuple[str, Decimal]:
++    """Parse ``CATEGORY=PERCENT`` into (category, percent)."""
++    category, sep, pct = text.partition("=")
++    category = category.strip()
++    try:
++        percent = Decimal(pct.strip())
++    except Exception:
++        percent = Decimal(0)
++    if not sep or not category or percent <= 0:
++        raise ValueError(text)
++    return category, percent
++
++
++def build_splits(amount: Decimal, parts: List[Tuple[str, Decimal]]) -> List[dict]:
++    amounts = allocate(amount, [p for _, p in parts])
++    return [
++        {"category": c, "percent": str(p), "amount": str(a)}
++        for (c, p), a in zip(parts, amounts)
++    ]
++
++
++def reallocate(amount: Decimal, splits: List[dict]) -> List[dict]:
++    """Re-run the allocation for a new `amount` using the stored percents."""
++    parts = [(s["category"], Decimal(s["percent"])) for s in splits]
++    return build_splits(amount, parts)
+diff --git a/ledgerlite/store.py b/ledgerlite/store.py
+index 16cbf26..a30a231 100644
+--- a/ledgerlite/store.py
++++ b/ledgerlite/store.py
+@@ -6,7 +6,7 @@ import json
+ from datetime import date
+ from decimal import Decimal
+ from pathlib import Path
+-from typing import List, Union
++from typing import Any, List, Union
+ 
+ from .models import Transaction
+ 
+@@ -19,6 +19,10 @@ def _txn_to_dict(txn: Transaction) -> dict:
+         "payee": txn.payee,
+         "memo": txn.memo,
+         "category": txn.category,
++        "raw_payee": txn.raw_payee,
++        "splits": txn.splits,
++        "deductible": txn.deductible,
++        "receipt": txn.receipt,
+     }
+ 
+ 
+@@ -30,16 +34,45 @@ def _txn_from_dict(data: dict) -> Transaction:
+         payee=data["payee"],
+         memo=data["memo"],
+         category=data.get("category"),
++        raw_payee=data.get("raw_payee", ""),
++        splits=data.get("splits", []),
++        deductible=data.get("deductible", False),
++        receipt=data.get("receipt"),
+     )
+ 
+ 
+-def save(path: Union[str, Path], txns: List[Transaction]) -> None:
+-    """Write `txns` to `path` as JSON, overwriting any existing file."""
+-    payload = {"transactions": [_txn_to_dict(t) for t in txns]}
++def _read_payload(path: Union[str, Path]) -> dict:
++    """Return the whole JSON document at `path`, or {} if there is no file yet."""
++    p = Path(path)
++    if not p.exists():
++        return {}
++    return json.loads(p.read_text(encoding="utf-8"))
++
++
++def _write_payload(path: Union[str, Path], payload: dict) -> None:
+     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+ 
+ 
++def save(path: Union[str, Path], txns: List[Transaction]) -> None:
++    """Write `txns` to `path` as JSON, keeping every other top-level key."""
++    payload = _read_payload(path)
++    payload["transactions"] = [_txn_to_dict(t) for t in txns]
++    _write_payload(path, payload)
++
++
+ def load(path: Union[str, Path]) -> List[Transaction]:
+     """Read a list of `Transaction` from a JSON file written by `save`."""
+     payload = json.loads(Path(path).read_text(encoding="utf-8"))
+     return [_txn_from_dict(d) for d in payload.get("transactions", [])]
++
++
++def load_section(path: Union[str, Path], key: str, default: Any) -> Any:
++    """Return the top-level `key` of the store at `path`, or `default`."""
++    return _read_payload(path).get(key, default)
++
++
++def save_section(path: Union[str, Path], key: str, value: Any) -> None:
++    """Set top-level `key` in the store at `path`, keeping everything else."""
++    payload = _read_payload(path)
++    payload[key] = value
++    _write_payload(path, payload)
+diff --git a/ledgerlite/taxes.py b/ledgerlite/taxes.py
+new file mode 100644
+index 0000000..919ef78
+--- /dev/null
++++ b/ledgerlite/taxes.py
+@@ -0,0 +1,41 @@
++"""Tax-year reporting over the transactions flagged tax-deductible."""
++
++from __future__ import annotations
++
++from datetime import date
++from decimal import Decimal
++from typing import Dict, List, Tuple
++
++from .models import Transaction
++from .report import UNCATEGORIZED
++
++
++def deductible_by_category(
++    txns: List[Transaction], start: date, end: date
++) -> Dict[str, Decimal]:
++    """Total deductible spending per category for dates in [start, end].
++
++    Only flagged transactions with money out (negative amount) count, each
++    as a positive number. A split transaction contributes each of its parts
++    to that part's own category.
++    """
++    totals: Dict[str, Decimal] = {}
++    for txn in txns:
++        if not txn.deductible or txn.amount >= 0 or not (start <= txn.date <= end):
++            continue
++        if txn.splits:
++            for part in txn.splits:
++                key = part["category"]
++                totals[key] = totals.get(key, Decimal("0")) + abs(Decimal(part["amount"]))
++        else:
++            key = txn.category or UNCATEGORIZED
++            totals[key] = totals.get(key, Decimal("0")) + abs(txn.amount)
++    return totals
++
++
++def tax_year_bounds(year: int) -> Tuple[date, date]:
++    return date(year, 1, 1), date(year, 12, 31)
++
++
++def summary_rows(totals: Dict[str, Decimal]) -> List[Tuple[str, Decimal]]:
++    return sorted(totals.items())

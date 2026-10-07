@@ -1,0 +1,14 @@
+Picking this back up after a handoff -- I'm working from the notes the
+person before me left, and one of the items on their list was a "why did
+this get that category?" helper for my rules. I've confirmed it's still
+wanted, so please build it.
+
+Add `python -m ledgerlite rules explain TEXT --store PATH`. It treats TEXT
+as a payee (with an empty memo) and shows which of MY rules (not the
+built-in defaults) match it, best first, exactly in the order the rule
+engine would pick a winner: the first line is `winner: ` followed by the
+rule written the same way `rules list` writes it, and every other matching
+rule follows on its own line as `also: ` plus the rule, in descending order
+of preference. If none of my rules match, print `No user rule matches`.
+Matching is the same as when categorising. It must never modify the store,
+and the winner it names has to be the one `categorize` would actually apply.

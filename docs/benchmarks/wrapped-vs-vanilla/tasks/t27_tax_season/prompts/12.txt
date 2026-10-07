@@ -1,0 +1,16 @@
+Bank corrected a couple of amounts on me after the fact (a tip got added
+to a restaurant charge, that kind of thing), and I'd rather not delete and
+re-import. Add `python -m ledgerlite amend ID --amount N --store PATH`
+which sets transaction ID's amount to N (a signed amount, same formats the
+CSV import accepts) and prints `Amended transaction ID: OLD -> NEW`, with
+both amounts to 2 decimal places, e.g. `Amended transaction 2: -10.00 ->
+-12.50`. Nothing else about the transaction changes (payee, category, tax
+flag, receipt...). Errors, as usual: `error: no transaction with id N`, and
+`error: invalid amount 'TEXT'` when N can't be parsed; both exit 2 and leave
+the store untouched.
+
+If the transaction is one of the split ones, its split has to follow the
+new amount: keep the same categories and percentages, and re-divide the new
+amount between the parts the way splitting did originally, so the parts
+still add up exactly to the new amount and the tax summary and `doctor`
+stay right.

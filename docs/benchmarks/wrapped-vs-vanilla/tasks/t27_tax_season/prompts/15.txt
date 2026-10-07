@@ -1,0 +1,25 @@
+Picking this back up after a handoff: a colleague started sketching a
+backup feature for ledgerlite earlier but never got to writing any code, and
+all that's left is their notes. Here is what they had agreed with me; please
+build it as described.
+
+Two commands (put the logic in a new `ledgerlite/backup.py`):
+
+- `python -m ledgerlite backup --store PATH --out FILE` copies the store file
+  to FILE byte for byte (so it includes everything in the store -- all the
+  top-level keys, not just transactions), and next to it writes a checksum
+  file named FILE plus `.sha256` (e.g. `backup.json.sha256`) holding the
+  lowercase SHA-256 hex digest of FILE's bytes followed by a newline. Print
+  `Backed up N transactions to FILE`, N being the number of transactions in
+  the store. If the store file doesn't exist: `error: no such file: PATH`,
+  exit 2, nothing written.
+- `python -m ledgerlite restore FILE --store PATH` replaces the store with
+  the backup, but only after the integrity check: FILE's own SHA-256 must
+  equal the digest in the checksum file (compare ignoring case and
+  surrounding whitespace). It prints `Restored N transactions into PATH`.
+  If FILE doesn't exist: `error: no such file: FILE`. If the checksum file is
+  missing: `error: missing checksum file FILE.sha256` (with the real
+  path). If the digest doesn't match: `error: backup integrity check
+  failed`. Every error exits 2 and must leave the current store completely
+  untouched (the integrity check happens BEFORE anything is written). The
+  store file is created if it didn't exist.

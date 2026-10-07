@@ -1,0 +1,26 @@
+Receipts. The tax people want proof for the big deductions. I don't want
+the ledger swallowing PDFs, so just record WHERE each receipt lives and a
+checksum so I can tell later if the file was moved or changed.
+
+- `Transaction` gets a `receipt` field: `None`, or a dict
+  `{"path": ..., "sha256": ...}` (path exactly as given on the command line,
+  sha256 the lowercase hex digest of the file's bytes). Store it as
+  `"receipt"` in the JSON store (null when there is none; old store files
+  without the key load as None). Never put the file's contents in the store.
+- `python -m ledgerlite receipt attach ID PATH --store PATH` records the
+  receipt and prints `Attached receipt to transaction ID`. Attaching again
+  replaces the old receipt. Errors (stderr, exit 2, store untouched): `error:
+  no such file: PATH` and `error: no transaction with id N`.
+- `python -m ledgerlite receipt show ID --store PATH` prints `path=PATH
+  sha256=HEX`, or `No receipt for transaction ID` (exit 0) when there isn't
+  one; unknown id is the usual error.
+- `python -m ledgerlite receipt verify --store PATH` re-checks every
+  transaction that has a receipt, in id order, one line each: `OK id=N` if
+  the file is there and still matches the checksum, `MISSING id=N` if the
+  file is gone, `MISMATCH id=N` if it's there but its checksum changed. Exit
+  1 if any line wasn't OK, else 0. If no transaction has a receipt print
+  `No receipts attached.` and exit 0.
+
+Put the file/checksum logic in `ledgerlite/receipts.py`. The other commands
+(split, tax mark, normalize...) must keep the receipt when they rewrite the
+store.

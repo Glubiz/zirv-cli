@@ -205,7 +205,7 @@ unknown lane or a lane/kind mismatch.
 **Lanes** say what a task is for:
 
 - `long` -- `kind=chain` long-session tasks, the zirv-vs-vanilla headline:
-  `t24_long_haul`, `t24b_long_haul` (t26/t27 will be added).
+  `t24_long_haul`, `t24b_long_haul`, `t27_tax_season` (t26 will be added).
 - `orch` -- `kind=orch`, run by `orch.py` (interactive session through a ConPTY),
   never by `run.py` (`--tasks all` skips them): `o01_ledger_suite`.
 - `jev` -- the short tasks `t13`, `t15`, `t17`-`t22`, used ONLY for measuring the Jev
@@ -224,7 +224,7 @@ using one for iterative screening and the other as the "unseen" holdout
 would leak almost the whole task into candidate selection -- both sit in
 `holdout` together (both stay in the `long` lane). With the short tasks gone the
 splits are: `dev` = t13, t15, t23 (the cheap screening set); `validation` = t17,
-t18, t19, t25; `holdout` = t20, t21, t22, t24, t24b; each still carries one
+t18, t19, t25; `holdout` = t20, t21, t22, t24, t24b, t27 (its own group); each still carries one
 `long_session` chain task (t23, t25, t24/t24b) so a manifest's `[stages.*]
 classes = ["long_session"]` filter has something on every stage, and the
 non-chain stages keep `feature`/`architecture`/`ambiguous` tasks. Change from the

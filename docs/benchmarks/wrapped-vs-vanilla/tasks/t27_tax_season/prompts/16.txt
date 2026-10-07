@@ -1,0 +1,10 @@
+Talked to my accountant and I need to change something from earlier. My
+tax year isn't the calendar year -- it's a fiscal year that starts on
+1 April. So `tax summary YEAR` should now cover 1 April of YEAR through 31
+March of YEAR+1, both days included (so `tax summary 2024` is 2024-04-01
+to 2025-03-31). That replaces the January-to-December behaviour we have
+now.
+
+Keep the old behaviour reachable behind a new `--calendar` flag on `tax
+summary` (`tax summary 2024 --calendar` covers 1 Jan to 31 Dec 2024, as it
+did before). Everything else about the command stays as it is.

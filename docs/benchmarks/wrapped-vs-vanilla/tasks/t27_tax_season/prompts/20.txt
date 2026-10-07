@@ -1,0 +1,22 @@
+Before I forget why half of this works the way it does -- especially the
+bits where we changed direction -- I want a short paper trail for whoever
+(maybe me) opens this project next quarter.
+
+Write `docs/design-notes/ledger-hygiene.md` covering, for each of the
+following, what we decided and WHY (a sentence or two of rationale each is
+plenty):
+
+- how your categorisation rules are resolved against each other and against
+  the built-in rules, including the tie-break and the fact that we changed it
+  after first building it;
+- what a "clean" merchant name is and where it gets applied;
+- what counts as a duplicate in `merge`, and the bug we hit with two
+  identical purchases and how matching works now;
+- how a split transaction's cents are divided between its parts, and what
+  `amend` does to a split;
+- what the tax year is for `tax summary` and `tax export`, how that
+  changed, and how to get the old behaviour back;
+- how backup and restore protect against a corrupted backup.
+
+Then add a short "Known gaps" list of what you'd still want to tackle (just
+what makes sense given what's here, you don't need to guess my plans).

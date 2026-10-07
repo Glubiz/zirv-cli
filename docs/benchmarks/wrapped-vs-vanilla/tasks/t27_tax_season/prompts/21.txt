@@ -1,0 +1,17 @@
+That's everything for today, thank you! Two last things before you go:
+
+1. Update `README.md` so it actually documents everything we built this
+   session: user categorisation rules (`rules add/list/explain`, and how
+   ties are resolved), `normalize` and merchant-name cleaning, `merge` (with
+   `--window`), `split` / `split-show` (with the cent-remainder rule),
+   `amend`, tax flags (`tax mark/unmark/list`), `tax summary` and `tax
+   export` (including the April fiscal year and `--calendar`), `receipt
+   attach/show/verify`, `doctor` and its checks, `search` and its query
+   terms, and `backup` / `restore` -- with at least a short usage example for
+   each. Integrate it into the README's existing structure rather than just
+   dumping a list at the bottom.
+
+2. In your final reply (not in the README), give me a concise, step-by-step
+   summary of everything we did this session -- including the `merge` bug we
+   found and fixed, and both places where we changed our minds about earlier
+   behaviour.

@@ -1,0 +1,10 @@
+I've been living with my rules for a bit and I changed my mind about how
+ties are broken. "Longer pattern wins" is wrong in practice: I keep adding a
+short, quick rule to override something and then it silently loses to some
+older, longer one. New plan: when two or more of my rules match with the
+SAME priority, the most recently added rule wins (the highest id),
+regardless of how long the patterns are. Priority still comes first, and my
+rules still always beat the built-ins -- only the tie-break changes.
+
+This should hold everywhere rules get applied (`categorize`, `import`,
+`merge`), not just one of them.

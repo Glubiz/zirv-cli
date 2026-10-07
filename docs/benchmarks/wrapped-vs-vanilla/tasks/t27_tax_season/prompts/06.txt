@@ -1,0 +1,17 @@
+Now the payoff for all that flagging: a yearly tax summary.
+
+Add `python -m ledgerlite tax summary YEAR --store PATH`. It covers
+transactions dated from January 1st to December 31st of YEAR (both days
+included) that are flagged tax-deductible, and only money going OUT counts
+(negative amounts, shown as positive numbers; positive amounts on a flagged
+transaction are ignored, not netted). Print one line per category,
+`CATEGORY: AMOUNT` with the amount to 2 decimal places, sorted by category
+name, then a final `TOTAL: AMOUNT` line. Transactions without a category are
+grouped under `uncategorized`. If nothing qualifies, just print `TOTAL:
+0.00`.
+
+The split transactions need to come out right in this report too -- think
+about what the numbers should be given how we just set splitting up, I want
+the accountant's totals to be exact to the cent.
+
+Put the logic in a new `ledgerlite/taxes.py` rather than in `cli.py`.

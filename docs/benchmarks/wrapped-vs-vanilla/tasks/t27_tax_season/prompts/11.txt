@@ -1,0 +1,14 @@
+Quick tidy-up before we go further. If you look at `cli.py`, nearly every
+handler has its own little "print `error: ...` to stderr and return 2" dance,
+and it's easy to get wrong when I add a command.
+
+Please centralise it: add `ledgerlite/errors.py` with a `CliError(Exception)`
+class (constructed with just the message, `str()` of it is the message).
+Handlers should `raise CliError("...")` for every user-facing failure
+instead of printing and returning 2 themselves, and `main()` should be the
+one place that catches `CliError`, prints `error: <message>` to stderr and
+returns 2.
+
+This is a pure refactor: every command, flag, output line, error message
+and exit code must behave exactly as it does right now. Don't change any
+functionality while you're in there.

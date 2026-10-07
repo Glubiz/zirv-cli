@@ -1,0 +1,32 @@
+Now the thing that's really been bugging me: my bank's statement periods
+overlap, so every time I import the next one a handful of transactions show
+up twice. I want a way to add a statement to the ledger that skips what I
+already have.
+
+Add `python -m ledgerlite merge CSV_PATH --store PATH [--window DAYS]`. It
+reads the CSV exactly like `import` does (same payee normalisation, same
+categorisation with my rules and the built-ins), but instead of replacing
+the ledger it ADDS the new rows to the transactions already in `--store`
+(if the file doesn't exist yet, it starts a fresh ledger). New rows get ids
+continuing after the highest id already in the store (an empty/new store
+starts at 1), in the order they appear in the CSV.
+
+An incoming row is a DUPLICATE, and gets skipped, when the ledger already
+holds a transaction with
+- the same payee after normalisation (compare case-insensitively, and
+  normalise the stored transaction's payee too, since old rows may still
+  carry the noisy statement text),
+- exactly the same signed amount (so a refund of the same size is NOT a
+  duplicate of the charge), and
+- a date within `--window` days of the incoming row's date, either side,
+  inclusive. The window defaults to 2 days; `--window 0` means same date
+  only. A negative window is an error: print `error: window must be >= 0`
+  to stderr and exit 2, touching nothing.
+
+Print `Merged A new transactions, skipped D duplicates` (always that
+wording, even for 1) where A is the number of rows added and D the number
+skipped. Everything else already in the store (rules etc.) must stay
+untouched.
+
+Put the duplicate check in its own module, `ledgerlite/dedupe.py`, and
+share whatever import and merge have in common rather than copying it.

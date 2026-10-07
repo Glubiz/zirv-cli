@@ -1,0 +1,9 @@
+Small one. I showed the `tax summary` output to my accountant and she'd
+rather see the biggest category first. Change `tax summary` so the category
+lines are ordered by amount, largest first, with categories that have the
+same amount ordered by name; the `TOTAL:` line stays last and nothing else
+about that command's output changes.
+
+Just that one command, please -- I know `summary` and `rules list` and a few
+others sort things differently and it looks a bit inconsistent, but I'm not
+asking about any of those right now, so leave them exactly as they are.

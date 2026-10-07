@@ -230,3 +230,54 @@ Every hidden-test step's reference score was verified with `python run.py
 1.0 on that step's own hidden tests (the template's one known baseline-red
 visible test excepted), and an unpatched pristine copy scores well below
 that on every step.
+
+## t27_tax_season: ledger hygiene and tax-season long-session chain
+
+`t27_tax_season` is a 21-step `kind=chain` task on the `ledgerlite` template,
+built to the same shape as `t24b_long_haul` (about 15 minutes for a Sonnet
+agent, context growing past ~150k tokens) but with a different story arc: getting
+the ledger ready for tax season and data hygiene. It deliberately shares no
+features with t24/t24b (currencies, OFX, recurring, budgets, cashflow,
+reconciliation, undo, `commands/` split). Every requirement a hidden test
+checks is stated in that step's prompt or an earlier one (the lesson of t24's
+steps 9/14); hidden tests drive the CLI and only name modules/functions the
+prompt names (`merchants.normalize_payee`, `errors.CliError`).
+
+| step | shape | axis | hidden tests | reference score |
+|---|---|---|---|---|
+| 01 | greenfield: user categorisation rules (`rules add/list`), priority + longer-pattern tie-break; store keeps other top-level keys (multi-module: rulebook, store, cli) | multi-module edit; constraint origin (store never clobbers other keys) | 15 | 1.0 |
+| 02 | feature: `merchants.normalize_payee`, `raw_payee`, `normalize` (multi-module) | multi-module edit | 11 | 1.0 |
+| 03 | feature: `merge` with duplicate detection and `--window` (multi-module: dedupe, cli); plants the deferred bug | multi-module edit; deferred-bug origin | 9 | 1.0 |
+| 04 | feature: `split` / `split-show`, integer-cent remainder rule (multi-module) | multi-module edit; decision origin (remainder rule) | 9 | 1.0 |
+| 05 | feature: tax flags `tax mark/unmark/list` | -- | 8 | 1.0 |
+| 06 | feature: `tax summary YEAR` (calendar year, per split part) | recall (split parts) | 7 | 1.0 (superseded from step 9) |
+| 07 | feature: `doctor` with three checks | -- | 7 | 1.0 |
+| 08 | feature: `receipt attach/show/verify` (path + SHA-256, no binaries; multi-module) | multi-module edit | 7 | 1.0 |
+| 09 | scope trap: reorder only `tax summary` biggest-first; wording mentions `summary`/`rules list` | scope discipline (untouched orderings are tested) | 6 | 1.0 |
+| 10 | bug report: `merge` skips both identical rows when the ledger holds one; match one-to-one | deferred bug surfaced | 8 | 1.0 |
+| 11 | behaviour-preserving refactor: `errors.CliError`, one catch in `main()` | refactor with regression tests | 5 | 1.0 |
+| 12 | feature: `amend ID --amount` re-divides a split "the way splitting did originally" | recall (step 4 remainder rule, not restated) | 6 | 1.0 |
+| 13 | change of plan: equal-priority tie-break flips to newest rule wins | changed requirement (reverses step 1) | 6 | 1.0 |
+| 14 | feature: `search` query language (`payee:`, `category:`, `amount>`, `year:`, `tax:`, bare words) | recall (clean payee, split-part categories) | 10 | 1.0 |
+| 15 | "picking this back up after a handoff": `backup` / `restore` with `.sha256` integrity check | resume-after-handoff phrasing | 8 | 1.0 |
+| 16 | change of plan: `tax summary` becomes April-March fiscal year, `--calendar` keeps the old | changed requirement (alters step 6) | 5 | 1.0 |
+| 17 | feature: `doctor` `missing-receipt` check "reported exactly like the other checks" | recall (step 7 format, step 5 flag, step 8 receipts) | 5 | 1.0 |
+| 18 | feature: `tax export` json/markdown fed by the same code as `tax summary` (multi-module) | recall (fiscal year, order, split parts); multi-module edit | 7 | 1.0 |
+| 19 | "picking this back up after a handoff": `rules explain` | recall (step 13 tie-break, not restated); handoff phrasing | 6 | 1.0 |
+| 20 | decision log `docs/design-notes/ledger-hygiene.md` (judge only) | recall of every decision incl. both reversals | - | rubric-graded |
+| 21 | wrap-up: README + final-reply summary naming the `merge` bug and both changes of plan (judge only) | -- | - | rubric-graded |
+
+Two earlier test files are deliberately superseded by a later change of plan
+(`verify_reference.py`'s `SUPERSEDED` map): `step_01/test_step1_tiebreak.py`
+from step 13, and `step_06/test_step6_tax_summary.py` from step 9 (ordering)
+and 16 (fiscal year). Each chain step is graded on its OWN hidden tests only
+(`grade_step_tests`), so these never conflict with the live run.
+
+Every reference score above was verified two ways: `python
+tasks/t27_tax_season/verify_reference.py` (FAIL-check against the previous
+step's patch, PASS-check of every still-applicable earlier step against the
+cumulative patch) and `python run.py --check-graders --tasks t27_tax_season`
+(each cumulative `reference/step_NN.patch` on a fresh pristine copy scores 1.0
+on that step's own hidden tests, the template's one known baseline-red
+visible test excepted, and the unpatched pristine copy scores below 1.0).
+The patches are CRLF to match the Windows checkout of `template/`, like t24b's.
