@@ -644,7 +644,9 @@ def drive(argv, cwd, env, prompt, log_path, timeout_s, idle_s=DEFAULT_IDLE_S, st
                 subs = subagent_files(main)
                 main_recs = read_records(main)
                 state = transcript_state(main_recs, {s.stem: read_records(s) for s in subs})
-                last_activity = max(newest_mtime([main] + subs), run.last_change)
+                # Transcript activity only: an idle TUI keeps redrawing its status line
+                # ("Checking for updates", zirv's status bar), which never goes quiet.
+                last_activity = newest_mtime([main] + subs)
                 if now - last_nudge_at < NUDGE_SETTLE_S:
                     time.sleep(2.0)
                     continue
