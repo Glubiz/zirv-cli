@@ -35,6 +35,9 @@ pub struct PromptConfig {
     /// Copied from `[supervise]` for prompt composition; serde skips it so the wrong `[prompt]` key hard-errors.
     #[serde(skip)]
     pub orchestrator_writes: OrchestratorWrites,
+    /// Copied from `[edit_guard]`: the worker "use the Edit tool" rule rides along with the guard; serde skips it.
+    #[serde(skip)]
+    pub edit_guard: bool,
     /// Set by `compile` when the host already lists the skills natively, so the prompt carries only the pointer; serde skips it, so it is no config key.
     #[serde(skip)]
     pub skill_index_native: bool,
@@ -53,6 +56,7 @@ impl Default for PromptConfig {
             skill_index_repo_filter: true,
             codex_orchestrator: true,
             orchestrator_writes: OrchestratorWrites::Advise,
+            edit_guard: false,
             skill_index_native: false,
         }
     }

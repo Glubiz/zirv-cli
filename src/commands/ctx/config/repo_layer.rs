@@ -1168,6 +1168,11 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["scope_guard", "enabled"],
         EnvKind::Bool,
     ),
+    (
+        "ZIRV_CTX_EDIT_GUARD_ENABLED",
+        &["edit_guard", "enabled"],
+        EnvKind::Bool,
+    ),
 ];
 
 /// Expose the config path for an env override without exposing parsing kinds outside this module.

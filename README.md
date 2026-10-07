@@ -6369,8 +6369,10 @@ own `ZIRV_CTX_SCOPE_GUARD_ENABLED`), never force it on for an operator who
 disabled it; disabled means no record is ever written, no checkpoint is ever
 shown, and Stop never blocks for it.
 
-**Shell edit guard** (no config key; zirv-supervised sessions only, i.e. those
-with `ZIRV_CTX_SESSION` set): `PreToolUse` denies a `Bash` command that runs an
+**Shell edit guard** (opt-in: `[edit_guard]`, default `enabled = false`, env
+`ZIRV_CTX_EDIT_GUARD_ENABLED`; a repo's `.zirv/ctx.toml` may only disable it;
+zirv-supervised sessions only, i.e. those with `ZIRV_CTX_SESSION` set): when
+enabled, `PreToolUse` denies a `Bash` command that runs an
 inline interpreter script (`python`/`python3`/`py`/`node`/`ruby`/`perl` with a
 heredoc, `-c` or `-e`) containing a file-write call when one of its quoted path
 literals is a git-tracked file, and points the agent at the `Edit` tool instead
