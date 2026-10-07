@@ -4681,7 +4681,7 @@ mid_turn = false              # operator-only: deliver session-addressed mail fr
 enabled = false               # ZIRV_CTX_SUPERVISOR_ENABLED; off means no spawns, no state files, unchanged hook output
 harness = "codex"             # claude or codex; ZIRV_CTX_SUPERVISOR_HARNESS
 model = ""                    # explicit consult model (e.g. claude-fable-5-1 or gpt-6-astra), REQUIRED while enabled (config error otherwise); ZIRV_CTX_SUPERVISOR_MODEL
-max_calls = 3                 # consults per session, every ruling kind included; ZIRV_CTX_SUPERVISOR_MAX_CALLS
+max_calls = 3                 # deprecated and ignored (consults are uncapped); still parsed so old configs load; ZIRV_CTX_SUPERVISOR_MAX_CALLS
 max_advice_bytes = 2048       # cap on a ruling's reason; ZIRV_CTX_SUPERVISOR_MAX_ADVICE_BYTES
 
 [models]
@@ -6239,16 +6239,16 @@ binding unless the operator overrides them, and they only ever narrow: a ruling 
 require a revision, stop a retry or pick one of the options the seat offered. It never writes code,
 answers a permission request, grants anything or widens scope.
 
-Hooks never call a model and never wait. A trigger checks local state and, with calls remaining,
+Hooks never call a model and never wait. A trigger checks local state and
 spawns one detached `zirv ctx supervisor consult` (evidence on its stdin) that runs a single
 `zirv ctx agent <harness> --mode read-only --quiet --json --task-class review` delegation with
 `-m <model>` (the delegation ledger records the spend). The reply must match the kind's strict
-format; one that does not produces no ruling, a logged fallback, and today's behaviour. A ruling is
+format; one that does not produces no ruling, a logged fallback, and today's behaviour (`ask` reports a redacted, 500-byte excerpt of the reply in its error). A choice reply may wrap its `CHOICE: <n>` line in markdown, a code fence or prose and may name the option by letter (`B`); two different picks are no ruling. A ruling is
 stored in `<state>/supervisor/rulings/rulings.json` (`id`, `session`, optional `workflow`, `kind`,
 `verdict`, `reason` redacted and capped at `max_advice_bytes`, `ts`, `status` open, resolved or
 overridden or lapsed) and mailed to the session (sender and topic `supervisor`). A consult's own child session
-never triggers (`ZIRV_SUPERVISOR_CONSULT`). `model` is required when enabled and `max_calls`
-bounds every kind per session; once it is spent the seat decides as it would without a supervisor.
+never triggers (`ZIRV_SUPERVISOR_CONSULT`). `model` is required when enabled. There is no per-session cap on consults; each
+unit of work (a plan text, a diffstat) is consulted on once, and the helper's own token and tool-call budget bounds each consult.
 
 | Kind | Reply format | Where it bites |
 |---|---|---|
@@ -6269,9 +6269,8 @@ stdout are terminals, and it is never auto-allowed, so an agent's attempt surfac
 prompt (`ask` and `status` stay auto-allowed). The residual: the ruling store lives in the state
 directory, which sessions can write, so binding rulings guard against a seat that drifts, not
 against a hostile agent. A `not_done` or `revise` ruling whose superseding consult cannot run
-lapses instead of binding forever: for `max_calls` spent, only after the Stop hook has blocked on it
-3 times (a plan ruling: after the gate has refused with it once); for nothing to review, only when
-`git status --porcelain` succeeds and is empty. The lapse is logged and mailed, so ACTIVITY shows it.
+lapses instead of binding forever when there is nothing to review, and only when
+`git status --porcelain` succeeds and is empty. The Stop hook blocks on a `not_done` ruling at most 3 times. The lapse is logged and mailed, so ACTIVITY shows it.
 Deliberate evasion of the prompt (for example `env -u ... script -q /dev/null ...`) is part of the
 same residual.
 `zirv ctx supervisor status [--json] [--session <short>]` prints per-session state and the open

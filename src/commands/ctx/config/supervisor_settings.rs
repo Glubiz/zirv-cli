@@ -10,7 +10,7 @@ pub struct SupervisorConfig {
     pub harness: String,
     /// Explicit consult model; required while enabled, never inferred.
     pub model: String,
-    /// Consults per session across every ruling kind.
+    /// Deprecated and ignored: consults are uncapped. Parsed so existing configs load.
     pub max_calls: u32,
     /// Byte cap on a ruling's reason.
     pub max_advice_bytes: usize,
@@ -55,7 +55,7 @@ mod tests {
     fn defaults_are_off_and_valid_without_a_model() {
         let cfg = SupervisorConfig::default();
         assert!(!cfg.enabled);
-        assert_eq!((cfg.max_calls, cfg.max_advice_bytes), (3, 2048));
+        assert_eq!(cfg.max_advice_bytes, 2048);
         assert!(cfg.validate().is_ok());
     }
 
@@ -104,7 +104,6 @@ mod tests {
                 "claude".to_string(),
             ),
             ("ZIRV_CTX_SUPERVISOR_MODEL".to_string(), "m".to_string()),
-            ("ZIRV_CTX_SUPERVISOR_MAX_CALLS".to_string(), "5".to_string()),
             (
                 "ZIRV_CTX_SUPERVISOR_MAX_ADVICE_BYTES".to_string(),
                 "512".to_string(),
@@ -114,10 +113,23 @@ mod tests {
         assert!(cfg.supervisor.enabled);
         assert_eq!(cfg.supervisor.harness, "claude");
         assert_eq!(cfg.supervisor.model, "m");
-        assert_eq!(
-            (cfg.supervisor.max_calls, cfg.supervisor.max_advice_bytes),
-            (5, 512)
-        );
+        assert_eq!(cfg.supervisor.max_advice_bytes, 512);
+    }
+
+    #[test]
+    fn the_deprecated_max_calls_key_still_loads_from_the_operator_config() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[supervisor]\nmax_calls = 3\n",
+        )
+        .expect("write");
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = std::collections::HashMap::<String, String>::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(!cfg.supervisor.enabled);
     }
 
     #[test]

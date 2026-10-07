@@ -208,7 +208,7 @@ model = "claude-opus-5-5"
 # enabled = false                    # master switch; off means no spawns, no state files, unchanged hook output. Default: false.
 # harness = "codex"                  # claude or codex. Default: codex.
 # model = ""                         # explicit consult model, required while enabled (a config error otherwise).
-# max_calls = 3                      # consults per session. Default: 3.
+# max_calls = 3                      # deprecated and ignored (consults are uncapped); still parsed so old configs load. Default: 3.
 # max_advice_bytes = 2048            # cap on a ruling's reason. Default: 2048.
 
 # [memory]                           # every key below is REPO-FORBIDDEN

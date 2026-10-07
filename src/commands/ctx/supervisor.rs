@@ -43,6 +43,8 @@ const REPORT_CAP: usize = 64 * 1024;
 const LAST_ADVICE_CHARS: usize = 200;
 const SEEN_KEEP: usize = 16;
 const TRIGGERS_KEEP: usize = 20;
+/// Outstanding `ask` reservations kept refundable; far above any realistic number in flight.
+const RESERVED_KEEP: usize = 64;
 /// What the prompt tells the helper it may use; the enforced cap sits above it so the model
 /// still has turns left to answer when it overshoots (#868).
 const HELPER_STATED_TOOL_CALLS: u32 = 3;
@@ -331,23 +333,7 @@ fn stable_session_key(env: EnvLookup<'_>) -> Option<String> {
     socket_short(env).or_else(|| mail::session_identity(env))
 }
 
-/// Cheap local pre-check: enabled, not inside a consult, and calls remain.
-pub(crate) fn has_budget(
-    state: &StateDir,
-    cfg: &CtxConfig,
-    env: EnvLookup<'_>,
-    session: &str,
-) -> bool {
-    if !cfg.supervisor.enabled || in_consult(env) {
-        return false;
-    }
-    let Some(path) = state_path(state, session) else {
-        return false;
-    };
-    load_state(&path).calls < cfg.supervisor.max_calls
-}
-
-/// Fire one consult unless off, inside a consult, over the cap, or `unit` was already
+/// Fire one consult unless off, inside a consult, or `unit` was already
 /// consulted on. Counts the call before spawning, so a slow consult cannot be re-fired.
 pub(crate) fn fire(
     state: &StateDir,
@@ -367,9 +353,6 @@ pub(crate) fn fire(
         return false;
     };
     let before = load_state(&path);
-    if before.calls >= cfg.supervisor.max_calls {
-        return false;
-    }
     if let Some(unit) = unit
         && before.seen.iter().any(|seen| seen == unit)
     {
@@ -490,7 +473,7 @@ pub(crate) fn error_repeats_request(
 }
 
 /// Before-done trigger: the Stop hook, once per distinct diffstat. Reads `git diff --stat`
-/// only after the cheap budget check passes.
+/// only after the cheap enabled/in-consult check passes.
 pub(crate) fn on_stop(
     state: &StateDir,
     cfg: &CtxConfig,
@@ -500,35 +483,6 @@ pub(crate) fn on_stop(
 ) {
     let lapsed = on_stop_with(state, cfg, env, repo, session, &spawn_consult);
     announce_lapsed(state, repo, &lapsed);
-}
-
-/// Lapse an open `kind` ruling when its superseding consult cannot run for want of budget.
-fn lapse_if_spent(
-    state: &StateDir,
-    cfg: &CtxConfig,
-    session: &str,
-    kind: RulingKind,
-    workflow: Option<&str>,
-) -> Vec<Ruling> {
-    let Some(path) = state_path(state, session) else {
-        return Vec::new();
-    };
-    if load_state(&path).calls < cfg.supervisor.max_calls {
-        return Vec::new();
-    }
-    // Only after the ruling has had its chances: the Stop hook's full blocks, or a gate refusal.
-    let ready = |ruling: &Ruling| match kind {
-        RulingKind::Done => ruling.blocks >= rulings::MAX_STOP_BLOCKS,
-        _ => ruling.refusals >= 1,
-    };
-    rulings::lapse_open(
-        state,
-        kind,
-        session,
-        workflow,
-        "the consult budget is spent",
-        &ready,
-    )
 }
 
 /// Record each lapse in the decision log and mail it to the session, so ACTIVITY shows it.
@@ -572,9 +526,6 @@ fn on_stop_with(
 ) -> Vec<Ruling> {
     if !cfg.supervisor.enabled || in_consult(env) {
         return Vec::new();
-    }
-    if !has_budget(state, cfg, env, session) {
-        return lapse_if_spent(state, cfg, session, RulingKind::Done, None);
     }
     let stat = git_diff_stat(repo);
     if stat.is_empty() {
@@ -620,11 +571,6 @@ pub(crate) fn on_plan_completed(
     let Some(session) = stable_session_key(&env).filter(|_| cfg.supervisor.enabled) else {
         return;
     };
-    let lapsed = lapse_if_spent(state, &cfg, &session, RulingKind::Plan, Some(&workflow.id));
-    if !lapsed.is_empty() {
-        announce_lapsed(state, &workflow.repo, &lapsed);
-        return;
-    }
     let read = |stage| {
         read_accepted_artifact(workflow, stage)
             .ok()
@@ -850,6 +796,29 @@ const UNPARSEABLE_EXCERPT_BYTES: usize = 1024;
 /// Detail cap: the reply excerpt plus its fixed prefix.
 const FALLBACK_DETAIL_BYTES: usize = UNPARSEABLE_EXCERPT_BYTES + 100;
 
+/// How much of the helper's reply the `ask` error carries back to the seat.
+const ASK_REPLY_EXCERPT_BYTES: usize = 500;
+
+/// A helper reply as one redacted, capped line; an empty reply is named, not blank.
+fn reply_excerpt(reply: &str, cap: usize) -> String {
+    let line = super::snapshot::redact_text(reply)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if line.is_empty() {
+        return "(empty reply)".to_string();
+    }
+    crate::utils::truncate_bytes(line, Some(cap))
+}
+
+/// The `ask` error for a reply that did not parse: it names what the helper actually said.
+fn unparsed_message(reply: &str) -> String {
+    format!(
+        "the helper's reply did not parse: {}",
+        reply_excerpt(reply, ASK_REPLY_EXCERPT_BYTES)
+    )
+}
+
 fn log_fallback(state: &StateDir, session: &str, detail: &str) {
     let _ = log::append(
         state,
@@ -901,20 +870,14 @@ fn rule_with(
     *tokens = (prompt.len() / 4) as u64;
     let report = run_helper(&prompt)?;
     let Some((verdict, reason)) = rulings::parse_reply(kind, &report, &options) else {
-        // One line, so the decision log stays greppable; empty replies are named, not blank.
-        let reply = super::snapshot::redact_text(&report)
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        let reply = if reply.is_empty() {
-            "(empty reply)".to_string()
-        } else {
-            crate::utils::truncate_bytes(reply, Some(UNPARSEABLE_EXCERPT_BYTES))
-        };
         log_fallback(
             state,
             session,
-            &format!("unparseable {} reply: no ruling: {reply}", kind.as_str()),
+            &format!(
+                "unparseable {} reply: no ruling: {}",
+                kind.as_str(),
+                reply_excerpt(&report, UNPARSEABLE_EXCERPT_BYTES)
+            ),
         );
         return Ok(None);
     };
@@ -1063,7 +1026,7 @@ const ASK_TICKET_ENV: &str = "ZIRV_SUPERVISOR_ASK_TICKET";
 const ASK_FAILED_EXIT: i32 = 3;
 
 /// How much of the consult child's stderr an error message carries.
-const ASK_STDERR_TAIL_BYTES: usize = 400;
+const ASK_STDERR_TAIL_BYTES: usize = 600;
 
 /// Only the `--ask` child honours the ticket its parent reserved; a direct consult consumes its own.
 fn ask_ticket_for(ask: bool, env: EnvLookup<'_>) -> String {
@@ -1107,6 +1070,7 @@ fn run_consult(
         .read_to_string(&mut evidence);
     if ask {
         let mut tokens = 0u64;
+        let last_reply = std::cell::RefCell::new(String::new());
         let outcome = rule_with(
             &state,
             &cfg,
@@ -1117,14 +1081,19 @@ fn run_consult(
             &evidence,
             options,
             &mut tokens,
-            &|prompt| delegated_report(&cfg, &repo, RulingKind::Choice, timeout_secs, prompt),
+            &|prompt| {
+                let reply =
+                    delegated_report(&cfg, &repo, RulingKind::Choice, timeout_secs, prompt)?;
+                last_reply.replace(reply.clone());
+                Ok(reply)
+            },
         );
         let failure = match outcome {
             Ok(Some(ruling)) => {
                 println!("{}", serde_json::to_string(&ruling)?);
                 return Ok(0);
             }
-            Ok(None) => "the helper's reply did not parse".to_string(),
+            Ok(None) => unparsed_message(&last_reply.borrow()),
             Err(error) => error.to_string(),
         };
         log_fallback(&state, session, &failure);
@@ -1281,15 +1250,13 @@ fn sandbox_hint(failure: &str) -> Option<String> {
         .then(|| format!("if this seat runs in Claude Code's sandbox, {SANDBOX_REMEDY}"))
 }
 
-/// Reserve one call of the session's `max_calls` budget and write a one-shot ticket unique to this
-/// reservation, returned so only its own consult consumes it and only its own refund removes it.
-fn reserve_ask_call(state: &StateDir, cfg: &CtxConfig, session: &str) -> Option<String> {
+/// Count one call and write a one-shot ticket unique to this reservation, returned so only its
+/// own consult consumes it and only its own refund removes it. `None` when the session's state
+/// cannot be locked.
+fn reserve_ask_call(state: &StateDir, session: &str) -> Option<String> {
     let path = state_path(state, session)?;
     let _lock = lock_beside(&path)?;
     let mut current = load_state(&path);
-    if current.calls >= cfg.supervisor.max_calls {
-        return None;
-    }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
@@ -1297,8 +1264,7 @@ fn reserve_ask_call(state: &StateDir, cfg: &CtxConfig, session: &str) -> Option<
     current.calls += 1;
     push_capped(&mut current.triggers, ASK_TICKET.to_string(), TRIGGERS_KEEP);
     push_capped(&mut current.tickets, ticket.clone(), TRIGGERS_KEEP);
-    // Uncapped: every reservation is one `calls`, so this is bounded by `max_calls`.
-    current.reserved.push(ticket.clone());
+    push_capped(&mut current.reserved, ticket.clone(), RESERVED_KEEP);
     current.consult_started();
     save_state(&path, &current);
     Some(ticket)
@@ -1332,7 +1298,7 @@ fn settle_ask_call(state: &StateDir, session: &str, id: &str, refund: bool) {
 }
 
 /// `zirv ctx supervisor ask`: one synchronous consult, never from a hook. Prints the chosen
-/// option and the reason; on any failure, or an exhausted budget, says so and exits non-zero so
+/// option and the reason; on any failure says so and exits non-zero so
 /// the seat decides as it would without a supervisor.
 fn run_ask_with<W: Write>(
     question: &str,
@@ -1357,15 +1323,15 @@ fn run_ask_with<W: Write>(
     if options.len() < 2 {
         return Err("ask needs at least two --option values".into());
     }
-    let Some(ticket) = reserve_ask_call(&state, &cfg, &session) else {
+    let Some(ticket) = reserve_ask_call(&state, &session) else {
         log_fallback(
             &state,
             &session,
-            "ask refused: the max_calls budget is spent",
+            "ask refused: the session state is unavailable",
         );
         writeln!(
             w,
-            "the supervisor's call budget is spent; decide yourself or ask the operator"
+            "the supervisor's session state is unavailable; decide yourself or ask the operator"
         )?;
         return Ok(1);
     };
@@ -1693,8 +1659,7 @@ mod tests {
         std::fs::write(repo.path().join("a.txt"), "one\n").expect("write");
         git(repo.path(), &["add", "."]);
         git(repo.path(), &["commit", "-qm", "init"]);
-        let mut cfg = enabled_cfg();
-        cfg.supervisor.max_calls = 10;
+        let cfg = enabled_cfg();
         let spawned = Cell::new(0);
         let spawn = |_: &ConsultRequest| {
             spawned.set(spawned.get() + 1);
@@ -1713,10 +1678,35 @@ mod tests {
     }
 
     #[test]
-    fn the_max_calls_cap_holds() {
+    fn consults_are_uncapped_and_their_state_vectors_stay_bounded() {
+        let (_dir, state) = fresh_state();
+        let cfg = enabled_cfg();
+        let spawned = Cell::new(0);
+        let spawn = |_: &ConsultRequest| {
+            spawned.set(spawned.get() + 1);
+            true
+        };
+        for _ in 0..50 {
+            fire(
+                &state,
+                &cfg,
+                &no_env,
+                request(Trigger::ErrorRepeats),
+                None,
+                &spawn,
+            );
+        }
+        assert_eq!(spawned.get(), 50);
+        let row = load_state(&state_path(&state, "abcd1234").expect("path"));
+        assert_eq!(row.calls, 50);
+        assert!(row.tickets.len() <= TRIGGERS_KEEP && row.triggers.len() <= TRIGGERS_KEEP);
+    }
+
+    #[test]
+    fn the_deprecated_max_calls_setting_does_not_cap_consults() {
         let (_dir, state) = fresh_state();
         let mut cfg = enabled_cfg();
-        cfg.supervisor.max_calls = 2;
+        cfg.supervisor.max_calls = 1;
         let spawned = Cell::new(0);
         let spawn = |_: &ConsultRequest| {
             spawned.set(spawned.get() + 1);
@@ -1732,7 +1722,7 @@ mod tests {
                 &spawn,
             );
         }
-        assert_eq!(spawned.get(), 2);
+        assert_eq!(spawned.get(), 5);
     }
 
     #[test]
@@ -1866,16 +1856,6 @@ mod tests {
     }
 
     #[test]
-    fn the_internal_helper_session_gets_no_consult_budget() {
-        let (_dir, state) = fresh_state();
-        let cfg = enabled_cfg();
-        let internal =
-            |key: &str| (key == crate::commands::ctx::adapters::INTERNAL_ENV).then(|| "1".into());
-        assert!(has_budget(&state, &cfg, &no_env, "s"));
-        assert!(!has_budget(&state, &cfg, &internal, "s"));
-    }
-
-    #[test]
     fn a_consult_child_is_marked_internal() {
         let mut command = std::process::Command::new("true");
         mark_consult(&mut command);
@@ -1907,6 +1887,19 @@ mod tests {
         let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
         assert!(log.contains("unparseable done reply"), "{log}");
         assert!(log.contains("NO_ADVICE"), "the reply is logged: {log}");
+    }
+
+    #[test]
+    fn the_ask_parse_failure_carries_the_redacted_truncated_reply() {
+        let long = format!("Picked the table.\n{}", "plain words here\n".repeat(100));
+        let message = unparsed_message(&long);
+        assert!(message.starts_with("the helper's reply did not parse: Picked the table."));
+        assert!(message.len() < 600, "{}", message.len());
+        assert!(!message.contains('\n'));
+        assert_eq!(
+            unparsed_message(""),
+            "the helper's reply did not parse: (empty reply)"
+        );
     }
 
     /// A reply that fails to parse must stay diagnosable: a single-line excerpt of up to 1 KiB,
@@ -2133,8 +2126,7 @@ mod tests {
     #[test]
     fn concurrent_fires_all_count_under_the_lock() {
         let (_dir, state) = fresh_state();
-        let mut cfg = enabled_cfg();
-        cfg.supervisor.max_calls = 100;
+        let cfg = enabled_cfg();
         let fired = std::sync::atomic::AtomicU32::new(0);
         std::thread::scope(|scope| {
             for _ in 0..8 {
@@ -2328,32 +2320,10 @@ mod tests {
             retry_stop_note(&state, &cfg, "abcd1234").is_none(),
             "a success ends it"
         );
-        // The existing floor: off, no note; and the budget is the same max_calls.
+        // The existing floor: off, no note.
         open_a(&state, RulingKind::Retry, "stop", "x");
         cfg.supervisor.enabled = false;
         assert!(retry_stop_note(&state, &cfg, "abcd1234").is_none());
-        let mut capped = enabled_cfg();
-        capped.supervisor.max_calls = 1;
-        let spawned = Cell::new(0);
-        let spawn = |_: &ConsultRequest| {
-            spawned.set(spawned.get() + 1);
-            true
-        };
-        for _ in 0..3 {
-            fire(
-                &state,
-                &capped,
-                &no_env,
-                request(Trigger::ErrorRepeats),
-                None,
-                &spawn,
-            );
-        }
-        assert_eq!(
-            spawned.get(),
-            1,
-            "a retry consult spends the shared max_calls budget"
-        );
     }
 
     #[test]
@@ -2409,7 +2379,7 @@ mod tests {
             (RulingKind::Choice, "a table")
         );
         let row = load_state(&state_path(&state, "operator").expect("path"));
-        assert_eq!(row.calls, 1, "ask spends the shared budget");
+        assert_eq!(row.calls, 1, "ask counts as one call");
 
         // An out-of-range choice is no ruling: the seat decides as it would without a supervisor.
         let bad = |_: &str, _: &[String], _: &str, _: u64, _: &str| -> CtxResult<Option<Ruling>> {
@@ -2490,15 +2460,12 @@ mod tests {
     fn a_consumed_ask_ticket_is_still_refunded_exactly_once() {
         let (dir, state) = fresh_state();
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
-        let env = ruling_env(state.root());
-        let lookup = |k: &str| env.get(k).cloned();
-        let cfg = CtxConfig::load(&std::env::current_dir().expect("cwd"), &lookup).expect("cfg");
-        let id = reserve_ask_call(&state, &cfg, "operator").expect("reserved");
+        let id = reserve_ask_call(&state, "operator").expect("reserved");
         assert!(take_ticket(&state, "operator", &id));
         settle_ask_call(&state, "operator", &id, true);
         let calls = || load_state(&state_path(&state, "operator").expect("path")).calls;
         assert_eq!(calls(), 0, "the child consumed it and failed: refunded");
-        let other = reserve_ask_call(&state, &cfg, "operator").expect("reserved");
+        let other = reserve_ask_call(&state, "operator").expect("reserved");
         settle_ask_call(&state, "operator", &id, true);
         settle_ask_call(&state, "operator", "ask:never-reserved", true);
         assert_eq!(calls(), 1, "a repeat, foreign or unknown refund is a no-op");
@@ -2510,9 +2477,8 @@ mod tests {
     #[test]
     fn the_session_stays_advising_until_the_last_overlapping_consult_settles() {
         let (_dir, state) = fresh_state();
-        let mut cfg = enabled_cfg();
-        cfg.supervisor.max_calls = 5;
-        let id = reserve_ask_call(&state, &cfg, "abcd1234").expect("reserved");
+        let cfg = enabled_cfg();
+        let id = reserve_ask_call(&state, "abcd1234").expect("reserved");
         assert!(fire(
             &state,
             &cfg,
@@ -2544,10 +2510,7 @@ mod tests {
     fn an_ask_is_advising_from_its_reservation_until_it_settles_and_a_failure_returns_to_idle() {
         let (dir, state) = fresh_state();
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
-        let env = ruling_env(state.root());
-        let lookup = |k: &str| env.get(k).cloned();
-        let cfg = CtxConfig::load(&std::env::current_dir().expect("cwd"), &lookup).expect("cfg");
-        let id = reserve_ask_call(&state, &cfg, "operator").expect("reserved");
+        let id = reserve_ask_call(&state, "operator").expect("reserved");
         let running = snapshot(&state, "operator");
         assert!((running.advising, running.last_name.as_str()) == (true, "ask"));
         assert!(running.updated.is_some(), "the mtime marks its start");
@@ -2557,7 +2520,7 @@ mod tests {
             !failed.advising && failed.calls == 0,
             "a failed ask settles to idle"
         );
-        let id = reserve_ask_call(&state, &cfg, "operator").expect("reserved");
+        let id = reserve_ask_call(&state, "operator").expect("reserved");
         settle_ask_call(&state, "operator", &id, false);
         assert!(
             !snapshot(&state, "operator").advising,
@@ -2569,16 +2532,9 @@ mod tests {
     fn the_oldest_outstanding_reservation_stays_refundable_past_the_trigger_cap() {
         let (dir, state) = fresh_state();
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
-        let mut env = ruling_env(state.root());
-        env.insert(
-            "ZIRV_CTX_SUPERVISOR_MAX_CALLS".to_string(),
-            "40".to_string(),
-        );
-        let lookup = |k: &str| env.get(k).cloned();
-        let cfg = CtxConfig::load(&std::env::current_dir().expect("cwd"), &lookup).expect("cfg");
-        let first = reserve_ask_call(&state, &cfg, "operator").expect("reserved");
+        let first = reserve_ask_call(&state, "operator").expect("reserved");
         for _ in 0..TRIGGERS_KEEP + 1 {
-            reserve_ask_call(&state, &cfg, "operator").expect("reserved");
+            reserve_ask_call(&state, "operator").expect("reserved");
         }
         let calls = || load_state(&state_path(&state, "operator").expect("path")).calls;
         assert_eq!(calls() as usize, TRIGGERS_KEEP + 2);
@@ -2590,10 +2546,7 @@ mod tests {
     fn a_direct_consult_ignores_a_foreign_ask_ticket() {
         let (dir, state) = fresh_state();
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
-        let env = ruling_env(state.root());
-        let lookup = |k: &str| env.get(k).cloned();
-        let cfg = CtxConfig::load(&std::env::current_dir().expect("cwd"), &lookup).expect("cfg");
-        let foreign = reserve_ask_call(&state, &cfg, "operator").expect("reserved");
+        let foreign = reserve_ask_call(&state, "operator").expect("reserved");
         let ticket = ask_ticket_for(false, &|key| {
             (key == ASK_TICKET_ENV).then(|| foreign.clone())
         });
@@ -2615,12 +2568,11 @@ mod tests {
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
         let env = ruling_env(state.root());
         let lookup = |k: &str| env.get(k).cloned();
-        let cfg = CtxConfig::load(&std::env::current_dir().expect("cwd"), &lookup).expect("cfg");
         let options = vec!["a".to_string(), "b".to_string()];
         let sibling = std::cell::RefCell::new(None);
         let failing = |session: &str, _: &[String], _: &str, _: u64, ticket: &str| {
             // B reserves while A's consult is in flight, then A's child consumes its ticket and fails.
-            *sibling.borrow_mut() = reserve_ask_call(&state, &cfg, session);
+            *sibling.borrow_mut() = reserve_ask_call(&state, session);
             assert!(take_ticket(&state, session, ticket));
             Err::<Option<Ruling>, _>("the supervisor child exit status: 3: boom".into())
         };
@@ -2650,7 +2602,7 @@ mod tests {
     }
 
     #[test]
-    fn ask_falls_back_when_the_supervisor_is_off_or_the_budget_is_spent() {
+    fn ask_falls_back_when_the_supervisor_is_off() {
         let (dir, state) = fresh_state();
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
         let never =
@@ -2674,25 +2626,17 @@ mod tests {
         )
         .expect("ask");
         assert_eq!(code, 1);
-        let mut on = ruling_env(state.root());
-        on.insert("ZIRV_CTX_SUPERVISOR_MAX_CALLS".to_string(), "0".to_string());
-        let mut out = Vec::new();
-        let code = run_ask_with(
-            "q",
-            &options,
-            "",
-            5,
-            &|k| on.get(k).cloned(),
-            &never,
-            &mut out,
-        )
-        .expect("ask");
-        assert_eq!(code, 1);
-        assert!(
-            String::from_utf8(out)
-                .expect("utf8")
-                .contains("budget is spent")
-        );
+    }
+
+    #[test]
+    fn outstanding_ask_reservations_stay_bounded() {
+        let (_dir, state) = fresh_state();
+        for _ in 0..RESERVED_KEEP + 10 {
+            reserve_ask_call(&state, "operator").expect("reserved");
+        }
+        let row = load_state(&state_path(&state, "operator").expect("path"));
+        assert_eq!(row.calls as usize, RESERVED_KEEP + 10);
+        assert_eq!(row.reserved.len(), RESERVED_KEEP);
     }
 
     #[test]
@@ -2757,47 +2701,6 @@ mod tests {
         assert!(override_ruling(&state, "nope", None).is_err());
     }
 
-    fn spend_budget(state: &StateDir, cfg: &CtxConfig) {
-        let path = state_path(state, "abcd1234").expect("path");
-        let mut row = load_state(&path);
-        row.calls = cfg.supervisor.max_calls;
-        save_state(&path, &row);
-    }
-
-    #[test]
-    fn a_done_ruling_lapses_when_the_budget_is_spent() {
-        let (_dir, state) = fresh_state();
-        let cfg = enabled_cfg();
-        let repo = tempfile::tempdir().expect("repo");
-        rulings::record(
-            &state,
-            "abcd1234",
-            None,
-            RulingKind::Done,
-            "not_done",
-            "tests",
-        );
-        spend_budget(&state, &cfg);
-        let spawn = |_: &ConsultRequest| -> bool { panic!("no budget, no consult") };
-        for _ in 0..rulings::MAX_STOP_BLOCKS {
-            let lapsed = on_stop_with(&state, &cfg, &no_env, repo.path(), "abcd1234", &spawn);
-            assert!(lapsed.is_empty(), "the Stop hook still has blocks to give");
-            assert!(rulings::take_stop_block(&state, "abcd1234").is_some());
-        }
-        let lapsed = on_stop_with(&state, &cfg, &no_env, repo.path(), "abcd1234", &spawn);
-        assert_eq!(lapsed.len(), 1);
-        assert!(open_rulings(&state, None).is_empty());
-        let stored = &rulings::all(&state)[0];
-        assert_eq!(stored.status, RulingStatus::Lapsed);
-        assert!(
-            stored
-                .lapse_reason
-                .as_deref()
-                .is_some_and(|r| r.contains("budget"))
-        );
-        assert!(gate_check(&state, "wf-1", Some("abcd1234"), false, true).is_ok());
-    }
-
     #[test]
     fn a_done_ruling_lapses_when_the_tree_is_clean() {
         let (_dir, state) = fresh_state();
@@ -2846,23 +2749,6 @@ mod tests {
         let lapsed = on_stop_with(&state, &cfg, &no_env, not_a_repo.path(), "abcd1234", &spawn);
         assert!(lapsed.is_empty(), "a git failure proves nothing");
         assert_eq!(open_rulings(&state, None).len(), 1);
-    }
-
-    #[test]
-    fn a_plan_ruling_lapses_when_the_budget_is_spent_and_not_before() {
-        let (_dir, state) = fresh_state();
-        let cfg = enabled_cfg();
-        open_a(&state, RulingKind::Plan, "revise", "cover rollback");
-        let plan = || lapse_if_spent(&state, &cfg, "abcd1234", RulingKind::Plan, Some("wf-1"));
-        assert!(plan().is_empty(), "budget left: still binding");
-        spend_budget(&state, &cfg);
-        assert!(
-            plan().is_empty(),
-            "never before the gate has refused with it"
-        );
-        assert!(gate_check(&state, "wf-1", None, false, false).is_err());
-        assert_eq!(plan().len(), 1);
-        assert!(gate_check(&state, "wf-1", None, false, false).is_ok());
     }
 
     #[test]

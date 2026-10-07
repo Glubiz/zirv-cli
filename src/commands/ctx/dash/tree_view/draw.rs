@@ -264,7 +264,7 @@ fn header(c: &mut Canvas, m: &Model, plan: &Plan) {
         (Some(a), false) => {
             arch_part.push(span(sep, pal::dim()));
             arch_part.push(span(
-                format!("supervisor on \u{b7} {}/{} consults", a.calls, a.max_calls),
+                format!("supervisor on \u{b7} {} consults", a.calls),
                 pal::fg(pal::ARCH),
             ));
         }
@@ -293,7 +293,7 @@ fn header(c: &mut Canvas, m: &Model, plan: &Plan) {
             arch_part = vec![
                 span(sep, pal::dim()),
                 span(
-                    format!("supervisor on \u{b7} {}/{}", a.calls, a.max_calls),
+                    format!("supervisor on \u{b7} {}", a.calls),
                     pal::fg(pal::ARCH),
                 ),
             ];
@@ -895,10 +895,7 @@ fn draw_sidecar(c: &mut Canvas, m: &Model, plan: &Plan, side: Rect) {
     };
     let usage = vec![
         vec![
-            span(
-                format!("{}/{}", a.calls, a.max_calls),
-                pal::strong(pal::ARCH),
-            ),
+            span(a.calls.to_string(), pal::strong(pal::ARCH)),
             span(" consults", pal::dim()),
         ],
         vec![
@@ -1238,7 +1235,7 @@ mod tests {
         let compact = draw(80, 24, &v, &f);
         assert!(!compact.contains("SUPERVISOR"), "no sidecar:\n{compact}");
         assert!(
-            compact.contains("supervisor on \u{b7} 1/3"),
+            compact.contains("supervisor on \u{b7} 1"),
             "folded into the header:\n{compact}"
         );
         assert!(
@@ -1417,7 +1414,7 @@ mod tests {
             "\u{25c6} error repeats",
             "\u{25c7} before done",
             "\u{bb} fixture path wrong",
-            "1/3 consults",
+            "1 consults",
             "tokens read 224k",
         ] {
             assert!(text.contains(expected), "missing {expected:?}:\n{text}");
