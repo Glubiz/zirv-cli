@@ -159,7 +159,10 @@ zirv meta-harness (v22)
 
 - zirv is the harness supervising this session -- context, usage, and cross-harness \
 communication. It launched the agent in this seat and is not one of the agents.
-- This seat coordinates and integrates; substantial implementation, tests and docs are a worker's. \
+- This seat coordinates and integrates. Delegate when it pays: independent areas a worker can \
+finish in parallel, or work large enough to fill this seat's context; a change this seat can \
+finish itself in a few turns is done here, because briefing one worker and integrating its \
+result costs more than doing it. \
 Delegate inside your own harness with its native subagent mechanism. `zirv agent \
 <name> \"<prompt>\" -- --model <m>` reaches a DIFFERENT harness -- it runs a supervised worker to \
 completion and returns its result; inside a dashboard it spawns an attached pane, returns that \
@@ -187,8 +190,9 @@ or any task where look or interaction is the point, audit the current state, pre
 representative target designs, and wait for explicit approval before implementing. Autonomous \
 work with no design dimension proceeds without asking.
 - Review in proportion, once. Trivial: your own verification is the review. Bounded: one \
-independent review of the diff. Substantial or risky: that review plus one review worker per \
-other enabled harness (`zirv agent <name>`) with a brief naming the diff and asking for \
+independent review of the diff. Substantial: that one independent review. Risky (security, data \
+loss, migrations, concurrency, public contracts): that review plus one review worker per other \
+enabled harness (`zirv agent <name>`) with a brief naming the diff and asking for \
 confirmed, concrete findings; a harness the roster marks capacity-limited gets only small, \
 bounded briefs. Before each review round on code, \
 one worker on the review model runs the `simplify` skill on the same diff (a fix round: only \
@@ -208,7 +212,10 @@ than trusting remembered or hand-copied command text.";
 pub const HARNESS_PROMPT_STANDARD: &str = "\
 zirv meta-harness (standard)
 
-- This seat coordinates and integrates; substantial implementation, tests and docs are a worker's. \
+- This seat coordinates and integrates. Delegate when it pays: independent areas a worker can \
+finish in parallel, or work large enough to fill this seat's context; a change this seat can \
+finish itself in a few turns is done here, because briefing one worker and integrating its \
+result costs more than doing it. \
 Delegate inside your own harness with its native subagent mechanism. `zirv agent \
 <name> \"<prompt>\" -- --model <m>` reaches a DIFFERENT harness -- it runs a supervised worker to \
 completion and returns its result; inside a dashboard it spawns an attached pane, returns that \
@@ -236,8 +243,9 @@ or any task where look or interaction is the point, audit the current state, pre
 representative target designs, and wait for explicit approval before implementing. Autonomous \
 work with no design dimension proceeds without asking.
 - Review in proportion, once. Trivial: your own verification is the review. Bounded: one \
-independent review of the diff. Substantial or risky: that review plus one review worker per \
-other enabled harness (`zirv agent <name>`) with a brief naming the diff and asking for \
+independent review of the diff. Substantial: that one independent review. Risky (security, data \
+loss, migrations, concurrency, public contracts): that review plus one review worker per other \
+enabled harness (`zirv agent <name>`) with a brief naming the diff and asking for \
 confirmed, concrete findings; a harness the roster marks capacity-limited gets only small, \
 bounded briefs. Before each review round on code, \
 one worker on the review model runs the `simplify` skill on the same diff (a fix round: only \
@@ -255,7 +263,10 @@ choice in `.zirv/.settings.toml`.";
 pub const HARNESS_PROMPT_MINIMAL: &str = "\
 zirv meta-harness (minimal)
 
-- This seat coordinates and integrates; substantial implementation, tests and docs are a worker's. \
+- This seat coordinates and integrates. Delegate when it pays: independent areas a worker can \
+finish in parallel, or work large enough to fill this seat's context; a change this seat can \
+finish itself in a few turns is done here, because briefing one worker and integrating its \
+result costs more than doing it. \
 Delegate inside your own harness with its native subagent mechanism. `zirv agent \
 <name> \"<prompt>\" -- --model <m>` reaches a DIFFERENT harness -- it runs a supervised worker to \
 completion and returns its result; inside a dashboard it spawns an attached pane, returns that \
@@ -280,8 +291,9 @@ or any task where look or interaction is the point, audit the current state, pre
 representative target designs, and wait for explicit approval before implementing. Autonomous \
 work with no design dimension proceeds without asking.
 - Review in proportion, once. Trivial: your own verification is the review. Bounded: one \
-independent review of the diff. Substantial or risky: that review plus one review worker per \
-other enabled harness (`zirv agent <name>`) with a brief naming the diff and asking for \
+independent review of the diff. Substantial: that one independent review. Risky (security, data \
+loss, migrations, concurrency, public contracts): that review plus one review worker per other \
+enabled harness (`zirv agent <name>`) with a brief naming the diff and asking for \
 confirmed, concrete findings; a harness the roster marks capacity-limited gets only small, \
 bounded briefs. Before each review round on code, \
 one worker on the review model runs the `simplify` skill on the same diff (a fix round: only \
@@ -5038,7 +5050,7 @@ mod tests {
 
     /// Wrapper behaviour redesign: the review round is sized to the change --
     /// a trivial change's own verification is the review, a bounded change
-    /// gets one independent review, and only a substantial or risky change
+    /// gets one independent review, and only a risky change
     /// also gets a review worker per other enabled harness -- and a
     /// capacity-limited harness still only ever gets small, bounded briefs.
     #[test]
@@ -5046,7 +5058,8 @@ mod tests {
         for claim in [
             "Review in proportion, once",
             "Trivial: your own verification is the review",
-            "Substantial or risky",
+            "Substantial: that one independent review. Risky (security, data loss, migrations, concurrency, public contracts)",
+            "Delegate when it pays",
             "capacity-limited gets only small, bounded briefs",
         ] {
             assert!(
@@ -5214,7 +5227,8 @@ mod tests {
         // Raised 3_800 -> 3_900 (simplify-paired-with-review): the review
         // bullet's new simplify-pairing sentence and gate wording pushed
         // this tier to 3_853 bytes even after tightening the added text.
-        const MAX_BYTES: usize = 3_900;
+        // Raised 3_900 -> 4_200 (delegate-when-it-pays + risky-only cross-review wording).
+        const MAX_BYTES: usize = 4_200;
         let len = HARNESS_PROMPT.len();
         let headroom = MAX_BYTES as i64 - len as i64;
         assert!(
@@ -5229,7 +5243,8 @@ mod tests {
     fn harness_prompt_standard_stays_under_its_byte_budget() {
         // Raised 3_400 -> 3_500 (simplify-paired-with-review): same review-
         // bullet addition as the verbose tier's own budget comment.
-        const MAX_BYTES: usize = 3_500;
+        // Raised 3_500 -> 3_800 (delegate-when-it-pays + risky-only cross-review wording).
+        const MAX_BYTES: usize = 3_800;
         let len = HARNESS_PROMPT_STANDARD.len();
         let headroom = MAX_BYTES as i64 - len as i64;
         assert!(
@@ -5244,7 +5259,8 @@ mod tests {
     fn harness_prompt_minimal_stays_under_its_byte_budget() {
         // Raised 2_850 -> 2_950 (simplify-paired-with-review): same review-
         // bullet addition as the verbose tier's own budget comment.
-        const MAX_BYTES: usize = 2_950;
+        // Raised 2_950 -> 3_300 (delegate-when-it-pays + risky-only cross-review wording).
+        const MAX_BYTES: usize = 3_300;
         let len = HARNESS_PROMPT_MINIMAL.len();
         let headroom = MAX_BYTES as i64 - len as i64;
         assert!(
@@ -8844,7 +8860,7 @@ mod tests {
                 &[
                     "never on implementation",
                     "Delegate substantial implementation",
-                    "implementation, tests and docs are a worker's",
+                    "Delegate when it pays",
                 ],
             ),
             (
