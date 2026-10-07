@@ -288,10 +288,11 @@ README-plus-summary wrap-up). `t24_long_haul`/`t24b_long_haul` (22 steps) and
 that a later step must still honour, a changed requirement mid-chain, an
 unresolved failure deliberately carried forward and fixed only after a
 step phrased as a resume-after-handoff, and a multi-module edit) are the
-others, and `t27_tax_season` (21 steps, a separate tax-season/data-hygiene arc
-with two changes of plan, a planted deferred bug, a scope trap and two
-handoff-phrased steps) is a second long chain -- see `tasks/README.md` for the
-per-task step tables.
+others, and `t26_household` (22 steps, a household sharing the ledger) and
+`t27_tax_season` (21 steps, a tax-season/data-hygiene arc) are two more long
+chains with the t24b shape (two changes of plan, a planted deferred bug, a scope
+trap and handoff-phrased steps each) -- see `tasks/README.md` for the per-task
+step tables.
 
 ```
 python run.py --tasks t23_afternoon --conds vanilla,zirv-nojev,zirv-jev-full --reps 2 --model sonnet \

@@ -1,0 +1,21 @@
+Picking this back up after a handoff -- I've been away from the keyboard
+for a bit and the notes I have are thin, so please check the code rather
+than trusting anyone's memory of what exists, mine included.
+
+What I need next: a way to correct an expense that was entered wrong,
+without deleting it and re-adding it.
+
+`python -m ledgerlite expense edit ID [--amount AMOUNT] [--payer NAME]
+[--desc TEXT] [--date YYYY-MM-DD] --store PATH`
+
+- At least one of the four options is required, otherwise `error: nothing
+  to edit`. An unknown id is `error: no such expense: ID` (same as `expense
+  show`). The payer, amount and date are validated exactly like in `expense
+  add`, same messages; if anything is invalid the expense is left entirely
+  unchanged.
+- Changing the amount re-splits the expense: same participants, same
+  weights it was originally split with, and the leftover cents handled the
+  way they are for any expense of that id. Changing only the payer,
+  description or date leaves the shares alone.
+- It prints `Updated expense ID` and `expense show ID` / `balance` / the
+  rest immediately reflect the new numbers.

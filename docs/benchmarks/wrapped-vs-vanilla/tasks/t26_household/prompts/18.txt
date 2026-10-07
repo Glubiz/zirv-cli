@@ -1,0 +1,23 @@
+The flat splits the books by calendar month, so I want a monthly view next to
+the per-member report. Add `python -m ledgerlite report month YYYY-MM
+--store PATH`, which looks only at expenses whose `date` falls in that
+month and prints:
+
+```
+Month: 2024-03
+Ana: paid 30.00 share 10.00 net 20.00
+Ben: paid 0.00 share 10.00 net -10.00
+Cara: paid 0.00 share 10.00 net -10.00
+```
+
+One line per member in the order they were added, `paid` = what they paid
+out for expenses in that month, `share` = their shares of those expenses,
+`net` = paid minus share (two decimals everywhere, minus sign when
+negative). Transfers are not part of this report. Whoever is on the list
+follows the archiving rules we already have: active members always appear
+(even with zeros), and an archived member appears only if they actually paid
+or had a share in an expense of that month.
+
+If there are no expenses in that month at all it prints `No expenses in
+YYYY-MM.` (the month as typed). A month that isn't a four-digit year, a
+dash and a month from 01 to 12 is `error: invalid month: TEXT`.

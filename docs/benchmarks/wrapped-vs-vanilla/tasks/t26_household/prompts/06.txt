@@ -1,0 +1,40 @@
+People also just hand each other money -- Ben pays Ana back for the pizza,
+Cara tops up the shared kitty, that kind of thing. Let's record those as
+transfers.
+
+`python -m ledgerlite transfer add --from NAME --to NAME --amount AMOUNT
+[--note TEXT] [--date YYYY-MM-DD] --store PATH` records that FROM handed
+AMOUNT to TO and prints `Added transfer ID: AMOUNT FROM -> TO` (two
+decimals, stored spellings of the names, e.g. `Added transfer 1: 10.00 Ben
+-> Ana`). Ids are 1, 2, 3, ... in the order added, separate from expense
+ids. The note defaults to empty, the date to today. Validation, in this
+order: unknown member (`error: unknown member: NAME`, FROM checked before
+TO), FROM and TO the same member (`error: cannot transfer to the same
+member`), then the amount and date with exactly the same rules and
+messages as `expense add`.
+
+A transfer is stored as a PAIR of entries that always travel together --
+one debit on the sender and one credit on the receiver, written in the same
+save, never one without the other. Layout: a top-level `transfers` list,
+each item `{"id": int, "date": "YYYY-MM-DD", "note": str, "entries":
+[{"member": FROM, "amount": -CENTS}, {"member": TO, "amount": CENTS}]}`
+(integer cents, the debit entry first).
+
+How it counts: a transfer is the sender paying the receiver back, so it
+moves the balances -- FROM's balance goes UP by the amount and TO's goes
+DOWN by the same amount (same sign convention as `balance` already has).
+`balance` and `settle suggest` must both reflect transfers.
+
+Two read commands:
+
+- `transfer list` prints one line per transfer in id order: `ID: DATE
+  AMOUNT FROM -> TO`, with ` (NOTE)` appended when the note isn't empty,
+  e.g. `1: 2024-03-02 10.00 Ben -> Ana (pizza)`; `No transfers.` if there
+  are none.
+- `account NAME --store PATH` shows one member's side of the transfers: one
+  line per entry belonging to that member, in transfer id order, `TID:
+  AMOUNT OTHER` where TID is `T` followed by the transfer id, AMOUNT is the
+  entry's signed amount with two decimals, and OTHER is the member on the
+  other side, e.g. `T1: -10.00 Ana` for Ben and `T1: 10.00 Ben` for Ana.
+  `No entries.` if the member has none; an unknown name is the usual
+  `error: unknown member: NAME`.

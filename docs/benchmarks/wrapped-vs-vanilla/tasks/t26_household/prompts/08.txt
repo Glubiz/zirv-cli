@@ -1,0 +1,17 @@
+Change of plan on the rounding. Ana pointed out that with "leftover cents
+start with the first participant" she gets the extra penny every single
+time, and the flat has noticed. Let's make it rotate instead.
+
+New rule for who gets the leftover cents: shares are still rounded down to
+a whole cent first, but the leftover cents are now handed out starting from
+a position that depends on the expense's id. For expense number N with P
+participants (in participant order), start at participant number
+`(N - 1) mod P` counting from 0, give out the leftover cents one at a time
+going forward, and wrap around from the last participant back to the first
+when you run off the end. So expense 1 behaves exactly like it did before,
+expense 2 starts at the second participant, expense 3 at the third, and
+when you run out of participants it wraps back to the first.
+
+This replaces the old rule for every expense added from now on, equal
+splits and `--split` ones alike. Expenses that are already recorded keep
+the shares they were stored with -- nobody's past gets rewritten.

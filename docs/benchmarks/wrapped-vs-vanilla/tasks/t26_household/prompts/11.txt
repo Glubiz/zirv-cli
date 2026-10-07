@@ -1,0 +1,12 @@
+Small one: the expense list is getting long, so add `--payer NAME` to
+`expense list`. With it, only the expenses paid by that member are printed,
+in the same format and id order as before (NAME matches case-insensitively;
+an unknown name is `error: unknown member: NAME`; if that member paid
+nothing it prints `No expenses.`). Without `--payer` nothing changes.
+
+While you're in the listing code you will probably notice that the old
+transaction side of the app -- `list` and its paging, the category rules,
+the CSV parsing -- has a few things in it that look wrong or inconsistent.
+Yes, I know. Tempting to clean up while you're there, but please don't:
+I have a separate plan for that code and it needs to stay exactly as it
+is for now. Today is only about the household features.

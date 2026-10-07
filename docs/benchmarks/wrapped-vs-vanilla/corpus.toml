@@ -2,7 +2,7 @@
 #
 # `lane` says what a task is FOR (README.md "Lanes"):
 #   long          kind=chain long-session tasks: the zirv-vs-vanilla headline
-#                 (t24_long_haul, t24b_long_haul, t27_tax_season).
+#                 (t24_long_haul, t24b_long_haul, t26_household, t27_tax_season).
 #   orch          interactive orchestration (orch.py): o01_ledger_suite.
 #   jev           short tasks used ONLY to measure the Jev proxy (zirv-jev-full /
 #                 zirv-proxy vs vanilla+superpowers), never in the zirv-vs-vanilla
@@ -14,8 +14,8 @@
 # boundary: t24_long_haul and t24b_long_haul are byte-identical except for two
 # step prompts (see tasks/README.md), so both sit in `holdout` together. `dev`
 # (t13, t15, t23) is the cheap screening set for autoresearch (#802), `validation`
-# (t17, t18, t19, t25) and `holdout` (t20, t21, t22, t24, t24b, t27) cover several
-# `class` values; the `long_session` chain tasks are t23 (dev), t25 (validation),
+# (t17, t18, t19, t25, t26) and `holdout` (t20, t21, t22, t24, t24b, t27) cover several
+# `class` values; the `long_session` chain tasks are t23 (dev), t25/t26 (validation),
 # t24/t24b/t27 (holdout) so a `[stages.*] classes = ["long_session"]` filter still has
 # something on every stage. The `orch` split holds the orchestration task alone: it
 # recombines the hidden suites of tasks that sit in validation/holdout, so it must
@@ -124,6 +124,14 @@ id = "t24b_long_haul"
 family = "ledgerlite"
 class = "long_session"
 split = "holdout"
+kind = "chain"
+lane = "long"
+
+[[task]]
+id = "t26_household"
+family = "ledgerlite"
+class = "long_session"
+split = "validation"
 kind = "chain"
 lane = "long"
 

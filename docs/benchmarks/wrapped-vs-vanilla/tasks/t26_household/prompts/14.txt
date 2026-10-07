@@ -1,0 +1,22 @@
+`cli.py` was a tidy 100-ish lines this morning and is now a wall of
+argparse setup and handlers for the household stuff, sitting right next to
+the old transaction commands. Please split it up before it gets any worse.
+
+Move ALL the household commands -- `member`, `expense`, `balance`,
+`settle`, `transfer`, `account`, `report`, `history`, `undo` -- out of
+`cli.py`: both their argparse setup and their handler functions go into a
+new module `ledgerlite/household_cli.py`. It exposes one function,
+`register(sub)`, which takes the top-level subparsers object (what
+`parser.add_subparsers(dest="command", ...)` returns), adds every household
+subcommand to it, and returns a dict mapping each of those nine top-level
+command names to its handler (a callable taking the parsed `argparse`
+namespace and returning the exit status, same as today). `cli.py` keeps
+only the original `import` / `list` / `summary` / `categorize` commands,
+calls `register(sub)` when it builds the parser, and dispatches to the
+right handler -- including the existing `error: ...` / exit 2 handling for
+household errors -- so none of the household command names or handler code
+should be left in `cli.py` itself.
+
+This is a pure refactor: every command, flag, output line, error message,
+exit code, and stored-file layout must behave exactly as it does right now.
+No functional changes, and the old transaction commands stay as they are.

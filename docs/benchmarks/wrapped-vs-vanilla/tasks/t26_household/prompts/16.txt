@@ -1,0 +1,30 @@
+I want to be able to archive members who move out (that's the next
+thing), and for that a member needs more than a name -- so the store file
+layout has to grow. Before that, let's do the layout change properly, with a
+version number and a migration, because there are already store files out in
+the wild (mine, for one).
+
+Version 2 of the store format:
+
+- The store file gets a top-level `"version": 2`. EVERY write to the store
+  file by ANY command (including `import` and `categorize`) stamps it.
+- `members` stops being a plain list of names. Each member becomes an
+  object `{"name": NAME, "archived": false}`, still in the order they were
+  added. Nothing else in the file changes shape: `expenses`, `transfers`,
+  `history` and `transactions` stay exactly as they are.
+- A file with no `version` key (or `"version": 1`) is a version 1 file, i.e.
+  the layout we've had until now, with `members` as a list of plain name
+  strings. Version 1 files must keep working everywhere: any command that
+  reads one must behave exactly as if it were a version 2 file with
+  every member not archived. They are migrated when something next writes
+  the file (the upgraded file keeps all its expenses, transfers and
+  transactions untouched). A command that only reads must NOT rewrite the
+  file. Change-history entries that are already in an old file must still
+  undo correctly after the migration.
+- A file whose `version` is higher than 2 was written by something newer
+  than this code and must not be touched: every command that opens the store
+  (the old transaction commands included) fails with `error: unsupported
+  store version: N` (N from the file), exit status 2, file left unchanged.
+
+Nothing about the behaviour of members, expenses, transfers and so on
+changes in this step; it's purely the file format plus the migration.

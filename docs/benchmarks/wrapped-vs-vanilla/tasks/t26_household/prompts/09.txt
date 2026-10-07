@@ -1,0 +1,38 @@
+Someone already fat-fingered an amount and we had to hand-edit the JSON, so
+I want a change history with an undo.
+
+**History.** Every command that CHANGES household data -- for now `member
+add`, `expense add` and `transfer add` -- appends one entry to a new
+top-level `history` list in the store file, only when it succeeded (a
+command that fails with an error records nothing). Read-only commands
+(`balance`, `settle suggest`, `report`, `list`/`show`, `account`...) and
+the transaction commands (`import`, `categorize`, `list`, `summary`) don't
+record anything. An entry has a sequence number `seq` (1, 2, 3, ..., never
+reused or reordered), a `label`, and whatever else you need to be able to
+restore the household data (members, expenses, transfers) to exactly what
+it was before that change. Labels: `member add NAME` (stored spelling),
+`expense add ID` and `transfer add ID` (the new record's id).
+
+`python -m ledgerlite history --store PATH` prints one line per entry,
+oldest first: `SEQ: LABEL`, or `No history.` when empty.
+
+**Undo.** `python -m ledgerlite undo --store PATH` undoes the most recent
+change that hasn't been undone yet: the household data goes back to exactly
+what it was before that change (so an id the undone change handed out gets
+handed out again next time), and it prints `Undid #SEQ: LABEL` using the
+undone entry's seq and label. Calling it again goes one change further
+back, and so on. If there is nothing left to undo it prints `Nothing to
+undo.` and exits 0 (not an error). `undo` never touches the transactions
+that `import` put in the file.
+
+**The history is append-only.** Undo must not delete or edit earlier
+entries; instead the undo itself is appended as a new entry with the label
+`undo #SEQ` (SEQ = the seq of the entry it undid) and shows up in `history`
+like any other. Undo entries themselves can't be undone, and an entry that
+has already been undone is skipped when looking for the next thing to
+undo.
+
+The three commands above need to be recorded retroactively, and -- this
+matters for the rest of the day -- any command that changes household data
+that we add later has to be recorded the same way, without me having to say
+so each time.

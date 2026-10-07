@@ -1,0 +1,42 @@
+Next: shared expenses. Someone pays for something and it gets split
+between everyone in the household.
+
+Add to `household.py` and the CLI (same `--store` file, same error
+convention as before):
+
+`python -m ledgerlite expense add --payer NAME --amount AMOUNT --desc TEXT
+[--date YYYY-MM-DD] --store PATH`
+
+- PAYER must be an existing member (matched case-insensitively; the stored
+  spelling is the one used everywhere). Otherwise `error: unknown member:
+  NAME` (NAME as typed).
+- AMOUNT is a normal money amount like `12.34`, and it must be positive:
+  `error: invalid amount: TEXT` if it can't be read as a number,
+  `error: amount must be positive` if it is zero or negative.
+- `--date` defaults to today; a bad date is `error: invalid date: TEXT`.
+- The expense is split equally between ALL members the household has at the
+  moment it is added (later joiners never get a share of an old expense).
+  Work in whole cents. When the amount doesn't divide evenly, each share is
+  rounded down to a cent and the leftover cents are handed out one at a
+  time, starting with the first participant and going on in order (for an
+  equal split, participants are in the order the members were added). So
+  10.00 between Ana, Ben and Cara is Ana 3.34, Ben 3.33, Cara 3.33.
+- Expense ids are 1, 2, 3, ... in the order added.
+- It prints `Added expense ID: AMOUNT paid by PAYER`, AMOUNT with exactly
+  two decimals, e.g. `Added expense 1: 30.00 paid by Ana`.
+
+Also:
+
+- `expense list` prints one line per expense in id order: `ID: DATE AMOUNT
+  PAYER DESC`, e.g. `1: 2024-03-01 30.00 Ana groceries`, or `No
+  expenses.`
+- `expense show ID` prints `Expense ID: AMOUNT paid by PAYER on DATE
+  (DESC)` and then one line per participant, in their stored order: `NAME:
+  SHARE` (two decimals). An unknown id is `error: no such expense: ID`.
+
+Storage: a top-level `expenses` list in the store file, each expense an
+object with exactly these keys: `id` (int), `date` (`YYYY-MM-DD`), `payer`
+(stored member name), `amount` (integer cents), `description`, `weights`
+(object: participant name -> int; for an equal split everyone has weight
+1 -- I'll want unequal weights soon) and `shares` (object: participant
+name -> integer cents, in participant order, summing to `amount`).

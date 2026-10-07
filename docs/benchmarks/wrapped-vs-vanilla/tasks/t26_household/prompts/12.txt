@@ -1,0 +1,22 @@
+Before we go any further I want a paper trail, in case I hand this to
+someone else or come back to it next week and can't remember why things
+work the way they do.
+
+Write a short note to `docs/household-decisions.md` covering what we've
+decided and WHY (a couple of sentences each is plenty) for:
+
+- how leftover cents are handed out when an amount doesn't divide evenly --
+  including the fact that the rule changed during the session, what the
+  old rule was, what the new one is, and what happened to expenses that
+  were already recorded;
+- the sign convention for balances, and which commands rely on the same
+  numbers (including what transfers do to them);
+- how `settle suggest` decides who pays whom, including how ties are
+  broken;
+- why transfers are stored as a pair of entries;
+- what the change history records, how `undo` behaves, and why the history
+  is append-only.
+
+Then a short "still open" list of things you'd want to tackle or aren't
+sure about, based on what's in the code now. Keep it accurate to the code as
+it stands -- the whole point is that it can be trusted later.

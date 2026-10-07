@@ -1,0 +1,14 @@
+Now the thing everyone actually wants to know: who is ahead and who owes?
+
+Add `python -m ledgerlite balance --store PATH`. It prints one line per
+member, in the order they were added: `NAME: AMOUNT`, where AMOUNT is what
+the member has paid out for the household's expenses minus the sum of
+their shares of all expenses, with exactly two decimals. So someone who has
+paid more than their share has a positive balance (the household owes them
+money), and someone who has paid less has a negative one, printed with a
+leading minus sign, e.g. `Ben: -10.00`. A member with nothing going on is
+`0.00`. With no members at all it prints `No members.`
+
+Keep the calculation in `household.py` as its own function rather than
+inside the CLI handler -- I have a feeling other commands are going to need
+the same numbers.

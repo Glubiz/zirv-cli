@@ -1,0 +1,32 @@
+Morning! Big day ahead -- I'll be sending you a bunch of follow-ups over
+the course of it, building on whatever you did before. The theme: my
+flatmates and I want to use ledgerlite as a shared household ledger, so
+this session is all about people sharing money. Let's start with the
+people.
+
+Add a new module `ledgerlite/household.py` for the household logic, and
+wire a `member` command family into the CLI:
+
+- `python -m ledgerlite member add NAME --store PATH` adds a household
+  member and prints `Added member NAME`. Surrounding whitespace in NAME is
+  stripped first. Names are unique case-insensitively: adding `ANA` when
+  `Ana` exists is an error, and so is an empty (or all-whitespace) name.
+- `python -m ledgerlite member list --store PATH` prints one name per
+  line, in the order they were added, or `No members.` if there are none.
+
+Error convention for everything we build today, please apply it from the
+start: a user error prints `error: <message>` to stderr, nothing to
+stdout, exits with status 2, and leaves the store file unchanged. The
+messages for this step are `error: member already exists: NAME` (NAME
+exactly as typed, after stripping) and `error: member name cannot be
+empty`.
+
+Storage: members go in the same `--store` JSON file the transactions
+already live in, under a top-level `members` key holding a plain list of
+names in the order they were added, e.g. `"members": ["Ana", "Ben"]`.
+Heads up that `store.save()` currently rewrites the whole file with only
+`{"transactions": [...]}`, which would wipe the members the next time
+somebody runs `import` or `categorize`. Everything I ask for today has to
+live side by side in that one file, so please make saving transactions
+leave every other top-level key in the file alone (and adding members must
+of course leave the transactions alone too).

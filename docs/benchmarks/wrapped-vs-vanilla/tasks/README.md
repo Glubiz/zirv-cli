@@ -281,3 +281,57 @@ cumulative patch) and `python run.py --check-graders --tasks t27_tax_season`
 on that step's own hidden tests, the template's one known baseline-red
 visible test excepted, and the unpatched pristine copy scores below 1.0).
 The patches are CRLF to match the Windows checkout of `template/`, like t24b's.
+
+## t26_household: a second long-haul chain, on a different story
+
+`t26_household` is a 22-step `kind=chain` task of the same shape as
+`t24b_long_haul` (sequential follow-ups to ONE agent session on the
+`ledgerlite` template, roughly 15 minutes for a Sonnet agent, context past
+~150k tokens) but with a story that shares nothing with t24's: **a household
+sharing the ledger** (members, shared expenses in integer cents, transfers as
+paired entries, settle-up, an append-only history with `undo`, a store-format
+version bump with migration, archiving and renaming members). None of t24's
+features (currencies, imports, recurring rules, pagination, budgets, cashflow,
+reconciliation, the CLI split, OFX, undo of imports) are reused. It sits in the
+`validation` split as its own group.
+
+Hidden tests drive the CLI through `python -m ledgerlite ...` and only check
+names, formats, messages and storage keys the step's prompt (or an earlier
+prompt) states. Tests that a later change of plan makes obsolete carry
+`superseded_by_NN` in their name; `verify_reference.py` expects exactly those
+to fail from step NN on (and to pass before it), and `run.py` only ever grades
+a step against its own tests, so graders are unaffected.
+
+| step | shape | axis exercised | hidden tests | reference score | pristine score |
+|---|---|---|---|---|---|
+| 01 | greenfield: `household.py`, `member add/list`, `store.save` keeps other keys | multi-module (household/store/cli); constraint origin (error convention, storage layout) | 9 | 1.0 | 0.0 |
+| 02 | feature: `expense add/list/show`, equal split in cents, leftover-cent rule | rule origin; **planted deferred bug** (amounts with >2 decimals are silently truncated) | 16 | 1.0 | 0.0 |
+| 03 | feature: `--split NAME=W,...` weighted shares | recall: "same leftover rule", error conventions, not restated | 11 | 1.0 | 0.0 |
+| 04 | feature: `balance` (sign convention) | decision origin (balance sign) | 7 | 1.0 | 0.0 |
+| 05 | feature: `settle suggest` (greedy, deterministic ties) | recall: balance numbers reused | 9 | 1.0 | 0.0 |
+| 06 | feature: `transfer add/list`, `account` (paired entries) | multi-module (household/balances/cli); recall of sign convention | 10 | 1.0 | 0.0 |
+| 07 | feature: `report member` (`Net` must equal `balance`) | recall: balance convention incl. transfers | 6 | 1.0 | 0.0 |
+| 08 | **change of plan**: leftover cents rotate by expense id | changed requirement; old expenses keep stored shares | 8 | 1.0 | 0.0 |
+| 09 | feature: append-only `history` + `undo` | multi-module (retro-fitting 3 commands); standing rule "record future changes too" | 12 | 1.0 | 0.0 |
+| 10 | feature: `expense edit` ("picking this back up after a handoff") | recall: weights, rotating rule, history rule not restated | 10 | 1.0 | 0.0 |
+| 11 | **scope trap**: `expense list --payer` while the old CSV/paging/rules oddities tempt a cleanup | untouched behaviour must stay unchanged (including the old buggy `report.page`) | 9 | 1.0 | 0.556 |
+| 12 | wrap-up checkpoint: `docs/household-decisions.md` (judge only) | accuracy of recorded decisions incl. the rule change | - | rubric-graded | - |
+| 13 | **change of plan**: only `--settles` transfers move balances; old stored transfers count as settling | changed requirement across balance/suggest/report | 8 | 1.0 | 0.0 |
+| 14 | **behaviour-preserving refactor**: `cli.py` -> `household_cli.py` (`register(sub)`) | refactor with regression net | 6 | 1.0 | 0.167 |
+| 15 | **bug report** ("picking this up after a handoff"): reject >2 decimals everywhere | planted bug surfaces; find every amount entry point | 7 | 1.0 | 0.0 |
+| 16 | feature: store format v2 + migration of v1 files, newer versions refused | multi-module (store/household/cli); read paths must not rewrite | 11 | 1.0 | 0.091 |
+| 17 | feature: `member archive`, `list --all`, archived rules | recall: "everyone" now means active members, uniqueness, balance, history rule | 13 | 1.0 | 0.0 |
+| 18 | feature: `report month YYYY-MM` | recall: expense dates, archived handling, member order | 10 | 1.0 | 0.0 |
+| 19 | feature: `settle apply` (one history entry for the whole run) | recall: suggest order, `--settles`, history rule, archived members | 8 | 1.0 | 0.0 |
+| 20 | feature: `member rename OLD NEW` everywhere | multi-module; recall: name rules, append-only history, v2 members | 10 | 1.0 | 0.0 |
+| 21 | feature: read-only `check` (invariants over everything built so far) | recall: cent sums, paired entries, v1 files untouched | 11 | 1.0 | 0.0 |
+| 22 | wrap-up: README + final-reply summary (judge only) | summary must name both changes of plan, the bug, the migration, the refactor | - | rubric-graded | - |
+
+Reference scores were verified with `python verify_reference.py` (from this
+task's directory; every cumulative `reference/step_NN.patch` applied to a fresh
+pristine template copy passes the hidden tests of steps 1..N, modulo the
+`superseded_by_NN` tests, and the visible suite stays green apart from the
+template's one baseline-red test; the previous step's patch fails step N's own
+tests) and `python run.py --check-graders --tasks t26_household` (pristine
+scores in the last column). Steps 12 and 22 are judge-graded through
+`rubric/step_NN.md`.

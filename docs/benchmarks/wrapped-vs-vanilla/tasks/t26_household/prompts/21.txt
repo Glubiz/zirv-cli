@@ -1,0 +1,33 @@
+I've been hand-editing the store file now and then (and we've just done a
+format migration), so I'd like a sanity check I can run afterwards:
+`python -m ledgerlite check --store PATH`.
+
+It only READS: it must never rewrite the file (not even to migrate an old
+version), and it doesn't touch the history. It looks for these problems, and
+prints one line per problem, in this order: all the expenses first, in the
+order they are stored, then all the transfers in the order they are stored.
+
+For each expense, in this order:
+
+- `expense ID: shares total X.XX but amount is Y.YY` when the integer-cent
+  shares don't add up to the expense's amount (two decimals each);
+- `expense ID: unknown member NAME` for every name that isn't a member
+  (archived members are members), looking at the payer first, then the
+  `weights` names, then the `shares` names, each distinct unknown name
+  reported once, in order of first appearance. Names are compared exactly,
+  spelling and capitalisation included.
+
+For each transfer, in this order:
+
+- `transfer ID: entries do not balance` when it doesn't have exactly two
+  entries, or the two entries' amounts don't add up to zero;
+- `transfer ID: unknown member NAME`, same rules as for expenses, over the
+  entries' members in order.
+
+If there are no problems it prints `ok` and exits 0. If there are problems
+it prints them and exits 1. A store that doesn't exist yet, or is empty, is
+`ok`. It works on old (version 1) files too, without rewriting them.
+
+Whatever we do to the data with the other commands should never produce a
+problem here -- keep that in mind, since I plan to run this after
+everything.

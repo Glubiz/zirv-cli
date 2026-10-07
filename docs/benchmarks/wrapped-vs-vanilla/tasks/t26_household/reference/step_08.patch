@@ -1,0 +1,501 @@
+diff --git a/ledgerlite/cli.py b/ledgerlite/cli.py
+index 9e51ebf..ba5388d 100644
+--- a/ledgerlite/cli.py
++++ b/ledgerlite/cli.py
+@@ -3,13 +3,14 @@
+ from __future__ import annotations
+ 
+ import argparse
++import sys
+ from decimal import Decimal
+ from typing import Optional, Sequence
+ 
+-from . import report
++from . import household, report
+ from .parse import read_csv
+ from .rules import DEFAULT_RULES, categorize
+-from .store import load, save
++from .store import load, load_data, save, save_data
+ 
+ DEFAULT_STORE = "ledger.json"
+ 
+@@ -47,9 +48,68 @@ def _build_parser() -> argparse.ArgumentParser:
+         "--store", default=DEFAULT_STORE, help="ledger JSON file to update (default: %(default)s)"
+     )
+ 
++    p_member = sub.add_parser("member", help="manage household members")
++    member_sub = p_member.add_subparsers(dest="member_command", required=True)
++    p_member_add = member_sub.add_parser("add", help="add a household member")
++    p_member_add.add_argument("name")
++    _add_store(p_member_add)
++    p_member_list = member_sub.add_parser("list", help="list household members")
++    _add_store(p_member_list)
++
++    p_expense = sub.add_parser("expense", help="shared household expenses")
++    expense_sub = p_expense.add_subparsers(dest="expense_command", required=True)
++    p_expense_add = expense_sub.add_parser("add", help="record a shared expense")
++    p_expense_add.add_argument("--payer", required=True)
++    p_expense_add.add_argument("--amount", required=True)
++    p_expense_add.add_argument("--desc", required=True)
++    p_expense_add.add_argument("--date", default=None)
++    p_expense_add.add_argument("--split", default=None)
++    _add_store(p_expense_add)
++    p_expense_list = expense_sub.add_parser("list", help="list shared expenses")
++    _add_store(p_expense_list)
++    p_expense_show = expense_sub.add_parser("show", help="show one expense and its shares")
++    p_expense_show.add_argument("id", type=int)
++    _add_store(p_expense_show)
++
++    p_balance = sub.add_parser("balance", help="show who is ahead and who owes")
++    _add_store(p_balance)
++
++    p_settle = sub.add_parser("settle", help="settle up between members")
++    settle_sub = p_settle.add_subparsers(dest="settle_command", required=True)
++    p_settle_suggest = settle_sub.add_parser("suggest", help="suggest who should pay whom")
++    _add_store(p_settle_suggest)
++
++    p_transfer = sub.add_parser("transfer", help="transfers between members")
++    transfer_sub = p_transfer.add_subparsers(dest="transfer_command", required=True)
++    p_transfer_add = transfer_sub.add_parser("add", help="record a transfer")
++    p_transfer_add.add_argument("--from", dest="sender", required=True)
++    p_transfer_add.add_argument("--to", dest="receiver", required=True)
++    p_transfer_add.add_argument("--amount", required=True)
++    p_transfer_add.add_argument("--note", default="")
++    p_transfer_add.add_argument("--date", default=None)
++    _add_store(p_transfer_add)
++    p_transfer_list = transfer_sub.add_parser("list", help="list transfers")
++    _add_store(p_transfer_list)
++
++    p_account = sub.add_parser("account", help="show one member's transfer entries")
++    p_account.add_argument("name")
++    _add_store(p_account)
++
++    p_report = sub.add_parser("report", help="household reports")
++    report_sub = p_report.add_subparsers(dest="report_command", required=True)
++    p_report_member = report_sub.add_parser("member", help="one member's totals")
++    p_report_member.add_argument("name")
++    _add_store(p_report_member)
++
+     return parser
+ 
+ 
++def _add_store(parser: argparse.ArgumentParser) -> None:
++    parser.add_argument(
++        "--store", default=DEFAULT_STORE, help="ledger JSON file (default: %(default)s)"
++    )
++
++
+ def _cmd_import(args: argparse.Namespace) -> int:
+     txns = read_csv(args.csv_path)
+     for txn in txns:
+@@ -106,11 +166,121 @@ def _cmd_categorize(args: argparse.Namespace) -> int:
+     return 0
+ 
+ 
++def _cmd_member(args: argparse.Namespace) -> int:
++    data = load_data(args.store)
++    if args.member_command == "add":
++        name = household.add_member(data, args.name)
++        save_data(args.store, data)
++        print(f"Added member {name}")
++        return 0
++    members = household.member_names(data)
++    if not members:
++        print("No members.")
++    for name in members:
++        print(name)
++    return 0
++
++
++def _cmd_expense(args: argparse.Namespace) -> int:
++    data = load_data(args.store)
++    fmt = household.format_cents
++    if args.expense_command == "add":
++        exp = household.add_expense(data, args.payer, args.amount, args.desc, args.date, args.split)
++        save_data(args.store, data)
++        print(f"Added expense {exp['id']}: {fmt(exp['amount'])} paid by {exp['payer']}")
++        return 0
++    if args.expense_command == "list":
++        rows = household.expenses(data)
++        if not rows:
++            print("No expenses.")
++        for exp in rows:
++            print(f"{exp['id']}: {exp['date']} {fmt(exp['amount'])} {exp['payer']} {exp['description']}")
++        return 0
++    exp = household.find_expense(data, args.id)
++    print(f"Expense {exp['id']}: {fmt(exp['amount'])} paid by {exp['payer']} "
++          f"on {exp['date']} ({exp['description']})")
++    for name, share in exp["shares"].items():
++        print(f"{name}: {fmt(share)}")
++    return 0
++
++
++def _cmd_balance(args: argparse.Namespace) -> int:
++    data = load_data(args.store)
++    result = household.balances(data)
++    if not result:
++        print("No members.")
++    for name, cents in result.items():
++        print(f"{name}: {household.format_cents(cents)}")
++    return 0
++
++
++def _cmd_settle(args: argparse.Namespace) -> int:
++    data = load_data(args.store)
++    plan = household.suggest_settlements(data)
++    if not plan:
++        print("Everyone is settled up.")
++    for payer, receiver, cents in plan:
++        print(f"{payer} pays {receiver} {household.format_cents(cents)}")
++    return 0
++
++
++def _cmd_transfer(args: argparse.Namespace) -> int:
++    data = load_data(args.store)
++    fmt = household.format_cents
++    if args.transfer_command == "add":
++        t = household.add_transfer(data, args.sender, args.receiver, args.amount,
++                                   args.note, args.date)
++        save_data(args.store, data)
++        sender, receiver, cents = household.transfer_parties(t)
++        print(f"Added transfer {t['id']}: {fmt(cents)} {sender} -> {receiver}")
++        return 0
++    rows = household.transfers(data)
++    if not rows:
++        print("No transfers.")
++    for t in rows:
++        sender, receiver, cents = household.transfer_parties(t)
++        line = f"{t['id']}: {t['date']} {fmt(cents)} {sender} -> {receiver}"
++        if t["note"]:
++            line += f" ({t['note']})"
++        print(line)
++    return 0
++
++
++def _cmd_account(args: argparse.Namespace) -> int:
++    data = load_data(args.store)
++    rows = household.account_entries(data, args.name)
++    if not rows:
++        print("No entries.")
++    for transfer_id, cents, other in rows:
++        print(f"T{transfer_id}: {household.format_cents(cents)} {other}")
++    return 0
++
++
++def _cmd_report(args: argparse.Namespace) -> int:
++    data = load_data(args.store)
++    fmt = household.format_cents
++    rep = household.member_report(data, args.name)
++    print(f"Member: {rep['name']}")
++    print(f"Paid: {fmt(rep['paid'])}")
++    print(f"Share: {fmt(rep['share'])}")
++    print(f"Sent: {fmt(rep['sent'])}")
++    print(f"Received: {fmt(rep['received'])}")
++    print(f"Net: {fmt(rep['net'])}")
++    return 0
++
++
+ _HANDLERS = {
+     "import": _cmd_import,
+     "list": _cmd_list,
+     "summary": _cmd_summary,
+     "categorize": _cmd_categorize,
++    "member": _cmd_member,
++    "expense": _cmd_expense,
++    "balance": _cmd_balance,
++    "settle": _cmd_settle,
++    "transfer": _cmd_transfer,
++    "account": _cmd_account,
++    "report": _cmd_report,
+ }
+ 
+ 
+@@ -118,7 +288,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
+     parser = _build_parser()
+     args = parser.parse_args(argv)
+     handler = _HANDLERS[args.command]
+-    return handler(args)
++    try:
++        return handler(args)
++    except household.HouseholdError as exc:
++        print(f"error: {exc}", file=sys.stderr)
++        return 2
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/ledgerlite/household.py b/ledgerlite/household.py
+new file mode 100644
+index 0000000..3173675
+--- /dev/null
++++ b/ledgerlite/household.py
+@@ -0,0 +1,238 @@
++"""Household sharing for ledgerlite: members, shared expenses and transfers.
++
++Everything here works on the plain dict that `store.load_data` returns, so
++the functions stay easy to test and the CLI layer only does I/O.
++"""
++
++from __future__ import annotations
++
++from datetime import date
++from decimal import InvalidOperation
++from typing import Dict, List, Optional, Tuple
++
++from .models import parse_money
++
++
++class HouseholdError(Exception):
++    """A user-facing problem; the CLI prints `error: <message>` and exits 2."""
++
++
++def member_names(data: dict) -> List[str]:
++    return list(data.get("members", []))
++
++
++def find_member(data: dict, name: str) -> str:
++    """Return the stored spelling of member `name` (case-insensitive match)."""
++    wanted = name.strip().lower()
++    for member in member_names(data):
++        if member.lower() == wanted:
++            return member
++    raise HouseholdError(f"unknown member: {name}")
++
++
++def add_member(data: dict, name: str) -> str:
++    name = name.strip()
++    if not name:
++        raise HouseholdError("member name cannot be empty")
++    if any(m.lower() == name.lower() for m in member_names(data)):
++        raise HouseholdError(f"member already exists: {name}")
++    data.setdefault("members", []).append(name)
++    return name
++
++
++def parse_cents(text: str) -> int:
++    """Parse a money amount typed by the user into integer cents."""
++    try:
++        value = parse_money(text)
++        return int(value * 100)
++    except (InvalidOperation, ValueError):
++        raise HouseholdError(f"invalid amount: {text}")
++
++
++def parse_positive_cents(text: str) -> int:
++    cents = parse_cents(text)
++    if cents <= 0:
++        raise HouseholdError("amount must be positive")
++    return cents
++
++
++def format_cents(cents: int) -> str:
++    sign = "-" if cents < 0 else ""
++    return f"{sign}{abs(cents) // 100}.{abs(cents) % 100:02d}"
++
++
++def parse_date(text: Optional[str]) -> str:
++    if text is None:
++        return date.today().isoformat()
++    try:
++        return date.fromisoformat(text).isoformat()
++    except ValueError:
++        raise HouseholdError(f"invalid date: {text}")
++
++
++def split_cents(total: int, weights: Dict[str, int], expense_id: int = 1) -> Dict[str, int]:
++    """Split `total` cents in proportion to `weights`.
++
++    Each share is rounded down to a whole cent; the cents left over are then
++    handed out one at a time. Where that starts rotates with the expense id:
++    expense N starts at participant (N - 1) mod P (0-based) and wraps around.
++    """
++    names = list(weights)
++    weight_sum = sum(weights.values())
++    shares = {n: total * weights[n] // weight_sum for n in names}
++    leftover = total - sum(shares.values())
++    start = (expense_id - 1) % len(names)
++    for name in (names[start:] + names[:start])[:leftover]:
++        shares[name] += 1
++    return shares
++
++
++def expenses(data: dict) -> List[dict]:
++    return data.setdefault("expenses", [])
++
++
++def find_expense(data: dict, expense_id: int) -> dict:
++    for exp in expenses(data):
++        if exp["id"] == expense_id:
++            return exp
++    raise HouseholdError(f"no such expense: {expense_id}")
++
++
++def parse_split(data: dict, text: str) -> Dict[str, int]:
++    """Parse `NAME=WEIGHT,NAME=WEIGHT` into {stored member name: weight}."""
++    weights: Dict[str, int] = {}
++    for part in text.split(","):
++        name, sep, raw = part.partition("=")
++        if not sep or not raw.strip().isdigit() or int(raw) <= 0:
++            raise HouseholdError(f"invalid split: {text}")
++        member = find_member(data, name)
++        if member in weights:
++            raise HouseholdError(f"duplicate member in split: {name.strip()}")
++        weights[member] = int(raw)
++    return weights
++
++
++def add_expense(data: dict, payer: str, amount: str, description: str,
++                on: Optional[str] = None, split: Optional[str] = None) -> dict:
++    payer = find_member(data, payer)
++    cents = parse_positive_cents(amount)
++    day = parse_date(on)
++    if split is None:
++        weights = {name: 1 for name in member_names(data)}
++    else:
++        weights = parse_split(data, split)
++    expense_id = max((e["id"] for e in expenses(data)), default=0) + 1
++    expense = {
++        "id": expense_id,
++        "date": day,
++        "payer": payer,
++        "amount": cents,
++        "description": description,
++        "weights": weights,
++        "shares": split_cents(cents, weights, expense_id),
++    }
++    expenses(data).append(expense)
++    return expense
++
++
++def balances(data: dict) -> Dict[str, int]:
++    """Net balance in cents per member, in member order.
++
++    Positive means the household owes the member (they paid more than their
++    share); negative means the member owes the household.
++    """
++    result = {name: 0 for name in member_names(data)}
++    for exp in expenses(data):
++        result[exp["payer"]] = result.get(exp["payer"], 0) + exp["amount"]
++        for name, share in exp["shares"].items():
++            result[name] = result.get(name, 0) - share
++    # A transfer is the sender paying the receiver back: the sender's balance
++    # goes up by the amount, the receiver's goes down.
++    for transfer in transfers(data):
++        for entry in transfer["entries"]:
++            result[entry["member"]] = result.get(entry["member"], 0) - entry["amount"]
++    return result
++
++
++def suggest_settlements(data: dict) -> List[Tuple[str, str, int]]:
++    """Greedy settle-up plan: a list of (payer, receiver, cents).
++
++    Repeatedly the member who owes the most pays the member who is owed the
++    most, as much as they can cover; ties go to whoever was added first.
++    """
++    order = {name: i for i, name in enumerate(balances(data))}
++    owes = {n: -c for n, c in balances(data).items() if c < 0}
++    owed = {n: c for n, c in balances(data).items() if c > 0}
++    plan: List[Tuple[str, str, int]] = []
++    while owes and owed:
++        debtor = min(owes, key=lambda n: (-owes[n], order[n]))
++        creditor = min(owed, key=lambda n: (-owed[n], order[n]))
++        pay = min(owes[debtor], owed[creditor])
++        plan.append((debtor, creditor, pay))
++        owes[debtor] -= pay
++        owed[creditor] -= pay
++        if owes[debtor] == 0:
++            del owes[debtor]
++        if owed[creditor] == 0:
++            del owed[creditor]
++    return plan
++
++
++def transfers(data: dict) -> List[dict]:
++    return data.setdefault("transfers", [])
++
++
++def add_transfer(data: dict, sender: str, receiver: str, amount: str,
++                 note: str = "", on: Optional[str] = None) -> dict:
++    """Record money handed from `sender` to `receiver` as a pair of entries."""
++    sender = find_member(data, sender)
++    receiver = find_member(data, receiver)
++    if sender == receiver:
++        raise HouseholdError("cannot transfer to the same member")
++    cents = parse_positive_cents(amount)
++    day = parse_date(on)
++    transfer = {
++        "id": max((t["id"] for t in transfers(data)), default=0) + 1,
++        "date": day,
++        "note": note,
++        "entries": [
++            {"member": sender, "amount": -cents},
++            {"member": receiver, "amount": cents},
++        ],
++    }
++    transfers(data).append(transfer)
++    return transfer
++
++
++def transfer_parties(transfer: dict) -> Tuple[str, str, int]:
++    """(sender, receiver, cents) of a transfer."""
++    out, into = transfer["entries"]
++    return out["member"], into["member"], into["amount"]
++
++
++def account_entries(data: dict, name: str) -> List[Tuple[int, int, str]]:
++    """(transfer id, signed cents, other member) for every entry of `name`."""
++    name = find_member(data, name)
++    rows = []
++    for transfer in transfers(data):
++        first, second = transfer["entries"]
++        for mine, other in ((first, second), (second, first)):
++            if mine["member"] == name:
++                rows.append((transfer["id"], mine["amount"], other["member"]))
++    return rows
++
++
++def member_report(data: dict, name: str) -> Dict[str, int]:
++    """Per-member totals in cents: paid, share, sent, received and net."""
++    name = find_member(data, name)
++    paid = sum(e["amount"] for e in expenses(data) if e["payer"] == name)
++    share = sum(e["shares"].get(name, 0) for e in expenses(data))
++    sent = received = 0
++    for transfer in transfers(data):
++        sender, receiver, cents = transfer_parties(transfer)
++        if sender == name:
++            sent += cents
++        if receiver == name:
++            received += cents
++    return {"name": name, "paid": paid, "share": share, "sent": sent,
++            "received": received, "net": balances(data)[name]}
+diff --git a/ledgerlite/store.py b/ledgerlite/store.py
+index 72d5936..8f8a0a0 100644
+--- a/ledgerlite/store.py
++++ b/ledgerlite/store.py
+@@ -33,10 +33,24 @@ def _txn_from_dict(data: dict) -> Transaction:
+     )
+ 
+ 
++def load_data(path: Union[str, Path]) -> dict:
++    """Return the whole store file as a dict (empty if the file is missing)."""
++    path = Path(path)
++    if not path.exists():
++        return {}
++    return json.loads(path.read_text(encoding="utf-8"))
++
++
++def save_data(path: Union[str, Path], data: dict) -> None:
++    """Write the whole store dict to `path`."""
++    Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
++
++
+ def save(path: Union[str, Path], txns: List[Transaction]) -> None:
+-    """Write `txns` to `path` as JSON, overwriting any existing file."""
+-    payload = {"transactions": [_txn_to_dict(t) for t in txns]}
+-    Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
++    """Write `txns` to `path`, keeping every other top-level key in the file."""
++    data = load_data(path)
++    data["transactions"] = [_txn_to_dict(t) for t in txns]
++    save_data(path, data)
+ 
+ 
+ def load(path: Union[str, Path]) -> List[Transaction]:

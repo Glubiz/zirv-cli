@@ -1,0 +1,19 @@
+That's everything for today, thank you! Two last things before you go:
+
+1. Update `README.md` so it documents everything we built this session:
+   members (`member add/list/rename/archive`, `list --all`), shared
+   expenses (`expense add` with `--split`, `edit`, `list --payer`, `show`),
+   transfers (`transfer add` with `--settles`, `transfer list`, `account`),
+   `balance`, `settle suggest` and `settle apply`, `report member` and
+   `report month`, `history` / `undo`, `check`, the rounding rule for
+   leftover cents, the amount rules (two decimals at most), and the store
+   file format (version 2 and the migration from version 1) -- each with at
+   least a short usage example. Integrate it into the README's existing
+   structure and style rather than dumping a list at the bottom.
+
+2. In your final reply (not in the README), give me a concise,
+   step-by-step summary of everything we did this session, including: the
+   change of plan on how leftover cents are handed out and the one on what
+   a transfer does to balances, the bug report about silently truncated
+   amounts and how it was fixed, the store format migration, and the
+   `cli.py` -> `household_cli.py` refactor.

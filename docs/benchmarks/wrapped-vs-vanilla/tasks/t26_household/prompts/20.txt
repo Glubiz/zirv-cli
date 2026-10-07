@@ -1,0 +1,25 @@
+Ben has decided he wants to be called "Benjamin" on everything and Cara
+spelled her own name wrong when I first typed it in, so: renaming members.
+
+`python -m ledgerlite member rename OLD NEW --store PATH` renames a member
+and prints `Renamed member OLD to NEW` (OLD in its stored spelling, NEW
+with surrounding whitespace stripped).
+
+- OLD is matched case-insensitively; unknown is the usual `error: unknown
+  member: NAME`. NEW must follow the same rules as a new member's name: not
+  empty (`error: member name cannot be empty`) and unique -- if it matches
+  any OTHER member, archived ones included, it's `error: member already
+  exists: NEW`. Renaming a member to a different capitalisation of their own
+  name (`Ana` -> `ANA`) is fine, and OLD checks come before NEW checks.
+- The new name has to show up everywhere the old one was stored: the member
+  entry (archived status unchanged, same position in the list), every
+  expense's payer, weights and shares (keeping their order), and the
+  entries of every transfer. Afterwards every command shows exactly the
+  same numbers as before, just under the new name -- balances, settle-up
+  suggestions, reports, `expense show`, `account NEW`, and so on -- and
+  `account OLD` is now an unknown member.
+- It's a household change like the others, so it goes in the history
+  (label `member rename OLD NEW`, OLD as stored, NEW as stripped) and can be
+  undone. Remember what we decided about the history being append-only:
+  entries that are already there are never rewritten, so they keep showing
+  the old name.

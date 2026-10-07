@@ -1,0 +1,21 @@
+Flatmates keep asking "how did you get that number?", so let's add a
+per-member report. `python -m ledgerlite report member NAME --store PATH`
+prints exactly these six lines (money with two decimals, member name in its
+stored spelling, name matched case-insensitively):
+
+```
+Member: Ana
+Paid: 30.00
+Share: 10.00
+Sent: 0.00
+Received: 10.00
+Net: 20.00
+```
+
+- `Paid`: total of the expenses this member paid.
+- `Share`: total of this member's shares across all expenses.
+- `Sent` / `Received`: total of the transfers this member sent / received.
+- `Net`: this member's balance. It has to be exactly what `balance` prints
+  for that member -- the two commands must never disagree.
+
+An unknown name is the usual `error: unknown member: NAME`.

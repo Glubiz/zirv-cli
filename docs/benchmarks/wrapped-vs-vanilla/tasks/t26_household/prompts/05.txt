@@ -1,0 +1,24 @@
+Good. Now the point of all this: nobody wants to work out by hand who
+should pay whom. Add `python -m ledgerlite settle suggest --store PATH`,
+which looks at the balances `balance` reports and prints a short list of
+payments that would bring everybody back to zero. It must not change the
+store.
+
+Use this greedy procedure (it keeps the number of payments low, and I want
+the output to be deterministic):
+
+1. Among the members who owe money (negative balance), take the one who
+   owes the most; among the members who are owed money (positive
+   balance), take the one who is owed the most. Ties in either group go
+   to whoever was added as a member first.
+2. The first pays the second whatever is smaller of "what the debtor
+   still owes" and "what the creditor is still owed". Print it as `PAYER
+   pays RECEIVER AMOUNT` (two decimals), e.g. `Ben pays Ana 10.00`.
+3. Reduce both balances by that amount, drop anyone who reaches zero, and
+   repeat until nobody is left.
+
+Payments are printed in the order they were generated, one per line. If
+nobody owes anything, print `Everyone is settled up.`
+
+Put the logic in `household.py` (not the CLI handler), working off the
+same balance numbers `balance` uses.

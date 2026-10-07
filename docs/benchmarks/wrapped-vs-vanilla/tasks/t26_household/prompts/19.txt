@@ -1,0 +1,18 @@
+`settle suggest` tells us who should pay whom, but then somebody has to type
+all the transfers in by hand. Let's have ledgerlite do the bookkeeping:
+`python -m ledgerlite settle apply [--date YYYY-MM-DD] --store PATH`.
+
+- It works out the same payments `settle suggest` would print, in the same
+  order, and records each one as a settling transfer: exactly what `transfer
+  add --from PAYER --to RECEIVER --amount AMOUNT --settles` would have
+  stored, with the note `settle apply`, and the given date (default
+  today; a bad date is the usual `error: invalid date: TEXT`, with nothing
+  recorded). Ids continue after whatever transfers already exist.
+- Afterwards everybody's balance is zero. That has to include an archived
+  member who still happens to owe or be owed something -- being archived
+  must not stop the payments from being recorded.
+- It prints `Settled N payments` (N = how many transfers it recorded). If
+  there is nothing to settle it prints `Everyone is settled up.`, records
+  no transfers, and nothing else happens.
+- The whole run is ONE change in the history: it's a single entry, so a
+  single `undo` takes all of the transfers it recorded back out.

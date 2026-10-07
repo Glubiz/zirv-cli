@@ -1,0 +1,21 @@
+Not every expense is split evenly -- Ben barely eats at home, and the
+cinema trip was only for two of us. Add a `--split` option to `expense
+add`:
+
+`--split NAME=WEIGHT,NAME=WEIGHT,...`
+
+- Only the listed members take part in the expense, in the order they are
+  listed (that is the participant order now, not the order the members were
+  added). Each share is proportional to the member's weight, e.g.
+  `--split Ana=1,Ben=2` gives Ben twice Ana's share. Weights are positive
+  whole numbers; the payer doesn't have to be one of the participants.
+- Rounding works exactly like it already does for equal splits -- same
+  rule for the leftover cents, nothing new to decide.
+- Names match case-insensitively and are stored in their member spelling;
+  the `weights` and `shares` objects in storage use the participant order.
+- Errors: a name that isn't a member is `error: unknown member: NAME`; a
+  malformed or non-positive weight, or anything else that isn't
+  `NAME=WEIGHT` pairs, is `error: invalid split: TEXT` (TEXT being the
+  whole `--split` value as typed); listing the same member twice is
+  `error: duplicate member in split: NAME`.
+- Without `--split` everything is exactly as before.

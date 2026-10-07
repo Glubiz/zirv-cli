@@ -1,0 +1,24 @@
+I got something wrong about transfers and I want to change it. Right now
+every transfer moves the balances, but people also move money around for
+reasons that have nothing to do with the shared expenses (Cara lending Ben
+cash for a train ticket, say), and that shouldn't touch what the flat owes.
+So from now on a transfer only counts toward balances when it is explicitly
+a settling one.
+
+- `transfer add` gets a new flag `--settles`. With it, the transfer behaves
+  exactly like transfers do today (sender's balance up, receiver's down).
+  WITHOUT it, the transfer is just recorded: it still gets stored as its
+  pair of entries and shows up in `transfer list` and `account NAME`, but it
+  has no effect at all on `balance`, `settle suggest`, or the `Sent`,
+  `Received` and `Net` lines of `report member` (those three only count
+  settling transfers from now on). The output of `transfer add` doesn't
+  change.
+- Each stored transfer gets a boolean `settles` key next to `note`. Transfers
+  already in a store file from before this change have no such key -- treat
+  those as settling, because that is what they were recorded as.
+- `transfer list` marks settling transfers by appending ` [settles]` as the
+  very last thing on the line (after the ` (NOTE)` part when there is one),
+  e.g. `1: 2024-03-02 10.00 Ben -> Ana (pizza) [settles]`. Non-settling
+  transfers print exactly as before.
+
+Everything else is unchanged.

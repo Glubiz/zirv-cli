@@ -1,0 +1,37 @@
+Cara is moving out at the end of the month, so: archiving members.
+
+`python -m ledgerlite member archive NAME --store PATH` marks the member as
+archived (the `archived` flag in the member object) and prints `Archived
+member NAME` (stored spelling). Errors, checked in this order: unknown name
+(`error: unknown member: NAME`), already archived (`error: member already
+archived: NAME`), and a member whose balance isn't exactly zero can't be
+archived (`error: member has a non-zero balance: NAME`) -- they have to
+settle up first.
+
+What archiving changes:
+
+- `member list` no longer shows archived members; `member list --all` shows
+  everyone in the order they were added, with ` (archived)` appended to the
+  archived ones, e.g. `Cara (archived)`. If nobody is left to show it
+  prints `No members.`
+- A new expense is only shared between the members who aren't archived:
+  from now on "everyone in the household" means the active members. An
+  archived member can't be a payer, can't be named in `--split`, can't be
+  the sender or receiver of a new transfer, and can't be set as an
+  expense's payer through `expense edit --payer`; all of those are `error:
+  member is archived: NAME`. For transfers that check comes right after the
+  unknown-member and same-member checks and before the amount checks; for
+  `expense add`/`edit` it comes right after the payer is looked up (and for
+  `--split`, as each name is looked up).
+- An archived member's name stays reserved: `member add` with the same name
+  (any capitalisation) is still `member already exists`.
+- `balance` leaves archived members out when their balance is zero, but if
+  an archived member ever does have a non-zero balance it still shows them
+  (that can happen, e.g. when an old expense they took part in gets
+  edited). `settle suggest` and the reports keep treating archived members
+  like any other member.
+- Old expenses are never touched by archiving: editing an old expense's
+  amount re-splits it between the same people as before, archived or not.
+
+Archiving is a change like any other, so you know what that implies for the
+history.

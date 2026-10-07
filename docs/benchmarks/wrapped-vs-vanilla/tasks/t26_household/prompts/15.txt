@@ -1,0 +1,24 @@
+Picking this up again after a handoff from the last working session --
+there's a bug report waiting that nobody has triaged. The report, from
+Ben:
+
+> I typed `--amount 10.005` for the taxi and ledgerlite happily accepted it
+> and recorded 10.00. Nothing told me it had thrown half a cent away. On a
+> bigger number I would have been quietly out of pocket and nobody would
+> have noticed.
+
+He's right: amounts aren't supposed to be silently altered. Fix it so that
+an amount with more than two decimal places is rejected instead of being
+rounded or truncated: `error: amount has more than 2 decimal places: TEXT`
+(TEXT exactly as typed), exit status 2, nothing written to the store and
+nothing recorded in the history. A value that is numerically a whole number
+of cents is fine however it is written -- `10`, `10.5`, `10.50` and
+`10.500` are all fine (10.500 is 10.50).
+
+The new check happens right after the text has been read as a number (so
+`abc` is still `invalid amount`) and before the "must be positive" check,
+so `0.001` reports the decimal-places error.
+
+This has to hold everywhere an amount is entered -- not only the command
+Ben happened to use. Please look for every place, and keep the existing
+messages and behaviour for valid amounts exactly as they are.
