@@ -1438,7 +1438,13 @@ fn place_subagents(
         agent_dirs.insert(record.session.clone(), dir);
     }
     for mut hooked in read_subagent_records(state) {
-        if let Some(native) = agents.remove(&hooked.agent_id) {
+        let native = agents.remove(&hooked.agent_id);
+        // Claude fires SubagentStart for internal forks too: no type, no dispatching tool call and no
+        // transcript of their own. They are not agents anyone dispatched or can open.
+        if native.is_none() && hooked.agent_type.is_empty() && hooked.tool_use_id.is_none() {
+            continue;
+        }
+        if let Some(native) = native {
             hooked.tool_use_id = hooked.tool_use_id.or(native.tool_use_id);
             hooked.description = hooked.description.or(native.description);
             hooked.requested_model = hooked.requested_model.or(native.requested_model);
@@ -2164,6 +2170,26 @@ mod tests {
             nodes.iter().all(|n| n.session.is_none()),
             "no session node, so no attribution"
         );
+    }
+
+    #[test]
+    fn a_hook_record_with_no_type_tool_call_or_transcript_is_not_an_agent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = state_for(dir.path());
+        let record = |id: &str, agent_type: &str| SubagentRecord {
+            session: "sess-832-abcdef".to_string(),
+            agent_id: id.to_string(),
+            agent_type: agent_type.to_string(),
+            status: "completed".to_string(),
+            started_at: 1,
+            ended_at: Some(1),
+            ..SubagentRecord::default()
+        };
+        save(&state, &record("fork", ""));
+        save(&state, &record("real", "Explore"));
+        let nodes = snapshot(&state, dir.path(), None, now_secs());
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["real"]);
     }
 
     #[test]
