@@ -245,6 +245,12 @@ class DialogTests(unittest.TestCase):
         ascii_trust = REAL_TRUST.replace("❯ No, exit", "> No, exit")
         self.assertEqual(orch.detect_dialog(ascii_trust), [(orch.DOWN, 0.4), (orch.ENTER, 0.0)])
 
+    def test_background_shell_in_status_line_means_not_finished(self):
+        # o02 zirv run: the seat ended its turn while a codex review shell ran on.
+        self.assertTrue(orch.background_running("✻ Worked for 14m 5s · done 13:03 · 1 shell still running"))
+        self.assertTrue(orch.background_running("  ⏵⏵ bypass permissions on · 2 shells · /tasks to see subagents"))
+        self.assertFalse(orch.background_running(REAL_READY_WRAP))
+
     def test_real_ready_screen_is_not_a_dialog_even_with_bypass_text(self):
         self.assertIsNone(orch.detect_dialog(REAL_READY_WRAP))
         self.assertTrue(orch.input_box_ready(REAL_READY_WRAP))

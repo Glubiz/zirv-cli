@@ -338,6 +338,15 @@ def detect_dialog(screen_text):
     return [(ENTER, 0.0)]
 
 
+BACKGROUND_RE = re.compile(r"\b\d+\s+(?:shells?|background tasks?)\b(?:\s+still running)?", re.I)
+
+
+def background_running(screen_text):
+    """True while the TUI reports background shells/tasks (e.g. "· 1 shell still
+    running"): the agent ended its turn but will resume when they report back."""
+    return bool(BACKGROUND_RE.search(screen_text or ""))
+
+
 def input_box_ready(screen_text):
     """True when the TUI shows its prompt box (ready for a pasted request)."""
     low = screen_text.lower()
@@ -686,7 +695,7 @@ def drive(argv, cwd, env, prompt, log_path, timeout_s, idle_s=DEFAULT_IDLE_S, st
                     run.screen.clear_tail()
                     time.sleep(1.5)
                     continue
-                if is_complete(state, now - last_activity, idle_s):
+                if is_complete(state, now - last_activity, idle_s) and not background_running(run.screen_text()):
                     if out["nudges"] < MAX_NUDGES and needs_nudge(final_text(main_recs)):
                         # the turn ended on a question nobody will answer: tell it to carry on
                         out["nudges"] += 1
