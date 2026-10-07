@@ -1611,6 +1611,35 @@ mod tests {
         );
     }
 
+    /// An auto-started workflow keeps `.zirv/work/` out of the user's `git status`, like a CLI start.
+    #[test]
+    fn auto_start_excludes_zirv_artifacts_from_git_status() {
+        let state = tempfile::tempdir().expect("state");
+        let repo = git_repo_with_commit();
+        let env = intake_env(state.path(), &[]);
+        let lookup = |k: &str| env.get(k).cloned();
+        let note = auto_start_workflow_note(
+            &CtxConfig::default(),
+            "s1",
+            &intake_stdin(CODING_PROMPT),
+            repo.path(),
+            &lookup,
+        );
+        assert!(note.is_some(), "a coding prompt starts a workflow");
+        let exclude = std::fs::read_to_string(repo.path().join(".git/info/exclude")).unwrap();
+        assert!(exclude.lines().any(|l| l == ".zirv/work/"), "{exclude}");
+        let work = repo.path().join(".zirv/work/wf");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("intent.md"), "x").unwrap();
+        let porcelain = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&porcelain.stdout), "");
+    }
+
     /// Issue #878: the auto-start turn carries the step context, binds the session, and every later
     /// step change is injected exactly once.
     #[test]

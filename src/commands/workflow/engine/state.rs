@@ -374,6 +374,14 @@ pub(super) fn work_dir_is_gitignored(repo: &Path) -> bool {
 /// (any git/IO failure is a silent no-op). A repo that already tracks `.zirv/`
 /// (zirv's own, which commits `.zirv/work/` on purpose) is left unchanged.
 pub(crate) fn exclude_zirv_artifacts_from_git(repo: &Path) {
+    // Runs on every state persist: skip the git shell-outs once a plain `.git` dir already lists everything wanted.
+    let verify_exists = repo.join(".zirv").join("verify.toml").exists();
+    if std::fs::read_to_string(repo.join(".git").join("info").join("exclude")).is_ok_and(|text| {
+        let has = |want: &str| text.lines().any(|have| have.trim() == want);
+        has(".zirv/work/") && (verify_exists || has(".zirv/verify.toml"))
+    }) {
+        return;
+    }
     let git = |args: &[&str]| {
         std::process::Command::new("git")
             .arg("-C")
@@ -840,7 +848,10 @@ pub(super) fn active_path(state: &StateDir, repo: &Path) -> PathBuf {
     repo_dir(state, repo).join("active")
 }
 
+/// Every workflow persist (CLI start, hook auto-start, maintenance, advance) funnels through here, so the
+/// git-status exclusion for zirv's `.zirv/work/` artifacts covers every entry point.
 pub(super) fn write_state_file(state_dir: &StateDir, state: &WorkflowState) -> CtxResult<()> {
+    exclude_zirv_artifacts_from_git(&state.repo);
     let dir = repo_dir(state_dir, &state.repo);
     create_private_dir_all(&dir)?;
     let json = serde_json::to_string_pretty(state)?;
@@ -2069,6 +2080,29 @@ mod tests {
             before,
             std::fs::read_to_string(&exclude).unwrap_or_default()
         );
+    }
+
+    /// Persisting any workflow state excludes zirv artifacts, whichever entry point created it.
+    #[test]
+    fn saving_a_workflow_excludes_zirv_artifacts_from_git() {
+        let repo = tempdir().unwrap();
+        git_init(repo.path());
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let wf = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "a task".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            low_classification(),
+        );
+        save(&state_dir, &wf, true).unwrap();
+        let text = std::fs::read_to_string(repo.path().join(".git/info/exclude")).unwrap();
+        assert_eq!(text.matches(".zirv/work/\n").count(), 1);
+        save(&state_dir, &wf, true).unwrap();
+        let again = std::fs::read_to_string(repo.path().join(".git/info/exclude")).unwrap();
+        assert_eq!(text, again);
     }
 
     #[test]
