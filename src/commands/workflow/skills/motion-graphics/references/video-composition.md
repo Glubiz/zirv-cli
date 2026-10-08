@@ -16,7 +16,7 @@ larger, borders 2x thicker, padding 3x larger, one idea per frame.
   bottom 20%, where platform UI sits.
 - `render` cannot scale down, so the canvas size is the output size. If a GIF
   will be viewed small, design every label at 2.2% of frame height or more
-  (24px at 1080p; 9px on a 720x405 canvas) and check a snapshot at the size
+  (24px at 1080p; 9px on a 720x405 canvas, the one floor) and check a snapshot at the size
   it will be seen.
 
 ## Type at video scale (1080p)
@@ -31,7 +31,7 @@ Scale margins and borders the same way.
 | Headline | 6-11% | 64-120px | 24-45px |
 | Hero numeral | 17-30% | 180-320px | 68-120px |
 | Body, callouts | 2.6-4% | 28-42px | 11-16px |
-| Labels | 1.7-2.2% minimum, 2.2% or more if viewed small | 18-24px | 7-9px |
+| Labels | 2.2% or more (the floor) | 24px or more | 9px or more |
 
 - At most 6-8 words per line and one statement per beat.
 - Weights: headlines 700-900, or 200-300 at statement size for contrast;
@@ -89,13 +89,17 @@ with one small element in the middle of a dark field is dead space.
   muted and alive.
 - Text holds 4.5:1 against what is behind it in every frame, including mid
   transition.
-- Banding: H.264 at 8 bits bands smooth dark gradients into visible steps.
-  Overlay grain at 4-8% opacity (an SVG `feTurbulence` tile or a noise PNG),
-  let gradients span at least 0.08 of lightness, and avoid a full-frame
-  linear gradient on near-black.
-- GIF holds 256 colours per frame: grain and long gradients dither and grow
-  the file. Keep grain at 4% or less when a GIF is required, and expect it
-  to be larger than the MP4.
+- Banding is an H.264/MP4 concern: 8-bit H.264 bands smooth dark gradients
+  into visible steps. For an MP4-only deliverable, overlay grain at 4-8%
+  opacity (an SVG `feTurbulence` tile or a noise PNG), let gradients span at
+  least 0.08 of lightness, and avoid a full-frame linear gradient on
+  near-black.
+- A GIF carries no grain or noise overlay: its 256-colour palette dithers
+  anyway, and per-frame noise defeats palette and frame-to-frame
+  compression. Measured: a static 4%-opacity `feTurbulence` grain took a
+  12 s, 1920x1080, 15 fps GIF from 9.0 MB to 63 MB; a slow camera push added
+  only about 0.4 MB. Check the GIF's size after rendering (about 10 MB or
+  less) and cut grain, noise and full-frame textures first.
 
 ## Show the subject's world
 
