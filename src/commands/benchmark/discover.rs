@@ -1,14 +1,14 @@
 //! Which harnesses are present, which models each could run, and who judges.
 //!
-//! Candidate models are the ones `zirv ctx models` lists as available on this
-//! machine, never a built-in table.
+//! Candidate models are the ones the runtime registry offers on this machine
+//! (available, listed, not retired), never a built-in table.
 
 use serde::{Deserialize, Serialize};
 
 use super::Filters;
 use crate::commands::ctx::adapters::{self, AgentAdapter, Liveness};
 use crate::commands::ctx::config::CtxConfig;
-use crate::commands::ctx::models::{AVAILABLE, ModelRow};
+use crate::commands::ctx::models::{self, Listing};
 
 /// Model name for a harness with no available registry rows: no model flag is pinned.
 pub const DEFAULT_MODEL: &str = "default";
@@ -55,7 +55,7 @@ pub fn discover(
     cfg: &CtxConfig,
     filters: &Filters,
     present: &dyn Fn(&str, &str) -> Liveness,
-    rows: &[ModelRow],
+    listing: &Listing,
 ) -> Result<Discovery, String> {
     for name in filters
         .harnesses
@@ -87,7 +87,7 @@ pub fn discover(
         });
         let wanted = filters.harnesses.is_empty() || filters.harnesses.iter().any(|h| h == name);
         if let (Some(adapter), true) = (adapter, wanted) {
-            candidates.extend(candidates_for(adapter.as_ref(), filters, rows));
+            candidates.extend(candidates_for(adapter.as_ref(), filters, listing));
         }
     }
 
@@ -137,16 +137,12 @@ fn judge_for(harness: &str, model: &str, candidates: &[Candidate]) -> Judge {
     }
 }
 
-/// A registry id is a model, not a placeholder, when it starts like a name.
-fn is_model_id(id: &str) -> bool {
-    id.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
-}
-
 fn candidates_for(
     adapter: &dyn AgentAdapter,
     filters: &Filters,
-    rows: &[ModelRow],
+    listing: &Listing,
 ) -> Vec<Candidate> {
+    let rows = &listing.rows;
     let name = adapter.name();
     let vendor = adapter.provider();
     let candidate = |model: &str, family: Option<&str>, output_price: Option<u64>| Candidate {
@@ -172,10 +168,7 @@ fn candidates_for(
             .collect();
     }
 
-    let available: Vec<&ModelRow> = rows
-        .iter()
-        .filter(|r| r.vendor == vendor && r.availability == AVAILABLE && is_model_id(&r.id))
-        .collect();
+    let available = models::candidates(&listing.registry, vendor, listing.now);
     if available.is_empty() {
         // Without a family to match, a filter leaves nothing for a default launch to satisfy.
         return if filters.families.is_empty() {
@@ -187,19 +180,18 @@ fn candidates_for(
 
     available
         .into_iter()
-        .filter(|row| {
-            filters.families.is_empty()
-                || row
-                    .family
-                    .as_ref()
-                    .is_some_and(|family| filters.families.contains(family))
-        })
-        .map(|row| {
-            candidate(
-                &row.id,
-                row.family.as_deref(),
-                row.output_micros_per_million,
-            )
+        .filter_map(|model| {
+            let row = rows.iter().find(|r| r.vendor == vendor && r.id == model.id);
+            let family = row.and_then(|r| r.family.as_deref());
+            let wanted = filters.families.is_empty()
+                || family.is_some_and(|f| filters.families.iter().any(|w| w == f));
+            wanted.then(|| {
+                candidate(
+                    &model.id,
+                    family,
+                    row.and_then(|r| r.output_micros_per_million),
+                )
+            })
         })
         .collect()
 }
@@ -226,6 +218,7 @@ fn highest_priced<'a>(candidates: &'a [Candidate], order: &[String]) -> Option<&
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::ctx::models::{AVAILABLE, ModelRow, Registry, RegistryModel};
     use std::collections::HashMap;
 
     fn cfg(env: &[(&str, &str)]) -> CtxConfig {
@@ -245,6 +238,30 @@ mod tests {
         ModelRow::for_test(vendor, id, family, AVAILABLE, price)
     }
 
+    /// A listing whose registry mirrors the rows: `available` rows are available models.
+    fn listing(rows: &[ModelRow]) -> Listing {
+        let models = rows
+            .iter()
+            .map(|r| {
+                let model = RegistryModel {
+                    vendor: r.vendor.clone(),
+                    id: r.id.clone(),
+                    available: r.availability == AVAILABLE,
+                    ..RegistryModel::default()
+                };
+                (format!("{}:{}", r.vendor, r.id), model)
+            })
+            .collect();
+        Listing {
+            registry: Registry {
+                updated_at: 0,
+                models,
+            },
+            rows: rows.to_vec(),
+            now: 100,
+        }
+    }
+
     fn models(candidates: &[Candidate]) -> Vec<&str> {
         candidates.iter().map(|c| c.model.as_str()).collect()
     }
@@ -260,7 +277,7 @@ mod tests {
 
     fn only_claude(rows: &[ModelRow], f: &Filters) -> Discovery {
         let present = adapters::only_installed(&["claude"]);
-        discover(&cfg(&[]), f, &present, rows).unwrap()
+        discover(&cfg(&[]), f, &present, &listing(rows)).unwrap()
     }
 
     #[test]
@@ -276,13 +293,31 @@ mod tests {
         assert_eq!(
             models(&d.candidates),
             vec![
+                "loner-1",
                 "vendor-alpha-1",
                 "vendor-alpha-2-1",
-                "vendor-beta-10",
-                "loner-1"
+                "vendor-beta-10"
             ]
         );
-        assert_eq!(d.candidates[1].family.as_deref(), Some("alpha"));
+        assert_eq!(d.candidates[2].family.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn a_retired_registry_id_is_not_planned() {
+        let v = claude_vendor();
+        let rows = [
+            row(v, "vendor-alpha-1", Some("alpha"), None),
+            row(v, "vendor-alpha-2", Some("alpha"), None),
+        ];
+        let mut with = listing(&rows);
+        with.registry
+            .models
+            .get_mut(&format!("{v}:vendor-alpha-2"))
+            .unwrap()
+            .retirement_at = Some(with.now);
+        let present = adapters::only_installed(&["claude"]);
+        let d = discover(&cfg(&[]), &filters(), &present, &with).unwrap();
+        assert_eq!(models(&d.candidates), vec!["vendor-alpha-1"]);
     }
 
     #[test]
@@ -367,7 +402,7 @@ mod tests {
             ],
             ..filters()
         };
-        let d = discover(&cfg(&[]), &f, &present, &rows).unwrap();
+        let d = discover(&cfg(&[]), &f, &present, &listing(&rows)).unwrap();
         assert_eq!(
             models(&d.candidates),
             vec!["vendor-alpha-1", "vendor-alpha-3"]
@@ -384,12 +419,19 @@ mod tests {
             harnesses: only.iter().map(|h| (*h).to_string()).collect(),
             ..filters()
         };
-        let err = discover(&cfg(&[]), &pin("goose", &[]), &present, &[]).unwrap_err();
+        let err =
+            discover(&cfg(&[]), &pin("goose", &[]), &present, &Listing::default()).unwrap_err();
         assert!(err.contains("harness 'goose' is not installed"), "{err}");
         let config = cfg(&[("ZIRV_AGENT_CODEX_ENABLED", "false")]);
-        let err = discover(&config, &pin("codex", &[]), &present, &[]).unwrap_err();
+        let err = discover(&config, &pin("codex", &[]), &present, &Listing::default()).unwrap_err();
         assert!(err.contains("harness 'codex' is disabled"), "{err}");
-        let err = discover(&cfg(&[]), &pin("codex", &["claude"]), &present, &[]).unwrap_err();
+        let err = discover(
+            &cfg(&[]),
+            &pin("codex", &["claude"]),
+            &present,
+            &Listing::default(),
+        )
+        .unwrap_err();
         assert!(err.contains("excluded by --harness"), "{err}");
     }
 
@@ -403,7 +445,7 @@ mod tests {
             families: vec!["beta".to_string()],
             ..filters()
         };
-        let d = discover(&cfg(&[]), &f, &present, &rows).unwrap();
+        let d = discover(&cfg(&[]), &f, &present, &listing(&rows)).unwrap();
         assert_eq!(models(&d.candidates), vec!["vendor-alpha-1"]);
     }
 
@@ -411,7 +453,7 @@ mod tests {
     fn an_absent_harness_is_excluded_and_a_disabled_one_is_marked() {
         let present = adapters::only_installed(&["claude", "codex"]);
         let config = cfg(&[("ZIRV_AGENT_CODEX_ENABLED", "false")]);
-        let d = discover(&config, &filters(), &present, &[]).unwrap();
+        let d = discover(&config, &filters(), &present, &Listing::default()).unwrap();
         let harnesses: Vec<&str> = d.candidates.iter().map(|c| c.harness.as_str()).collect();
         assert_eq!(harnesses, vec!["claude"]);
         let presence = |name: &str| {
@@ -432,7 +474,7 @@ mod tests {
             harnesses: vec!["codex".to_string()],
             ..filters()
         };
-        let d = discover(&cfg(&[]), &f, &present, &[]).unwrap();
+        let d = discover(&cfg(&[]), &f, &present, &Listing::default()).unwrap();
         assert!(d.candidates.iter().all(|c| c.harness == "codex"));
         assert_eq!(d.harnesses.len(), adapters::ADAPTERS.len());
     }
@@ -444,7 +486,7 @@ mod tests {
             harnesses: vec!["nope".to_string()],
             ..filters()
         };
-        assert!(discover(&cfg(&[]), &f, &present, &[]).is_err());
+        assert!(discover(&cfg(&[]), &f, &present, &Listing::default()).is_err());
     }
 
     fn priced(harness: &str, model: &str, price: Option<u64>) -> Candidate {
@@ -504,7 +546,7 @@ mod tests {
             ..filters()
         };
         assert!(
-            discover(&cfg(&[]), &f, &present, &[])
+            discover(&cfg(&[]), &f, &present, &Listing::default())
                 .unwrap()
                 .judge
                 .is_none()
@@ -513,7 +555,7 @@ mod tests {
             judge: Some(("codex".to_string(), "x-model".to_string())),
             ..filters()
         };
-        let judge = discover(&cfg(&[]), &f, &present, &[])
+        let judge = discover(&cfg(&[]), &f, &present, &Listing::default())
             .unwrap()
             .judge
             .unwrap();
@@ -531,6 +573,6 @@ mod tests {
             judge: Some(("codex".to_string(), "m".to_string())),
             ..filters()
         };
-        assert!(discover(&cfg(&[]), &f, &present, &[]).is_err());
+        assert!(discover(&cfg(&[]), &f, &present, &Listing::default()).is_err());
     }
 }
