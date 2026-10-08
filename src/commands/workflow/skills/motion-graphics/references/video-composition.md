@@ -87,7 +87,7 @@ with one small element in the middle of a dark field is dead space.
 - Tinted neutrals: no `#000` or `#fff`. A dark ground sits at OKLCH L
   0.14-0.22 with chroma 0.02-0.04, lit from one side.
 - One accent hue for the subject's key state. Add a second hue only when it
-  carries meaning (decay against fresh, before against after).
+  carries meaning (before against after, warning against safe).
 - "Muted is fine. Flat is not." A flat navy field with small grey text is
   flat; a deep ground with a light source, grain and one hot accent is
   muted and alive.

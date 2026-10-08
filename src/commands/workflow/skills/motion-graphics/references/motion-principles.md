@@ -22,10 +22,10 @@ cannot name the verb, the element is not designed yet. Recipes at 1080p:
 | becomes | a word or shape turns into an object or into the next word: scale, mask and position matched across the change |
 | counts | a proxy object tweened 0 to N, `Math.round` into tabular numerals, `power2.out` or `steps(N)` |
 | types | characters revealed with `steps(N)` at 18-30 characters per second |
-| splits | characters staggered 0.02-0.03 s each, only for words of 12 characters or fewer |
+| splits | characters staggered 0.03-0.05 s each, only for words of 12 characters or fewer |
 | pushes | the camera wrapper scales 1 to 1.06-1.15 across the scene, `sine.inOut` |
-| travels | the camera moves to another region of the world, 0.6-1.2 s `expo.inOut` or `power3.inOut` |
-| hands over | an object leaves one place with `power3.in` and arrives in another with `power3.out`, same speed at the hand-over |
+| travels | `travel()` moves the depth layers to another region of the world (concept-and-world.md), 0.6-1.2 s `expo.inOut` or `power3.inOut` |
+| passes | an object leaves one place with `power3.in` and arrives in another with `power3.out`, same speed at the switch |
 
 Mix at least three verbs and three directions across a film. Uniform
 `y: 30, opacity: 0` on everything is the web habit that makes video flat.
@@ -107,7 +107,8 @@ from contrast, and the slowest scene should run about 3x the fastest.
 
 Each scene builds during its first 30%, breathes from 30-70% (the viewer
 reads while the camera drifts or a secondary element completes), and
-resolves in the last 30% (the exit begins or a carrier hands over).
+resolves in the last 30% (the exit begins or a carrier crosses into the
+next beat).
 
 ## Holds: legible, never frozen
 
