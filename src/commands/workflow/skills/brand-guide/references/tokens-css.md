@@ -101,7 +101,7 @@ value from evidence and mark unapproved identity values `/* proposed */`.
   --film-travel: 0.9;
   --gsap-enter: power4.out;
   --gsap-exit: power3.in;
-  --gsap-move: expo.inOut;
+  --gsap-move: power2.inOut;
 
   /* Video type at 1080p. A composition sets --frame-scale on :root
      (frame height / 1080) after importing this file. */
