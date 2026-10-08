@@ -11,7 +11,7 @@ metadata:
   x-zirv-phases: design,implement
   x-zirv-required-capabilities: repo.read
   x-zirv-optional-capabilities: repo.write,shell.exec,network.access
-  x-zirv-context-budget-bytes: "5700"
+  x-zirv-context-budget-bytes: "5800"
 ---
 
 A brand is a set of decisions that must survive every new page and every
@@ -119,6 +119,7 @@ are not brand evidence.
 Report the mode, the guide's path (or the stub's source and ref), the
 evidence read, what was added or changed with its changelog rows, the items
 still `[proposed]` that need the operator, and any conflicts found. When an
-identity-level item has no evidence and the operator is reachable, ask;
-otherwise ship it marked `[proposed]` and say so. Never present a proposal
+identity-level item has no evidence and the operator is reachable, ask,
+unless the work is an unattended film or UI build, which proceeds with
+`[proposed]` values and reports them; otherwise ship it marked `[proposed]` and say so. Never present a proposal
 as settled.
