@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="96" height="96" role="img" aria-label="zirv mark">
+  <!-- Approved vector master (operator, 2026-10-08). Geometry from the site's inline hex motif
+       (radius ratios 1 / .65 / .35, round joins); gradient from the logo PNG. -->
+  <defs>
+    <linearGradient id="g" gradientTransform="rotate(28)" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#11e2ff"/><stop offset=".52" stop-color="#1bb4ee"/><stop offset="1" stop-color="#2191dd"/>
+    </linearGradient>
+  </defs>
+  <polygon points="24,2 43.05,13 43.05,35 24,46 4.95,35 4.95,13" fill="none" stroke="url(#g)" stroke-width="2.4" stroke-linejoin="round"/>
+  <polygon points="24,10.9 34.7,17.2 34.7,29.8 24,36.1 13.3,29.8 13.3,17.2" fill="none" stroke="url(#g)" stroke-width="2.4" stroke-linejoin="round"/>
+  <polygon points="24,18 28.9,20.8 28.9,27.2 24,30 19.1,27.2 19.1,20.8" fill="url(#g)" stroke="url(#g)" stroke-width="1.2" stroke-linejoin="round"/>
+</svg>
