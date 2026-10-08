@@ -891,6 +891,61 @@ mod tests {
         );
     }
 
+    /// Every frontend phase skill's injected context (header, frontend
+    /// profile, resolved skill stack) must fit the default
+    /// `workflow.max_context_bytes` without the truncation marker. The
+    /// uncapped render is measured first so the byte count is reported.
+    #[test]
+    fn every_frontend_phase_skill_context_fits_the_default_workflow_cap() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let _vars = crate::commands::ctx::testenv::VarGuard::set(&[
+            (
+                "ZIRV_CTX_STATE_DIR",
+                Some(root.path().to_str().expect("utf-8 tempdir path")),
+            ),
+            ("ZIRV_CTX_WORKFLOW_MAX_CONTEXT_BYTES", Some("10000000")),
+        ]);
+        let default_cap = crate::commands::ctx::config::WorkflowConfig::default().max_context_bytes;
+        let mut over = Vec::new();
+        for skill in [
+            "frontend-design",
+            "frontend-plan",
+            "frontend-implement",
+            "frontend-debug",
+            "frontend-test",
+            "frontend-review",
+            "frontend-verify",
+        ] {
+            let mut state = skip_leading_artifact_steps(WorkflowState::start(
+                repo.path().to_path_buf(),
+                "small feature".into(),
+                WorkflowKind::Feature,
+                None,
+                true,
+                low_classification(),
+            ));
+            state.profile = WorkflowProfile::Frontend;
+            let index = state.current_step;
+            state.steps[index].skill = skill.to_string();
+            let uncapped = render_current_context(&state, repo.path(), None)
+                .unwrap()
+                .unwrap();
+            let capped = cap_workflow_context(uncapped.clone(), default_cap);
+            eprintln!(
+                "workflow-context bytes {skill}: {} / {default_cap}",
+                uncapped.len()
+            );
+            if capped.contains("workflow context truncated") {
+                over.push(format!("{skill}={}", uncapped.len()));
+            }
+        }
+        assert!(
+            over.is_empty(),
+            "frontend contexts over the default {default_cap}-byte cap: {over:?}"
+        );
+    }
+
     /// Review finding on the test above: `cap_workflow_context` used to
     /// compute `keep = max_bytes.saturating_sub(marker.len())` and still
     /// append the FULL marker regardless, so a `max_context_bytes` small
