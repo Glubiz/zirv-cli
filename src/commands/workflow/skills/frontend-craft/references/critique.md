@@ -10,73 +10,111 @@ that does not move, speak or surprise is not finished.
 - All fresh `zirv frontend render` captures (390, 768, 1440). They show
   only the resting first viewport after 2 s.
 - A full-height capture at 1440 and 390 for any page longer than one
-  screen (recipe in layout-and-composition.md).
+  screen: the script below writes it as `<width>-full.png`.
 - State captures: loading, empty, error and success (query parameters,
   toggles or fixtures).
 - Life captures: mid-arrival and after it, a hover state, a keyboard focus
   state, and two scroll positions, at 1440 and 390. The script below drives
   the browser recorded in the render report through the DevTools protocol
-  with Node 22 or newer (built-in `fetch` and `WebSocket`):
+  with Node 22 or newer (built-in `fetch` and `WebSocket`). It runs a fresh
+  temporary profile, so it never touches the user's own browser, and it
+  sets the viewport exactly, because a window size alone is clamped to a
+  minimum width and narrow captures come out too wide:
 
 ```js
 // life-capture.mjs: node life-capture.mjs <browser> <url> <out-dir> [width] [selector]
 import { spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
-const [browser, url, out, width = "1440", selector = "main a, main button"] = process.argv.slice(2);
-const chrome = spawn(browser, ["--headless=new", "--remote-debugging-port=9333",
-  "--hide-scrollbars", `--window-size=${width},1000`, "about:blank"], { stdio: "ignore" });
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+const [browser, url, out, widthArg = "1440", selector = "main a, main button"] = process.argv.slice(2);
+const width = Number(widthArg), height = width < 600 ? 844 : 1000;
+mkdirSync(out, { recursive: true });
+const profile = mkdtempSync(join(tmpdir(), "life-capture-")); // fresh profile, never the user's browser
+const chrome = spawn(browser, ["--headless=new", `--user-data-dir=${profile}`,
+  "--remote-debugging-port=0", "--no-first-run", "--no-default-browser-check",
+  "--hide-scrollbars", "about:blank"], { stdio: "ignore" });
+let failed = null;
+chrome.once("error", (e) => (failed = e));
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-let pages = null;
-for (let i = 0; i < 50 && !pages; i++) {
-  await wait(200);
-  pages = await fetch("http://127.0.0.1:9333/json").then((r) => r.json()).catch(() => null);
+let ws;
+try {
+  let port = 0;
+  for (let i = 0; i < 100 && !port && !failed; i++) { // the browser writes its chosen port here
+    await wait(100);
+    try { port = Number(readFileSync(join(profile, "DevToolsActivePort"), "utf8").split("\n")[0]); } catch {}
+  }
+  if (failed) throw failed;
+  if (!port) throw new Error("no DevToolsActivePort: the browser did not start or a sandbox blocked it");
+  const targets = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
+  ws = new WebSocket(targets.find((t) => t.type === "page").webSocketDebuggerUrl);
+  await new Promise((resolve, reject) => {
+    ws.addEventListener("open", resolve, { once: true });
+    ws.addEventListener("error", () => reject(new Error("DevTools socket failed")), { once: true });
+  });
+  let seq = 0;
+  const pending = new Map();
+  ws.addEventListener("message", (e) => {
+    const m = JSON.parse(e.data);
+    const call = pending.get(m.id);
+    if (!call) return;
+    pending.delete(m.id);
+    if (m.error) call.reject(new Error(`${call.method}: ${m.error.message}`));
+    else call.resolve(m.result);
+  });
+  const cdp = (method, params = {}) => new Promise((resolve, reject) => {
+    pending.set(++seq, { method, resolve, reject });
+    ws.send(JSON.stringify({ id: seq, method, params }));
+  });
+  const js = async (expression) =>
+    (await cdp("Runtime.evaluate", { expression, returnByValue: true })).result.value;
+  const shot = async (name, fullPage = false) => {
+    const params = {};
+    if (fullPage) {
+      const h = await js("document.documentElement.scrollHeight");
+      Object.assign(params, { captureBeyondViewport: true, clip: { x: 0, y: 0, width, height: h, scale: 1 } });
+    }
+    const { data } = await cdp("Page.captureScreenshot", params);
+    writeFileSync(join(out, `${width}-${name}.png`), Buffer.from(data, "base64"));
+  };
+  const tab = async () => {
+    for (const type of ["rawKeyDown", "keyUp"])
+      await cdp("Input.dispatchKeyEvent", { type, key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 });
+  };
+  await cdp("Page.enable");
+  // an exact viewport at any width: a window size alone is clamped to a minimum width
+  await cdp("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: width < 600 });
+  await cdp("Page.navigate", { url });
+  await wait(400); await shot("arrival-mid");
+  await wait(2600); await shot("arrival-done"); await shot("full", true);
+  const point = await js(`(() => { const el = document.querySelector(${JSON.stringify(selector)});
+    if (!el) return null; el.scrollIntoView({ block: "center", behavior: "instant" });
+    const r = el.getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; })()`);
+  if (!point) throw new Error(`nothing matches ${selector}: pass the primary action's selector`);
+  await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: point[0], y: point[1] });
+  await wait(400); await shot("hover");
+  await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: 0, y: 0 });
+  await js(`document.activeElement?.blur(); scrollTo({ top: 0, behavior: "instant" });
+    document.body.tabIndex = -1; document.body.focus({ preventScroll: true });
+    document.body.removeAttribute("tabindex")`); // Tab now starts at the top of the page
+  await tab(); await tab();
+  await wait(300); await shot("focus");
+  const total = await js("document.documentElement.scrollHeight");
+  for (const f of [0.35, 0.7]) {
+    await js(`scrollTo({ top: ${Math.round(total * f)}, behavior: "instant" })`);
+    await wait(900); await shot(`scroll-${Math.round(f * 100)}`);
+  }
+} finally {
+  ws?.close();
+  await new Promise((resolve) => { chrome.once("exit", resolve); chrome.kill(); setTimeout(resolve, 3000); });
+  rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
 }
-if (!pages) throw new Error("no DevTools endpoint on 127.0.0.1:9333: port blocked or browser did not start");
-const ws = new WebSocket(pages.find((p) => p.type === "page").webSocketDebuggerUrl);
-await new Promise((r) => ws.addEventListener("open", r, { once: true }));
-let seq = 0;
-const pending = new Map();
-ws.addEventListener("message", (e) => {
-  const m = JSON.parse(e.data);
-  if (pending.has(m.id)) { pending.get(m.id)(m.result); pending.delete(m.id); }
-});
-const cdp = (method, params = {}) =>
-  new Promise((r) => { pending.set(++seq, r); ws.send(JSON.stringify({ id: seq, method, params })); });
-const js = async (expression) =>
-  (await cdp("Runtime.evaluate", { expression, returnByValue: true })).result.value;
-const shot = async (name) => {
-  const { data } = await cdp("Page.captureScreenshot");
-  writeFileSync(`${out}/${width}-${name}.png`, Buffer.from(data, "base64"));
-};
-const tab = async () => {
-  for (const type of ["rawKeyDown", "keyUp"])
-    await cdp("Input.dispatchKeyEvent", { type, key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 });
-};
-await cdp("Page.enable");
-await cdp("Page.navigate", { url });
-await wait(400); await shot("arrival-mid");
-await wait(2600); await shot("arrival-done");
-const [x, y] = await js(`(() => { const el = document.querySelector(${JSON.stringify(selector)});
-  el.scrollIntoView({ block: "center" }); const r = el.getBoundingClientRect();
-  return [r.x + r.width / 2, r.y + r.height / 2]; })()`);
-await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
-await wait(400); await shot("hover");
-await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: 0, y: 0 });
-await js("scrollTo(0, 0)");
-for (const type of ["mousePressed", "mouseReleased"]) // click an empty corner: Tab starts at the top
-  await cdp("Input.dispatchMouseEvent", { type, x: 1, y: 1, button: "left", clickCount: 1 });
-await tab(); await tab();
-await wait(300); await shot("focus");
-const height = await js("document.documentElement.scrollHeight");
-for (const f of [0.35, 0.7]) {
-  await js(`scrollTo(0, ${Math.round(height * f)})`);
-  await wait(900); await shot(`scroll-${Math.round(f * 100)}`);
-}
-ws.close(); chrome.kill();
 ```
 
-  If the debugging port cannot bind (a sandbox), or no browser is
-  available, say which life states are unverified; never claim them.
+  It writes `<width>-arrival-mid`, `-arrival-done`, `-full`, `-hover`,
+  `-focus`, `-scroll-35` and `-scroll-70` PNGs; run it at 1440 and 390. If
+  the browser cannot start or report its port (a sandbox), say which life
+  states are unverified; never claim them.
 - The plan: subject, world, type pair, palette, layout sketch, voice, life
   layer, signature, and the three moments ELEVATE replaced.
 
@@ -131,9 +169,9 @@ the scroll, ambient and imagery items.
   like the product.
 - ELEVATE: the three generic moments named in the plan are gone, replaced
   by moments only this product could have.
-- Operate: a suggested next action with its reason; time drawn against a
-  now-line where work is time-bound; a changed item travels to its group;
-  no spinner for a local action.
+- Operate: the likely next action pre-filled with its reason; time drawn
+  where the data is time-bound; a changed item moves visibly to where it now
+  belongs; no spinner for a local action.
 - The director test: name the one frame a design director would screenshot
   to show a colleague. If you cannot name one, the page is not finished.
 

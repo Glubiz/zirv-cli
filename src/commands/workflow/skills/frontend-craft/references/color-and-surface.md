@@ -61,7 +61,7 @@ equal and contrast is predictable; C is chroma; H is hue in degrees.
   bold); 3:1 for UI component boundaries, focus indicators and chart marks
   that carry meaning. Aim for 7:1 on long reading.
 - Rules of thumb in OKLCH, always confirmed with a checker: on light paper
-  (L 0.96 or more) text needs L 0.55 or less for 4.5:1; on a dark ground
+  (L 0.96 or more) text needs L 0.52 or less for 4.5:1; on a dark ground
   (L 0.22 or less) text needs L 0.68 or more. An accent at L 0.70 or above
   is a fill or large shape on light paper, never small text.
 - Text over gradients, grain or imagery: measure against the worst pixel it
@@ -158,7 +158,7 @@ Drawn scene in depth planes, when no photography exists:
   detail; the nearest plane is darkest and sharpest. On a dark ground,
   reverse it: far planes darker and bluer. Light comes from the same side
   as the page's atmosphere gradient.
-- Shapes from the world: ridges, rooftops, waves, shelves, machines. A
+- Shapes from the world: ridges, rooftops, fields, shelves, machines. A
   smooth deterministic silhouette is a sum of two sines:
 
 ```js

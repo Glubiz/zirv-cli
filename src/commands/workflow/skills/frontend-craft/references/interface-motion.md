@@ -21,7 +21,7 @@ and a performance budget.
 | Medium (dropdown, popover, toast, card expand) | 200-300 ms |
 | Large (drawer, modal, sheet) | 300-400 ms in, 200-300 ms out |
 | Item travelling to a new place in a list | 250-350 ms |
-| Arrival sequence, whole | up to 1.2 s; each piece 400-700 ms |
+| Arrival sequence, whole | up to 1.2 s; each piece 400-800 ms |
 
 Travel of 100px or less takes 200 ms or less; 100-400px takes 250-350 ms;
 a full viewport 400-500 ms. Nothing that answers input takes longer than
@@ -60,8 +60,8 @@ hover-capable pointers), press and keyboard focus.
 
 ```css
 .btn {
-  transition: transform 180ms var(--ease-out), background-color 150ms linear,
-    box-shadow 200ms var(--ease-out);
+  transition: transform 140ms var(--ease-out), background-color 120ms linear,
+    box-shadow 150ms var(--ease-out);
 }
 @media (hover: hover) and (pointer: fine) {
   .btn:hover {
@@ -92,30 +92,35 @@ When something changes place or state, the user should see it go there.
 View Transitions for in-page updates, with an instant fallback:
 
 ```js
+const reduceMotion = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
 function commit(update) {
-  const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
-  if (!document.startViewTransition || still) return update();
+  if (!document.startViewTransition || reduceMotion()) return update();
   document.startViewTransition(update);
 }
 ```
 
 ```css
-/* give each moving item a unique name, e.g. style="view-transition-name: job-1042" */
+/* give each moving item a unique name, e.g. style="view-transition-name: packet-0412" */
 ::view-transition-group(*) {
   animation-duration: 300ms;
   animation-timing-function: var(--ease-move);
 }
-::view-transition-old(root), ::view-transition-new(root) { animation: none; }
+/* no root cross-fade; normal blending stops the two opaque snapshots adding up to white */
+::view-transition-old(root), ::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
 ```
 
 Name only the items that can move (up to about 50); turning off the root
 cross-fade keeps the rest of the page still.
 
 FLIP when the DOM nodes are kept (keyed rendering) and View Transitions are
-unavailable:
+unavailable (`reduceMotion()` is the helper above):
 
 ```js
 function flip(elements, mutate) {
+  if (reduceMotion()) return mutate(); // the CSS floor does not stop el.animate()
   const first = new Map([...elements].map((el) => [el, el.getBoundingClientRect()]));
   mutate();
   for (const [el, a] of first) {
@@ -136,6 +141,7 @@ A confirmation grows out of the control that caused it (the toast needs
 
 ```js
 function growFrom(source, toast) {
+  if (reduceMotion()) return; // the toast simply appears
   const a = source.getBoundingClientRect(), b = toast.getBoundingClientRect();
   toast.animate([
     { transform: `translate(${a.left - b.left}px, ${a.top - b.top}px) scale(${a.width / b.width}, ${a.height / b.height})`, opacity: 0 },
@@ -156,7 +162,12 @@ the steps beside it pass:
 
 ```html
 <section class="story">
-  <figure class="story-art" data-step="1" aria-hidden="true">...</figure>
+  <figure class="story-art" aria-hidden="true">
+    <svg viewBox="0 0 600 400">
+      <path class="path" pathLength="1" d="..."/>
+      <g class="detail-3">...</g>
+    </svg>
+  </figure>
   <div class="story-steps">
     <article data-step="1">...</article>
     <article data-step="2">...</article>
@@ -168,8 +179,13 @@ the steps beside it pass:
 ```css
 .story { display: grid; grid-template-columns: 7fr 5fr; gap: 48px; }
 .story-art { position: sticky; top: 12vh; align-self: start; }
-.story-art .path { transition: stroke-dashoffset 600ms var(--ease-move); }
-.story-art[data-step="2"] .path { stroke-dashoffset: 0; }
+/* default (no script, reduced motion, print): everything drawn and visible */
+.story-art .path { stroke-dasharray: 1; stroke-dashoffset: 0;
+  transition: stroke-dashoffset 600ms var(--ease-move); }
+.story-art .detail-3 { transition: opacity 300ms linear; }
+/* only while scripted: hide what a step has not reached yet; reached stays drawn */
+.story-art.is-live[data-step="1"] .path { stroke-dashoffset: 1; }
+.story-art.is-live:is([data-step="1"], [data-step="2"]) .detail-3 { opacity: 0; }
 @media (max-width: 700px) {
   .story { grid-template-columns: 1fr; }
   .story-art { top: 0; z-index: 1; max-height: 40vh; }
@@ -178,14 +194,19 @@ the steps beside it pass:
 
 ```js
 const art = document.querySelector(".story-art");
-const io = new IntersectionObserver((entries) => {
-  for (const e of entries) if (e.isIntersecting) art.dataset.step = e.target.dataset.step;
-}, { rootMargin: "-45% 0px -45% 0px" });
-document.querySelectorAll(".story-steps [data-step]").forEach((el) => io.observe(el));
+if ("IntersectionObserver" in window && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
+  art.dataset.step = "1";
+  art.classList.add("is-live");
+  const io = new IntersectionObserver((entries) => {
+    for (const e of entries) if (e.isIntersecting) art.dataset.step = e.target.dataset.step;
+  }, { rootMargin: "-45% 0px -45% 0px" });
+  document.querySelectorAll(".story-steps [data-step]").forEach((el) => io.observe(el));
+}
 ```
 
-The first step's state must be a complete picture on its own: that is what
-the first-viewport capture, readers without script and print will see.
+Each rule hides only what a step has not reached, so steps 2 and 3 keep
+everything drawn so far, and without script the artefact is complete: that
+is what readers without script, reduced motion and print see.
 
 Scroll-driven animations add polish where supported:
 
@@ -207,8 +228,8 @@ a full-height capture still shows everything.
 
 ## 4. Ambient motion from the subject's world
 
-One process the product watches, shown moving: a flow along a path, a
-clock, a queue draining, light changing. At most one per viewport. It
+One process the product watches, shown moving: parcels along a route, a
+clock, plants growing, a counter turning over. At most one per viewport. It
 pauses off screen, stops under reduced motion, and either stops within
 5 s or has a visible pause control (WCAG 2.2.2).
 
@@ -228,59 +249,94 @@ document.querySelectorAll("[data-ambient]").forEach((el) => watch.observe(el));
 For a continuous loop (`infinite`, flagged as advisory), add a pause button
 (`aria-pressed`, toggling `.is-paused`) and say why the loop carries meaning.
 
-A now-line on time-bound data is ambient without animating: update a custom
-property once a minute.
+A live "now" marker on time-bound data is ambient without animating:
+position it from a custom property updated once a minute, over the span the
+view shows (for a rail timetable, its first and last departure).
 
 ```js
-const dayStart = new Date().setHours(6, 0, 0, 0), dayLength = 14 * 3600e3; // the shown span
-const tick = () => document.documentElement.style.setProperty(
-  "--now", String((Date.now() - dayStart) / dayLength));
+const view = document.querySelector(".timetable"); // data-start / data-end: ISO times
+const start = Date.parse(view.dataset.start), end = Date.parse(view.dataset.end);
+const tick = () => view.style.setProperty("--now",
+  String(Math.min(1, Math.max(0, (Date.now() - start) / (end - start)))));
 tick(); setInterval(tick, 60_000);
 ```
 
 ```css
-.now-line { position: absolute; inset-block: 0; width: 2px; background: var(--accent);
-  inset-inline-start: calc(var(--now) * 100%); }
+.timetable { position: relative; }
+.now-marker { position: absolute; inset-block: 0; width: 2px; background: var(--accent);
+  inset-inline-start: calc(var(--now, 0) * 100%); }
 ```
 
-A generative canvas scene can draw the world's process (a current, a
-crowd, growth) when no imagery exists. Seeded, capped, paused when unseen:
+A generative canvas scene can draw the world's process when no imagery
+exists. Example: seedlings on a greenhouse bench growing and leaning toward
+a lamp that drifts along the glass. Seeded, cheap, stopped off screen and
+under reduced motion, guarded against duplicate loops, with a pause button:
+
+```html
+<figure class="bench">
+  <canvas class="scene" aria-hidden="true"></canvas>
+  <button class="scene-toggle" type="button">Pause animation</button>
+</figure>
+```
 
 ```js
-const canvas = document.querySelector("canvas.scene"); // aria-hidden="true"
+const canvas = document.querySelector(".bench canvas");
+const toggle = document.querySelector(".bench .scene-toggle");
 const ctx = canvas.getContext("2d");
 const still = matchMedia("(prefers-reduced-motion: reduce)");
-let seed = 7, visible = true;
+let seed = 11, visible = false, paused = false, running = false, last = 0;
 const rand = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
-const dots = Array.from({ length: 240 }, () => ({ x: rand(), y: rand() }));
+const sprouts = Array.from({ length: 60 }, () =>
+  ({ x: 0.03 + rand() * 0.94, max: 0.3 + rand() * 0.45, rate: 0.6 + rand() * 0.8 }));
+let growth = still.matches ? 20000 : 2500; // ms of growth shown; a formed first frame
 function fit() {
   const dpr = Math.min(devicePixelRatio, 2);
   canvas.width = canvas.clientWidth * dpr; canvas.height = canvas.clientHeight * dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
-function step(t) {
-  const w = canvas.clientWidth, h = canvas.clientHeight;
-  ctx.fillStyle = "rgba(14, 30, 48, 0.08)"; ctx.fillRect(0, 0, w, h); // fading trails
-  ctx.strokeStyle = "rgba(190, 220, 235, 0.55)"; ctx.beginPath();
-  for (const d of dots) {
-    const a = 0.5 + 0.6 * Math.sin(d.y * 7 + t * 0.0004); // field direction
-    const dx = Math.cos(a) * 0.0015, dy = Math.sin(a) * 0.0015;
-    ctx.moveTo(d.x * w, d.y * h); ctx.lineTo((d.x + dx) * w, (d.y + dy) * h);
-    d.x = (d.x + dx + 1) % 1; d.y = (d.y + dy + 1) % 1;
-  }
-  ctx.stroke();
+function leaf(x, y, size, angle) {
+  ctx.beginPath(); ctx.ellipse(x, y, size * 2, size, angle, 0, Math.PI * 2); ctx.fill();
 }
-function loop(t) { step(t); if (visible && !still.matches && !document.hidden) requestAnimationFrame(loop); }
-fit(); for (let i = 0; i < 120; i++) step(i * 16); // a formed first frame for captures
-new IntersectionObserver(([e]) => { visible = e.isIntersecting; if (visible) requestAnimationFrame(loop); })
-  .observe(canvas);
-document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && visible) requestAnimationFrame(loop);
+function draw(t) {
+  const w = canvas.clientWidth, h = canvas.clientHeight, soil = h * 0.92;
+  const lamp = w * (0.5 + 0.35 * Math.sin(t * 0.00012)); // the lamp drifting along the glass
+  ctx.clearRect(0, 0, w, h);
+  ctx.lineWidth = 2; ctx.lineCap = "round";
+  ctx.strokeStyle = "#4f6f32"; ctx.fillStyle = "#7fa548";
+  for (const s of sprouts) {
+    const grown = Math.min(1, (t / 8000) * s.rate); // full height after 5-13 s
+    const x = s.x * w, top = soil - grown * s.max * h;
+    const lean = ((lamp - x) / w) * 36 * grown;      // lean toward the light
+    ctx.beginPath(); ctx.moveTo(x, soil);
+    ctx.quadraticCurveTo(x, (soil + top) / 2, x + lean, top); ctx.stroke();
+    if (grown > 0.4) { leaf(x + lean - 5, top, 3 * grown, -0.5); leaf(x + lean + 5, top, 3 * grown, 0.5); }
+  }
+}
+function frame(now) {
+  growth += Math.min(now - last, 50); last = now; // no jump after a pause or tab switch
+  draw(growth);
+  if (visible && !paused && !still.matches && !document.hidden) requestAnimationFrame(frame);
+  else running = false;
+}
+function play() {
+  if (running || paused || !visible || still.matches || document.hidden) return;
+  running = true; last = performance.now(); requestAnimationFrame(frame);
+}
+toggle.hidden = still.matches;
+toggle.addEventListener("click", () => {
+  paused = !paused;
+  toggle.textContent = paused ? "Play animation" : "Pause animation";
+  play();
 });
+fit(); draw(growth);
+new IntersectionObserver(([e]) => { visible = e.isIntersecting; play(); }).observe(canvas);
+document.addEventListener("visibilitychange", play);
+still.addEventListener("change", () => { toggle.hidden = still.matches; play(); });
 ```
 
-Keep it under 4 ms a frame (about 300 strokes), cap the pixel ratio at 2,
-and keep any text over the canvas at 4.5:1 against its brightest frame.
+Keep it under 4 ms a frame, cap the pixel ratio at 2, keep the pause button
+visible and keyboard-reachable while the scene moves, and keep any text over
+the canvas at 4.5:1 against its brightest frame.
 
 ## 5. One delight
 
@@ -308,11 +364,12 @@ delight never gates the task and never hides information.
 
 ## The arrival sequence (persuade pages)
 
-One sequence, finished well inside 1.2 s: headline lines rise 24-40px from
-behind a clip mask (600 ms `--ease-out-strong`, 80 ms between lines); at
-200 ms the artefact draws in (`stroke-dashoffset`, 800-1000 ms
-`--ease-move`, marks staggered 40 ms); at 500 ms copy and action rise 12px
-over 400 ms. `zirv frontend render` captures at 2 s of virtual time: a
+One sequence, finished by about 1.0 s: headline lines rise 24-40px from
+behind a clip mask (600 ms `--ease-out-strong`, 80 ms between at most three
+lines, so the last lands at 760 ms); at 200 ms the artefact draws in
+(`stroke-dashoffset`, 600-800 ms `--ease-move`, done by 1.0 s, marks
+staggered 40 ms inside that); at 500 ms copy and action rise 12px over
+400 ms, landing at 900 ms. `zirv frontend render` captures at 2 s of virtual time: a
 sequence still running is captured mid-flight, one waiting for scroll is
 captured empty.
 

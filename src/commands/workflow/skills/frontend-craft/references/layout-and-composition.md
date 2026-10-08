@@ -139,26 +139,27 @@ what data? Put that data first and make the decision one step.
   format; headers aligned like their data; sticky header; the identifying
   column first and pinned on narrow screens.
 - Urgency lives in the data: group or sort by what needs action (for a
-  bike workshop: "Promised today 3", "Waiting for parts 2", "Ready for
-  pickup 5") with group headers that carry a count and the bulk action. A separate alert card that repeats table rows
-  doubles the reading and splits the action.
+  lab's sample freezer audit: "Expired 3", "Expires this week 5", "In date
+  212") with group headers that carry a count and the bulk action. A
+  separate alert card that repeats table rows doubles the reading and splits
+  the action.
 - Status: icon or shape plus word plus colour, in a fixed-width column.
   Pills on every value turn the table into confetti.
-- Inline assignment: an "Assign" text button in the cell opens a combobox
-  popover -- type to filter, arrows to move, Enter assigns, Esc cancels,
-  focus returns to the cell. Show each option's current load ("Ana, 1 bike
-  promised today") so the choice is informed, and put the suggested choice
-  first with its reason. Update optimistically with a 5-8 s undo, and let
-  the row travel to its new group (interface-motion.md). A full select
-  element on every row is heavy, noisy and slow to scan.
-- Time made visible: where work is time-bound, draw it against a now-line
-  (a day strip per row or a lane per person) so lateness is seen, not
-  computed.
+- Inline actions: a text button in the cell opens a combobox popover --
+  type to filter, arrows to move, Enter applies, Esc cancels, focus returns
+  to the cell. Put the likely choice first with its reason (for the freezer
+  map: "Rack C, box 4 -- same study, nearest free slot"). Update
+  optimistically with a 5-8 s undo and let the item move visibly to where it
+  now belongs (interface-motion.md). A full select element on every row is
+  heavy, noisy and slow to scan.
+- Time made visible: where the data is time-bound, draw the time (a bar
+  that shortens toward a departure, items placed on a time axis with a live
+  "now" marker) so lateness is seen, not computed.
 - Filters: segmented views with counts, reflected in the URL.
 - Use the canvas: at 1440 a 900px table leaves half the screen empty. Add a
-  second region that serves the job -- an assignment or detail panel, a
-  capacity strip per person, a timeline of today's deadlines. At 390 rows
-  become two-line items with deadline and action on the trailing edge; the
+  second region that serves the job -- a detail panel, a map of where the
+  items physically are, a timeline of what comes next. At 390 rows become
+  two-line items with the key time and the action on the trailing edge; the
   second region becomes a sheet.
 - States: loading is skeleton rows at final height (no layout shift);
   empty says what it means and offers the next action; error says what
@@ -185,18 +186,16 @@ what data? Put that data first and make the decision one step.
 `zirv frontend render` captures only the first viewport at 390x844,
 768x1024 and 1440x1000 after 2 s of virtual time: no scroll, no hover. For
 any page longer than one screen, also take a full-height capture with the
-browser recorded in the render report, for example:
+life-capture script in critique.md (`node life-capture.mjs <browser> <url>
+<out-dir> 1440`, then `390`; it writes `<width>-full.png`). It sets the
+viewport exactly and captures beyond it at full page height. Do not use a
+tall `--window-size` instead: headless windows are clamped to a minimum
+width, so narrow captures come out too wide, and elements sized in vh or
+dvh stretch to the window's height.
 
-```sh
-"<browser>" --headless=new --hide-scrollbars --virtual-time-budget=2000 \
-  --window-size=1440,5000 --screenshot=full-1440.png file:///abs/path/index.html
-```
-
-Repeat at 390 wide. Elements sized in vh or dvh stretch in a tall window:
-judge the hero from the normal capture and the flow from the tall one.
 Content hidden until it scrolls into view will look missing -- make content
 visible by default (see interface-motion.md). Hover, focus, mid-arrival and
-scroll states need the life captures in critique.md.
+scroll states come from the same script.
 
 ## Cliches and the better move
 

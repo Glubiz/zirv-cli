@@ -109,17 +109,19 @@ and progress) and reserve the opposite for meaning (failure, rewind, loss).
 
 ## Camera
 
-- Build a `#camera` wrapper around one large stage (the world, see
-  concept-and-world.md) and move it; never fake camera moves by animating
-  every element.
-- Push-in: scale 1 -> 1.06-1.15 across a scene, `sine.inOut` or
+One camera model, the same as concept-and-world.md: a `#camera` wrapper
+around one large stage that only scales (pushes and pulls), and three
+depth layers inside it that the `travel()` helper moves. Never fake camera
+moves by animating every element.
+
+- Push-in: scale `#camera` 1 -> 1.06-1.15 across a scene, `sine.inOut` or
   `power1.inOut`, for focus and tension.
-- Travel: x and y across the stage to the next region, 0.6-1.2 s
-  `expo.inOut` or `power3.inOut`, with a blur peak of 6-12px at the
-  midpoint for fast travel.
-- Parallax: put each depth layer in its own wrapper and move them by 0.3x
-  (background), 0.6x (midground) and 1x (foreground) of the camera's
-  travel, all on the same timeline position.
+- Travel: `travel(x, y, at)` to the next region, 0.6-1.2 s `expo.inOut` or
+  `power3.inOut`; for fast travel add a blur peak of 6-12px on `#camera`
+  at the midpoint.
+- Parallax is built into `travel()`: the far layer moves 0.3x, the content
+  layer 1x (it holds the regions, so each region lands exactly in frame),
+  the near layer 1.4x, all at the same timeline position.
 - Rack focus: blur the background 0 -> 6px over 0.4 s as the foreground
   lands.
 - Impact: a 4-8px nudge for 4-6 frames with `steps` on a stamp or a
@@ -137,12 +139,13 @@ read as slides.
 Type is the protagonist for most of a film; UI and objects support it.
 
 Split words into masked spans once, synchronously, before building the
-timeline (escape any `<` or `&` in the source text first):
+timeline:
 
 ```js
+const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
 for (const el of document.querySelectorAll("[data-split]")) {
   el.innerHTML = el.textContent.trim().split(/\s+/)
-    .map((w) => `<span class="mask"><span class="w">${w}</span></span>`).join(" ");
+    .map((w) => `<span class="mask"><span class="w">${esc(w)}</span></span>`).join(" ");
 }
 ```
 
