@@ -1844,22 +1844,22 @@ pub fn builtin_manifests() -> CtxResult<Vec<SkillManifest>> {
             &[],
             r#"Scale this to the change: a trivial fix only needs to match existing patterns and verify the states it touches; the rest is for new or reworked UI. An established design system is authority: refine it, don't compete. Decide routine design calls yourself instead of asking.
 
-Reject interchangeable AI UI. Models drift to one safe average: Inter or system type, a pale tint everywhere, hero plus three cards, a headline word in colour, tracked caps labels, everything centred. The cure is a subject, not a ban list.
+Reject interchangeable AI UI. Models drift to one safe average: Inter or system type, a pale tint everywhere, hero plus three cards, a headline word in colour, tracked caps labels, everything centred and still. The cure is a subject, not a ban list.
 
 Before code, write a compact plan:
 1. Subject, audience, the visitor's one job, surface mode: persuade, operate, read or experience.
-2. The world's materials: its artefacts, instruments, documents, places and words. The hero is its most characteristic artefact, shown doing its job with real product truth. Never invent claims, metrics, quotes or users.
-3. A type pair chosen by the world's era, material and voice; tinted neutrals, one dominant colour, one sharp accent; a layout sketch per section derived from its content; one signature moment where boldness is spent.
+2. The world's materials: its artefacts, instruments, documents, places, people and words. The hero is its most characteristic artefact, shown doing its job with real product truth. Never invent claims, metrics, quotes or users.
+3. A type pair chosen by the world's era, material and voice; tinted neutrals, one dominant colour, one sharp accent; a layout sketch per section derived from its content; the copy's voice; one signature moment.
 4. Critique the plan: if it still works with a competitor's name swapped in, or matches the drift above, replace each default you reached for.
-Then build, render, critique it (references/critique.md), fix in one batch, stop.
+Build, then ELEVATE new persuade or experience surfaces and substantial operate surfaces (references/elevate.md): redesign the three most generic moments, add the life layer, raise contrast. Render, critique (references/critique.md), fix in one batch, stop.
 
-Commit: on persuade and experience surfaces, display type 4-8x body and asymmetric grids; surfaces with depth (layered light, grain, drawn illustration) where the world calls for it. Operate surfaces earn craft through density, alignment, tabular numerals, status beyond colour, keyboard paths. Self-host fonts with @font-face and font-display (files next to the page or @fontsource), never a hosted font CDN: the render capture blocks external hosts, so the review would judge fallback type.
+On persuade and experience surfaces commit to one display moment with tension, layered depth with overlap and a full-bleed moment, loud and quiet sections alternating. Operate surfaces come alive through anticipation, visible time, fast feedback, density and alignment. Self-host fonts with @font-face and font-display, never a hosted font CDN: the render capture blocks external hosts.
 
 Floor: semantic HTML, labels, keyboard order, focus-visible, 4.5:1 text and 3:1 UI contrast, 44px targets, reduced motion, loading/empty/error/partial states, long content, recomposition at 390/768/1440.
 
-`zirv frontend check` advisory craft findings (gradients, type >= 7rem, fonts) ask you to justify the choice against the plan, not delete it; fix blocking findings. `zirv frontend render` captures only the first viewport (390x844, 768x1024, 1440x1000) after 2 s; also capture long pages at full height in a tall headless-browser window.
+`zirv frontend check`: justify advisory craft findings against the plan, fix blocking ones. `zirv frontend render` sees only resting first viewports (390x844, 768x1024, 1440x1000); critique.md shows how to capture full height, mid-motion, hover, focus and scroll.
 
-Read with `zirv skill read frontend-craft references/<file>`: typography.md and color-and-surface.md before picking type or colour, layout-and-composition.md before laying out a page or tool, interface-motion.md before adding motion, critique.md before judging a plan or render."#,
+Read with `zirv skill read frontend-craft references/<file>`: typography.md and color-and-surface.md before picking type or colour, layout-and-composition.md before laying out, interface-motion.md before adding motion, elevate.md after the first build, critique.md before judging a plan or render."#,
         ),
         manifest(
             "frontend-design",
@@ -1872,7 +1872,7 @@ Read with `zirv skill read frontend-craft references/<file>`: typography.md and 
             false,
             &[Phase::Design],
             &["frontend-craft", "design"],
-            r#"Inspect the target, its tokens, components, neighbouring flows and real content, then decide: refinement, a new surface in an established world, or an explicit redesign. Read typography.md, color-and-surface.md and layout-and-composition.md. Write the frontend-craft plan as a short design note: subject, audience, job, mode, the world's materials, the hero artefact, a type pair with a one-line reason each, the palette as OKLCH values, a layout sketch per section or region, the signature moment, and the journey and states that matter. Critique it once against the interchangeable-product test and replace every choice you cannot defend from the world. Make the calls a design lead would make; no mood-board menus. End with observable acceptance criteria: what the 390 and 1440 first viewports show, states, accessibility."#,
+            r#"Inspect the target, its tokens, components, neighbouring flows and real content, then decide: refinement, a new surface in an established world, or an explicit redesign. Read typography.md, color-and-surface.md, layout-and-composition.md and interface-motion.md. Write the frontend-craft plan as a short design note: subject, audience, job, mode, the world's materials and emotional anchor, the hero artefact, a type pair with a one-line reason each, the palette as OKLCH values, a layout sketch per section marked loud or quiet, the voice with two sample lines, the life layer (what responds, what moves with the world, the one delight), and the journey and states that matter. Critique it once against the interchangeable-product test and replace every choice you cannot defend from the world. Make the calls a design lead would make; no mood-board menus. End with observable acceptance criteria: what the 390 and 1440 first viewports show, the life evidence, states, accessibility."#,
         ),
         manifest(
             "frontend-plan",
@@ -1885,7 +1885,7 @@ Read with `zirv skill read frontend-craft references/<file>`: typography.md and 
             false,
             &[Phase::Plan],
             &["frontend-craft", "plan"],
-            r#"Turn the design plan into dependency-ordered units naming routes, components, tokens, font files, assets, data seams and tests. Order: semantic structure with real content; tokens (type scale, OKLCH palette, spacing, easing) and self-hosted fonts; the hero artefact and signature; composition per breakpoint, recomposed rather than scaled; interaction, states and recovery; motion last. List the states the surface needs (loading, empty, partial, error, success, disabled, permission, long or localized content, keyboard, reduced motion) and map each material risk to its evidence: detector, tests, render captures, a full-height capture for long pages. Keep the incumbent system where one exists. Schedule exactly one render-critique-fix round; no theme votes, server handoffs or open-ended polish."#,
+            r#"Turn the design plan into dependency-ordered units naming routes, components, tokens, font files, assets, data seams and tests. Order: semantic structure with real content; tokens (type scale, OKLCH palette, spacing, easing) and self-hosted fonts; the hero artefact and signature; composition per breakpoint, recomposed rather than scaled; interaction, states and recovery; the life layer last. List the states the surface needs (loading, empty, partial, error, success, disabled, permission, long or localized content, keyboard, reduced motion) and map each material risk to its evidence: detector, tests, render captures, full-height and life captures. Keep the incumbent system where one exists. Schedule one ELEVATE pass and one render-critique-fix round; no theme votes, server handoffs or open-ended polish."#,
         ),
         manifest(
             "frontend-implement",
@@ -1898,7 +1898,7 @@ Read with `zirv skill read frontend-craft references/<file>`: typography.md and 
             false,
             &[Phase::Implement],
             &["frontend-craft", "implement"],
-            r#"Build the committed plan in the repository's framework, data flow and components. Order: semantic structure with real content and behaviour; tokens as CSS custom properties (type scale, OKLCH palette, spacing, radii, easing); self-hosted fonts; the hero artefact drawn with real product truth in SVG, canvas or markup, never a static mock or invented metric; composition per breakpoint; states and recovery; motion. Keep every value inside the token system. Run `zirv frontend check` and fast tests after meaningful edits. After a complete pass, render, add a full-height capture for long pages, look at everything together, critique with references/critique.md, fix causes in one batch, render once more, stop. If the result is quieter than the plan (fallback font, missing atmosphere, smaller type), fix toward the plan or say why."#,
+            r#"Build the committed plan in the repository's framework, data flow and components. Order: semantic structure with real content and behaviour; tokens as CSS custom properties (type scale, OKLCH palette, spacing, radii, easing); self-hosted fonts; the hero artefact drawn with real product truth in SVG, canvas or markup, never a static mock or invented metric; composition per breakpoint; states and recovery; the life layer from interface-motion.md with its reduced-motion paths. Keep every value inside the token system. Run `zirv frontend check` and fast tests after meaningful edits. After a complete pass, ELEVATE, then take the render and life captures from critique.md, look at everything together, critique, fix causes in one batch, render once more, stop. If the result is quieter or stiller than the plan, fix toward the plan or say why."#,
         ),
         manifest(
             "frontend-debug",
@@ -1929,7 +1929,7 @@ Read with `zirv skill read frontend-craft references/<file>`: typography.md and 
             false,
             &[Phase::Test],
             &["frontend-craft", "testing"],
-            r#"Run `zirv frontend check` and the project's configured checks, then exercise the changed journey and component contracts. Prove behaviour: system status, control and undo, error prevention and recovery, roles and labels, keyboard order and focus management, touch targets, state transitions, reduced motion. Drive realistic loading, empty, partial, error, success, disabled, permission and destructive states; long, short and localized content; 200% zoom; dense data; 390, 768 and 1440 widths. Check layout shift and input latency on the primary path. Record surface, viewport, state, input method and change fingerprint. Tests prove behaviour; only a fresh render, actually looked at, proves composition and craft."#,
+            r#"Run `zirv frontend check` and the project's configured checks, then exercise the changed journey and component contracts. Prove behaviour: system status, control and undo, error prevention and recovery, roles and labels, keyboard order and focus management, touch targets, hover, press and focus responses, state transitions and their reduced-motion paths. Drive realistic loading, empty, partial, error, success, disabled, permission and destructive states; long, short and localized content; 200% zoom; dense data; 390, 768 and 1440 widths. Check layout shift and input latency on the primary path. Record surface, viewport, state, input method and change fingerprint. Tests prove behaviour; only a fresh render, actually looked at, proves composition and craft."#,
         ),
         manifest(
             "frontend-review",
@@ -1942,7 +1942,7 @@ Read with `zirv skill read frontend-craft references/<file>`: typography.md and 
             false,
             &[Phase::Review],
             &["frontend-craft", "review"],
-            r#"Judge what a user sees, not what was intended. First look at every fresh capture and any full-height capture with references/critique.md, before detector findings or rationale; then reconcile with the diff, detector, behaviour evidence and established system. Score 1-5: product-specificity, user-journey, hierarchy, system-coherence, typography, color-contrast, layout-rhythm, interaction-affordance, state-completeness, responsive-composition, accessibility, content-clarity, resilience. New or substantial UI is scored on all thirteen; a trivial or bounded change is scored only on the dimensions it touches. A pass needs every scored dimension >= 4 and no unresolved finding; anonymous or timid output is a finding. If evidence is stale, let the workflow collect check and render evidence, then run `zirv frontend review` for the isolated reviewer; never accept caller-authored scores."#,
+            r#"Judge what a user sees, not what was intended. First look at every fresh capture, full-height and life capture with references/critique.md and its alive test, before detector findings or rationale; then reconcile with the diff, detector, behaviour evidence and established system. Score 1-5: product-specificity, user-journey, hierarchy, system-coherence, typography, color-contrast, layout-rhythm, interaction-affordance, state-completeness, responsive-composition, accessibility, content-clarity, resilience. New or substantial UI is scored on all thirteen; a trivial or bounded change is scored only on the dimensions it touches. A pass needs every scored dimension >= 4 and no unresolved finding; anonymous, timid or lifeless output is a finding. If evidence is stale, let the workflow collect check and render evidence, then run `zirv frontend review` for the isolated reviewer; never accept caller-authored scores."#,
         ),
         manifest(
             "frontend-verify",
@@ -1955,7 +1955,7 @@ Read with `zirv skill read frontend-craft references/<file>`: typography.md and 
             false,
             &[Phase::Verify],
             &["frontend-craft", "verify"],
-            r#"Inspect the final diff and require fresh evidence for every affected surface: `zirv frontend check` with no blocking finding, project tests, behaviour and accessibility checks, `zirv frontend render` captures plus a full-height capture for long pages, and the isolated `zirv frontend review` scores. Let the workflow collect what is missing; never hand setup or judgment to a human or accept caller-authored scores. All evidence must match the final change and profile fingerprints. Require every scored dimension >= 4, scaled the same way as the review (all thirteen for new or substantial UI, only the touched ones for a trivial or bounded change), and no unresolved visual finding. Check the shipped surface still carries the plan's world, type and signature. Report exactly what passed, failed, was unavailable or skipped; source reading or stale captures are not visual proof."#,
+            r#"Inspect the final diff and require fresh evidence for every affected surface: `zirv frontend check` with no blocking finding, project tests, behaviour and accessibility checks, `zirv frontend render` captures plus a full-height capture for long pages, and the isolated `zirv frontend review` scores. Let the workflow collect what is missing; never hand setup or judgment to a human or accept caller-authored scores. All evidence must match the final change and profile fingerprints. Require every scored dimension >= 4, scaled the same way as the review (all thirteen for new or substantial UI, only the touched ones for a trivial or bounded change), and no unresolved visual finding. Check the shipped surface still carries the plan's world, type, signature and life layer. Report exactly what passed, failed, was unavailable or skipped; source reading or stale captures are not visual proof."#,
         ),
         manifest(
             "plan",
@@ -2103,6 +2103,10 @@ const EMBEDDED_RESOURCES: &[(&str, &[(&str, &str)])] = &[
                 include_str!("skills/frontend-craft/references/critique.md"),
             ),
             (
+                "references/elevate.md",
+                include_str!("skills/frontend-craft/references/elevate.md"),
+            ),
+            (
                 "references/interface-motion.md",
                 include_str!("skills/frontend-craft/references/interface-motion.md"),
             ),
@@ -2119,6 +2123,10 @@ const EMBEDDED_RESOURCES: &[(&str, &[(&str, &str)])] = &[
     (
         "motion-graphics",
         &[
+            (
+                "references/concept-and-world.md",
+                include_str!("skills/motion-graphics/references/concept-and-world.md"),
+            ),
             (
                 "references/motion-principles.md",
                 include_str!("skills/motion-graphics/references/motion-principles.md"),
@@ -4002,7 +4010,7 @@ mod tests {
         let repo = tempdir().unwrap();
         let registry = SkillRegistry::load(repo.path(), None, false, false).unwrap();
         let skill = registry.get("frontend-craft").unwrap();
-        assert_eq!(skill.resources.len(), 5);
+        assert_eq!(skill.resources.len(), 6);
         assert_eq!(
             skill.content_hash,
             compute_content_hash(&skill.manifest, &skill.resources).unwrap()
@@ -4025,8 +4033,9 @@ mod tests {
             .filter(|resource| resource.skill_id == "frontend-craft")
             .map(|resource| resource.path.as_str())
             .collect();
-        assert_eq!(owned.len(), 5, "{:?}", loaded.resources);
+        assert_eq!(owned.len(), 6, "{:?}", loaded.resources);
         assert!(owned.contains(&"references/typography.md"));
+        assert!(owned.contains(&"references/elevate.md"));
         let mut out = Vec::new();
         write_load_text(&mut out, &loaded).unwrap();
         let printed = String::from_utf8(out).unwrap();

@@ -7,9 +7,10 @@ template however good its type is.
 
 ## Build the palette from the world
 
-1. Name 3-5 colours that physically exist in the subject's world: for sea
-   kayaking, chart-paper buff, chart-ink blue, slate water at dusk, buoy
-   orange, kelp; for a translation agency, paper, proof-mark red, ink. Pick
+1. Name 3-5 colours that physically exist in the subject's world: for a
+   night-train operator, sleeper-car upholstery green, brass fittings,
+   enamel platform-sign blue, sodium-lamp amber; for a bike workshop,
+   chain-grease black, frame-paint red, tyre grey, chalkboard green. Pick
    the dominant from that list, not from a UI kit.
 2. Structure it as:
    - a neutral ramp tinted toward the dominant hue (about 60% of the area),
@@ -33,19 +34,19 @@ equal and contrast is predictable; C is chroma; H is hue in degrees.
   pure white glares.
 - Dominant: C 0.06-0.16 at L 0.30-0.55 for ink and immersive bands.
 - Accent: C 0.15-0.25, at least 60 degrees of hue away from the dominant,
-  or its world-given complement (buoy orange against sea blue).
-- Example, sea-slate world:
+  or its world-given complement (sodium amber against upholstery green).
+- Example, night-train world:
 
 ```css
 :root {
-  --h: 232;
+  --h: 165;                              /* sleeper-car green */
   --paper: oklch(0.975 0.008 var(--h));
   --ink: oklch(0.24 0.03 var(--h));
   --ink-2: oklch(0.46 0.025 var(--h));  /* about 6.6:1 on paper */
   --line: oklch(0.88 0.012 var(--h));
-  --deep: oklch(0.30 0.07 var(--h));
-  --accent: oklch(0.70 0.17 55);        /* buoy orange: fills, not text */
-  --accent-ink: oklch(0.52 0.16 45);    /* accent as text on paper */
+  --deep: oklch(0.30 0.06 var(--h));
+  --accent: oklch(0.78 0.15 75);        /* sodium amber: fills, not text */
+  --accent-ink: oklch(0.50 0.12 65);    /* accent as text on paper */
 }
 ```
 
@@ -61,8 +62,8 @@ equal and contrast is predictable; C is chroma; H is hue in degrees.
   that carry meaning. Aim for 7:1 on long reading.
 - Rules of thumb in OKLCH, always confirmed with a checker: on light paper
   (L 0.96 or more) text needs L 0.55 or less for 4.5:1; on a dark ground
-  (L 0.22 or less) text needs L 0.68 or more. An accent at L 0.70 is a fill
-  or large shape on light paper, never small text.
+  (L 0.22 or less) text needs L 0.68 or more. An accent at L 0.70 or above
+  is a fill or large shape on light paper, never small text.
 - Text over gradients, grain or imagery: measure against the worst pixel it
   can land on at every breakpoint. Fix with a scrim (a gradient behind the
   text at 40-70% of the ground colour) or move the text.
@@ -120,15 +121,16 @@ Atmosphere recipes:
 }
 ```
 
-- Material: paper (warm L 0.96, fibre grain, a faint printed graticule as
-  1px lines at L -0.05), a chart (contours, soundings, a compass rose drawn
-  in SVG with the palette's inks), an instrument (narrow linear ramps and a
-  1px highlight edge), a screen (only when the world is a screen).
-- Drawn illustration: SVG built from the world's real geometry -- a
-  coastline, stream arrows, a route, a document, a workflow -- in the
-  palette's inks. It beats stock imagery, renders offline and stays sharp.
-- Real imagery: only photographs the project supplies, with a scrim under
-  any text. Never placeholder stock, never generated people.
+- Material: paper (warm L 0.96, fibre grain, a faint printed grid as 1px
+  lines at L -0.05), a map or plan (contours, a grid, a legend drawn in SVG
+  with the palette's inks), an instrument (narrow linear ramps and a 1px
+  highlight edge), a screen (only when the world is a screen).
+- Drawn illustration: SVG built from the world's real geometry -- a track
+  plan, a floor plan, a machine part, a route, a document, a workflow -- in
+  the palette's inks. It beats stock imagery, renders offline and stays
+  sharp. Scenes with depth are in the next section.
+- Real imagery: only photographs the project supplies (art direction
+  below). Never placeholder stock, never generated people.
 - Elevation: at most 3 levels. Tint shadows with the surface hue and layer
   them: `0 1px 2px oklch(0.25 0.03 var(--h) / 0.08), 0 8px 24px -4px
   oklch(0.25 0.03 var(--h) / 0.12)`. On dark grounds, raise elevation with
@@ -144,12 +146,65 @@ Caveats:
 - Under `prefers-contrast: more`, drop grain and scrims behind text. Under
   `forced-colors: active`, borders and focus must still show.
 
+## Imagery: scenes, people and place
+
+A page with no image of its world has no emotional anchor. The anchor is
+the person who uses the product or the place where it is used.
+
+Drawn scene in depth planes, when no photography exists:
+
+- Build 3-5 planes from back to front. On a light sky each plane further
+  back is lighter by L 0.06-0.10, has about 30% less chroma and less
+  detail; the nearest plane is darkest and sharpest. On a dark ground,
+  reverse it: far planes darker and bluer. Light comes from the same side
+  as the page's atmosphere gradient.
+- Shapes from the world: ridges, rooftops, waves, shelves, machines. A
+  smooth deterministic silhouette is a sum of two sines:
+
+```js
+const silhouette = (y, amp, phase, w = 1440, h = 900) => {
+  let d = `M0 ${h} L0 ${y}`;
+  for (let x = 0; x <= w; x += 24) {
+    const v = y + amp * (Math.sin(x * 0.004 + phase) + 0.45 * Math.sin(x * 0.013 + phase * 2));
+    d += ` L${x} ${v.toFixed(1)}`;
+  }
+  return `${d} L${w} ${h} Z`;
+};
+// four planes, far to near: fill each with the next step of the ramp
+const planes = [[420, 40, 1], [500, 55, 2.3], [580, 70, 4.1], [680, 50, 5.7]]
+  .map(([y, amp, phase], i) => `<path class="plane-${i}" d="${silhouette(y, amp, phase)}"/>`);
+```
+
+- People: a figure as silhouette or detail (hands at work, a back turned to
+  the view, a small figure in a large place). Small figures make a place
+  feel vast; a close crop makes the work feel intimate. Never invented
+  faces, never generated photographs of people.
+- Give the planes slow parallax with a scroll timeline (interface-motion.md)
+  and keep one plane still so the scene does not swim.
+- Mark the scene `aria-hidden="true"` when it is decorative; give it a
+  short text alternative when it carries meaning.
+
+Supplied photography, art-directed:
+
+- Crop to one focal point (`object-fit: cover` plus `object-position` on the
+  subject), and recrop for 390 rather than letting the centre win.
+- Grade toward the palette: a dominant-colour overlay at 15-25% with
+  `mix-blend-mode: multiply` (light pages) or `soft-light` (dark pages),
+  or `filter: saturate(0.85) contrast(1.05)`.
+- Set type in the image's negative space, with a scrim only where the
+  worst pixel needs it; let the image bleed off at least one edge.
+
+Colour fields as events: at least one band filled edge to edge with the
+dominant or the accent, and a contrast flip (dark to light or back) at the
+page's turning point. A field of colour is the cheapest way to make a long
+page feel paced.
+
 ## Detector findings
 
 `zirv frontend check` flags every gradient (`craft/unjustified-gradient`),
 purple-blue gradients, gradient text, coloured glows and decorative blur as
 advisory. Advisory means: justify the choice against the plan in your report
-("dusk-sea atmosphere behind the hero; grain prevents banding") and remove
+("night-platform atmosphere behind the hero; grain prevents banding") and remove
 only what you cannot justify. Blocking findings, such as missing focus
 visibility, must be fixed.
 
@@ -165,6 +220,8 @@ visibility, must be fixed.
   action and the signature only.
 - Grey text on a coloured band -> muted text derived from the band's hue.
 - Glassmorphism cards -> solid material surfaces.
+- No image of the world anywhere -> a drawn scene, a person or a place,
+  or art-directed photography.
 - A red left-edge stripe to flag a card -> put urgency into the data: group,
   sort, and label with word plus icon.
 
