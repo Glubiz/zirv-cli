@@ -835,15 +835,17 @@ fn load_bundle(
     })
 }
 
+const RESOURCE_DIRS: [(&str, SkillResourceKind); 3] = [
+    ("scripts", SkillResourceKind::Script),
+    ("references", SkillResourceKind::Reference),
+    ("assets", SkillResourceKind::Asset),
+];
+
 /// Scan known resource directories recursively under the bundle root with symlink and size checks. (#539)
 fn scan_bundle_resources(bundle_root: &Path) -> CtxResult<Vec<SkillResource>> {
     let mut resources = Vec::new();
     let mut total_bytes = 0usize;
-    for (dirname, kind) in [
-        ("scripts", SkillResourceKind::Script),
-        ("references", SkillResourceKind::Reference),
-        ("assets", SkillResourceKind::Asset),
-    ] {
+    for (dirname, kind) in RESOURCE_DIRS {
         let dir = bundle_root.join(dirname);
         if !dir.is_dir() {
             continue;
@@ -2145,12 +2147,8 @@ fn embedded_skill_resources(id: &str) -> Vec<SkillResource> {
     let mut resources: Vec<SkillResource> = embedded_bodies(id)
         .iter()
         .filter_map(|(path, body)| {
-            let kind = match path.split('/').next()? {
-                "scripts" => SkillResourceKind::Script,
-                "references" => SkillResourceKind::Reference,
-                "assets" => SkillResourceKind::Asset,
-                _ => return None,
-            };
+            let dirname = path.split('/').next()?;
+            let (_, kind) = RESOURCE_DIRS.into_iter().find(|(dir, _)| *dir == dirname)?;
             Some(SkillResource {
                 kind,
                 path: (*path).to_string(),
