@@ -1,0 +1,140 @@
+# Embedded benchmark corpus for `zirv benchmark`. Fixture files live in
+# fixture/ and are materialized as the agent's repo for every run.
+schema = 1
+
+[[task]]
+id = "w-read"
+role = "worker"
+prompt = """
+In the tinyshop repository in your working directory, look at the Inventory class in tinyshop/inventory.py. Which Inventory method refuses to reserve more units than are in stock, and what exception type does it raise? Do not edit any files. Reply with your final answer as `<method> <ExceptionType>`.
+"""
+
+[[task.grader]]
+type = "answer_regex"
+pattern = '\breserve\b'
+
+[[task.grader]]
+type = "answer_regex"
+pattern = '\bInsufficientStock\b'
+
+[[task]]
+id = "w-rename"
+role = "worker"
+prompt = """
+In the tinyshop repository in your working directory, rename the function calc_subtotal to line_subtotal everywhere it appears: its definition in tinyshop/pricing.py, its call sites, the tests in tests/test_pricing.py, and README.md. Do not change behaviour. Do not fix any other problem you notice.
+"""
+
+[[task.grader]]
+type = "file_regex"
+path = "tinyshop/pricing.py"
+pattern = 'calc_subtotal'
+absent = true
+
+[[task.grader]]
+type = "file_regex"
+path = "tests/test_pricing.py"
+pattern = 'calc_subtotal'
+absent = true
+
+[[task.grader]]
+type = "file_regex"
+path = "README.md"
+pattern = 'calc_subtotal'
+absent = true
+
+[[task.grader]]
+type = "file_regex"
+path = "tinyshop/pricing.py"
+pattern = 'def line_subtotal\('
+absent = false
+
+[[task.grader]]
+type = "python"
+code = """import sys; sys.path.insert(0, '.')
+from tinyshop.pricing import line_subtotal, order_total
+assert line_subtotal(2, 3) == 6
+assert order_total([(2, 3)]) == 6
+"""
+
+[[task]]
+id = "w-bugfix"
+role = "worker"
+prompt = """
+In the tinyshop repository in your working directory, apply_discount in tinyshop/pricing.py gives wrong results for percentage discounts: it subtracts the percent as an absolute amount instead of taking that percentage off the price. Fix it so that apply_discount(price, percent) returns the price reduced by percent per cent of the price, rounded with round_money. Do not change round_money. Do not fix any other problem you notice.
+"""
+
+[[task.grader]]
+type = "python"
+code = """import sys; sys.path.insert(0, '.')
+from tinyshop.pricing import apply_discount
+assert apply_discount(200, 10) == 180
+assert apply_discount(80, 25) == 60
+assert apply_discount(50, 0) == 50
+assert apply_discount(10, 100) == 0
+"""
+
+[[task]]
+id = "w-feature"
+role = "worker"
+prompt = """
+In the tinyshop repository in your working directory, add a method Inventory.release(sku, quantity) to tinyshop/inventory.py that returns previously reserved units to stock, so the stock level for sku goes back up by quantity. It must raise ValueError when quantity is not positive, the same way restock does. Do not change any other behaviour. Do not fix any other problem you notice.
+"""
+
+[[task.grader]]
+type = "python"
+code = """import sys; sys.path.insert(0, '.')
+from tinyshop.inventory import Inventory
+inv = Inventory()
+inv.restock('a', 5)
+inv.reserve('a', 3)
+inv.release('a', 2)
+assert inv.levels['a'] == 4
+for q in (0, -1):
+    try:
+        inv.release('a', q)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('release(%d) should raise ValueError' % q)
+"""
+
+[[task]]
+id = "o-review"
+role = "orchestrator"
+prompt = """
+The file changes.diff in your working directory is a proposed patch that has not been applied to the repository. Review it. Name the function the patch breaks and explain the defect in one or two sentences. Do not edit any files.
+"""
+
+[[task.grader]]
+type = "answer_regex"
+pattern = '\breserve\b'
+
+[[task]]
+id = "o-plan"
+role = "orchestrator"
+prompt = """
+Plan only. Do not edit any files. The tinyshop library must support prices in several currencies: every price carries an ISO currency code, and order_total must refuse to mix currencies in one order. Read the repository in your working directory and reply with only a JSON object of the form {"files": [...], "steps": [...], "risks": [...]}, where the lists name the files you would change, the ordered implementation steps, and the risks. Do not add any text outside the JSON object.
+"""
+
+[[task.grader]]
+type = "answer_json"
+required = ["files", "steps", "risks"]
+
+[[task.grader]]
+type = "answer_regex"
+pattern = 'tinyshop/pricing\.py'
+
+[[task]]
+id = "o-triage"
+role = "orchestrator"
+prompt = """
+The file ci-failure.log in your working directory is the output of a failing CI run. Which source file and function contain the root cause of the failure? The root cause is not the test itself. Do not edit any files. Reply as `<path>:<function>`, then one sentence of reasoning.
+"""
+
+[[task.grader]]
+type = "answer_regex"
+pattern = 'tinyshop/util\.py'
+
+[[task.grader]]
+type = "answer_regex"
+pattern = 'round_money'

@@ -384,6 +384,18 @@ pub(super) fn is_supervisor_override(tokens: &[String]) -> bool {
             .any(|t| t.eq_ignore_ascii_case("override"))
 }
 
+/// `zirv benchmark run` spends real model quota, so it always prompts. Token-based like
+/// [`is_supervisor_override`], so every spelling the hook parses matches.
+pub(super) fn is_benchmark_run(tokens: &[String]) -> bool {
+    tokens
+        .first()
+        .is_some_and(|program| sql_program_name(program) == "zirv")
+        && tokens
+            .get(1)
+            .is_some_and(|t| t.eq_ignore_ascii_case("benchmark"))
+        && tokens.get(2).is_some_and(|t| t.eq_ignore_ascii_case("run"))
+}
+
 /// Require every segment of a reserved zirv command to be retry-safe.
 /// Reserved names alone do not prove sandbox safety: ctx launchers and
 /// payload-carrying verbs can run caller-controlled subprocesses, and

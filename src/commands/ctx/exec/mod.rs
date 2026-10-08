@@ -37,6 +37,7 @@ mod supervision;
 pub use self::accounting::ExecutionReport;
 #[cfg(test)]
 pub use self::accounting::ExecutionSegment;
+pub(crate) use self::accounting::add_usage;
 use self::accounting::{
     evaluate_worker_budget, harvest_spend, objective_layer_for_restart, record_execution_segment,
 };

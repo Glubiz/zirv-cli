@@ -56,10 +56,7 @@ pub fn mean(xs: &[f64]) -> f64 {
     xs.iter().sum::<f64>() / xs.len() as f64
 }
 
-/// The median of `xs` (the 50th nearest-rank percentile). Unused in
-/// production today (`promote.rs` calls `percentile` directly for its own
-/// median needs); kept as public API and exercised by its own test below.
-#[cfg_attr(not(test), allow(dead_code))]
+/// The median of `xs` (the 50th nearest-rank percentile).
 pub fn median(xs: &[f64]) -> f64 {
     percentile(xs, 50.0)
 }

@@ -1,3 +1,4 @@
+pub mod benchmark;
 pub mod command_schema;
 pub mod create;
 pub mod ctx;

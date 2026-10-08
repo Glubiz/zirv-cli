@@ -60,3 +60,6 @@
 # make these differ from what CI (Linux/macOS) sees. Pin to LF.
 /src/commands/workflow/packs/*.toml text eol=lf
 /tests/fixtures/workflow/** text eol=lf
+
+# `zirv benchmark` corpus fixtures are embedded with include_str!, so pin LF.
+/src/commands/benchmark/corpus/fixture/** text eol=lf
