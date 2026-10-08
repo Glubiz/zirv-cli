@@ -2734,7 +2734,9 @@ derives a repository-specific design profile, classifies each surface as
 persuade/operate/read/experience, and requires a product-grounded design thesis,
 signature, justified risk, system, complete user journey, and resilient state
 matrix before implementation. A built-in craft floor plus phase skills drive
-the work; a 44-rule offline detector checks deterministic accessibility, UX,
+the work, and `frontend-craft` ships on-demand references (typography,
+color and surface, layout, interface motion, critique) read with `zirv skill
+read frontend-craft references/<file>`; a 44-rule offline detector checks deterministic accessibility, UX,
 responsive, content, motion, internationalization, media, performance, and
 anti-slop hazards. Zirv starts and cleans up the discovered dev server, captures
 narrow/intermediate/wide screenshots, and requires a fresh AI review with 13
@@ -3068,7 +3070,9 @@ from HTML/CSS/JS "video as code," backed by HeyGen Hyperframes
 skill's own instructions and bumped deliberately with a zirv release --
 `npx` runs prompt-free, so an unpinned invocation would execute whatever npm
 serves that day. The skill never calls `ffmpeg` directly, never installs
-packages, and never downloads music.
+packages, and never downloads music. Its design craft (motion principles,
+video composition, transitions and rhythm) ships as on-demand references:
+`zirv skill read motion-graphics references/<file>`.
 
 **Prerequisites.** Node 22+ and FFmpeg on `PATH` are required; `zirv setup`
 reports both (flagging a Node below 22) alongside optional narration
