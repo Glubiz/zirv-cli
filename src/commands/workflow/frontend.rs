@@ -269,11 +269,11 @@ fn synthesize_profile(repo: PathBuf, evidence: RepositoryEvidence) -> FrontendPr
         direction: if existing {
             "Extend the repository's strongest established visual language; remove local inconsistency instead of introducing a competing system."
         } else {
-            "Choose one confident, product-specific visual concept from the task and content; avoid a generic dashboard or landing-page template."
+            "Ground the design in the subject's world: lead with its most characteristic artefact, shown with real product truth, not a template."
         }
         .into(),
         typography: if evidence.fonts.is_empty() {
-            "Select an intentional type pairing or family suited to the product; establish a restrained, legible hierarchy and never default to interchangeable AI typography."
+            "Choose a type pair by the world's era, material and voice, self-hosted via @font-face, with real display scale; avoid system or habitual faces unless an established system already uses them."
                 .into()
         } else {
             format!(
@@ -282,7 +282,7 @@ fn synthesize_profile(repo: PathBuf, evidence: RepositoryEvidence) -> FrontendPr
             )
         },
         color: if evidence.colors.is_empty() {
-            "Derive a compact semantic palette from the product context with accessible contrast; use accents sparingly and avoid default purple-blue gradients."
+            "Build an OKLCH palette from the world: tinted neutrals, one dominant colour, one sharp accent; 4.5:1 text, 3:1 UI; status never by colour alone."
                 .into()
         } else {
             format!(
@@ -294,16 +294,16 @@ fn synthesize_profile(repo: PathBuf, evidence: RepositoryEvidence) -> FrontendPr
             (true, true) => "Match the existing radius and elevation grammar; do not turn every region into a floating rounded card.",
             (true, false) => "Preserve the existing radius rhythm and prefer borders, spacing, or tone over decorative shadows.",
             (false, true) => "Use the existing elevation language selectively and keep geometry crisp unless content requires softness.",
-            (false, false) => "Choose one restrained geometry rule and create hierarchy with layout before containers or effects.",
+            (false, false) => "One geometry rule suited to the world's materials; hierarchy from scale, space and alignment before containers.",
         }
         .into(),
         motion: if evidence.has_motion {
             "Preserve purposeful existing motion, honor reduced-motion preferences, and animate state or spatial change rather than decoration."
         } else {
-            "Add motion only when it explains state, hierarchy, or continuity; keep it subtle and fully reduced-motion safe."
+            "Spend motion on one orchestrated moment and on feedback to user actions; transform and opacity, with a reduced-motion path."
         }
         .into(),
-        density: "Infer density from the product's information and interaction load; prioritize scanability without excessive whitespace or cramped controls."
+        density: "Set by mode: operate surfaces dense, aligned, keyboard-fast; persuade and read surfaces generous in scale and space."
             .into(),
         evidence_paths: evidence.paths,
         observed_fonts: evidence.fonts,
@@ -344,12 +344,9 @@ preservation: {}",
         profile.autonomy.preservation_rule,
     ) + r#"
 quality contract v2 (resolve autonomously; never ask for initialization):
-- classify the current surface, not the whole product: persuade = earn a decision; operate = complete a task; read = understand; experience = encounter the work itself. Let that mode set expression, density, motion, and familiarity.
-- before code, name the concrete subject, audience, single user job, product truth that cannot be invented, one design thesis, one memorable signature, one justified aesthetic risk, and the category-default arrangement this surface refuses. Preserve an established world; replace it only when the task explicitly calls for redesign.
-- derive a compact system for type roles, semantic color, spacing rhythm, geometry, elevation, imagery/iconography, and motion. Spend boldness in one place. Every structural or decorative device must encode content, state, or the chosen world.
-- design the whole journey: arrival, primary path, decision points, feedback, cancellation/undo, loading, empty, partial, error, success, disabled, permission, offline/slow, long-content, localization/RTL, keyboard, touch, zoom, reduced-motion, narrow, intermediate, and wide behavior where relevant.
-- evaluate with the interchangeable-product test plus hierarchy, system coherence, typography, color/contrast, layout rhythm, interaction affordance, state completeness, responsive composition, accessibility, content clarity, and resilience. A clean detector is a floor, not proof of quality.
-- verification is bounded: build fully, inspect all device captures together, batch fixes, confirm once, then stop. Missing or stale visual evidence never becomes a pass."#
+- name each surface's mode (persuade, operate, read, experience); before code, plan subject, audience, job, the world's materials, hero artefact, type, palette, layout, one signature. Never invent product truth.
+- critique the plan with the interchangeable-product test; build; render (full height for long pages); critique with frontend-craft references/critique.md; fix in one batch; stop.
+- floor: states, keyboard, focus, contrast, reduced motion, recomposition at 390/768/1440. Justify advisory craft findings, fix blocking ones. Missing or stale render evidence is never a pass."#
 }
 
 fn scan_repository(repo: &Path) -> CtxResult<RepositoryEvidence> {
