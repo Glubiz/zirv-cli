@@ -195,7 +195,7 @@ A bare `zirv benchmark` prints help. Every flag:
 
 #### Candidates
 
-Candidates are discovered, never hard-coded. For each live harness, `benchmark` takes the models `zirv ctx models` lists as `available` for that harness's vendor (the Codex models cache and models seen in Claude transcripts; refresh with `zirv ctx models refresh`), skips placeholder rows, and benchmarks every such model id, each labelled with its registry family. `--family` and `--model` narrow the set. "Available" means seen in this machine's Codex model cache or Claude transcripts, so a retired id can still be listed; its runs fail and show in the `failed` column. A harness with no available rows gets one `default` candidate with no model flag; the report records the model the transcript names.
+Candidates are discovered, never hard-coded. For each live harness, `benchmark` takes the models in the runtime registry that are available for that harness's vendor (the Codex models cache and models seen in Claude transcripts; refresh with `zirv ctx models refresh`), skips placeholder rows, hidden ids and ids whose retirement date has passed, and benchmarks every such model id, each labelled with its registry family. `--family` and `--model` narrow the set. "Available" means seen in this machine's Codex model cache or Claude transcripts, so an id that is retiring but not yet retired is still a candidate, and a transcript-only id the vendor has since withdrawn can still be listed; its runs fail and show in the `failed` column. A harness with no available rows gets one `default` candidate with no model flag; the report records the model the transcript names.
 
 #### Running
 
