@@ -11,7 +11,7 @@ metadata:
   x-zirv-phases: implement,present
   x-zirv-required-capabilities: repo.read,repo.write,shell.exec
   x-zirv-optional-capabilities: artifact.render
-  x-zirv-context-budget-bytes: "7200"
+  x-zirv-context-budget-bytes: "7600"
 ---
 
 A motion graphics request asks for a finished film: directed like one, and
@@ -23,7 +23,7 @@ frame-accurate video -- not a hand-rolled encoder, and not a web page filmed.
 Between steps 2 and 3 below, once the project folder exists, write
 `direction.md` in it:
 
-1. Read all three references first (before or after step 1-2):
+1. Read all three references before writing direction.md:
    `zirv skill read motion-graphics references/motion-principles.md`, then
    `references/video-composition.md` and
    `references/transitions-and-rhythm.md`. Skipping them is the main cause
@@ -36,12 +36,17 @@ Between steps 2 and 3 below, once the project folder exists, write
    1.5 s before the end and holds still.
 4. A style frame: background, foreground and one accent (tinted, never
    pure black or white); two families embedded from local woff2 files with
-   `@font-face` -- replace the scaffold's Inter; get the files, for example,
-   with `npm pack @fontsource/<family>`; video-scale type as a share of
-   frame height (headlines 6-11%, body 2.6-4%, labels 1.7-2.2% or more; at
-   1080p 64-120px, 28-42px, 18-24px; at 720x405 24-45px, 11-16px, 8px
-   minimum, so keep GIF labels few and large); three layers
-   per scene; content anchored to edges, not centred.
+   `@font-face`, chosen from the subject's world with the method,
+   families-by-character list and overused list in `zirv skill read
+   frontend-craft references/typography.md` -- the scaffold's Inter and
+   habitual picks such as Space Grotesk are out unless the brief's brand uses
+   them; get the files, for example, with `npm pack @fontsource/<family>`;
+   video-scale type as a share of frame height (headlines 6-11%, body
+   2.6-4%, labels 2.2% or more; at 1080p 64-120px, 28-42px, 24px; at 720x405
+   24-45px, 11-16px, 9px minimum, so keep GIF labels few and large); three
+   layers per scene; content anchored to edges, not centred. A composition
+   rendered to GIF carries no grain or noise overlay (grain is for MP4-only
+   deliverables: it took one GIF from 9 MB to 63 MB).
 5. A verb for every element (rises, draws, wipes, counts, ejects). An
    element without a verb is not designed yet.
 
@@ -109,7 +114,9 @@ and the scaffold loads GSAP from cdn.jsdelivr.net (or vendor it). Run steps
    `render --format gif --fps <n> --gif-loop 0 --output renders/<slug>.gif`
    with `--fps 15` for text and UI motion and `--fps 25` for bodies,
    objects or continuous motion (GIF delays count in 1/100 s, so 25 plays
-   evenly and 24 does not). A render takes minutes; let it finish.
+   evenly and 24 does not). A render takes minutes; let it finish. Check the
+   GIF's size afterwards: aim at or under about 10 MB, and above that cut
+   grain/noise and full-frame textures first.
 9. Register each file with `zirv artifact render <path>` (MP4 as video, GIF
    as image) and present each with `zirv artifact present <id> --agent
    <your harness>`.
