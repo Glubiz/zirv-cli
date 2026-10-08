@@ -401,7 +401,12 @@ fn scan_repository(repo: &Path) -> CtxResult<RepositoryEvidence> {
     let brand_guide = std::fs::symlink_metadata(&guide).is_ok_and(|metadata| metadata.is_file());
     if brand_guide {
         hash.write(BRAND_GUIDE_PATH.as_bytes());
-        hash.write(&read_bounded(&guide, MAX_FILE_BYTES as usize)?);
+        // Length is hashed too: the changelog is appended past the bounded read.
+        // An unreadable guide degrades to a length-only hash, never a failed profile.
+        if let Ok(metadata) = std::fs::metadata(&guide) {
+            hash.write(&metadata.len().to_le_bytes());
+        }
+        hash.write(&read_bounded(&guide, MAX_FILE_BYTES as usize).unwrap_or_default());
     }
 
     Ok(RepositoryEvidence {
@@ -685,6 +690,55 @@ mod tests {
         std::fs::write(brand.join("BRAND.md"), "# Brand\nPrimary: kiln red.\n").expect("edit");
         let edited = ensure_profile(&state, repo.path()).expect("profile after edit");
         assert_ne!(added.source_fingerprint, edited.source_fingerprint);
+    }
+
+    /// Without a regular `brand/BRAND.md` the fingerprint is untouched (a
+    /// directory or symlink of that name is ignored), tokens.css is already
+    /// scanned evidence, and a size change past the bounded read refreshes it.
+    #[test]
+    fn brand_guide_fingerprint_is_stable_without_a_guide_and_tracks_length() {
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::write(repo.path().join("app.css"), "body { color: #111111; }").expect("css");
+        let baseline = scan_repository(repo.path()).expect("scan").fingerprint;
+
+        let brand = repo.path().join("brand");
+        std::fs::create_dir_all(brand.join("BRAND.md")).expect("directory named guide");
+        let with_dir = scan_repository(repo.path()).expect("scan dir");
+        assert!(!with_dir.brand_guide);
+        assert_eq!(baseline, with_dir.fingerprint);
+
+        std::fs::remove_dir(brand.join("BRAND.md")).expect("remove dir");
+        #[cfg(unix)]
+        {
+            std::fs::write(repo.path().join("real.md"), "# Brand\n").expect("target");
+            std::os::unix::fs::symlink(repo.path().join("real.md"), brand.join("BRAND.md"))
+                .expect("symlink");
+            let with_link = scan_repository(repo.path()).expect("scan link");
+            assert!(!with_link.brand_guide);
+            assert_eq!(baseline, with_link.fingerprint);
+            std::fs::remove_file(brand.join("BRAND.md")).expect("remove link");
+        }
+
+        std::fs::write(brand.join("tokens.css"), ":root { --a: #222222; }").expect("tokens");
+        let tokens = scan_repository(repo.path())
+            .expect("scan tokens")
+            .fingerprint;
+        std::fs::write(brand.join("tokens.css"), ":root { --a: #333333; }").expect("edit tokens");
+        let edited = scan_repository(repo.path())
+            .expect("scan edited tokens")
+            .fingerprint;
+        assert_ne!(tokens, edited);
+
+        let head = "a".repeat(MAX_FILE_BYTES as usize);
+        std::fs::write(brand.join("BRAND.md"), format!("{head}\n")).expect("guide");
+        let first = scan_repository(repo.path())
+            .expect("scan guide")
+            .fingerprint;
+        std::fs::write(brand.join("BRAND.md"), format!("{head}\nchangelog entry\n")).expect("grow");
+        let grown = scan_repository(repo.path())
+            .expect("scan grown")
+            .fingerprint;
+        assert_ne!(first, grown);
     }
 
     #[test]
