@@ -169,7 +169,7 @@ In a pipe or with redirected output (non-TTY), `zirv tour` prints all sections p
 `zirv benchmark` finds which harness and model stack suits this machine. It runs each candidate solo against a small embedded task corpus, then composes a recommended orchestrator and worker from the per-role scores.
 
 ```bash
-zirv benchmark plan   [--harness <name>]... [--tier <cheap|standard|deep>]... [--model <harness:model>]... [--task <id>]... [--judge <harness:model>] [--no-judge] [--json]
+zirv benchmark plan   [--harness <name>]... [--family <name>]... [--model <harness:model>]... [--task <id>]... [--judge <harness:model>] [--no-judge] [--json]
 zirv benchmark run    [same filters] [--reps <n>] [--max-usd <usd>] [--timeout-secs <s>] --yes [--json]
 zirv benchmark report [<run-id>] [--json]
 ```
@@ -177,10 +177,10 @@ zirv benchmark report [<run-id>] [--json]
 A bare `zirv benchmark` prints help. Every flag:
 
 - `--harness <name>`: restrict to this harness. Repeatable.
-- `--tier cheap|standard|deep`: restrict tier-derived models. Repeatable. Default: all three.
-- `--model <harness>:<model>`: benchmark exactly these models instead of the tier-derived ones. Repeatable.
+- `--family <name>`: restrict the discovered models to these model families (the `FAMILY` column of `zirv ctx models`). Repeatable. Default: every family.
+- `--model <harness>:<model>`: benchmark exactly these model ids instead of the discovered ones; any id the harness accepts, so an older version can be benchmarked on request. Repeatable.
 - `--task <id>`: restrict to these corpus tasks. Repeatable.
-- `--judge <harness>:<model>`: override the judge. Default: the present candidate with the highest model strength.
+- `--judge <harness>:<model>`: override the judge. Default: the candidate with the highest output price in the effective price table (ties go by `[fallback] order`, then harness name); candidates without a known price never judge.
 - `--no-judge`: skip the LLM judge and use deterministic graders only.
 - `--reps <n>` (`run` only): runs per candidate and task. Default: `1`.
 - `--max-usd <usd>` (`run` only): spend cap for agent and judge runs together. Default: `10`.
@@ -191,7 +191,11 @@ A bare `zirv benchmark` prints help. Every flag:
 
 #### What `plan` shows
 
-`plan` makes no model call and is read-only. It lists the harnesses with their liveness (live, absent or disabled), the candidates with their tier, the tasks (with any skipped, and why), the judge, the number of agent runs and judge calls, the spend cap, and the date of the price table. It prints no cost estimate.
+`plan` makes no model call and is read-only. It lists the harnesses with their liveness (live, absent or disabled), the candidates with their model family, the tasks (with any skipped, and why), the judge, the number of agent runs and judge calls, the spend cap, and the date of the price table. It prints no cost estimate.
+
+#### Candidates
+
+Candidates are discovered, never hard-coded. For each live harness, `benchmark` takes the models `zirv ctx models` lists as `available` for that harness's vendor (the Codex models cache and models seen in Claude transcripts; refresh with `zirv ctx models refresh`), skips placeholder rows, and benchmarks every such model id, each labelled with its registry family. `--family` and `--model` narrow the set. "Available" means seen in this machine's Codex model cache or Claude transcripts, so a retired id can still be listed; its runs fail and show in the `failed` column. A harness with no available rows gets one `default` candidate with no model flag; the report records the model the transcript names.
 
 #### Running
 
@@ -204,7 +208,7 @@ Costs are API-equivalent: tokens priced with the price table (see [Model discove
 - Deterministic graders check the final answer or the workdir: regex matches, required JSON keys, and Python checks run with `python3 -I`. Correctness is passed graders divided by evaluated graders. Python graders are skipped when `python3` is absent.
 - Unless `--no-judge` is set or a task sets `judge = false`, a blind LLM judge scores each run from 0 to 10. Its rubric contains only the task prompt, the final answer and the workdir diff (truncated to 20 KB).
 - The composite score (0 to 1) is the mean of the available components, correctness and judge score / 10.
-- The default judge is the strongest present candidate. A model tends to rate its own output higher, so `plan` and `report` note when the judge is also a candidate.
+- The default judge is the candidate with the highest known output price (see `--judge`). A model tends to rate its own output higher, so `plan` and `report` note when the judge is also a candidate.
 
 #### Recommendation
 

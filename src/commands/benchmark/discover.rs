@@ -1,16 +1,17 @@
 //! Which harnesses are present, which models each could run, and who judges.
+//!
+//! Candidate models are the ones `zirv ctx models` lists as available on this
+//! machine, never a built-in table.
 
 use serde::{Deserialize, Serialize};
 
 use super::Filters;
 use crate::commands::ctx::adapters::{self, AgentAdapter, Liveness};
-use crate::commands::ctx::catalogue::{self, Tier};
 use crate::commands::ctx::config::CtxConfig;
+use crate::commands::ctx::models::{AVAILABLE, ModelRow};
 
-/// Model name for a harness whose vendor ladder is unknown: no model flag is pinned.
+/// Model name for a harness with no available registry rows: no model flag is pinned.
 pub const DEFAULT_MODEL: &str = "default";
-
-const ALL_TIERS: [Tier; 3] = [Tier::Cheap, Tier::Standard, Tier::Deep];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -30,9 +31,10 @@ pub struct HarnessInfo {
 pub struct Candidate {
     pub harness: String,
     pub model: String,
-    pub tier: Option<Tier>,
+    pub family: Option<String>,
+    /// Output price per million tokens; the judge default's proxy for capability.
     #[serde(skip)]
-    strength: Option<u8>,
+    output_price: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -53,6 +55,7 @@ pub fn discover(
     cfg: &CtxConfig,
     filters: &Filters,
     present: &dyn Fn(&str, &str) -> Liveness,
+    rows: &[ModelRow],
 ) -> Result<Discovery, String> {
     for name in filters
         .harnesses
@@ -84,8 +87,21 @@ pub fn discover(
         });
         let wanted = filters.harnesses.is_empty() || filters.harnesses.iter().any(|h| h == name);
         if let (Some(adapter), true) = (adapter, wanted) {
-            candidates.extend(candidates_for(adapter.as_ref(), filters));
+            candidates.extend(candidates_for(adapter.as_ref(), filters, rows));
         }
+    }
+
+    for (harness, model) in &filters.models {
+        let excluded = !filters.harnesses.is_empty() && !filters.harnesses.contains(harness);
+        let state = match harnesses.iter().find(|info| info.name == *harness) {
+            _ if excluded => "excluded by --harness",
+            Some(info) if info.presence == Presence::Live => continue,
+            Some(info) if info.presence == Presence::Disabled => "disabled",
+            _ => "not installed",
+        };
+        return Err(format!(
+            "--model {harness}:{model}: harness '{harness}' is {state}"
+        ));
     }
 
     let judge = match &filters.judge {
@@ -101,7 +117,7 @@ pub fn discover(
             }
             Some(judge_for(harness, model, &candidates))
         }
-        None => strongest(&candidates, &cfg.fallback.order)
+        None => highest_priced(&candidates, &cfg.fallback.order)
             .map(|best| judge_for(&best.harness, &best.model, &candidates)),
     };
     Ok(Discovery {
@@ -121,14 +137,23 @@ fn judge_for(harness: &str, model: &str, candidates: &[Candidate]) -> Judge {
     }
 }
 
-fn candidates_for(adapter: &dyn AgentAdapter, filters: &Filters) -> Vec<Candidate> {
+/// A registry id is a model, not a placeholder, when it starts like a name.
+fn is_model_id(id: &str) -> bool {
+    id.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+}
+
+fn candidates_for(
+    adapter: &dyn AgentAdapter,
+    filters: &Filters,
+    rows: &[ModelRow],
+) -> Vec<Candidate> {
     let name = adapter.name();
-    let vendor = catalogue::vendor(adapter.provider());
-    let candidate = |model: &str, tier: Option<Tier>| Candidate {
+    let vendor = adapter.provider();
+    let candidate = |model: &str, family: Option<&str>, output_price: Option<u64>| Candidate {
         harness: name.to_string(),
         model: model.to_string(),
-        tier,
-        strength: vendor.and_then(|v| catalogue::strength(v, model)),
+        family: family.map(str::to_string),
+        output_price,
     };
 
     if !filters.models.is_empty() {
@@ -136,59 +161,66 @@ fn candidates_for(adapter: &dyn AgentAdapter, filters: &Filters) -> Vec<Candidat
             .models
             .iter()
             .filter(|(harness, _)| harness == name)
-            .map(|(_, model)| candidate(model, None))
+            .map(|(_, model)| {
+                let row = rows.iter().find(|r| r.vendor == vendor && r.id == *model);
+                candidate(
+                    model,
+                    row.and_then(|r| r.family.as_deref()),
+                    row.and_then(|r| r.output_micros_per_million),
+                )
+            })
             .collect();
     }
 
-    let tiers = if filters.tiers.is_empty() {
-        ALL_TIERS.as_slice()
-    } else {
-        filters.tiers.as_slice()
-    };
-    let Some(vendor) = vendor else {
-        return vec![candidate(DEFAULT_MODEL, None)];
-    };
-    let mut out: Vec<Candidate> = Vec::new();
-    for tier in tiers {
-        let Some(model) = catalogue::tier_model(vendor, *tier) else {
-            continue;
+    let available: Vec<&ModelRow> = rows
+        .iter()
+        .filter(|r| r.vendor == vendor && r.availability == AVAILABLE && is_model_id(&r.id))
+        .collect();
+    if available.is_empty() {
+        // Without a family to match, a filter leaves nothing for a default launch to satisfy.
+        return if filters.families.is_empty() {
+            vec![candidate(DEFAULT_MODEL, None, None)]
+        } else {
+            Vec::new()
         };
-        if out.iter().any(|existing| existing.model == model) {
-            continue;
-        }
-        out.push(candidate(model, Some(*tier)));
     }
-    // A harness that ignores model flags would benchmark one model under several names.
-    if out
-        .first()
-        .is_some_and(|first| adapter.model_args(&first.model).is_empty())
-    {
-        return vec![candidate(DEFAULT_MODEL, None)];
-    }
-    out
+
+    available
+        .into_iter()
+        .filter(|row| {
+            filters.families.is_empty()
+                || row
+                    .family
+                    .as_ref()
+                    .is_some_and(|family| filters.families.contains(family))
+        })
+        .map(|row| {
+            candidate(
+                &row.id,
+                row.family.as_deref(),
+                row.output_micros_per_million,
+            )
+        })
+        .collect()
 }
 
-/// Highest ladder strength; a tie goes to the harness earliest in `[fallback] order`.
-fn strongest<'a>(candidates: &'a [Candidate], order: &[String]) -> Option<&'a Candidate> {
+/// Highest output price; a tie goes to the harness earliest in `[fallback] order`, then by name.
+fn highest_priced<'a>(candidates: &'a [Candidate], order: &[String]) -> Option<&'a Candidate> {
     let rank = |harness: &str| {
         order
             .iter()
             .position(|name| name == harness)
             .unwrap_or(usize::MAX)
     };
-    let mut best: Option<&Candidate> = None;
-    for candidate in candidates.iter().filter(|c| c.strength.is_some()) {
-        let better = best.is_none_or(|current| {
-            (
-                candidate.strength,
-                std::cmp::Reverse(rank(&candidate.harness)),
-            ) > (current.strength, std::cmp::Reverse(rank(&current.harness)))
-        });
-        if better {
-            best = Some(candidate);
-        }
-    }
-    best
+    candidates
+        .iter()
+        .filter(|c| c.output_price.is_some())
+        .max_by(|a, b| {
+            a.output_price
+                .cmp(&b.output_price)
+                .then_with(|| rank(&b.harness).cmp(&rank(&a.harness)))
+                .then_with(|| b.harness.cmp(&a.harness))
+        })
 }
 
 #[cfg(test)]
@@ -209,85 +241,188 @@ mod tests {
         Filters::default()
     }
 
-    fn names(discovery: &Discovery) -> Vec<&str> {
-        let mut out: Vec<&str> = discovery
-            .candidates
+    fn row(vendor: &str, id: &str, family: Option<&str>, price: Option<u64>) -> ModelRow {
+        ModelRow::for_test(vendor, id, family, AVAILABLE, price)
+    }
+
+    fn models(candidates: &[Candidate]) -> Vec<&str> {
+        candidates.iter().map(|c| c.model.as_str()).collect()
+    }
+
+    /// Resolves the vendor slug the claude adapter runs, so tests name no vendor.
+    fn claude_vendor() -> &'static str {
+        adapters::ADAPTERS
             .iter()
-            .map(|c| c.harness.as_str())
-            .collect();
-        out.dedup();
-        out
+            .find(|(n, _)| *n == "claude")
+            .map(|(_, ctor)| ctor(None).provider())
+            .unwrap()
     }
 
-    #[test]
-    fn an_absent_harness_is_excluded() {
+    fn only_claude(rows: &[ModelRow], f: &Filters) -> Discovery {
         let present = adapters::only_installed(&["claude"]);
-        let d = discover(&cfg(&[]), &filters(), &present).unwrap();
-        assert_eq!(names(&d), vec!["claude"]);
-        let codex = d.harnesses.iter().find(|h| h.name == "codex").unwrap();
-        assert_eq!(codex.presence, Presence::Absent);
+        discover(&cfg(&[]), f, &present, rows).unwrap()
     }
 
     #[test]
-    fn a_disabled_harness_is_excluded() {
-        let present = adapters::only_installed(&["claude", "codex"]);
-        let config = cfg(&[("ZIRV_AGENT_CODEX_ENABLED", "false")]);
-        let d = discover(&config, &filters(), &present).unwrap();
-        assert_eq!(names(&d), vec!["claude"]);
-        let codex = d.harnesses.iter().find(|h| h.name == "codex").unwrap();
-        assert_eq!(codex.presence, Presence::Disabled);
+    fn every_available_id_is_a_candidate_with_its_family() {
+        let v = claude_vendor();
+        let rows = [
+            row(v, "vendor-alpha-1", Some("alpha"), None),
+            row(v, "vendor-alpha-2-1", Some("alpha"), None),
+            row(v, "vendor-beta-10", Some("beta"), None),
+            row(v, "loner-1", None, None),
+        ];
+        let d = only_claude(&rows, &filters());
+        assert_eq!(
+            models(&d.candidates),
+            vec![
+                "vendor-alpha-1",
+                "vendor-alpha-2-1",
+                "vendor-beta-10",
+                "loner-1"
+            ]
+        );
+        assert_eq!(d.candidates[1].family.as_deref(), Some("alpha"));
     }
 
     #[test]
-    fn tier_candidates_come_from_the_catalogue_without_duplicates() {
-        let present = adapters::only_installed(&["claude"]);
-        let d = discover(&cfg(&[]), &filters(), &present).unwrap();
-        let vendor = catalogue::vendor("anthropic").unwrap();
-        let expected: Vec<&str> = ALL_TIERS
-            .iter()
-            .filter_map(|t| catalogue::tier_model(vendor, *t))
-            .collect();
-        let got: Vec<&str> = d.candidates.iter().map(|c| c.model.as_str()).collect();
-        assert_eq!(got, expected);
+    fn unavailable_hidden_and_snapshot_rows_are_excluded() {
+        let v = claude_vendor();
+        let rows = [
+            row(v, "vendor-alpha-1", Some("alpha"), None),
+            ModelRow::for_test(v, "vendor-alpha-9", Some("alpha"), "hidden", None),
+            ModelRow::for_test(v, "vendor-alpha-8", Some("alpha"), "snapshot", None),
+        ];
+        let d = only_claude(&rows, &filters());
+        assert_eq!(models(&d.candidates), vec!["vendor-alpha-1"]);
     }
 
     #[test]
-    fn a_tier_filter_narrows_the_candidates() {
-        let present = adapters::only_installed(&["claude"]);
-        let f = Filters {
-            tiers: vec![Tier::Cheap],
-            ..filters()
-        };
-        let d = discover(&cfg(&[]), &f, &present).unwrap();
-        assert_eq!(d.candidates.len(), 1);
-        assert_eq!(d.candidates[0].tier, Some(Tier::Cheap));
+    fn placeholders_are_not_models() {
+        let v = claude_vendor();
+        let rows = [
+            row(v, "<placeholder>", None, None),
+            row(v, "vendor-alpha-1", Some("alpha"), None),
+        ];
+        let d = only_claude(&rows, &filters());
+        assert_eq!(models(&d.candidates), vec!["vendor-alpha-1"]);
     }
 
     #[test]
-    fn an_unresolvable_vendor_gets_a_single_default_candidate() {
-        let present = adapters::only_installed(&["goose"]);
-        let d = discover(&cfg(&[]), &filters(), &present).unwrap();
+    fn rows_without_a_family_each_stand_alone() {
+        let v = claude_vendor();
+        let rows = [row(v, "loner-1", None, None), row(v, "loner-2", None, None)];
+        let d = only_claude(&rows, &filters());
+        assert_eq!(models(&d.candidates), vec!["loner-1", "loner-2"]);
+    }
+
+    #[test]
+    fn rows_of_another_vendor_are_not_candidates() {
+        let rows = [row(
+            "some-other-vendor",
+            "vendor-alpha-1",
+            Some("alpha"),
+            None,
+        )];
+        let d = only_claude(&rows, &filters());
+        assert_eq!(models(&d.candidates), vec![DEFAULT_MODEL]);
+    }
+
+    #[test]
+    fn a_harness_with_no_available_rows_gets_one_default_candidate() {
+        let d = only_claude(&[], &filters());
         assert_eq!(d.candidates.len(), 1);
         assert_eq!(d.candidates[0].model, DEFAULT_MODEL);
-        assert_eq!(d.candidates[0].tier, None);
+        assert_eq!(d.candidates[0].family, None);
     }
 
     #[test]
-    fn explicit_models_replace_the_tier_candidates() {
-        let present = adapters::only_installed(&["claude", "codex"]);
+    fn the_family_filter_keeps_only_those_families() {
+        let v = claude_vendor();
+        let rows = [
+            row(v, "vendor-alpha-1", Some("alpha"), None),
+            row(v, "vendor-beta-1", Some("beta"), None),
+            row(v, "loner-1", None, None),
+        ];
         let f = Filters {
-            models: vec![("claude".to_string(), "sonnet".to_string())],
+            families: vec!["beta".to_string()],
             ..filters()
         };
-        let d = discover(&cfg(&[]), &f, &present).unwrap();
-        assert_eq!(d.candidates.len(), 1);
         assert_eq!(
-            (
-                d.candidates[0].harness.as_str(),
-                d.candidates[0].model.as_str()
-            ),
-            ("claude", "sonnet")
+            models(&only_claude(&rows, &f).candidates),
+            vec!["vendor-beta-1"]
         );
+        assert!(only_claude(&[], &f).candidates.is_empty());
+    }
+
+    #[test]
+    fn a_model_pin_replaces_the_registry_candidates_with_exact_ids() {
+        let v = claude_vendor();
+        let rows = [row(v, "vendor-alpha-3", Some("alpha"), Some(7))];
+        let present = adapters::only_installed(&["claude", "codex"]);
+        let f = Filters {
+            models: vec![
+                ("claude".to_string(), "vendor-alpha-1".to_string()),
+                ("claude".to_string(), "vendor-alpha-3".to_string()),
+            ],
+            ..filters()
+        };
+        let d = discover(&cfg(&[]), &f, &present, &rows).unwrap();
+        assert_eq!(
+            models(&d.candidates),
+            vec!["vendor-alpha-1", "vendor-alpha-3"]
+        );
+        assert_eq!(d.candidates[0].family, None);
+        assert_eq!(d.candidates[1].family.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn a_model_pin_on_an_unavailable_harness_is_an_error_naming_its_state() {
+        let present = adapters::only_installed(&["claude", "codex"]);
+        let pin = |harness: &str, only: &[&str]| Filters {
+            models: vec![(harness.to_string(), "vendor-alpha-1".to_string())],
+            harnesses: only.iter().map(|h| (*h).to_string()).collect(),
+            ..filters()
+        };
+        let err = discover(&cfg(&[]), &pin("goose", &[]), &present, &[]).unwrap_err();
+        assert!(err.contains("harness 'goose' is not installed"), "{err}");
+        let config = cfg(&[("ZIRV_AGENT_CODEX_ENABLED", "false")]);
+        let err = discover(&config, &pin("codex", &[]), &present, &[]).unwrap_err();
+        assert!(err.contains("harness 'codex' is disabled"), "{err}");
+        let err = discover(&cfg(&[]), &pin("codex", &["claude"]), &present, &[]).unwrap_err();
+        assert!(err.contains("excluded by --harness"), "{err}");
+    }
+
+    #[test]
+    fn pins_are_exact_and_ignore_the_family_filter() {
+        let v = claude_vendor();
+        let rows = [row(v, "vendor-alpha-1", Some("alpha"), None)];
+        let present = adapters::only_installed(&["claude"]);
+        let f = Filters {
+            models: vec![("claude".to_string(), "vendor-alpha-1".to_string())],
+            families: vec!["beta".to_string()],
+            ..filters()
+        };
+        let d = discover(&cfg(&[]), &f, &present, &rows).unwrap();
+        assert_eq!(models(&d.candidates), vec!["vendor-alpha-1"]);
+    }
+
+    #[test]
+    fn an_absent_harness_is_excluded_and_a_disabled_one_is_marked() {
+        let present = adapters::only_installed(&["claude", "codex"]);
+        let config = cfg(&[("ZIRV_AGENT_CODEX_ENABLED", "false")]);
+        let d = discover(&config, &filters(), &present, &[]).unwrap();
+        let harnesses: Vec<&str> = d.candidates.iter().map(|c| c.harness.as_str()).collect();
+        assert_eq!(harnesses, vec!["claude"]);
+        let presence = |name: &str| {
+            d.harnesses
+                .iter()
+                .find(|h| h.name == name)
+                .unwrap()
+                .presence
+        };
+        assert_eq!(presence("codex"), Presence::Disabled);
+        assert_eq!(presence("copilot"), Presence::Absent);
     }
 
     #[test]
@@ -297,8 +432,8 @@ mod tests {
             harnesses: vec!["codex".to_string()],
             ..filters()
         };
-        let d = discover(&cfg(&[]), &f, &present).unwrap();
-        assert_eq!(names(&d), vec!["codex"]);
+        let d = discover(&cfg(&[]), &f, &present, &[]).unwrap();
+        assert!(d.candidates.iter().all(|c| c.harness == "codex"));
         assert_eq!(d.harnesses.len(), adapters::ADAPTERS.len());
     }
 
@@ -309,43 +444,56 @@ mod tests {
             harnesses: vec!["nope".to_string()],
             ..filters()
         };
-        assert!(discover(&cfg(&[]), &f, &present).is_err());
+        assert!(discover(&cfg(&[]), &f, &present, &[]).is_err());
+    }
+
+    fn priced(harness: &str, model: &str, price: Option<u64>) -> Candidate {
+        Candidate {
+            harness: harness.to_string(),
+            model: model.to_string(),
+            family: None,
+            output_price: price,
+        }
     }
 
     #[test]
-    fn the_judge_is_the_strongest_present_candidate() {
-        let present = adapters::only_installed(&["claude"]);
-        let d = discover(&cfg(&[]), &filters(), &present).unwrap();
-        let strongest = d
-            .candidates
-            .iter()
-            .max_by_key(|c| c.strength)
-            .expect("a candidate");
+    fn the_judge_is_the_candidate_with_the_highest_output_price() {
+        let v = claude_vendor();
+        let rows = [
+            row(v, "vendor-alpha-1", Some("alpha"), Some(10)),
+            row(v, "vendor-beta-1", Some("beta"), Some(50)),
+            row(v, "vendor-gamma-1", Some("gamma"), None),
+        ];
+        let d = only_claude(&rows, &filters());
         let judge = d.judge.expect("a judge");
-        assert_eq!(judge.model, strongest.model);
+        assert_eq!(judge.model, "vendor-beta-1");
         assert!(judge.also_candidate);
     }
 
     #[test]
-    fn a_strength_tie_goes_to_the_first_harness_in_fallback_order() {
-        let tied = |harness: &str| Candidate {
-            harness: harness.to_string(),
-            model: "m".to_string(),
-            tier: None,
-            strength: Some(5),
-        };
-        let candidates = vec![tied("claude"), tied("codex")];
+    fn a_price_tie_goes_to_fallback_order_then_harness_name() {
+        let candidates = vec![
+            priced("claude", "m", Some(5)),
+            priced("codex", "m", Some(5)),
+        ];
         let order = vec!["codex".to_string(), "claude".to_string()];
-        assert_eq!(strongest(&candidates, &order).unwrap().harness, "codex");
+        assert_eq!(
+            highest_priced(&candidates, &order).unwrap().harness,
+            "codex"
+        );
         let order = vec!["claude".to_string()];
-        assert_eq!(strongest(&candidates, &order).unwrap().harness, "claude");
+        assert_eq!(
+            highest_priced(&candidates, &order).unwrap().harness,
+            "claude"
+        );
+        assert_eq!(highest_priced(&candidates, &[]).unwrap().harness, "claude");
     }
 
     #[test]
-    fn candidates_without_a_known_strength_never_judge() {
-        let present = adapters::only_installed(&["goose"]);
-        let d = discover(&cfg(&[]), &filters(), &present).unwrap();
+    fn candidates_without_a_known_price_never_judge() {
+        let d = only_claude(&[], &filters());
         assert!(d.judge.is_none());
+        assert_eq!(highest_priced(&[priced("claude", "m", None)], &[]), None);
     }
 
     #[test]
@@ -355,12 +503,20 @@ mod tests {
             no_judge: true,
             ..filters()
         };
-        assert!(discover(&cfg(&[]), &f, &present).unwrap().judge.is_none());
+        assert!(
+            discover(&cfg(&[]), &f, &present, &[])
+                .unwrap()
+                .judge
+                .is_none()
+        );
         let f = Filters {
             judge: Some(("codex".to_string(), "x-model".to_string())),
             ..filters()
         };
-        let judge = discover(&cfg(&[]), &f, &present).unwrap().judge.unwrap();
+        let judge = discover(&cfg(&[]), &f, &present, &[])
+            .unwrap()
+            .judge
+            .unwrap();
         assert_eq!(
             (judge.harness.as_str(), judge.model.as_str()),
             ("codex", "x-model")
@@ -375,6 +531,6 @@ mod tests {
             judge: Some(("codex".to_string(), "m".to_string())),
             ..filters()
         };
-        assert!(discover(&cfg(&[]), &f, &present).is_err());
+        assert!(discover(&cfg(&[]), &f, &present, &[]).is_err());
     }
 }
