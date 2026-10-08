@@ -2,6 +2,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 
 use clap::Parser;
+use commands::benchmark;
 use commands::ctx;
 use commands::setup;
 use commands::workflow;
@@ -104,6 +105,11 @@ fn is_top_level_report(argv: &[String]) -> bool {
 fn is_top_level_update(argv: &[String]) -> bool {
     argv.get(1)
         .is_some_and(|name| name.eq_ignore_ascii_case("update"))
+}
+
+fn is_top_level_benchmark(argv: &[String]) -> bool {
+    argv.get(1)
+        .is_some_and(|name| name.eq_ignore_ascii_case("benchmark"))
 }
 
 /// True when argv[1] names the `context` built-in (issue #45, "Context
@@ -476,6 +482,10 @@ fn main() {
 
     if is_top_level_update(&argv) {
         std::process::exit(update::dispatch(&argv[1..]));
+    }
+
+    if is_top_level_benchmark(&argv) {
+        std::process::exit(benchmark::dispatch(&argv[1..]));
     }
 
     if let Some(verb) = top_level_ctx_alias(&argv) {
@@ -1253,6 +1263,17 @@ mod tests {
             "3.20.0"
         ])));
         assert!(!is_top_level_update(&argv(&["zirv", "updates"])));
+    }
+
+    #[test]
+    fn benchmark_is_intercepted_case_insensitively() {
+        assert!(is_top_level_benchmark(&argv(&[
+            "zirv",
+            "benchmark",
+            "plan"
+        ])));
+        assert!(is_top_level_benchmark(&argv(&["zirv", "BenchMark"])));
+        assert!(!is_top_level_benchmark(&argv(&["zirv", "benchmarks"])));
     }
 
     /// FINDING 2: every reserved command name -- whatever its casing -- is

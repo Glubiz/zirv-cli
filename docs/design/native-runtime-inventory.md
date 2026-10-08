@@ -57,6 +57,10 @@ criterion).
 | `artifact present` | shared |  |
 | `artifact render` | shared |  |
 | `artifact show` | shared |  |
+| `benchmark` | shared |  |
+| `benchmark plan` | shared | read-only; makes no model call |
+| `benchmark report` | shared | re-renders a stored run; makes no model call |
+| `benchmark run` | shared | launches installed harnesses solo through `ctx exec`; owns no model-calling call site of its own |
 | `chat` | N11 (#480) |  |
 | `commands` | shared |  |
 | `context` | N06 (#475) |  |

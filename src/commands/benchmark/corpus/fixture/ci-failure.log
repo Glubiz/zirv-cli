@@ -1,0 +1,16 @@
+Running job: unit-tests
+$ python3 -m unittest discover -s tests -t .
+F.
+======================================================================
+FAIL: test_order_total_rounds_to_cents (tests.test_pricing.PricingTest.test_order_total_rounds_to_cents)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "tests/test_pricing.py", line 11, in test_order_total_rounds_to_cents
+    self.assertEqual(order_total([(0.125, 1)]), 0.13)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0.12 != 0.13
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.000s
+
+FAILED (failures=1)

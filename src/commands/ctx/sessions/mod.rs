@@ -34,7 +34,8 @@ use bookkeeping::{
     workflow_path,
 };
 #[cfg(test)]
-pub use nesting::{ALLOW_NESTED_ENV, SUPERVISION_ENV};
+pub use nesting::ALLOW_NESTED_ENV;
+pub use nesting::SUPERVISION_ENV;
 pub(crate) use nesting::{OwnerLiveness, dashboard_owner_liveness};
 pub use nesting::{nesting_refusal, scrub_supervision_env, scrub_supervision_env_cmd};
 pub(crate) use ops::notify_mail;

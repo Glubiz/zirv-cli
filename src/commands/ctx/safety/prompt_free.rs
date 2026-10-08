@@ -13,6 +13,10 @@ use super::*;
 /// prompt-free; repo-authored scripts are not built-ins and never match.
 pub(super) const PROMPT_FREE_EXCLUSIONS: &[(&str, &str)] = &[
     ("setup", "rewrites harness configuration and can reset it"),
+    (
+        "benchmark run",
+        "spends real model quota on every candidate",
+    ),
     ("ctx exec", "supervises a caller-supplied headless command"),
     ("ctx wrap", "runs a caller-supplied interactive command"),
     ("ctx run", "runs a caller-supplied command"),

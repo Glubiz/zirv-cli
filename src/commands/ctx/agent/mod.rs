@@ -903,7 +903,7 @@ fn flags_with_system_prompt(args: &AgentArgs, adapter: &dyn AgentAdapter) -> Vec
 
 /// Delegation-only model defaults avoid inheriting costly interactive models; operator model and policy pins always win.
 /// Use trailing extras to protect launcher prefixes and a no-prompt sandbox because unattended workers cannot answer approvals.
-fn worker_launch_flags(
+pub(crate) fn worker_launch_flags(
     cfg: &CtxConfig,
     name: &str,
     adapter: &dyn AgentAdapter,

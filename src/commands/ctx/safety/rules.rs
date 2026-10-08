@@ -371,6 +371,10 @@ fn built_in_structural_rule_matches(rule: &Rule, command: &str) -> Option<bool> 
             sql_tokens(&collapse_whitespace(command))
                 .is_some_and(|tokens| is_supervisor_override(&tokens)),
         ),
+        "zirv benchmark run*" => Some(
+            sql_tokens(&collapse_whitespace(command))
+                .is_some_and(|tokens| is_benchmark_run(&tokens)),
+        ),
         "* | sh" | "* | bash" | "* | zsh" | "*| sh" | "*| bash" => {
             // The semantic pipeline analyzer below owns this family so it
             // can require a network-fetching upstream stage.
@@ -733,6 +737,67 @@ mod tests {
                 Verdict::Ask,
                 "{command}: expected Ask, got {:?}",
                 outcome.verdict
+            );
+        }
+    }
+
+    #[test]
+    fn benchmark_run_remains_gated_while_plan_and_report_stay_allowed() {
+        let policy = SafetyPolicy::default();
+        for command in ["zirv benchmark run --yes", "ZIRV BENCHMARK RUN --yes"] {
+            for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
+                let outcome = evaluate(&policy, command, mode);
+                assert_eq!(
+                    outcome.verdict,
+                    Verdict::Ask,
+                    "{command} under {mode:?}: expected Ask, got {:?}",
+                    outcome.verdict
+                );
+            }
+        }
+        for command in ["zirv benchmark plan", "zirv benchmark report"] {
+            let outcome = evaluate(&policy, command, LaunchMode::Headless);
+            assert_eq!(
+                outcome.verdict,
+                Verdict::Allow,
+                "{command}: expected Allow, got {:?}",
+                outcome.verdict
+            );
+        }
+    }
+
+    #[test]
+    fn benchmark_run_asks_even_when_the_configured_default_allows() {
+        let policy = SafetyPolicy {
+            default: Verdict::Allow,
+            interactive_default: Verdict::Allow,
+            ..SafetyPolicy::default()
+        };
+        for command in [
+            "/usr/local/bin/zirv benchmark run --yes",
+            "zirv  benchmark   run --yes",
+            "zirv 'benchmark' run --yes",
+            "bash -c 'zirv benchmark run --yes'",
+            "echo $(zirv benchmark run --yes)",
+            "a && zirv benchmark run --yes",
+            "true; ./zirv benchmark run --yes",
+            "a | zirv benchmark run --yes",
+            "env X=1 zirv benchmark run --yes",
+            "ZIRV.exe benchmark RUN --yes",
+        ] {
+            for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
+                assert_eq!(
+                    evaluate(&policy, command, mode).verdict,
+                    Verdict::Ask,
+                    "{command} under {mode:?}"
+                );
+            }
+        }
+        for command in ["zirv benchmark plan --json", "a && zirv benchmark report"] {
+            assert_eq!(
+                evaluate(&policy, command, LaunchMode::Interactive).verdict,
+                Verdict::Allow,
+                "{command}"
             );
         }
     }

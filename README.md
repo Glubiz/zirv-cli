@@ -164,6 +164,71 @@ zirv tour unstuck
 
 In a pipe or with redirected output (non-TTY), `zirv tour` prints all sections plainly and exits 0, suitable for scripts or documentation.
 
+### Benchmarking agents and models (`zirv benchmark`)
+
+`zirv benchmark` finds which harness and model stack suits this machine. It runs each candidate solo against a small embedded task corpus, then composes a recommended orchestrator and worker from the per-role scores.
+
+```bash
+zirv benchmark plan   [--harness <name>]... [--tier <cheap|standard|deep>]... [--model <harness:model>]... [--task <id>]... [--judge <harness:model>] [--no-judge] [--json]
+zirv benchmark run    [same filters] [--reps <n>] [--max-usd <usd>] [--timeout-secs <s>] --yes [--json]
+zirv benchmark report [<run-id>] [--json]
+```
+
+A bare `zirv benchmark` prints help. Every flag:
+
+- `--harness <name>`: restrict to this harness. Repeatable.
+- `--tier cheap|standard|deep`: restrict tier-derived models. Repeatable. Default: all three.
+- `--model <harness>:<model>`: benchmark exactly these models instead of the tier-derived ones. Repeatable.
+- `--task <id>`: restrict to these corpus tasks. Repeatable.
+- `--judge <harness>:<model>`: override the judge. Default: the present candidate with the highest model strength.
+- `--no-judge`: skip the LLM judge and use deterministic graders only.
+- `--reps <n>` (`run` only): runs per candidate and task. Default: `1`.
+- `--max-usd <usd>` (`run` only): spend cap for agent and judge runs together. Default: `10`.
+- `--timeout-secs <s>` (`run` only): timeout per run. Default: `600`.
+- `--yes` (`run` only): required to spend quota. Without it, `run` prints the plan and exits 2 without starting anything.
+- `--json`: print one JSON document instead of text.
+- `report [<run-id>]`: re-render a stored run. Without an id, the newest run.
+
+#### What `plan` shows
+
+`plan` makes no model call and is read-only. It lists the harnesses with their liveness (live, absent or disabled), the candidates with their tier, the tasks (with any skipped, and why), the judge, the number of agent runs and judge calls, the spend cap, and the date of the price table. It prints no cost estimate.
+
+#### Running
+
+`run` executes one run at a time, never in parallel, and appends a row to `results.jsonl` after each one. It stops launching new runs once measured spend reaches `--max-usd`; runs that never start are recorded as skipped with reason `spend cap`. The report prints at the end.
+
+Costs are API-equivalent: tokens priced with the price table (see [Model discovery and pricing](#model-discovery-and-pricing)). A subscription user sees what the same tokens would cost at API rates, not a bill. Cost is decided per run from its transcript: the segments' token counts times the price table. It is `unknown`, never `$0`, when a segment's transcript carries no token counts (as with goose, grok, kimi, muse and cursor-agent) or its model has no price; one unknown segment makes the run `unknown`. `plan` cannot know this ahead of time, so it only states the rule. Runs with unknown cost are not counted against `--max-usd`. The model a row records is the one the transcript names, so a `default` candidate shows the real model in the report.
+
+#### How quality is scored
+
+- Deterministic graders check the final answer or the workdir: regex matches, required JSON keys, and Python checks run with `python3 -I`. Correctness is passed graders divided by evaluated graders. Python graders are skipped when `python3` is absent.
+- Unless `--no-judge` is set or a task sets `judge = false`, a blind LLM judge scores each run from 0 to 10. Its rubric contains only the task prompt, the final answer and the workdir diff (truncated to 20 KB).
+- The composite score (0 to 1) is the mean of the available components, correctness and judge score / 10.
+- The default judge is the strongest present candidate. A model tends to rate its own output higher, so `plan` and `report` note when the judge is also a candidate.
+
+#### Recommendation
+
+- Orchestrator: the highest orchestrator score. Scores within 0.005 of each other go to the lower median cost, then the lower median wall time.
+- Worker: the lowest median cost among workers scoring within 0.10 of the best worker score. If no cost is known, the fastest. Ties go to the higher score.
+
+The recommendation is composed from per-role solo scores. It does not measure delegation overhead, and it is not validated end to end. The report prints the smallest sample size per cell and warns when it is below 3.
+
+#### Where results go
+
+Results live under the zirv state directory in `benchmark/<run-id>/`:
+
+- `run.json`: run settings, candidates, tasks, judge, spend cap and price-table date.
+- `results.jsonl`: one row per attempted or skipped run. It is append-only, so a crashed run can still be reported.
+- `answers/`: the final answer of each run.
+
+Each run works in a corpus fixture under the system temp directory (`zirv-benchmark/<run-id>/work`). The fixture is rebuilt before every run, and the whole `zirv-benchmark/<run-id>` directory is removed when `run` finishes. The operator's repository is never used.
+
+Child runs disable zirv's supervisor, memory harvest, usage pacing and cross-harness fallback (`ZIRV_CTX_SUPERVISOR_ENABLED=false`, `ZIRV_CTX_MEMORY_HARVEST=false`, `ZIRV_CTX_PACE=false`, `ZIRV_CTX_FALLBACK=false`), so zirv's own model calls and reroutes stay out of the measurement. The supervision identity variables of the calling session are not passed on, so `benchmark` can be started from inside a zirv session.
+
+#### Agents
+
+`run` spends real quota, so a built-in safety rule always makes it ask, in interactive and headless launches alike and whatever `[safety] default` says; the rule matches every spelling the hook parses (case, extra spaces, quoting, compounds, `$(...)`, `env`, `zirv.exe`, path-qualified `zirv`). `plan` and `report` are read-only and stay allowed. The graders run corpus Python with a cleared environment (`HOME` set to the workdir) in their own process group, killed whole on timeout. `report <run-id>` accepts only generated run ids.
+
 ### `ZIRV.md` instruction files
 
 Zirv's own native instruction file. Sources, closest scope first:
@@ -1475,6 +1540,11 @@ protocol and harness: [docs/benchmarks/wrapped-vs-vanilla.md](docs/benchmarks/wr
   tour](#guided-tour).
 - **Self-update** — `update` (`--version <x.y.z>`) installs the latest or a
   specified zirv release. See [Upgrading](#upgrading).
+- **Model benchmark** — `benchmark` (`plan`, `run`, `report`) detects the
+  installed harnesses and models, runs an embedded role-tagged task corpus
+  against each candidate, and measures wall time, API-equivalent USD and
+  quality, then recommends an orchestrator and a worker. See [Benchmarking
+  agents and models](#benchmarking-agents-and-models-zirv-benchmark).
 - **Bug and feature reports** — `report` (`bug`/`feature`) files a Zirv
   issue on GitHub, optionally attaching a redacted `snapshot`.
 - **Workflow artifacts** — `artifact` registers and inspects workflow
@@ -1998,7 +2068,7 @@ marks it as shadowed in the listing.
 <!-- zchk-doc-reserved:start -->
 `help`, `version`, `init`, `create`, `ctx`, `memory`, `context`, `setup`, `report`,
 `chat`, `agent`, `skill`, `workflow`, `test`, `verify`, `artifact`, `frontend`,
-`commands`, `update`, `session`, `tour`, `native`, and their short aliases `h`, `v`, `i`, `c`,
+`commands`, `update`, `session`, `tour`, `native`, `benchmark`, and their short aliases `h`, `v`, `i`, `c`,
 <!-- zchk-doc-reserved:end -->
 are handled as built-in commands before zirv ever
 looks in `.zirv/`. The comparison is case-insensitive (`Chat`/`CHAT` collide

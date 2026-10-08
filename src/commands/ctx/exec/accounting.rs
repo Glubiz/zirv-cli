@@ -60,7 +60,7 @@ fn read_transcript_spend(
 }
 
 /// Saturating sum used across child restarts and budget checks.
-fn add_usage(a: &TranscriptUsage, b: &TranscriptUsage) -> TranscriptUsage {
+pub(crate) fn add_usage(a: &TranscriptUsage, b: &TranscriptUsage) -> TranscriptUsage {
     TranscriptUsage {
         input_tokens: a.input_tokens.saturating_add(b.input_tokens),
         cache_creation_input_tokens: a
