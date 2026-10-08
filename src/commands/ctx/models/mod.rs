@@ -217,10 +217,47 @@ fn load_listing(cfg: &CtxConfig, state: &StateDir, discover: bool) -> (Registry,
     (registry, effective_prices(cfg, state))
 }
 
-/// The rows `zirv ctx models` prints, so other commands list exactly the same models.
-pub(crate) fn listing_rows(cfg: &CtxConfig, state: &StateDir) -> Vec<ModelRow> {
+/// What `zirv ctx models` prints (`rows`), with the runtime registry behind it and the time it was read.
+#[derive(Debug, Default)]
+pub(crate) struct Listing {
+    pub(crate) registry: Registry,
+    pub(crate) rows: Vec<ModelRow>,
+    pub(crate) now: u64,
+}
+
+pub(crate) fn listing(cfg: &CtxConfig, state: &StateDir) -> Listing {
     let (registry, prices) = load_listing(cfg, state, true);
-    list_rows(cfg, &registry, &prices)
+    let rows = list_rows(cfg, &registry, &prices);
+    Listing {
+        registry,
+        rows,
+        now: state::now_secs(),
+    }
+}
+
+/// Models the runtime registry says can run for `vendor` at `now`, ordered by id.
+/// Reads only discovery results: never the catalogue or price tables.
+pub(crate) fn candidates<'a>(
+    registry: &'a Registry,
+    vendor: &str,
+    now: u64,
+) -> Vec<&'a RegistryModel> {
+    let mut models: Vec<&RegistryModel> = registry
+        .models
+        .values()
+        .filter(|m| {
+            m.vendor == vendor
+                && m.available
+                && m.visibility.as_deref().is_none_or(|v| v == "list")
+                && m.retirement_at.is_none_or(|at| at > now)
+                && m.id
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric())
+        })
+        .collect();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models
 }
 
 /// Rows with `availability` of `available` are models this machine has actually seen or been offered.
@@ -429,17 +466,25 @@ fn discover_local(mut registry: Registry, now: u64) -> Registry {
     if let Some(path) = codex_cache_path()
         && let Ok(text) = std::fs::read_to_string(path)
     {
-        for model in registry.models.values_mut() {
-            if model.sources.iter().any(|source| source == "codex-cache") {
-                model.available = false;
-            }
-        }
-        merge_observations(&mut registry, parse_codex_cache(&text, now), now);
+        apply_codex_cache(&mut registry, &text, now);
     }
     if let Some(root) = claude_projects_path() {
-        merge_observations(&mut registry, scan_claude_transcripts(&root, now), now);
+        merge_observations(&mut registry, scan_claude_transcripts(&root));
     }
     registry
+}
+
+fn apply_codex_cache(registry: &mut Registry, text: &str, now: u64) {
+    // An unreadable cache says nothing about availability, so it must not withdraw models.
+    let Some(observed) = parse_codex_cache(text, now) else {
+        return;
+    };
+    for model in registry.models.values_mut() {
+        if model.sources.iter().any(|source| source == "codex-cache") {
+            model.available = false;
+        }
+    }
+    merge_observations(registry, observed);
 }
 
 fn codex_cache_path() -> Option<PathBuf> {
@@ -454,11 +499,9 @@ fn claude_projects_path() -> Option<PathBuf> {
         .map(|home| home.join(".claude/projects"))
 }
 
-fn parse_codex_cache(text: &str, now: u64) -> Vec<RegistryModel> {
-    let Ok(cache) = serde_json::from_str::<CodexCache>(text) else {
-        return Vec::new();
-    };
-    cache
+fn parse_codex_cache(text: &str, now: u64) -> Option<Vec<RegistryModel>> {
+    let cache = serde_json::from_str::<CodexCache>(text).ok()?;
+    let models = cache
         .models
         .into_iter()
         .map(|model| {
@@ -493,10 +536,12 @@ fn parse_codex_cache(text: &str, now: u64) -> Vec<RegistryModel> {
                 ..RegistryModel::default()
             }
         })
-        .collect()
+        .collect();
+    Some(models)
 }
 
-fn parse_claude_transcript(text: &str, now: u64) -> Vec<RegistryModel> {
+/// `seen` is when the transcript was last written, not when it is read.
+fn parse_claude_transcript(text: &str, seen: u64) -> Vec<RegistryModel> {
     let mut ids = BTreeSet::new();
     for line in text.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -520,8 +565,8 @@ fn parse_claude_transcript(text: &str, now: u64) -> Vec<RegistryModel> {
                 version: model_version("anthropic", &id),
                 id,
                 available: true,
-                first_seen: now,
-                last_seen: now,
+                first_seen: seen,
+                last_seen: seen,
                 sources: vec!["claude-transcript".to_string()],
                 ..RegistryModel::default()
             }
@@ -529,14 +574,17 @@ fn parse_claude_transcript(text: &str, now: u64) -> Vec<RegistryModel> {
         .collect()
 }
 
-fn scan_claude_transcripts(root: &Path, now: u64) -> Vec<RegistryModel> {
+fn scan_claude_transcripts(root: &Path) -> Vec<RegistryModel> {
     let mut files = Vec::new();
     collect_jsonl(root, &mut files);
     files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
     let mut observations = Vec::new();
-    for (_, path) in files.into_iter().take(MAX_TRANSCRIPTS) {
+    for (modified, path) in files.into_iter().take(MAX_TRANSCRIPTS) {
         if let Some(text) = read_transcript_tail(&path, MAX_TRANSCRIPT_BYTES) {
-            observations.extend(parse_claude_transcript(&text, now));
+            let seen = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |age| age.as_secs());
+            observations.extend(parse_claude_transcript(&text, seen));
         }
     }
     observations
@@ -582,18 +630,17 @@ fn collect_jsonl(root: &Path, files: &mut Vec<(std::time::SystemTime, PathBuf)>)
     }
 }
 
-fn merge_observations(registry: &mut Registry, observations: Vec<RegistryModel>, now: u64) {
+fn merge_observations(registry: &mut Registry, observations: Vec<RegistryModel>) {
     for mut observed in observations {
         let key = format!("{}:{}", observed.vendor, observed.id);
         if let Some(existing) = registry.models.get_mut(&key) {
-            let first_seen = existing.first_seen;
             for source in &existing.sources {
                 if !observed.sources.contains(source) {
                     observed.sources.push(source.clone());
                 }
             }
-            observed.first_seen = first_seen;
-            observed.last_seen = now;
+            observed.first_seen = existing.first_seen.min(observed.first_seen);
+            observed.last_seen = existing.last_seen.max(observed.last_seen);
             *existing = observed;
         } else {
             registry.models.insert(key, observed);
@@ -1315,7 +1362,8 @@ mod tests {
         let rows = parse_codex_cache(
             include_str!("../../../../tests/fixtures/codex-models-cache.json"),
             10,
-        );
+        )
+        .expect("fixture parses");
         let retiring = rows
             .iter()
             .find(|row| row.id == "gpt-5.5")
@@ -1345,6 +1393,122 @@ mod tests {
         let text = read_transcript_tail(&path, MAX_TRANSCRIPT_BYTES).expect("tail");
         assert_eq!(text.trim(), line);
         assert_eq!(parse_claude_transcript(&text, 1).len(), 1);
+    }
+
+    fn registry_of(models: Vec<RegistryModel>) -> Registry {
+        Registry {
+            updated_at: 0,
+            models: models
+                .into_iter()
+                .map(|m| (format!("{}:{}", m.vendor, m.id), m))
+                .collect(),
+        }
+    }
+
+    fn model(vendor: &str, id: &str) -> RegistryModel {
+        RegistryModel {
+            vendor: vendor.into(),
+            id: id.into(),
+            available: true,
+            ..RegistryModel::default()
+        }
+    }
+
+    fn candidate_ids(registry: &Registry, vendor: &str, now: u64) -> Vec<String> {
+        candidates(registry, vendor, now)
+            .iter()
+            .map(|m| m.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn an_unfamiliar_family_in_the_registry_is_a_candidate() {
+        let registry = registry_of(vec![model("openai", "zeta-9"), model("openai", "alpha-1")]);
+        assert_eq!(
+            candidate_ids(&registry, "openai", 100),
+            ["alpha-1", "zeta-9"]
+        );
+    }
+
+    #[test]
+    fn hidden_retired_unavailable_foreign_and_placeholder_ids_are_not_candidates() {
+        let hidden = RegistryModel {
+            visibility: Some("hide".into()),
+            ..model("openai", "hidden-1")
+        };
+        let retired = RegistryModel {
+            retirement_at: Some(100),
+            ..model("openai", "retired-1")
+        };
+        let retiring_later = RegistryModel {
+            retirement_at: Some(101),
+            ..model("openai", "later-1")
+        };
+        let unavailable = RegistryModel {
+            available: false,
+            ..model("openai", "gone-1")
+        };
+        let registry = registry_of(vec![
+            hidden,
+            retired,
+            retiring_later,
+            unavailable,
+            model("anthropic", "other-1"),
+            model("openai", "<synthetic>"),
+        ]);
+        assert_eq!(candidate_ids(&registry, "openai", 100), ["later-1"]);
+    }
+
+    #[test]
+    fn a_catalogue_only_id_without_a_registry_row_is_not_a_candidate() {
+        let rung = catalogue::vendors()
+            .iter()
+            .flat_map(|v| v.rungs.iter().map(move |r| (v.slug, r.id)))
+            .next()
+            .expect("a catalogue rung");
+        assert!(candidates(&Registry::default(), rung.0, 100).is_empty());
+    }
+
+    #[test]
+    fn a_malformed_codex_cache_keeps_previously_discovered_models_available() {
+        let known = RegistryModel {
+            vendor: "openai".into(),
+            id: "zeta-9".into(),
+            available: true,
+            first_seen: 1,
+            last_seen: 1,
+            sources: vec!["codex-cache".into()],
+            ..RegistryModel::default()
+        };
+        let mut registry = Registry {
+            updated_at: 1,
+            models: BTreeMap::from([("openai:zeta-9".into(), known)]),
+        };
+        apply_codex_cache(&mut registry, "{ not json", 50);
+        let model = &registry.models["openai:zeta-9"];
+        assert!(model.available);
+        assert_eq!(model.last_seen, 1);
+    }
+
+    #[test]
+    fn rereading_an_old_transcript_keeps_its_own_time_as_last_seen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"assistant","message":{"model":"claude-opus-5-5","content":[]}}"#,
+        )
+        .expect("write");
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_modified(old))
+            .expect("set mtime");
+        let mut registry = Registry::default();
+        merge_observations(&mut registry, scan_claude_transcripts(dir.path()));
+        let model = &registry.models["anthropic:claude-opus-5-5"];
+        assert_eq!((model.first_seen, model.last_seen), (1_000, 1_000));
     }
 
     #[test]

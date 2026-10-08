@@ -150,7 +150,7 @@ fn execute(
     let stdout = &mut std::io::stdout();
     match command {
         Command::Plan { filters, json } => {
-            let rows = model_rows(&cfg, env)?;
+            let listing = model_listing(&cfg, env)?;
             let plan = match run::plan(
                 &cfg,
                 &filters,
@@ -158,7 +158,7 @@ fn execute(
                 DEFAULT_MAX_USD,
                 python_present,
                 present,
-                &rows,
+                &listing,
             ) {
                 Ok(plan) => plan,
                 Err(error) => return Ok(usage_error(error)),
@@ -182,7 +182,7 @@ fn execute(
             yes,
             json,
         } => {
-            let rows = model_rows(&cfg, env)?;
+            let listing = model_listing(&cfg, env)?;
             let plan = match run::plan(
                 &cfg,
                 &filters,
@@ -190,7 +190,7 @@ fn execute(
                 max_usd,
                 python_present,
                 present,
-                &rows,
+                &listing,
             ) {
                 Ok(plan) => plan,
                 Err(error) => return Ok(usage_error(error)),
@@ -271,10 +271,10 @@ fn usage_error(error: String) -> i32 {
     2
 }
 
-/// The models `zirv ctx models` lists, so the candidates always agree with it.
-fn model_rows(cfg: &CtxConfig, env: EnvLookup<'_>) -> Result<Vec<models::ModelRow>, String> {
+/// The runtime registry and the `zirv ctx models` rows (for prices and families).
+fn model_listing(cfg: &CtxConfig, env: EnvLookup<'_>) -> Result<models::Listing, String> {
     let state = StateDir::resolve(env).map_err(|e| e.to_string())?;
-    Ok(models::listing_rows(cfg, &state))
+    Ok(models::listing(cfg, &state))
 }
 
 fn benchmark_root(env: EnvLookup<'_>) -> Result<std::path::PathBuf, String> {

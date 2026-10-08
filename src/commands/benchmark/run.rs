@@ -16,7 +16,7 @@ use crate::commands::ctx::agent;
 use crate::commands::ctx::config::{CtxConfig, EnvLookup};
 use crate::commands::ctx::event::{SessionId, SessionRef, TranscriptUsage};
 use crate::commands::ctx::exec::{self, ExecArgs};
-use crate::commands::ctx::models::ModelRow;
+use crate::commands::ctx::models::Listing;
 use crate::commands::ctx::price::{self, PriceTable};
 use crate::commands::ctx::sessions::SUPERVISION_ENV;
 use crate::commands::ctx::state;
@@ -235,7 +235,7 @@ pub fn plan(
     max_usd: f64,
     python_present: bool,
     present: &dyn Fn(&str, &str) -> Liveness,
-    rows: &[ModelRow],
+    listing: &Listing,
 ) -> Result<Plan, String> {
     let corpus = corpus::embedded()?;
     for id in &filters.tasks {
@@ -243,7 +243,7 @@ pub fn plan(
             return Err(format!("unknown task '{id}'"));
         }
     }
-    let discovery = discover::discover(cfg, filters, present, rows)?;
+    let discovery = discover::discover(cfg, filters, present, listing)?;
 
     let mut tasks = Vec::new();
     let mut skipped_tasks = Vec::new();
@@ -1042,10 +1042,20 @@ mod tests {
             no_judge: true,
             ..Filters::default()
         };
-        let with_python = plan(&cfg, &filters, 2, 10.0, true, &present, &[]).unwrap();
+        let with_python =
+            plan(&cfg, &filters, 2, 10.0, true, &present, &Listing::default()).unwrap();
         assert_eq!(with_python.agent_runs, 4);
         assert_eq!(with_python.judge_calls, 0);
-        let without = plan(&cfg, &filters, 2, 10.0, false, &present, &[]).unwrap();
+        let without = plan(
+            &cfg,
+            &filters,
+            2,
+            10.0,
+            false,
+            &present,
+            &Listing::default(),
+        )
+        .unwrap();
         assert_eq!(without.agent_runs, 2);
         assert_eq!(without.skipped_tasks[0].id, "w-bugfix");
         assert!(render_plan(&without).contains("skipped: python3 not found"));
@@ -1060,7 +1070,7 @@ mod tests {
                 1.0,
                 true,
                 &present,
-                &[]
+                &Listing::default()
             )
             .is_err()
         );
@@ -1071,8 +1081,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = CtxConfig::load(tmp.path(), &|_| None).unwrap();
         let present = adapters::only_installed(&["goose"]);
-        let text =
-            render_plan(&plan(&cfg, &Filters::default(), 1, 10.0, true, &present, &[]).unwrap());
+        let text = render_plan(
+            &plan(
+                &cfg,
+                &Filters::default(),
+                1,
+                10.0,
+                true,
+                &present,
+                &Listing::default(),
+            )
+            .unwrap(),
+        );
         assert!(text.contains("source: models discovered on this machine, see `zirv ctx models`"));
         assert!(text.contains("transcript tokens x the price table"));
         assert!(text.contains("runs with unknown cost are not counted against the spend cap"));
@@ -1111,7 +1131,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = CtxConfig::load(tmp.path(), &|_| None).unwrap();
         let present = adapters::only_installed(&["claude"]);
-        let unpriced = plan(&cfg, &Filters::default(), 1, 10.0, true, &present, &[]).unwrap();
+        let unpriced = plan(
+            &cfg,
+            &Filters::default(),
+            1,
+            10.0,
+            true,
+            &present,
+            &Listing::default(),
+        )
+        .unwrap();
         assert!(render_plan(&unpriced).contains(
             "judge: none (no candidate has a known output price; pass --judge <harness:model>)"
         ));
@@ -1122,7 +1151,7 @@ mod tests {
             10.0,
             true,
             &adapters::only_installed(&[]),
-            &[],
+            &Listing::default(),
         )
         .unwrap();
         assert!(nobody.candidates.is_empty() && !nobody.judge_unpriced);
@@ -1130,7 +1159,7 @@ mod tests {
             no_judge: true,
             ..Filters::default()
         };
-        let asked = plan(&cfg, &filters, 1, 10.0, true, &present, &[]).unwrap();
+        let asked = plan(&cfg, &filters, 1, 10.0, true, &present, &Listing::default()).unwrap();
         let text = render_plan(&asked);
         assert!(text.contains("judge: none\n"));
         assert!(!text.contains("known output price"));
