@@ -11,7 +11,7 @@ metadata:
   x-zirv-phases: implement,present
   x-zirv-required-capabilities: repo.read,repo.write,shell.exec
   x-zirv-optional-capabilities: artifact.render
-  x-zirv-context-budget-bytes: "7900"
+  x-zirv-context-budget-bytes: "8192"
 ---
 
 A motion graphics request asks for a finished film, directed like one and
@@ -41,7 +41,8 @@ Between steps 2 and 3 below, once the project folder exists, write
    without one takes the style frame from the product's own evidence (site,
    app, terminal UI) as brand-guide's Establish mode does, writes it to
    `brand/` with identity items marked [proposed], proceeds with those
-   values and reports the proposals for approval; it never waits. Otherwise:
+   values and reports the proposals at the end; it never asks or waits, even
+   when the operator is reachable. Otherwise:
    background, foreground and one accent from the subject's
    world (never pure black or white, not near-black with an acid accent by
    reflex); two families embedded from local woff2 files with `@font-face`,
@@ -89,7 +90,12 @@ and the scaffold loads GSAP from cdn.jsdelivr.net (or vendor it). Run steps
    wide for a GIF-only request). Derive per-frame state (counters, rigs)
    from the timeline, e.g. a tween on a proxy object whose setter applies
    it: the renderer and `snapshot --at` jump to arbitrary times, so timers,
-   `requestAnimationFrame` or previous-frame state are wrong.
+   `requestAnimationFrame` or previous-frame state are wrong. Keep an opaque
+   full-frame floor (brand ground colour) as the bottom layer, outside any
+   camera or transformed container, so no frame has alpha: a partly
+   transparent frame makes the GIF render fail with FFmpeg "Error while
+   filtering: Internal bug" (exit 190). Fix the floor; never retry with other
+   flags.
 4. Gate before any full render: `hyperframes check --json` (lint, runtime,
    layout, motion, contrast). Fix every error; fix warnings that describe a
    real defect (a pivot warning on a deliberately jointed limb does not).
