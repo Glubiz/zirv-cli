@@ -1,0 +1,119 @@
+/* brand/tokens.css -- zirv design tokens. Guide: brand/BRAND.md.
+   Matches the guide's changelog row of 2026-10-08 (all items approved by the operator).
+   Values marked "approved" were approved by the operator on 2026-10-08; all others
+   are read from cli.zirv.io (index-tumLBnu_.css, 2026-10-08). The brand is dark-only. */
+
+/* Fonts: files in brand/assets/fonts/, resolved relative to this file. Latin subset. */
+@font-face { font-family: "Archivo"; src: url("assets/fonts/archivo-latin-600-normal.woff2") format("woff2"); font-weight: 600; font-style: normal; font-display: swap; }
+@font-face { font-family: "Archivo"; src: url("assets/fonts/archivo-latin-700-normal.woff2") format("woff2"); font-weight: 700; font-style: normal; font-display: swap; }
+@font-face { font-family: "Archivo"; src: url("assets/fonts/archivo-latin-800-normal.woff2") format("woff2"); font-weight: 800; font-style: normal; font-display: swap; }
+@font-face { font-family: "IBM Plex Sans"; src: url("assets/fonts/ibm-plex-sans-latin-400-normal.woff2") format("woff2"); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: "IBM Plex Sans"; src: url("assets/fonts/ibm-plex-sans-latin-400-italic.woff2") format("woff2"); font-weight: 400; font-style: italic; font-display: swap; }
+@font-face { font-family: "IBM Plex Sans"; src: url("assets/fonts/ibm-plex-sans-latin-500-normal.woff2") format("woff2"); font-weight: 500; font-style: normal; font-display: swap; }
+@font-face { font-family: "IBM Plex Sans"; src: url("assets/fonts/ibm-plex-sans-latin-600-normal.woff2") format("woff2"); font-weight: 600; font-style: normal; font-display: swap; }
+@font-face { font-family: "JetBrains Mono"; src: url("assets/fonts/jetbrains-mono-latin-400-normal.woff2") format("woff2"); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: "JetBrains Mono"; src: url("assets/fonts/jetbrains-mono-latin-500-normal.woff2") format("woff2"); font-weight: 500; font-style: normal; font-display: swap; }
+@font-face { font-family: "JetBrains Mono"; src: url("assets/fonts/jetbrains-mono-latin-700-normal.woff2") format("woff2"); font-weight: 700; font-style: normal; font-display: swap; }
+
+:root {
+  /* Colour roles. Dark only (settled): the site declares color-scheme: dark and
+     ships no light theme. No light theme exists (BRAND.md section 5). */
+  color-scheme: dark;
+  --color-bg: #080d13;            /* page ground */
+  --color-bg-alt: #0c131b;        /* alternate section band */
+  --color-well: #05090d;          /* terminal and code interior, darker than bg */
+  --color-surface: #101a25;       /* cards, tags, code panels */
+  --color-surface-raised: #16222f;/* raised surface, terminal chrome */
+  --color-line: #1e2e40;          /* hairline borders, decorative (1.4:1) */
+  --color-line-strong: #294059;   /* hover and stronger borders */
+  --color-ink: #dce9f0;           /* primary text, 15.7:1 on bg */
+  --color-ink-soft: #9db4c3;      /* body and secondary text, 9.1:1 */
+  --color-ink-muted: #7c93a3;     /* labels, meta, 6.1:1 */
+  --color-accent: #22d9f5;        /* the cyan: links, eyebrows, emphasis, prompt; 11.4:1 */
+  --color-accent-hot: #11e2ff;    /* gradient start only */
+  --color-accent-blue: #2191dd;   /* gradient end only */
+  --color-accent-navy: #193c66;   /* logo dark facet only */
+  --color-accent-deep: #0c3a48;   /* tinted accent fills: selected tab, badge */
+  --color-accent-ink: #080d13;    /* text on accent or gradient fills, 11.4:1 */
+  --color-focus: #22d9f5;         /* approved: focus ring reuses accent (not in site CSS) */
+  --gradient-accent: linear-gradient(28deg, #11e2ff 0%, #1bb4ee 52%, #2191dd 100%);
+  /* Rot verdicts (settled, from the site's verdict list and terminal mock) */
+  --color-healthy: #5fd08a;       /* 0-39   */
+  --color-advise: #e8b24b;        /* 40-64  */
+  --color-compact: #e8843b;       /* 65-84  */
+  --color-restart: #f2705b;       /* 85+; also error and dead */
+  --color-success: var(--color-healthy);
+  --color-warning: var(--color-advise);
+  --color-danger: var(--color-restart);
+  --color-info: var(--color-accent);
+
+  /* Families */
+  --font-display: "Archivo", "Segoe UI", system-ui, sans-serif;
+  --font-text: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Type scale: the site's own px steps (about 1.2 ratio) */
+  --text-11: 0.6875rem; --text-13: 0.8125rem; --text-body: 1rem; --text-19: 1.1875rem;
+  --text-23: 1.4375rem; --text-28: 1.75rem; --text-33: 2.0625rem; --text-40: 2.5rem;
+  --text-48: 3rem; --text-58: 3.625rem;
+  --text-mono-small: 0.6875rem; --text-mono-label: 0.78125rem; --text-mono: 0.8125rem; --text-mono-lg: 0.9375rem;
+  --leading-body: 1.6;            /* approved: not read from the CSS */
+  --leading-heading: 1.08;        /* approved */
+  --tracking-display: -0.025em;   /* site range -0.015 to -0.035em */
+  --tracking-label: 0.16em;       /* uppercase mono eyebrow; 0.04em for tags */
+  --tracking-tag: 0.04em;
+
+  /* Spacing (site scale; 4px base) */
+  --space-1: 4px;  --space-2: 8px;  --space-3: 12px; --space-4: 16px; --space-5: 20px;
+  --space-6: 24px; --space-8: 32px; --space-10: 40px; --space-12: 48px; --space-14: 56px;
+  --space-16: 64px; --space-20: 80px; --space-24: 96px;
+
+  /* Layout */
+  --width-page: 1140px; --width-measure: 720px; --width-prose: 68ch;
+  --width-label-col: 152px; --width-rail: 216px; --width-sidebar: 272px;
+
+  /* Radii: small and near-square. 4 most used, 8 next; 50% for status dots. */
+  --radius-s: 4px; --radius-m: 8px; --radius-l: 10px; --radius-dot: 50%;
+  --border-width: 1px;
+  /* Elevation: none. Depth is surface steps plus hairlines; the only shadow is the active marker. */
+  --shadow-marker: inset 2px 0 0 var(--color-accent);
+
+  /* Interface motion. The site has no transitions (settled); these durations and
+     eases are approved for new interfaces and match the film eases. */
+  --dur-press: 120ms;   /* approved */
+  --dur-small: 160ms;   /* approved */
+  --dur-medium: 240ms;  /* approved */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);    /* approved; power4.out */
+  --ease-in: cubic-bezier(0.5, 0, 0.75, 0);      /* approved; power3.in */
+  --ease-move: cubic-bezier(0.65, 0, 0.35, 1);   /* approved; power2.inOut */
+  --ease-steps: steps(1);                         /* settled: cursor blink */
+  --dur-blink: 1.15s;                             /* settled: cursor, on for 55% */
+  --dur-shimmer: 1.6s;                            /* settled: loading skeleton, linear */
+
+  /* Film motion (all approved): plain seconds and GSAP ease names. 12 s film at
+     120 bpm-style grid: one beat is 0.5 s. */
+  --film-beat: 0.5;
+  --film-type-char: 0.035;   /* typed terminal text: seconds per character */
+  --film-enter: 0.5;
+  --film-exit: 0.35;
+  --film-travel: 0.8;
+  --film-blink: 1.15;
+  --gsap-enter: power3.out;
+  --gsap-exit: power2.in;
+  --gsap-move: power2.inOut;
+  --gsap-type: none;         /* typing is linear or stepped, never eased */
+  --gsap-verdict: steps(1);  /* verdict colour changes are hard cuts between bands */
+
+  /* Video type at 1080p; a composition sets --frame-scale (frame height / 1080).
+     Approved: Archivo for statements, JetBrains Mono for everything terminal. */
+  --frame-scale: 1;
+  --video-statement: calc(140px * var(--frame-scale));
+  --video-headline: calc(88px * var(--frame-scale));
+  --video-body: calc(36px * var(--frame-scale));
+  --video-terminal: calc(30px * var(--frame-scale));
+  --video-label: calc(22px * var(--frame-scale));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --dur-press: 0ms; --dur-small: 0ms; --dur-medium: 0ms; }
+}
