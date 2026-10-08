@@ -243,6 +243,7 @@ impl From<skill_tools::SkillInstructionPart> for SkillInstructionPart {
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct SkillLoadResourceEntry {
+    skill_id: String,
     path: String,
     kind: String,
     bytes: usize,
@@ -251,6 +252,7 @@ struct SkillLoadResourceEntry {
 impl From<skill_tools::SkillLoadResource> for SkillLoadResourceEntry {
     fn from(resource: skill_tools::SkillLoadResource) -> Self {
         Self {
+            skill_id: resource.skill_id,
             path: resource.path,
             kind: resource.kind,
             bytes: resource.bytes,
@@ -1601,6 +1603,23 @@ mod tests {
         let headless_value = serde_json::to_value(SkillLoadResult::from(headless)).expect("json");
 
         assert_eq!(mcp_result["data"], headless_value);
+    }
+
+    #[test]
+    fn skill_load_tool_lists_dependency_resources_with_their_owning_skill() {
+        let f = Fixture::new();
+        let result = f
+            .scope
+            .call("skill_load", json!({"id":"frontend-implement"}))
+            .expect("skill_load");
+        let resources = result["data"]["resources"].as_array().expect("resources");
+        assert!(
+            resources.iter().any(|resource| {
+                resource["path"] == "references/typography.md"
+                    && resource["skill_id"] == "frontend-craft"
+            }),
+            "{resources:?}"
+        );
     }
 
     #[test]

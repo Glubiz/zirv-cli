@@ -11,7 +11,7 @@ metadata:
   x-zirv-phases: implement,present
   x-zirv-required-capabilities: repo.read,repo.write,shell.exec
   x-zirv-optional-capabilities: artifact.render
-  x-zirv-context-budget-bytes: "6800"
+  x-zirv-context-budget-bytes: "7200"
 ---
 
 A motion graphics request asks for a finished film: directed like one, and
@@ -20,10 +20,10 @@ frame-accurate video -- not a hand-rolled encoder, and not a web page filmed.
 
 ## Direct before you build
 
-Before authoring the composition (step 3 below), write `direction.md` in
-the project folder:
+Between steps 2 and 3 below, once the project folder exists, write
+`direction.md` in it:
 
-1. Read all three references first:
+1. Read all three references first (before or after step 1-2):
    `zirv skill read motion-graphics references/motion-principles.md`, then
    `references/video-composition.md` and
    `references/transitions-and-rhythm.md`. Skipping them is the main cause
@@ -37,8 +37,10 @@ the project folder:
 4. A style frame: background, foreground and one accent (tinted, never
    pure black or white); two families embedded from local woff2 files with
    `@font-face` -- replace the scaffold's Inter; get the files, for example,
-   with `npm pack @fontsource/<family>`; video-scale type (at 1080p
-   headlines 64-120px, body 28-42px, labels 18-24px or more); three layers
+   with `npm pack @fontsource/<family>`; video-scale type as a share of
+   frame height (headlines 6-11%, body 2.6-4%, labels 1.7-2.2% or more; at
+   1080p 64-120px, 28-42px, 18-24px; at 720x405 24-45px, 11-16px, 8px
+   minimum, so keep GIF labels few and large); three layers
    per scene; content anchored to edges, not centred.
 5. A verb for every element (rises, draws, wipes, counts, ejects). An
    element without a verb is not designed yet.

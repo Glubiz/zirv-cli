@@ -897,7 +897,20 @@ mod tests {
     /// uncapped render is measured first so the byte count is reported.
     #[test]
     fn every_frontend_phase_skill_context_fits_the_default_workflow_cap() {
-        let repo = tempdir().unwrap();
+        let greenfield = tempdir().unwrap();
+        // Existing-system branch at the scan's caps: 8 fonts of 96 bytes, 8
+        // colours, and more evidence files than the path cap.
+        let existing = tempdir().unwrap();
+        let mut css = String::new();
+        for index in 0..12 {
+            css.push_str(&format!(
+                "a{index} {{ font-family: '{index:02}{}'; color: #{index:08x}; }}\n",
+                "f".repeat(94)
+            ));
+        }
+        for index in 0..40 {
+            std::fs::write(existing.path().join(format!("s{index}.css")), &css).unwrap();
+        }
         let root = tempdir().unwrap();
         let _vars = crate::commands::ctx::testenv::VarGuard::set(&[
             (
@@ -908,36 +921,44 @@ mod tests {
         ]);
         let default_cap = crate::commands::ctx::config::WorkflowConfig::default().max_context_bytes;
         let mut over = Vec::new();
-        for skill in [
-            "frontend-design",
-            "frontend-plan",
-            "frontend-implement",
-            "frontend-debug",
-            "frontend-test",
-            "frontend-review",
-            "frontend-verify",
-        ] {
-            let mut state = skip_leading_artifact_steps(WorkflowState::start(
-                repo.path().to_path_buf(),
-                "small feature".into(),
-                WorkflowKind::Feature,
-                None,
-                true,
-                low_classification(),
-            ));
-            state.profile = WorkflowProfile::Frontend;
-            let index = state.current_step;
-            state.steps[index].skill = skill.to_string();
-            let uncapped = render_current_context(&state, repo.path(), None)
-                .unwrap()
-                .unwrap();
-            let capped = cap_workflow_context(uncapped.clone(), default_cap);
-            eprintln!(
-                "workflow-context bytes {skill}: {} / {default_cap}",
-                uncapped.len()
-            );
-            if capped.contains("workflow context truncated") {
-                over.push(format!("{skill}={}", uncapped.len()));
+        for (label, repo) in [("greenfield", &greenfield), ("existing", &existing)] {
+            for skill in [
+                "frontend-design",
+                "frontend-plan",
+                "frontend-implement",
+                "frontend-debug",
+                "frontend-test",
+                "frontend-review",
+                "frontend-verify",
+            ] {
+                let mut state = skip_leading_artifact_steps(WorkflowState::start(
+                    repo.path().to_path_buf(),
+                    "small feature".into(),
+                    WorkflowKind::Feature,
+                    None,
+                    true,
+                    low_classification(),
+                ));
+                state.profile = WorkflowProfile::Frontend;
+                let index = state.current_step;
+                state.steps[index].skill = skill.to_string();
+                let uncapped = render_current_context(&state, repo.path(), None)
+                    .unwrap()
+                    .unwrap();
+                let capped = cap_workflow_context(uncapped.clone(), default_cap);
+                if label == "existing" {
+                    assert!(
+                        uncapped.contains("basis: ExistingSystem"),
+                        "the seeded repo must take the observed-evidence branch"
+                    );
+                }
+                eprintln!(
+                    "workflow-context bytes {label} {skill}: {} / {default_cap}",
+                    uncapped.len()
+                );
+                if capped.contains("workflow context truncated") {
+                    over.push(format!("{label} {skill}={}", uncapped.len()));
+                }
             }
         }
         assert!(
