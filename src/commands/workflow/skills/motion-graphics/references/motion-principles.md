@@ -58,7 +58,8 @@ At 30 fps, 0.1 s is 3 frames.
 - Slow 0.5-0.8 s: hero type, large shapes, transitions.
 - Very slow 0.8-2 s: camera pushes, ambient drift, line drawings.
 
-Entrances last 0.8 s at most; exits take about 75% of their entrance. Do
+Element entrances last 0.8 s at most (line and path draws, camera moves and
+ambient drift are exempt and follow the table above); exits take about 75% of their entrance. Do
 not default to 0.4-0.5 s for everything: rhythm comes from contrast, and
 the slowest scene should run about 3x the fastest.
 
