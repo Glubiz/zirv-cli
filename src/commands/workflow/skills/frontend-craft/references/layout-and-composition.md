@@ -83,7 +83,10 @@ what data? Put that data first and make the decision one step.
 
 - Density: rows 36-40px by default (32 compact, 44-48 touch); text
   13-14px; cell padding 8-12px horizontal; row dividers at low contrast or
-  zebra striping at L +0.015.
+  zebra striping at L +0.015. Dense rows never shrink targets: interactive
+  controls inside rows keep a 44px hit area on coarse pointers (padding or
+  a pseudo-element extending the hit area) and at least 24x24px on fine
+  pointers (WCAG 2.5.8).
 - Alignment: text left, numbers right with tabular numerals, one date
   format; headers aligned like their data; sticky header; the identifying
   column first and pinned on narrow screens.

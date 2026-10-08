@@ -15,18 +15,23 @@ larger, borders 2x thicker, padding 3x larger, one idea per frame.
 - For 9:16 social placements keep key content out of the top 12% and the
   bottom 20%, where platform UI sits.
 - `render` cannot scale down, so the canvas size is the output size. If a GIF
-  will be viewed small, design every label at 24px or more on a 1920 canvas
-  and check a snapshot at the size it will be seen.
+  will be viewed small, design every label at 2.2% of frame height or more
+  (24px at 1080p; 9px on a 720x405 canvas) and check a snapshot at the size
+  it will be seen.
 
 ## Type at video scale (1080p)
 
-| Role | Size |
-| --- | --- |
-| Statement (1-4 words) | 120-200px, 60-80% of frame width |
-| Headline | 64-120px |
-| Hero numeral | 180-320px |
-| Body, callouts | 28-42px |
-| Labels | 18-24px minimum, 24px or more if the GIF is viewed small |
+Sizes are a share of frame height, with 1080p pixels as the worked example
+and the same shares scaled to a 720x405 GIF canvas (multiply by 0.375).
+Scale margins and borders the same way.
+
+| Role | Share of height | 1080p | 720x405 |
+| --- | --- | --- | --- |
+| Statement (1-4 words) | 11-18%, 60-80% of frame width | 120-200px | 45-75px |
+| Headline | 6-11% | 64-120px | 24-45px |
+| Hero numeral | 17-30% | 180-320px | 68-120px |
+| Body, callouts | 2.6-4% | 28-42px | 11-16px |
+| Labels | 1.7-2.2% minimum, 2.2% or more if viewed small | 18-24px | 7-9px |
 
 - At most 6-8 words per line and one statement per beat.
 - Weights: headlines 700-900, or 200-300 at statement size for contrast;
