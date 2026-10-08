@@ -4,6 +4,7 @@
 adr-authoring	-	We picked Postgres over DynamoDB for the ledger last week; write up the architecture decision so the reasoning is not lost.
 alert-rule-diagnosis	-	The checkout latency rule stayed quiet through the whole slowdown last night. Work out why we had a silent alert.
 architecture-discovery	-	I just inherited the billing platform and it is an unfamiliar codebase to me; work out the real service boundaries before we change anything.
+brand-guide	-	We have no brand guide yet; build one from our live website and the app's CSS so every new page and video uses the same brand tokens.
 cicd-diagnosis	-	CI is red on main since this morning and the failing job passes when I re-run it. Figure out what is going on.
 dashboard-review	-	Review this dashboard the payments team uses during incidents and tell me which panels are worth keeping.
 data-analysis	-	Run the numbers on trial signups: what is the rate of conversion to paid by signup week?

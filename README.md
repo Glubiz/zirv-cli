@@ -62,6 +62,7 @@
   - [Frontend quality](#frontend-quality)
   - [The skill library](#the-skill-library)
   - [The motion-graphics skill](#the-motion-graphics-skill)
+  - [Brand guide](#brand-guide)
 - [Context Management (zirv ctx)](#context-management-zirv-ctx)
   - [MCP bridge](#mcp-bridge)
   - [Cross-harness fallback and handover](#cross-harness-fallback-and-handover)
@@ -2961,7 +2962,7 @@ shell -- records one `SkillActivated` event: `skill_id`, `skill_version`,
 `skill_content_hash`, `skill_source`, and `skill_surface` (`native-tool`,
 `mcp`, or `cli`). A refusal records nothing.
 
-**Catalogue.** 29 professional-domain skills ship as portable bundles under
+**Catalogue.** 30 professional-domain skills ship as portable bundles under
 `src/commands/workflow/skills/`, parsed through the identical loader a
 custom bundle uses, alongside the original 24 flat, in-binary built-ins
 (`brainstorm`, `write-plan`, `review`, the `frontend-*` family, and so on)
@@ -2978,6 +2979,7 @@ this README's earlier paragraphs already describe.
 | Observability | `saved-object-change-management` | kibana | yes |
 | Docs | `technical-documentation` | none | no |
 | Code quality | `dependency-risk-review`, `simplify` | none | no |
+| Design | `brand-guide` | none | no |
 | Media | `motion-graphics` | none | no |
 | Experimentation | `fuck-around-and-find-out` | none | no |
 
@@ -3107,6 +3109,36 @@ which is non-commercial and therefore not a default.
 wrapped host runs through its own shell tool is not metered. Its outputs
 register with `zirv artifact render` as `video` (`mp4`/`webm`/`mov`) or
 `image` (`gif`) artifacts, the same artifact pipeline any other skill uses.
+
+### Brand guide
+
+A brand's decisions live in the repository that uses them, under `brand/`:
+
+| Path | Holds |
+| --- | --- |
+| `brand/BRAND.md` | The guide: identity, audience, voice and vocabulary, logo rules, colour and type roles, layout, imagery, icons, interface and film motion, accessibility commitments, don'ts, open proposals, and a changelog. |
+| `brand/tokens.css` | CSS custom properties -- colour roles (OKLCH, light and dark), fonts, type scale, spacing, radii, elevation, motion durations and eases with their GSAP names, and video type sizes. Web pages link or import it; a motion project copies it into its own folder before rendering. |
+| `brand/assets/` | Logo SVGs, self-hosted woff2 fonts, imagery. |
+
+When the brand is owned by another repository, `brand/BRAND.md` is a short
+pointer stub naming the source (a path, or a git URL and ref); agents read
+the guide there. There is no config key: the folder is the convention.
+
+The built-in `brand-guide` skill works with that folder in four modes:
+**establish** a guide from evidence only (a live site fetched with ordinary
+network tools, the app's CSS and tokens, logos, README and interface copy,
+terminal interfaces, earlier films), marking anything the evidence cannot
+settle as proposed and holding logo, primary colours, type families and
+voice for operator approval; **use** it before UI or motion work, where it
+outranks the frontend profile and the craft and motion references, which
+only fill its gaps; **update** it with a changelog entry (date, change,
+reason, source) whenever work makes a durable decision, never silently
+changing an existing token; and **revise** it on request by auditing real
+usage for drift and proposing one diff. `frontend-craft` and
+`motion-graphics` both defer to it, and the frontend profile's direction
+names `brand/BRAND.md` whenever the file exists (an edit to the guide
+refreshes the cached profile). Templates and the discovery checklist:
+`zirv skill read brand-guide references/<file>`.
 
 ## Context Management (zirv ctx)
 

@@ -71,7 +71,12 @@ struct RepositoryEvidence {
     has_shadow: bool,
     has_motion: bool,
     truncated: bool,
+    brand_guide: bool,
 }
+
+/// The repo-owned brand guide (or a stub pointing at the repository that
+/// owns it); see the built-in `brand-guide` skill.
+const BRAND_GUIDE_PATH: &str = "brand/BRAND.md";
 
 #[derive(Debug, Args)]
 pub struct FrontendArgs {
@@ -266,7 +271,9 @@ fn synthesize_profile(repo: PathBuf, evidence: RepositoryEvidence) -> FrontendPr
         } else {
             ProfileBasis::AutonomousBaseline
         },
-        direction: if existing {
+        direction: if evidence.brand_guide {
+            "Follow the brand guide at brand/BRAND.md and brand/tokens.css; it outranks scanned evidence and these defaults; record new durable decisions in its changelog."
+        } else if existing {
             "Extend the repository's strongest established visual language; remove local inconsistency instead of introducing a competing system."
         } else {
             "Ground the design in the subject's world: lead with its most characteristic artefact, shown with real product truth, not a template."
@@ -388,6 +395,14 @@ fn scan_repository(repo: &Path) -> CtxResult<RepositoryEvidence> {
         }
     }
     hash.write(if truncated { b"truncated" } else { b"complete" });
+    // Markdown is not scanned as evidence, so the guide is hashed on its own:
+    // adding or editing it must invalidate a cached profile.
+    let guide = repo.join(BRAND_GUIDE_PATH);
+    let brand_guide = std::fs::symlink_metadata(&guide).is_ok_and(|metadata| metadata.is_file());
+    if brand_guide {
+        hash.write(BRAND_GUIDE_PATH.as_bytes());
+        hash.write(&read_bounded(&guide, MAX_FILE_BYTES as usize)?);
+    }
 
     Ok(RepositoryEvidence {
         fingerprint: hash.finish(),
@@ -398,6 +413,7 @@ fn scan_repository(repo: &Path) -> CtxResult<RepositoryEvidence> {
         has_shadow,
         has_motion,
         truncated,
+        brand_guide,
     })
 }
 
@@ -641,6 +657,34 @@ mod tests {
 
         assert_ne!(first.source_fingerprint, second.source_fingerprint);
         assert!(second.observed_colors.contains(&"#eeeeee".to_string()));
+    }
+
+    /// A brand guide is markdown, which the evidence scan never reads, so
+    /// adding or editing `brand/BRAND.md` must still refresh a cached
+    /// profile and the direction must point at the guide.
+    #[test]
+    fn brand_guide_is_named_in_the_direction_and_its_edits_refresh_the_profile() {
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::write(repo.path().join("app.css"), "body { color: #111111; }").expect("css");
+        let root = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(root.path().to_path_buf());
+        let before = ensure_profile(&state, repo.path()).expect("profile");
+        assert!(!before.direction.contains("brand/BRAND.md"));
+
+        let brand = repo.path().join("brand");
+        std::fs::create_dir_all(&brand).expect("brand dir");
+        std::fs::write(brand.join("BRAND.md"), "# Brand\nPrimary: moss green.\n").expect("guide");
+        let added = ensure_profile(&state, repo.path()).expect("profile with guide");
+        assert_ne!(before.source_fingerprint, added.source_fingerprint);
+        assert!(
+            added.direction.contains("brand/BRAND.md") && added.direction.contains("tokens.css"),
+            "{}",
+            added.direction
+        );
+
+        std::fs::write(brand.join("BRAND.md"), "# Brand\nPrimary: kiln red.\n").expect("edit");
+        let edited = ensure_profile(&state, repo.path()).expect("profile after edit");
+        assert_ne!(added.source_fingerprint, edited.source_fingerprint);
     }
 
     #[test]
