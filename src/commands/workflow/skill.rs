@@ -1622,6 +1622,10 @@ const CATALOGUE: &[(&str, &str)] = &[
         include_str!("skills/architecture-discovery/SKILL.md"),
     ),
     (
+        "src/commands/workflow/skills/brand-guide/SKILL.md",
+        include_str!("skills/brand-guide/SKILL.md"),
+    ),
+    (
         "src/commands/workflow/skills/cicd-diagnosis/SKILL.md",
         include_str!("skills/cicd-diagnosis/SKILL.md"),
     ),
@@ -1842,7 +1846,7 @@ pub fn builtin_manifests() -> CtxResult<Vec<SkillManifest>> {
                 Phase::Present,
             ],
             &[],
-            r#"Scale this to the change: a trivial fix only needs to match existing patterns and verify the states it touches; the rest is for new or reworked UI. An established design system is authority: refine it, don't compete. Decide routine design calls yourself instead of asking.
+            r#"Scale this to the change: a trivial fix only needs to match existing patterns and verify the states it touches; the rest is for new or reworked UI. A brand guide (brand/BRAND.md, brand/tokens.css) outranks everything below; use and update it with the brand-guide skill. An established design system is authority: refine it, don't compete. Decide routine design calls yourself instead of asking.
 
 Reject interchangeable AI UI. Models drift to one safe average: Inter or system type, a pale tint everywhere, hero plus three cards, a headline word in colour, tracked caps labels, everything centred and still. The cure is a subject, not a ban list.
 
@@ -2091,6 +2095,23 @@ Read with `zirv skill read frontend-craft references/<file>`: typography.md and 
 /// Compiled-in reference files per built-in skill id: (bundle-relative path,
 /// body). Works for Rust `manifest(...)` built-ins and CATALOGUE bundles alike.
 const EMBEDDED_RESOURCES: &[(&str, &[(&str, &str)])] = &[
+    (
+        "brand-guide",
+        &[
+            (
+                "references/brand-template.md",
+                include_str!("skills/brand-guide/references/brand-template.md"),
+            ),
+            (
+                "references/discovery.md",
+                include_str!("skills/brand-guide/references/discovery.md"),
+            ),
+            (
+                "references/tokens-css.md",
+                include_str!("skills/brand-guide/references/tokens-css.md"),
+            ),
+        ],
+    ),
     (
         "frontend-craft",
         &[
@@ -2568,7 +2589,7 @@ mod tests {
     /// original 24 never did, so this is no longer "no built-in should
     /// require an integration yet" -- see the discipline test below for the
     /// real invariant (external writes always name an integration).
-    const CATALOGUE_LEN: usize = 29;
+    const CATALOGUE_LEN: usize = 30;
     const BUILTIN_LEN: usize = 24 + CATALOGUE_LEN;
 
     #[test]
