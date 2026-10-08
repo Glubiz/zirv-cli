@@ -78,7 +78,43 @@ pub enum Confidence {
     Low,
 }
 
+fn model_tier_for(execution: ExecutionMode) -> ModelTier {
+    match execution {
+        ExecutionMode::Direct => ModelTier::Fast,
+        ExecutionMode::Bounded => ModelTier::Standard,
+        ExecutionMode::Orchestrated => ModelTier::Deep,
+    }
+}
+
+/// Read shape of [`ExecutionProfile`]: a record without `model_tier` gets the tier derived from its `execution`.
+#[derive(Deserialize)]
+struct ExecutionProfileWire {
+    classification: Classification,
+    execution: ExecutionMode,
+    #[serde(default)]
+    model_tier: Option<ModelTier>,
+    validation: ValidationProfile,
+    domains: Vec<WorkDomainTag>,
+    confidence: Confidence,
+    reasons: Vec<String>,
+}
+
+impl From<ExecutionProfileWire> for ExecutionProfile {
+    fn from(w: ExecutionProfileWire) -> Self {
+        Self {
+            model_tier: w.model_tier.unwrap_or_else(|| model_tier_for(w.execution)),
+            classification: w.classification,
+            execution: w.execution,
+            validation: w.validation,
+            domains: w.domains,
+            confidence: w.confidence,
+            reasons: w.reasons,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "ExecutionProfileWire")]
 pub struct ExecutionProfile {
     pub classification: Classification,
     pub execution: ExecutionMode,
@@ -168,11 +204,7 @@ impl ExecutionProfile {
             classification.complexity
         ));
 
-        let model_tier = match execution {
-            ExecutionMode::Direct => ModelTier::Fast,
-            ExecutionMode::Bounded => ModelTier::Standard,
-            ExecutionMode::Orchestrated => ModelTier::Deep,
-        };
+        let model_tier = model_tier_for(execution);
 
         let mut domains = BTreeSet::new();
         if classification.work_domain.domain == WorkDomain::Frontend {
@@ -592,6 +624,21 @@ mod tests {
             },
         )
         .expect("classification")
+    }
+
+    #[test]
+    fn a_stored_profile_without_model_tier_loads_with_the_derived_tier() {
+        for (paths, lines) in [
+            (vec!["src/util.rs"], 5),
+            (vec!["src/a.rs", "src/b.rs"], 400),
+        ] {
+            let profile =
+                ExecutionProfile::derive("implement feature", &classification(&paths, lines));
+            let mut value = serde_json::to_value(&profile).expect("serialize");
+            value.as_object_mut().expect("object").remove("model_tier");
+            let loaded: ExecutionProfile = serde_json::from_value(value).expect("loads");
+            assert_eq!(loaded, profile);
+        }
     }
 
     #[test]

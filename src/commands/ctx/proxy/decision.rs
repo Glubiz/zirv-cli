@@ -179,6 +179,7 @@ impl SeatTier {
 /// a `zirv chat` launch. Every field traces to a reason; `fallbacks` names
 /// every decider that was tried and skipped before `decider` won.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "ProxyDecisionWire")]
 pub struct ProxyDecision {
     pub request_sha256: String,
     pub repo: PathBuf,
@@ -218,6 +219,77 @@ pub struct ProxyDecision {
     /// Records unattended launch mode for clarification text and serialized decisions; absent values default to interactive. (#537)
     #[serde(default)]
     pub headless: bool,
+}
+
+/// Read shape of [`ProxyDecision`]: a record persisted without `seat_tier`/`worker_tier`
+/// gets the values `finalize_derived_fields` would derive from its own fields.
+#[derive(Deserialize)]
+struct ProxyDecisionWire {
+    request_sha256: String,
+    repo: PathBuf,
+    intent: Intent,
+    complexity: Complexity,
+    risk: RiskBand,
+    execution: ExecutionMode,
+    seat_role: SeatRole,
+    validation: ValidationProfile,
+    workflow: Option<String>,
+    orchestrator: Seat,
+    #[serde(default)]
+    seat_tier: Option<SeatTier>,
+    #[serde(default)]
+    worker_tier: Option<Tier>,
+    needs_clarification: f32,
+    #[serde(default)]
+    needs_clarification_decisive: bool,
+    #[serde(default)]
+    clarification_category: Option<String>,
+    #[serde(default)]
+    domains: Vec<String>,
+    decider: Decider,
+    confidence: BTreeMap<String, f32>,
+    reasons: Vec<String>,
+    fallbacks: Vec<String>,
+    elapsed_ms: u64,
+    usage: Option<Usage>,
+    created_at: u64,
+    #[serde(default)]
+    headless: bool,
+}
+
+impl From<ProxyDecisionWire> for ProxyDecision {
+    fn from(w: ProxyDecisionWire) -> Self {
+        Self {
+            seat_tier: w.seat_tier.unwrap_or_else(|| {
+                SeatTier::from_execution_complexity_risk(w.execution, w.complexity, w.risk)
+            }),
+            worker_tier: w
+                .worker_tier
+                .unwrap_or_else(|| worker_tier_from_execution(w.execution)),
+            request_sha256: w.request_sha256,
+            repo: w.repo,
+            intent: w.intent,
+            complexity: w.complexity,
+            risk: w.risk,
+            execution: w.execution,
+            seat_role: w.seat_role,
+            validation: w.validation,
+            workflow: w.workflow,
+            orchestrator: w.orchestrator,
+            needs_clarification: w.needs_clarification,
+            needs_clarification_decisive: w.needs_clarification_decisive,
+            clarification_category: w.clarification_category,
+            domains: w.domains,
+            decider: w.decider,
+            confidence: w.confidence,
+            reasons: w.reasons,
+            fallbacks: w.fallbacks,
+            elapsed_ms: w.elapsed_ms,
+            usage: w.usage,
+            created_at: w.created_at,
+            headless: w.headless,
+        }
+    }
 }
 
 // Shared Jev question and answer shapes are re-exported above. (#537)
@@ -1985,6 +2057,36 @@ mod tests {
             usage: None,
             created_at: 0,
             headless: false,
+        }
+    }
+
+    #[test]
+    fn a_stored_decision_without_tiers_loads_with_the_derived_tiers() {
+        let cfg = CtxConfig::default();
+        for (complexity, risk) in [
+            (Complexity::Trivial, RiskBand::Low),
+            (Complexity::Bounded, RiskBand::Low),
+            (Complexity::Substantial, RiskBand::Low),
+            (Complexity::Architectural, RiskBand::Low),
+            (Complexity::Substantial, RiskBand::High),
+        ] {
+            let mut decision = sample_decision();
+            decision.complexity = complexity;
+            decision.risk = risk;
+            finalize_derived_fields(&mut decision, &cfg);
+            let mut value = serde_json::to_value(&decision).expect("serialize");
+            let object = value.as_object_mut().expect("object");
+            object.remove("seat_tier");
+            object.remove("worker_tier");
+            let loaded: ProxyDecision = serde_json::from_value(value).expect("loads");
+            assert_eq!(
+                loaded.seat_tier, decision.seat_tier,
+                "{complexity:?}/{risk:?}"
+            );
+            assert_eq!(
+                loaded.worker_tier, decision.worker_tier,
+                "{complexity:?}/{risk:?}"
+            );
         }
     }
 
