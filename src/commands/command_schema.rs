@@ -220,6 +220,8 @@ const READ_ONLY: &[&str] = &[
     "zirv frontend check",
     "zirv frontend capabilities",
     "zirv frontend benchmark",
+    "zirv benchmark plan",
+    "zirv benchmark report",
     "zirv setup status",
     "zirv skill list",
     "zirv skill show",
@@ -389,6 +391,9 @@ const MUTATING: &[&str] = &[
     "zirv workflow research run",
     // Issue #802: writes report.json/report.md into the campaign directory.
     "zirv workflow research report",
+    // Spends real model quota: dispatches every candidate through the exec
+    // path and writes `<state>/benchmark/<run-id>/` (run.json, results.jsonl).
+    "zirv benchmark run",
 ];
 
 fn classify(path: &str) -> Option<bool> {
@@ -539,7 +544,7 @@ pub fn command_entries() -> CtxResult<Vec<CommandEntry>> {
     let mut entries = Vec::new();
     let mut unclassified = Vec::new();
 
-    let roots: [Command; 8] = [
+    let roots: [Command; 9] = [
         super::ctx::CtxCli::command(),
         super::ctx::memory_cli::MemoryCli::command(),
         super::ctx::context_cli::ContextCli::command(),
@@ -548,6 +553,7 @@ pub fn command_entries() -> CtxResult<Vec<CommandEntry>> {
         super::setup::SetupCli::command(),
         super::update::UpdateCli::command(),
         super::ctx::session::SessionCli::command(),
+        super::benchmark::BenchmarkCli::command(),
     ];
     for root in &roots {
         let prefix = root.get_name().to_string();

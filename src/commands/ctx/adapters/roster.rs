@@ -40,6 +40,16 @@ pub(crate) fn adapter_liveness(
     name: &str,
     cache: Option<&mut ProbeCache>,
 ) -> Result<(Box<dyn AgentAdapter>, Liveness), String> {
+    adapter_liveness_with(cfg, name, cache, &liveness_probe)
+}
+
+/// [`adapter_liveness`] with an injected presence oracle, so a caller can state the machine it reasons about.
+pub(crate) fn adapter_liveness_with(
+    cfg: &CtxConfig,
+    name: &str,
+    cache: Option<&mut ProbeCache>,
+    present: &dyn Fn(&str, &str) -> Liveness,
+) -> Result<(Box<dyn AgentAdapter>, Liveness), String> {
     let bin = cfg.agent_bin.as_deref();
     let Some((_, ctor)) = ADAPTERS.iter().find(|(n, _)| *n == name) else {
         return Err(format!("no adapter registered for '{name}'"));
@@ -55,9 +65,9 @@ pub(crate) fn adapter_liveness(
     let verdict = match cache {
         Some(cache) => {
             let key = ProbeCache::key(name, &program, resolved_bin);
-            cache.get_or_probe(&key, || liveness_probe(name, &program))
+            cache.get_or_probe(&key, || present(name, &program))
         }
-        None => liveness_probe(name, &program),
+        None => present(name, &program),
     };
     Ok((adapter, verdict))
 }

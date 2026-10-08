@@ -253,6 +253,13 @@ fn write_builtins<W: Write>(
                 desc: &["Install the latest or a specified zirv release"],
             },
             Row {
+                name: "benchmark plan|run|report",
+                desc: &[
+                    "Measure which harness and model stack is best here (run spends quota;",
+                    "needs --yes)",
+                ],
+            },
+            Row {
                 name: "skill [--json]",
                 desc: &[
                     "Print the bundled operator orientation skill for this binary (also `zirv",
@@ -507,6 +514,7 @@ mod tests {
             "init",
             "report",
             "update",
+            "benchmark",
             "ctx",
             "--dry-run",
             "--name",

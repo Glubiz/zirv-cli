@@ -4900,7 +4900,7 @@ mod tests {
             .as_array()
             .expect("reserved built-in permission rules");
         for name in crate::utils::RESERVED_COMMANDS {
-            if matches!(*name, "ctx" | "setup") {
+            if matches!(*name, "ctx" | "setup" | "benchmark") {
                 continue;
             }
             let expected = serde_json::json!(format!("Bash(zirv {name} *)"));
@@ -4945,7 +4945,10 @@ mod tests {
                 .as_array()
                 .expect("reserved built-in sandbox exclusions");
             for name in crate::utils::RESERVED_COMMANDS {
-                if matches!(*name, "ctx" | "setup" | "test" | "verify" | "frontend") {
+                if matches!(
+                    *name,
+                    "ctx" | "setup" | "benchmark" | "test" | "verify" | "frontend"
+                ) {
                     continue;
                 }
                 let expected = serde_json::json!(format!("zirv {name} *"));
@@ -5821,7 +5824,7 @@ mod tests {
             .find(|a| a.starts_with("--allowedTools="))
             .expect("an --allowedTools= token");
         for name in crate::utils::RESERVED_COMMANDS {
-            if matches!(*name, "ctx" | "setup") {
+            if matches!(*name, "ctx" | "setup" | "benchmark") {
                 continue;
             }
             let rule = format!("Bash(zirv {name} *)");
@@ -5838,6 +5841,9 @@ mod tests {
         assert!(!allow_arg.contains("Bash(zirv ctx wrap *)"));
         assert!(!allow_arg.contains("Bash(zirv ctx usage *)"));
         assert!(!allow_arg.contains("Bash(zirv setup *)"));
+        assert!(!allow_arg.contains("Bash(zirv benchmark *)"));
+        assert!(allow_arg.contains("Bash(zirv benchmark plan *)"));
+        assert!(allow_arg.contains("Bash(zirv benchmark report *)"));
         assert!(allow_arg.contains("Bash(zirv test *)"));
         assert!(allow_arg.contains("Bash(zirv verify *)"));
         assert!(allow_arg.contains("Bash(zirv frontend *)"));

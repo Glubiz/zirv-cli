@@ -1,0 +1,17 @@
+--- a/tinyshop/inventory.py
++++ b/tinyshop/inventory.py
+@@ -11,12 +11,12 @@
+ 
+     def restock(self, sku, quantity):
+         if quantity <= 0:
+-            raise ValueError("restock quantity must be positive")
++            raise ValueError(f"{sku}: restock quantity must be positive")
+         self.levels[sku] = self.levels.get(sku, 0) + quantity
+ 
+     def reserve(self, sku, quantity):
+         available = self.levels.get(sku, 0)
+-        if quantity > available:
++        if quantity >= available:
+             raise InsufficientStock(f"{sku}: wanted {quantity}, have {available}")
+         self.levels[sku] = available - quantity
+ 

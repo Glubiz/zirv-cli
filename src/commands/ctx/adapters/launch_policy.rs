@@ -460,6 +460,10 @@ pub const SHIPPED_POSTURE_ASK: &[(&str, &str)] = &[
         "Bash(zirv ctx supervisor override*)",
         "lifts a binding supervisor ruling; operator-only",
     ),
+    (
+        "Bash(zirv benchmark run*)",
+        "spends real model quota on every candidate harness",
+    ),
     ("Bash(rm -rf *)", "recursive force-delete"),
     (
         "Bash(rm -fr *)",

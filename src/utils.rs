@@ -24,14 +24,37 @@ pub const COMMANDS_DIR_NAME: &str = "commands";
 /// built-ins in `main.rs` before any script lookup happens. A script or
 /// shortcut sharing one of these names can never be reached.
 pub const RESERVED_COMMANDS: &[&str] = &[
-    "help", "h", "version", "v", "init", "i", "create", "c", "ctx", "chat", "agent", "memory",
-    "context", "setup", "report", "skill", "workflow", "test", "verify", "artifact", "frontend",
-    "commands", "update", "session", "tour",
+    "help",
+    "h",
+    "version",
+    "v",
+    "init",
+    "i",
+    "create",
+    "c",
+    "ctx",
+    "chat",
+    "agent",
+    "memory",
+    "context",
+    "setup",
+    "report",
+    "skill",
+    "workflow",
+    "test",
+    "verify",
+    "artifact",
+    "frontend",
+    "commands",
+    "update",
+    "session",
+    "tour",
     // Issue #540: `native` is a thin top-level alias for `zirv chat --runtime
     // native` (see `main.rs`'s `is_top_level_native_alias`/`rewrite_native_
     // alias_args`), reserved case-insensitively like every other built-in so
     // a `.zirv/native.yaml` script or shortcut can never shadow it.
     "native",
+    "benchmark",
 ];
 
 /// Compared case-insensitively, the same way `is_reserved_zirv_file` compares
@@ -576,6 +599,7 @@ mod tests {
         assert!(is_reserved_command("setup"));
         assert!(is_reserved_command("update"));
         assert!(is_reserved_command("tour"));
+        assert!(is_reserved_command("benchmark"));
         assert!(!is_reserved_command("build"));
     }
 

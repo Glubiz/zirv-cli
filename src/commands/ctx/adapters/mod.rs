@@ -64,10 +64,10 @@ pub use probe::{
 };
 #[cfg(test)]
 pub(crate) use roster::READINESS_NOTE_CALLS;
-pub(crate) use roster::adapter_liveness;
 #[cfg(test)]
 pub use roster::harness_prompt_lines;
 pub use roster::{HarnessRosterReport, harness_prompt_lines_cached, readiness_note};
+pub(crate) use roster::{adapter_liveness, adapter_liveness_with};
 
 /// `Debug` is a supertrait so `Box<dyn AgentAdapter>` can appear in
 /// `Result::expect_err` (the registry tests assert on the unknown-adapter
