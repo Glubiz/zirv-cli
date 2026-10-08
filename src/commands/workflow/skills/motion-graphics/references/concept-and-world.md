@@ -45,6 +45,9 @@ screen as proof. Write the choice and the reason in `direction.md`.
 Design one stage larger than the frame that holds every scene as a region,
 and move a camera through it. Scenes do not appear from black: they are
 already there, and the edge of the next region is visible while you travel.
+The camera model (shared with transitions-and-rhythm.md): `#camera` only
+scales, for pushes and pulls; `travel()` moves the three depth layers
+inside it, with parallax built in.
 
 ```html
 <div id="root" data-composition-id="main" data-duration="12"
