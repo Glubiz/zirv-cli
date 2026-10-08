@@ -300,7 +300,7 @@ fn synthesize_profile(repo: PathBuf, evidence: RepositoryEvidence) -> FrontendPr
         motion: if evidence.has_motion {
             "Preserve purposeful existing motion, honor reduced-motion preferences, and animate state or spatial change rather than decoration."
         } else {
-            "Spend motion on one orchestrated moment and on feedback to user actions; transform and opacity, with a reduced-motion path."
+            "Every control responds, state changes show their cause, and one moment moves with the world; transform and opacity, with a reduced-motion path."
         }
         .into(),
         density: "Set by mode: operate surfaces dense, aligned, keyboard-fast; persuade and read surfaces generous in scale and space."
@@ -345,7 +345,7 @@ preservation: {}",
     ) + r#"
 quality contract v2 (resolve autonomously; never ask for initialization):
 - name each surface's mode (persuade, operate, read, experience); before code, plan subject, audience, job, the world's materials, hero artefact, type, palette, layout, one signature. Never invent product truth.
-- critique the plan with the interchangeable-product test; build; render (full height for long pages); critique with frontend-craft references/critique.md; fix in one batch; stop.
+- critique the plan with the interchangeable-product test; build; ELEVATE (frontend-craft references/elevate.md); capture per references/critique.md; critique; fix in one batch; stop.
 - floor: states, keyboard, focus, contrast, reduced motion, recomposition at 390/768/1440. Justify advisory craft findings, fix blocking ones. Missing or stale render evidence is never a pass."#
 }
 

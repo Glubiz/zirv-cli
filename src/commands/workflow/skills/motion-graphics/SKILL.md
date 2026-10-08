@@ -11,44 +11,43 @@ metadata:
   x-zirv-phases: implement,present
   x-zirv-required-capabilities: repo.read,repo.write,shell.exec
   x-zirv-optional-capabilities: artifact.render
-  x-zirv-context-budget-bytes: "7600"
+  x-zirv-context-budget-bytes: "7400"
 ---
 
-A motion graphics request asks for a finished film: directed like one, and
-rendered by a mature seekable-timeline renderer that turns HTML/CSS/JS into
-frame-accurate video -- not a hand-rolled encoder, and not a web page filmed.
+A motion graphics request asks for a finished film, directed like one and
+rendered by a seekable-timeline renderer that turns HTML/CSS/JS into
+frame-accurate video -- not a hand-rolled encoder, not a web page filmed.
 
 ## Direct before you build
 
 Between steps 2 and 3 below, once the project folder exists, write
 `direction.md` in it:
 
-1. Read all three references before writing direction.md:
-   `zirv skill read motion-graphics references/motion-principles.md`, then
-   `references/video-composition.md` and
-   `references/transitions-and-rhythm.md`. Skipping them is the main cause
-   of small UI-scale type, dead space and fade-only motion.
-2. The idea in one line: the film's argument as one visual metaphor built
-   from the subject's own objects, using the brief's real content.
-3. A beat sheet: the rhythm in words ("fast-fast-SLOW-fast-hold"), then
-   each beat's start and end in seconds, what is on screen, and how it
-   leaves; 2-3 transition types, repeated; the end card lands at least
-   1.5 s before the end and holds still.
-4. A style frame: background, foreground and one accent (tinted, never
-   pure black or white); two families embedded from local woff2 files with
-   `@font-face`, chosen from the subject's world with the method,
-   families-by-character list and overused list in `zirv skill read
-   frontend-craft references/typography.md` -- the scaffold's Inter and
-   habitual picks such as Space Grotesk are out unless the brief's brand uses
-   them; get the files, for example, with `npm pack @fontsource/<family>`;
-   video-scale type as a share of frame height (headlines 6-11%, body
-   2.6-4%, labels 2.2% or more; at 1080p 64-120px, 28-42px, 24px; at 720x405
-   24-45px, 11-16px, 9px minimum, so keep GIF labels few and large); three
-   layers per scene; content anchored to edges, not centred. A composition
-   rendered to GIF carries no grain or noise overlay (grain is for MP4-only
-   deliverables: it took one GIF from 9 MB to 63 MB).
-5. A verb for every element (rises, draws, wipes, counts, ejects). An
-   element without a verb is not designed yet.
+1. First read all four references with `zirv skill read motion-graphics
+   references/<file>`: concept-and-world.md, motion-principles.md,
+   video-composition.md, transitions-and-rhythm.md. Skipping them is the
+   main cause of UI-scale type, dead space and fade-only motion.
+2. Concept: three metaphors from literal to abstract; pick the least literal
+   one the audience still reads in about a second, and say why. Kinetic
+   type leads; UI is a prop for at most a third of the film.
+3. Beat sheet on a beat grid (0.5 s at 120 bpm): the rhythm in words, then
+   each beat's start and end, what is on screen, its verb and how it
+   leaves; 2-3 energetic transition types on the beat (cuts, floods, masks,
+   morphs, match cuts), never dim-and-fade; no still hold over about 0.75 s
+   except a final 1-1.5 s settle; an end card that is built, not shown.
+4. Style frame: background, foreground and one accent from the subject's
+   world (never pure black or white, not near-black with an acid accent by
+   reflex); two families embedded from local woff2 files with `@font-face`,
+   chosen with `zirv skill read frontend-craft references/typography.md` --
+   the scaffold's Inter and habitual picks such as Space Grotesk are out
+   unless the brand uses them; get files, for example, with `npm pack
+   @fontsource/<family>`; type sized as a share of frame height
+   (video-composition.md); one large world the camera travels through, in
+   three depth layers. A composition rendered to GIF carries no grain or
+   noise overlay (grain is for MP4-only deliverables: it took one GIF from
+   9 MB to 63 MB).
+5. A verb for every element; hero moves get anticipation, 4-8% overshoot,
+   follow-through and a settle.
 
 ## Pipeline
 
@@ -87,13 +86,13 @@ and the scaffold loads GSAP from cdn.jsdelivr.net (or vendor it). Run steps
 4. Gate before any full render: `hyperframes check --json` (lint, runtime,
    layout, motion, contrast). Fix every error; fix warnings that describe a
    real defect (a pivot warning on a deliberately jointed limb does not).
-   Then `hyperframes snapshot --at <t1>,<t2>,...` (stills in `snapshots/`,
-   `--zoom` for detail; without `--at` it takes five evenly spaced frames
-   and misses transitions). Shoot the opening, each beat's hold, every
-   transition midpoint, the signature move in flight and the final hold.
-   Look at each against the beat sheet and references: video-scale type,
-   no dead space, contrast, the pause test, overflow, collisions. One repair
-   pass; never change the duration just to hide a defect. Take stills with
+   Then `hyperframes snapshot --at 0.5,1,1.5,...` every 0.5 s plus each
+   transition midpoint (stills in `snapshots/`, `--zoom` for detail;
+   without `--at` it takes five evenly spaced frames and misses
+   transitions). Review them as a contact sheet against direction.md:
+   every frame a poster, neighbouring frames differ meaningfully,
+   video-scale type, contrast, no overflow or collisions. One repair pass;
+   never change the duration just to hide a defect. Take stills with
    `snapshot`, never with an encoder.
 5. Narration: `hyperframes tts "<line>" --voice <id> --output <path>` runs
    Kokoro-82M locally, no account; first use downloads several hundred MiB
@@ -114,9 +113,9 @@ and the scaffold loads GSAP from cdn.jsdelivr.net (or vendor it). Run steps
    `render --format gif --fps <n> --gif-loop 0 --output renders/<slug>.gif`
    with `--fps 15` for text and UI motion and `--fps 25` for bodies,
    objects or continuous motion (GIF delays count in 1/100 s, so 25 plays
-   evenly and 24 does not). A render takes minutes; let it finish. Check the
-   GIF's size afterwards: aim at or under about 10 MB, and above that cut
-   grain/noise and full-frame textures first.
+   evenly and 24 does not). A render takes minutes; let it finish. Keep the
+   GIF at or under about 10 MB; above that cut grain, noise and full-frame
+   textures first.
 9. Register each file with `zirv artifact render <path>` (MP4 as video, GIF
    as image) and present each with `zirv artifact present <id> --agent
    <your harness>`.
@@ -130,7 +129,8 @@ substituting a gate above.
 
 ## Contract
 
-Report the one-line idea and rhythm, the preflight result, the project
-path, which gates passed and what each one's failures were before they were
-fixed, whether narration shipped and why not if it did not, and the two
-rendered file paths with their registered artifact ids.
+Report the chosen concept and why, the rhythm, the poster frame's time, the
+preflight result, the project path, which gates passed and what each one's
+failures were before they were fixed, whether narration shipped and why not
+if it did not, and the two rendered file paths with their registered
+artifact ids.
