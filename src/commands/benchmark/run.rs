@@ -13,10 +13,10 @@ use super::discover::{self, Candidate, DEFAULT_MODEL, HarnessInfo, Judge};
 use super::report::usd_amount;
 use crate::commands::ctx::adapters::{self, Liveness};
 use crate::commands::ctx::agent;
-use crate::commands::ctx::catalogue::Tier;
 use crate::commands::ctx::config::{CtxConfig, EnvLookup};
 use crate::commands::ctx::event::{SessionId, SessionRef, TranscriptUsage};
 use crate::commands::ctx::exec::{self, ExecArgs};
+use crate::commands::ctx::models::ModelRow;
 use crate::commands::ctx::price::{self, PriceTable};
 use crate::commands::ctx::sessions::SUPERVISION_ENV;
 use crate::commands::ctx::state;
@@ -47,9 +47,13 @@ pub enum Status {
 pub struct Row {
     pub schema: u32,
     pub harness: String,
+    /// The model the run actually used: the transcript's, once a launch succeeded.
     pub model: String,
+    /// The planned candidate's label (e.g. `default`); empty in rows from before this field.
+    #[serde(default)]
+    pub candidate: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tier: Option<Tier>,
+    pub family: Option<String>,
     pub task: String,
     pub role: Role,
     pub rep: u32,
@@ -90,10 +94,19 @@ pub struct Row {
 }
 
 impl Row {
+    /// The planned candidate this run belongs to, falling back to `model` for old rows.
+    pub fn candidate_label(&self) -> &str {
+        if self.candidate.is_empty() {
+            &self.model
+        } else {
+            &self.candidate
+        }
+    }
+
     pub fn new(
         harness: &str,
         model: &str,
-        tier: Option<Tier>,
+        family: Option<&str>,
         task: &str,
         role: Role,
         rep: u32,
@@ -103,7 +116,8 @@ impl Row {
             schema: ROW_SCHEMA,
             harness: harness.to_string(),
             model: model.to_string(),
-            tier,
+            candidate: model.to_string(),
+            family: family.map(str::to_string),
             task: task.to_string(),
             role,
             rep,
@@ -149,6 +163,8 @@ pub struct RunMeta {
     pub max_usd: f64,
     pub prices_as_of: String,
     pub python3: bool,
+    #[serde(default)]
+    pub judge_unpriced: bool,
 }
 
 #[cfg(test)]
@@ -167,6 +183,7 @@ impl RunMeta {
             max_usd: 10.0,
             prices_as_of: "2026-01-01".to_string(),
             python3: true,
+            judge_unpriced: false,
         }
     }
 }
@@ -181,6 +198,8 @@ pub struct Plan {
     pub reps: u32,
     pub agent_runs: usize,
     pub judge_calls: usize,
+    /// The default judge is absent because no candidate has a known output price.
+    pub judge_unpriced: bool,
     pub max_usd: f64,
     pub prices_as_of: String,
     pub python3: bool,
@@ -203,6 +222,7 @@ impl Plan {
             max_usd: self.max_usd,
             prices_as_of: self.prices_as_of.clone(),
             python3: self.python3,
+            judge_unpriced: self.judge_unpriced,
         }
     }
 }
@@ -215,6 +235,7 @@ pub fn plan(
     max_usd: f64,
     python_present: bool,
     present: &dyn Fn(&str, &str) -> Liveness,
+    rows: &[ModelRow],
 ) -> Result<Plan, String> {
     let corpus = corpus::embedded()?;
     for id in &filters.tasks {
@@ -222,7 +243,7 @@ pub fn plan(
             return Err(format!("unknown task '{id}'"));
         }
     }
-    let discovery = discover::discover(cfg, filters, present)?;
+    let discovery = discover::discover(cfg, filters, present, rows)?;
 
     let mut tasks = Vec::new();
     let mut skipped_tasks = Vec::new();
@@ -249,6 +270,9 @@ pub fn plan(
         } else {
             0
         },
+        judge_unpriced: discovery.judge.is_none()
+            && !filters.no_judge
+            && !discovery.candidates.is_empty(),
         task_ids: tasks.iter().map(|task| task.id.clone()).collect(),
         harnesses: discovery.harnesses,
         candidates: discovery.candidates,
@@ -272,14 +296,16 @@ pub fn render_plan(plan: &Plan) -> String {
         out.push_str("  none\n");
     }
     for c in &plan.candidates {
-        let tier = c
-            .tier
-            .map_or("-".to_string(), |t| format!("{t:?}").to_lowercase());
         out.push_str(&format!(
-            "  {:<14} {:<24} tier {tier}\n",
-            c.harness, c.model
+            "  {:<14} {:<32} family {}\n",
+            c.harness,
+            c.model,
+            c.family.as_deref().unwrap_or("-")
         ));
     }
+    out.push_str(
+        "  source: models discovered on this machine, see `zirv ctx models`; refresh with `zirv ctx models refresh`\n",
+    );
     out.push_str("\ntasks\n");
     for task in &plan.tasks {
         out.push_str(&format!("  {:<12} {}\n", task.id, task.role.as_str()));
@@ -299,6 +325,9 @@ pub fn render_plan(plan: &Plan) -> String {
                 );
             }
         }
+        None if plan.judge_unpriced => out.push_str(
+            "\njudge: none (no candidate has a known output price; pass --judge <harness:model>)\n",
+        ),
         None => out.push_str("\njudge: none\n"),
     }
     out.push_str(&format!(
@@ -367,8 +396,9 @@ impl Runner<'_> {
         let cap_micros = (plan.max_usd * 1_000_000.0).round() as u64;
         let mut spent: u64 = 0;
         let mut rows = Vec::new();
+        let tasks = interleave_roles(&plan.tasks);
         for rep in 0..plan.reps {
-            for task in &plan.tasks {
+            for task in &tasks {
                 for candidate in &plan.candidates {
                     let row = if spent >= cap_micros {
                         let mut row = base_row(candidate, task, rep, Status::Skipped);
@@ -499,11 +529,29 @@ impl Runner<'_> {
     }
 }
 
+/// Workers and orchestrators alternate (corpus order within each role), so a spend cap that
+/// hits mid-run leaves both roles with results.
+fn interleave_roles(tasks: &[Task]) -> Vec<&Task> {
+    let (workers, orchestrators): (Vec<&Task>, Vec<&Task>) =
+        tasks.iter().partition(|task| task.role == Role::Worker);
+    let mut workers = workers.into_iter();
+    let mut orchestrators = orchestrators.into_iter();
+    let mut out = Vec::with_capacity(tasks.len());
+    loop {
+        let before = out.len();
+        out.extend(workers.next());
+        out.extend(orchestrators.next());
+        if out.len() == before {
+            return out;
+        }
+    }
+}
+
 fn base_row(candidate: &Candidate, task: &Task, rep: u32, status: Status) -> Row {
     Row::new(
         &candidate.harness,
         &candidate.model,
-        candidate.tier,
+        candidate.family.as_deref(),
         &task.id,
         task.role,
         rep,
@@ -780,7 +828,7 @@ mod tests {
 
     fn candidate(harness: &str, model: &str) -> Candidate {
         serde_json::from_value(serde_json::json!({
-            "harness": harness, "model": model, "tier": null
+            "harness": harness, "model": model, "family": null
         }))
         .unwrap()
     }
@@ -797,6 +845,7 @@ mod tests {
             task_ids: tasks.iter().map(|t| t.id.clone()).collect(),
             agent_runs: candidates.len() * tasks.len() * reps as usize,
             judge_calls: 0,
+            judge_unpriced: false,
             candidates,
             skipped_tasks: Vec::new(),
             judge: None,
@@ -989,15 +1038,14 @@ mod tests {
         let cfg = CtxConfig::load(tmp.path(), &|_| None).unwrap();
         let present = adapters::only_installed(&["claude"]);
         let filters = Filters {
-            tiers: vec![crate::commands::ctx::catalogue::Tier::Cheap],
             tasks: vec!["w-bugfix".to_string(), "w-read".to_string()],
             no_judge: true,
             ..Filters::default()
         };
-        let with_python = plan(&cfg, &filters, 2, 10.0, true, &present).unwrap();
+        let with_python = plan(&cfg, &filters, 2, 10.0, true, &present, &[]).unwrap();
         assert_eq!(with_python.agent_runs, 4);
         assert_eq!(with_python.judge_calls, 0);
-        let without = plan(&cfg, &filters, 2, 10.0, false, &present).unwrap();
+        let without = plan(&cfg, &filters, 2, 10.0, false, &present, &[]).unwrap();
         assert_eq!(without.agent_runs, 2);
         assert_eq!(without.skipped_tasks[0].id, "w-bugfix");
         assert!(render_plan(&without).contains("skipped: python3 not found"));
@@ -1011,7 +1059,8 @@ mod tests {
                 1,
                 1.0,
                 true,
-                &present
+                &present,
+                &[]
             )
             .is_err()
         );
@@ -1022,12 +1071,85 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = CtxConfig::load(tmp.path(), &|_| None).unwrap();
         let present = adapters::only_installed(&["goose"]);
-        let text = render_plan(&plan(&cfg, &Filters::default(), 1, 10.0, true, &present).unwrap());
+        let text =
+            render_plan(&plan(&cfg, &Filters::default(), 1, 10.0, true, &present, &[]).unwrap());
+        assert!(text.contains("source: models discovered on this machine, see `zirv ctx models`"));
         assert!(text.contains("transcript tokens x the price table"));
         assert!(text.contains("runs with unknown cost are not counted against the spend cap"));
         assert!(!text.contains("cost measured"));
         assert!(text.contains("spend cap: $10.00"));
         assert!(!text.to_lowercase().contains("estimate"));
+    }
+
+    #[test]
+    fn roles_alternate_so_a_spend_cap_leaves_both_roles_with_results() {
+        let ids = [
+            "w-read", "w-rename", "w-bugfix", "o-review", "o-plan", "o-triage",
+        ];
+        let plan = plan_for(vec![candidate("claude", "vendor-model-2")], &ids, 1, 2.0);
+        let order: Vec<&str> = interleave_roles(&plan.tasks)
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "w-read", "o-review", "w-rename", "o-plan", "w-bugfix", "o-triage"
+            ]
+        );
+        let (_tmp, rows) = stub_run(&plan, &mut |_| Ok(launched(Some(1_000_000))));
+        let ran: Vec<Role> = rows
+            .iter()
+            .filter(|r| r.status == Status::Ok)
+            .map(|r| r.role)
+            .collect();
+        assert_eq!(ran, vec![Role::Worker, Role::Orchestrator]);
+    }
+
+    #[test]
+    fn a_missing_default_judge_is_explained_only_when_it_was_not_asked_for() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = CtxConfig::load(tmp.path(), &|_| None).unwrap();
+        let present = adapters::only_installed(&["claude"]);
+        let unpriced = plan(&cfg, &Filters::default(), 1, 10.0, true, &present, &[]).unwrap();
+        assert!(render_plan(&unpriced).contains(
+            "judge: none (no candidate has a known output price; pass --judge <harness:model>)"
+        ));
+        let nobody = plan(
+            &cfg,
+            &Filters::default(),
+            1,
+            10.0,
+            true,
+            &adapters::only_installed(&[]),
+            &[],
+        )
+        .unwrap();
+        assert!(nobody.candidates.is_empty() && !nobody.judge_unpriced);
+        let filters = Filters {
+            no_judge: true,
+            ..Filters::default()
+        };
+        let asked = plan(&cfg, &filters, 1, 10.0, true, &present, &[]).unwrap();
+        let text = render_plan(&asked);
+        assert!(text.contains("judge: none\n"));
+        assert!(!text.contains("known output price"));
+    }
+
+    fn test_table() -> PriceTable {
+        PriceTable {
+            as_of: "2026-01-01".to_string(),
+            models: [(
+                "vendor-model-2".to_string(),
+                price::ModelPrice {
+                    input_micros: 1_000_000,
+                    cache_write_micros: 1_000_000,
+                    cache_read_micros: 100_000,
+                    output_micros: 5_000_000,
+                },
+            )]
+            .into(),
+        }
     }
 
     fn usage(input: u64, cache_read: u64, output: u64) -> TranscriptUsage {
@@ -1043,28 +1165,31 @@ mod tests {
     /// codex-shaped segment instead: input split from cached input, no cache-write class.
     #[test]
     fn a_codex_shaped_segment_with_tokens_and_a_priced_model_has_a_known_cost() {
-        let table = price::built_in_table();
+        let table = test_table();
         let tokens = usage(1_000, 5_000, 200);
-        let cost = segments_cost([(Some("gpt-5.6-terra"), &tokens)].into_iter(), &table);
+        let cost = segments_cost([(Some("vendor-model-2"), &tokens)].into_iter(), &table);
         assert!(cost.is_some_and(|micros| micros > 0));
     }
 
     #[test]
     fn a_zero_usage_segment_is_an_unknown_cost_never_free() {
-        let table = price::built_in_table();
+        let table = test_table();
         let none = TranscriptUsage::default();
         assert_eq!(
-            segments_cost([(Some("sonnet"), &none)].into_iter(), &table),
+            segments_cost([(Some("vendor-model-2"), &none)].into_iter(), &table),
             None
         );
         let tokens = usage(10, 0, 10);
-        let mixed = [(Some("sonnet"), &tokens), (Some("sonnet"), &none)];
+        let mixed = [
+            (Some("vendor-model-2"), &tokens),
+            (Some("vendor-model-2"), &none),
+        ];
         assert_eq!(segments_cost(mixed.into_iter(), &table), None);
     }
 
     #[test]
     fn an_unpriced_or_unnamed_model_is_an_unknown_cost() {
-        let table = price::built_in_table();
+        let table = test_table();
         let tokens = usage(10, 0, 10);
         assert_eq!(
             segments_cost([(Some("no-such-model"), &tokens)].into_iter(), &table),
@@ -1076,11 +1201,15 @@ mod tests {
 
     #[test]
     fn segment_costs_add_up() {
-        let table = price::built_in_table();
+        let table = test_table();
         let tokens = usage(1_000, 0, 100);
-        let one = segments_cost([(Some("sonnet"), &tokens)].into_iter(), &table).unwrap();
+        let one = segments_cost([(Some("vendor-model-2"), &tokens)].into_iter(), &table).unwrap();
         let two = segments_cost(
-            [(Some("sonnet"), &tokens), (Some("sonnet"), &tokens)].into_iter(),
+            [
+                (Some("vendor-model-2"), &tokens),
+                (Some("vendor-model-2"), &tokens),
+            ]
+            .into_iter(),
             &table,
         );
         assert_eq!(two, Some(one * 2));
@@ -1096,10 +1225,10 @@ mod tests {
         );
         let (_tmp, rows) = stub_run(&plan, &mut |_| {
             let mut out = launched(None);
-            out.model = Some("sonnet".to_string());
+            out.model = Some("vendor-model-2".to_string());
             Ok(out)
         });
-        assert_eq!(rows[0].model, "sonnet");
+        assert_eq!(rows[0].model, "vendor-model-2");
     }
 
     #[test]

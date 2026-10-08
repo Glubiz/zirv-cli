@@ -154,11 +154,7 @@ pub fn run(args: &ModelsArgs, w: &mut dyn Write) -> CtxResult<i32> {
             return Ok(0);
         }
     }
-    let mut registry = load_registry(&state);
-    if args.command.is_none() && cfg.models.discovery {
-        registry = discover_local(registry, state::now_secs());
-    }
-    let prices = effective_prices(&cfg, &state);
+    let (registry, prices) = load_listing(&cfg, &state, args.command.is_none());
     let rows = list_rows(&cfg, &registry, &prices);
     let card = scorecard::build(&state, &prices.table, state::now_secs());
     let warnings = avoid_warnings(&cfg, &registry);
@@ -212,20 +208,64 @@ pub fn run(args: &ModelsArgs, w: &mut dyn Write) -> CtxResult<i32> {
     Ok(0)
 }
 
+/// The stored registry, plus models observed locally when `discover` and `[models] discovery` allow it, with effective prices.
+fn load_listing(cfg: &CtxConfig, state: &StateDir, discover: bool) -> (Registry, EffectivePrices) {
+    let mut registry = load_registry(state);
+    if discover && cfg.models.discovery {
+        registry = discover_local(registry, state::now_secs());
+    }
+    (registry, effective_prices(cfg, state))
+}
+
+/// The rows `zirv ctx models` prints, so other commands list exactly the same models.
+pub(crate) fn listing_rows(cfg: &CtxConfig, state: &StateDir) -> Vec<ModelRow> {
+    let (registry, prices) = load_listing(cfg, state, true);
+    list_rows(cfg, &registry, &prices)
+}
+
+/// Rows with `availability` of `available` are models this machine has actually seen or been offered.
+pub(crate) const AVAILABLE: &str = "available";
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
-struct ModelRow {
-    vendor: String,
-    id: String,
-    family: Option<String>,
+pub(crate) struct ModelRow {
+    pub(crate) vendor: String,
+    pub(crate) id: String,
+    pub(crate) family: Option<String>,
     rung: Option<String>,
     tier: Option<String>,
-    availability: String,
+    pub(crate) availability: String,
     input_micros_per_million: Option<u64>,
-    output_micros_per_million: Option<u64>,
+    pub(crate) output_micros_per_million: Option<u64>,
     price_source: Option<String>,
     approximate: bool,
     retirement_at: Option<u64>,
     upgrade: Option<String>,
+}
+
+#[cfg(test)]
+impl ModelRow {
+    pub(crate) fn for_test(
+        vendor: &str,
+        id: &str,
+        family: Option<&str>,
+        availability: &str,
+        output_micros_per_million: Option<u64>,
+    ) -> Self {
+        Self {
+            vendor: vendor.to_string(),
+            id: id.to_string(),
+            family: family.map(str::to_string),
+            rung: None,
+            tier: None,
+            availability: availability.to_string(),
+            input_micros_per_million: None,
+            output_micros_per_million,
+            price_source: None,
+            approximate: false,
+            retirement_at: None,
+            upgrade: None,
+        }
+    }
 }
 
 fn list_rows(cfg: &CtxConfig, registry: &Registry, prices: &EffectivePrices) -> Vec<ModelRow> {
@@ -272,7 +312,7 @@ fn list_rows(cfg: &CtxConfig, registry: &Registry, prices: &EffectivePrices) -> 
                 availability: model
                     .map_or(
                         "snapshot",
-                        |m| if m.available { "available" } else { "hidden" },
+                        |m| if m.available { AVAILABLE } else { "hidden" },
                     )
                     .to_string(),
                 input_micros_per_million: price.map(|p| p.input_micros),

@@ -13,8 +13,8 @@ use std::io::Write;
 use clap::{Args, Parser, Subcommand};
 
 use crate::commands::ctx::adapters::{self, Liveness};
-use crate::commands::ctx::catalogue::Tier;
 use crate::commands::ctx::config::{CtxConfig, EnvLookup, env_from_process};
+use crate::commands::ctx::models;
 use crate::commands::ctx::price;
 use crate::commands::ctx::state::{self, StateDir};
 
@@ -80,10 +80,11 @@ pub struct Filters {
     /// Restrict to these harnesses.
     #[arg(long = "harness", value_name = "name")]
     pub harnesses: Vec<String>,
-    /// Restrict tier-derived models to these tiers (default: all three).
-    #[arg(long = "tier", value_name = "cheap|standard|deep", value_parser = parse_tier)]
-    pub tiers: Vec<Tier>,
-    /// Benchmark exactly these models instead of the tier-derived ones.
+    /// Restrict discovered models to these model families (see `zirv ctx models`).
+    #[arg(long = "family", value_name = "name")]
+    pub families: Vec<String>,
+    /// Benchmark exactly these model ids instead of the discovered ones. Pins are exact:
+    /// `--family` does not filter them, and a pin on an unavailable harness is an error.
     #[arg(long = "model", value_name = "harness:model", value_parser = parse_pair)]
     pub models: Vec<(String, String)>,
     /// Restrict to these corpus tasks.
@@ -95,15 +96,6 @@ pub struct Filters {
     /// Skip the LLM judge; deterministic graders only.
     #[arg(long)]
     pub no_judge: bool,
-}
-
-fn parse_tier(raw: &str) -> Result<Tier, String> {
-    match raw {
-        "cheap" => Ok(Tier::Cheap),
-        "standard" => Ok(Tier::Standard),
-        "deep" => Ok(Tier::Deep),
-        _ => Err("expected cheap, standard or deep".to_string()),
-    }
 }
 
 fn parse_pair(raw: &str) -> Result<(String, String), String> {
@@ -158,14 +150,19 @@ fn execute(
     let stdout = &mut std::io::stdout();
     match command {
         Command::Plan { filters, json } => {
-            let plan = run::plan(
+            let rows = model_rows(&cfg, env)?;
+            let plan = match run::plan(
                 &cfg,
                 &filters,
                 DEFAULT_REPS,
                 DEFAULT_MAX_USD,
                 python_present,
                 present,
-            )?;
+                &rows,
+            ) {
+                Ok(plan) => plan,
+                Err(error) => return Ok(usage_error(error)),
+            };
             emit(stdout, json, &plan, &run::render_plan(&plan))?;
             Ok(0)
         }
@@ -185,7 +182,19 @@ fn execute(
             yes,
             json,
         } => {
-            let plan = run::plan(&cfg, &filters, reps, max_usd, python_present, present)?;
+            let rows = model_rows(&cfg, env)?;
+            let plan = match run::plan(
+                &cfg,
+                &filters,
+                reps,
+                max_usd,
+                python_present,
+                present,
+                &rows,
+            ) {
+                Ok(plan) => plan,
+                Err(error) => return Ok(usage_error(error)),
+            };
             if !yes {
                 emit(stdout, json, &plan, &run::render_plan(&plan))?;
                 let message = "re-run with --yes to start; this spends real model quota";
@@ -256,6 +265,18 @@ fn run_benchmark(
     Ok(report::build(meta, &rows?))
 }
 
+/// A filter that names something that cannot run is the caller's mistake, like a bad flag.
+fn usage_error(error: String) -> i32 {
+    crate::output::error(error);
+    2
+}
+
+/// The models `zirv ctx models` lists, so the candidates always agree with it.
+fn model_rows(cfg: &CtxConfig, env: EnvLookup<'_>) -> Result<Vec<models::ModelRow>, String> {
+    let state = StateDir::resolve(env).map_err(|e| e.to_string())?;
+    Ok(models::listing_rows(cfg, &state))
+}
+
 fn benchmark_root(env: EnvLookup<'_>) -> Result<std::path::PathBuf, String> {
     let state = StateDir::resolve(env).map_err(|e| e.to_string())?;
     Ok(state.root().join("benchmark"))
@@ -306,12 +327,12 @@ mod tests {
             "claude",
             "--harness",
             "codex",
-            "--tier",
-            "cheap",
-            "--tier",
-            "deep",
+            "--family",
+            "alpha",
+            "--family",
+            "beta",
             "--model",
-            "claude:opus",
+            "claude:vendor-model-2",
             "--task",
             "w-read",
             "--judge",
@@ -338,10 +359,10 @@ mod tests {
             panic!("expected run");
         };
         assert_eq!(filters.harnesses, vec!["claude", "codex"]);
-        assert_eq!(filters.tiers, vec![Tier::Cheap, Tier::Deep]);
+        assert_eq!(filters.families, vec!["alpha", "beta"]);
         assert_eq!(
             filters.models,
-            vec![("claude".to_string(), "opus".to_string())]
+            vec![("claude".to_string(), "vendor-model-2".to_string())]
         );
         assert_eq!(filters.judge, Some(("codex".to_string(), "m".to_string())));
         assert_eq!(
@@ -366,8 +387,26 @@ mod tests {
     }
 
     #[test]
+    fn a_model_pin_on_a_harness_that_cannot_run_exits_2() {
+        let tmp = testenv::repo();
+        let _home = testenv::HomeGuard::set(&tmp.path().join("home"));
+        let env: HashMap<&str, String> = [(
+            state::STATE_ENV,
+            tmp.path().join("state").display().to_string(),
+        )]
+        .into();
+        let lookup = |key: &str| env.get(key).cloned();
+        let _cwd = testenv::CwdGuard::enter(tmp.path()).unwrap();
+        let command = parse(&["plan", "--model", "goose:vendor-model-2"])
+            .unwrap()
+            .command;
+        let code = execute(command, &lookup, &adapters::only_installed(&["claude"]));
+        assert_eq!(code, Ok(2));
+    }
+
+    #[test]
     fn bad_values_are_rejected() {
-        assert!(parse(&["run", "--tier", "huge"]).is_err());
+        assert!(parse(&["run", "--tier", "deep"]).is_err());
         assert!(parse(&["run", "--model", "nocolon"]).is_err());
         assert!(parse(&["run", "--reps", "0"]).is_err());
         assert!(parse(&["run", "--max-usd", "-1"]).is_err());

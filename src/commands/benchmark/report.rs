@@ -53,42 +53,171 @@ pub struct Recommendation {
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
     pub meta: RunMeta,
+    pub total_runs: usize,
     pub skipped_runs: usize,
+    /// Tasks left out of a role's comparison, and why.
+    pub notes: Vec<RoleNote>,
     pub cells: Vec<Cell>,
     pub recommendation: Recommendation,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RoleNote {
+    pub role: Role,
+    pub text: String,
+    /// No task was completed by every candidate, so the role cannot be compared.
+    pub empty: bool,
+}
+
 pub fn build(meta: RunMeta, rows: &[Row]) -> Report {
-    let cells = cells(rows);
+    let (comparable, notes) = comparable_rows(&meta, rows);
+    let cells = cells(&comparable);
     let recommendation = recommend(&cells);
     Report {
+        total_runs: rows.len(),
         skipped_runs: rows.iter().filter(|r| r.status == Status::Skipped).count(),
         meta,
+        notes,
         cells,
         recommendation,
     }
+}
+
+/// A planned candidate: harness and planned model label.
+type Key<'a> = (&'a str, &'a str);
+/// One planned run: task id and repetition.
+type Pair<'a> = (&'a str, u32);
+
+/// Within a role, only the (task, rep) pairs every compared candidate completed (ok or failed,
+/// not skipped) are compared, so a spend cap cannot give two candidates different run sets.
+/// The planned candidates come from `meta`, keyed by their planned label, not the model a run
+/// ended up using; a planned candidate with no completed run is named and left out.
+fn comparable_rows(meta: &RunMeta, rows: &[Row]) -> (Vec<Row>, Vec<RoleNote>) {
+    let planned: Vec<(&str, &str)> = if meta.candidates.is_empty() {
+        let mut seen: Vec<(&str, &str)> = Vec::new();
+        for row in rows {
+            let key = (row.harness.as_str(), row.candidate_label());
+            if !seen.contains(&key) {
+                seen.push(key);
+            }
+        }
+        seen
+    } else {
+        meta.candidates
+            .iter()
+            .map(|c| (c.harness.as_str(), c.model.as_str()))
+            .collect()
+    };
+    let pair_label = |task: &str, rep: u32| {
+        if meta.reps > 1 {
+            format!("{task} rep {}", rep + 1)
+        } else {
+            task.to_string()
+        }
+    };
+
+    let mut kept = Vec::new();
+    let mut notes = Vec::new();
+    for role in [Role::Worker, Role::Orchestrator] {
+        let ran: Vec<&Row> = rows
+            .iter()
+            .filter(|r| r.role == role && r.status != Status::Skipped)
+            .collect();
+        let owned_by = |row: &Row, (harness, label): (&str, &str)| {
+            row.harness == harness && row.candidate_label() == label
+        };
+        let (completers, idle): (Vec<Key>, Vec<Key>) = planned
+            .iter()
+            .copied()
+            .partition(|key| ran.iter().any(|r| owned_by(r, *key)));
+        if completers.is_empty() {
+            continue;
+        }
+        let mut pairs: Vec<(&str, u32)> = Vec::new();
+        for row in ran
+            .iter()
+            .filter(|r| completers.iter().any(|k| owned_by(r, *k)))
+        {
+            let pair = (row.task.as_str(), row.rep);
+            if !pairs.contains(&pair) {
+                pairs.push(pair);
+            }
+        }
+        let (common, excluded): (Vec<Pair>, Vec<Pair>) =
+            pairs.into_iter().partition(|(task, rep)| {
+                completers.iter().all(|key| {
+                    ran.iter()
+                        .any(|r| owned_by(r, *key) && r.task == *task && r.rep == *rep)
+                })
+            });
+        let labels = |pairs: &[(&str, u32)]| {
+            pairs
+                .iter()
+                .map(|(task, rep)| pair_label(task, *rep))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut parts = Vec::new();
+        if !excluded.is_empty() && common.is_empty() {
+            parts.push(
+                "no task was completed by every candidate (spend cap), so the role is not compared"
+                    .to_string(),
+            );
+        } else if !excluded.is_empty() {
+            parts.push(format!(
+                "compared over {} only; {} not completed by every candidate (spend cap)",
+                labels(&common),
+                labels(&excluded)
+            ));
+        }
+        for (harness, label) in &idle {
+            parts.push(format!("{harness}/{label} excluded: no completed runs"));
+        }
+        if !parts.is_empty() {
+            notes.push(RoleNote {
+                role,
+                text: parts.join("; "),
+                empty: common.is_empty(),
+            });
+        }
+        kept.extend(
+            ran.into_iter()
+                .filter(|r| {
+                    completers.iter().any(|k| owned_by(r, *k))
+                        && common.contains(&(r.task.as_str(), r.rep))
+                })
+                .cloned(),
+        );
+    }
+    (kept, notes)
 }
 
 /// One cell per candidate and role, in first-seen order; skipped rows are not runs.
 pub fn cells(rows: &[Row]) -> Vec<Cell> {
     let mut keys: Vec<(&str, &str, Role)> = Vec::new();
     for row in rows.iter().filter(|r| r.status != Status::Skipped) {
-        let key = (row.harness.as_str(), row.model.as_str(), row.role);
+        let key = (row.harness.as_str(), row.candidate_label(), row.role);
         if !keys.contains(&key) {
             keys.push(key);
         }
     }
     keys.into_iter()
-        .map(|(harness, model, role)| {
+        .map(|(harness, label, role)| {
             let group: Vec<&Row> = rows
                 .iter()
                 .filter(|r| {
                     r.status != Status::Skipped
                         && r.harness == harness
-                        && r.model == model
+                        && r.candidate_label() == label
                         && r.role == role
                 })
                 .collect();
+            // Show the model the transcript named when the candidate was only a label.
+            let model = group
+                .iter()
+                .map(|r| r.model.as_str())
+                .find(|m| *m != label)
+                .unwrap_or(label);
             cell(harness, model, role, &group)
         })
         .collect()
@@ -292,12 +421,15 @@ pub fn render_text(report: &Report) -> String {
                 );
             }
         }
+        None if meta.judge_unpriced => out.push_str(
+            "judge: none (no candidate had a known output price; deterministic graders only)\n",
+        ),
         None => out.push_str("judge: none (deterministic graders only)\n"),
     }
     if report.skipped_runs > 0 {
         out.push_str(&format!(
-            "{} run(s) skipped (spend cap)\n",
-            report.skipped_runs
+            "warning: {} of {} runs skipped by the spend cap (--max-usd {}); raise it or narrow with --family/--model\n",
+            report.skipped_runs, report.total_runs, meta.max_usd
         ));
     }
     out.push('\n');
@@ -343,9 +475,19 @@ pub fn render_text(report: &Report) -> String {
 
     let rec = &report.recommendation;
     out.push_str("\nrecommendation\n");
-    for (label, pick) in [("orchestrator", &rec.orchestrator), ("worker", &rec.worker)] {
+    let note_for = |role: Role| report.notes.iter().find(|n| n.role == role);
+    for (role, label, pick) in [
+        (Role::Orchestrator, "orchestrator", &rec.orchestrator),
+        (Role::Worker, "worker", &rec.worker),
+    ] {
+        if let Some(note) = note_for(role).filter(|n| !n.empty) {
+            out.push_str(&format!("  note: {label}: {}\n", note.text));
+        }
         match pick {
-            None => out.push_str(&format!("  {label}: none\n")),
+            None => match note_for(role).filter(|n| n.empty) {
+                Some(note) => out.push_str(&format!("  {label}: none ({})\n", note.text)),
+                None => out.push_str(&format!("  {label}: none\n")),
+            },
             Some(pick) => {
                 out.push_str(&format!(
                     "  {label}: {}/{}  score {:.2}\n    {}\n    apply with:\n",
@@ -567,7 +709,9 @@ mod tests {
         let unknown = row("h", Role::Worker, Status::Ok);
         let report = Report {
             meta: RunMeta::for_test(),
+            total_runs: 1,
             skipped_runs: 0,
+            notes: Vec::new(),
             cells: cells(&[unknown]),
             recommendation: recommend(&[]),
         };
@@ -580,7 +724,9 @@ mod tests {
     fn the_text_report_carries_the_caveat_and_none_for_empty_roles() {
         let report = Report {
             meta: RunMeta::for_test(),
+            total_runs: 0,
             skipped_runs: 0,
+            notes: Vec::new(),
             cells: Vec::new(),
             recommendation: recommend(&[]),
         };
@@ -588,6 +734,148 @@ mod tests {
         assert!(text.contains("orchestrator: none"));
         assert!(text.contains("worker: none"));
         assert!(text.contains("delegation overhead not measured"));
+    }
+
+    fn done(harness: &str, task: &str, role: Role, correctness: f64) -> Row {
+        let mut row = Row::new(harness, "m", None, task, role, 0, Status::Ok);
+        row.correctness = Some(correctness);
+        row
+    }
+
+    fn skipped(harness: &str, task: &str, role: Role) -> Row {
+        let mut row = Row::new(harness, "m", None, task, role, 0, Status::Skipped);
+        row.skip_reason = Some("spend cap".to_string());
+        row
+    }
+
+    #[test]
+    fn candidates_are_compared_only_over_tasks_every_candidate_completed() {
+        let rows = [
+            done("a", "t1", Role::Worker, 1.0),
+            done("a", "t2", Role::Worker, 0.0),
+            done("b", "t1", Role::Worker, 0.5),
+            skipped("b", "t2", Role::Worker),
+        ];
+        let report = build(RunMeta::for_test(), &rows);
+        let score = |harness: &str| {
+            report
+                .cells
+                .iter()
+                .find(|c| c.harness == harness)
+                .and_then(|c| c.score)
+        };
+        assert_eq!((score("a"), score("b")), (Some(1.0), Some(0.5)));
+        assert_eq!(report.notes.len(), 1);
+        assert!(
+            report.notes[0]
+                .text
+                .contains("compared over t1 only; t2 not completed")
+        );
+        assert!(!report.notes[0].empty);
+    }
+
+    #[test]
+    fn a_role_with_no_commonly_completed_task_is_none_with_the_reason() {
+        let rows = [
+            done("a", "t1", Role::Orchestrator, 1.0),
+            done("b", "t2", Role::Orchestrator, 1.0),
+        ];
+        let report = build(RunMeta::for_test(), &rows);
+        assert!(report.recommendation.orchestrator.is_none());
+        assert!(report.cells.is_empty());
+        let text = render_text(&report);
+        assert!(text.contains("orchestrator: none (no task was completed by every candidate"));
+    }
+
+    fn meta_with(candidates: &[(&str, &str)], reps: u32) -> RunMeta {
+        let mut meta = RunMeta::for_test();
+        meta.reps = reps;
+        meta.candidates = candidates
+            .iter()
+            .map(|(harness, model)| {
+                serde_json::from_value(
+                    serde_json::json!({"harness": harness, "model": model, "family": null}),
+                )
+                .unwrap()
+            })
+            .collect();
+        meta
+    }
+
+    #[test]
+    fn a_default_candidate_is_one_candidate_whatever_model_its_rows_record() {
+        let mut ok = done("a", "t1", Role::Worker, 1.0);
+        ok.candidate = "default".to_string();
+        ok.model = "vendor-model-2".to_string();
+        let mut failed = Row::new("a", "default", None, "t2", Role::Worker, 0, Status::Failed);
+        failed.correctness = Some(0.0);
+        let mut other = done("a", "t2", Role::Worker, 1.0);
+        other.candidate = "default".to_string();
+        other.model = "vendor-model-2".to_string();
+        let report = build(meta_with(&[("a", "default")], 1), &[ok, failed, other]);
+        assert_eq!(report.cells.len(), 1);
+        assert_eq!(report.cells[0].model, "vendor-model-2");
+        assert_eq!(report.cells[0].n, 3);
+        assert!(report.notes.is_empty());
+    }
+
+    #[test]
+    fn a_planned_candidate_with_no_completed_run_is_named_in_the_role_note() {
+        let rows = [
+            done("a", "t1", Role::Worker, 1.0),
+            skipped("b", "t1", Role::Worker),
+        ];
+        let report = build(meta_with(&[("a", "m"), ("b", "m")], 1), &rows);
+        assert_eq!(report.cells.len(), 1);
+        assert!(
+            report.notes[0]
+                .text
+                .contains("b/m excluded: no completed runs")
+        );
+        assert!(!report.notes[0].empty);
+    }
+
+    #[test]
+    fn commonality_is_per_task_and_rep_so_cells_have_equal_n() {
+        let rep = |harness: &str, task: &str, rep: u32| {
+            let mut row = done(harness, task, Role::Worker, 1.0);
+            row.rep = rep;
+            row
+        };
+        let rows = [
+            rep("a", "t1", 0),
+            rep("a", "t1", 1),
+            rep("b", "t1", 0),
+            skipped("b", "t1", Role::Worker),
+        ];
+        let report = build(meta_with(&[("a", "m"), ("b", "m")], 2), &rows);
+        assert!(report.cells.iter().all(|c| c.n == 1), "{:?}", report.cells);
+        assert!(report.notes[0].text.contains("t1 rep 2 not completed"));
+    }
+
+    #[test]
+    fn an_unpriced_default_judge_is_worded_like_the_plan_in_the_report() {
+        let mut meta = RunMeta::for_test();
+        meta.judge_unpriced = true;
+        let text = render_text(&build(meta, &[]));
+        assert!(text.contains("judge: none (no candidate had a known output price"));
+        let plain = render_text(&build(RunMeta::for_test(), &[]));
+        assert!(plain.contains("judge: none (deterministic graders only)"));
+    }
+
+    #[test]
+    fn a_spend_cap_skip_prints_the_warning_with_counts() {
+        let rows = [
+            done("a", "t1", Role::Worker, 1.0),
+            skipped("a", "t2", Role::Worker),
+            skipped("a", "t3", Role::Worker),
+        ];
+        let text = render_text(&build(RunMeta::for_test(), &rows));
+        assert!(text.contains(
+            "warning: 2 of 3 runs skipped by the spend cap (--max-usd 10); raise it or narrow with --family/--model"
+        ));
+        let clean = render_text(&build(RunMeta::for_test(), &rows[..1]));
+        assert!(!clean.contains("skipped by the spend cap"));
     }
 
     #[test]
