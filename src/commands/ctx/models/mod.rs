@@ -59,14 +59,14 @@ enum ModelsCommand {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Registry {
     pub updated_at: u64,
     pub models: BTreeMap<String, RegistryModel>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct RegistryModel {
     pub vendor: String,
     pub id: String,
@@ -88,7 +88,7 @@ pub struct RegistryModel {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 struct PriceCache {
     fetched_at: u64,
     models_dev_etag: Option<String>,
@@ -1295,6 +1295,20 @@ pub(crate) fn spawn_refresh_if_due_detached(cfg: &CtxConfig, state: &StateDir) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_and_price_cache_tolerate_unknown_fields() {
+        let registry: Registry = serde_json::from_str(
+            r#"{"updated_at":7,"future":1,"models":{"m":{"id":"m","vendor":"v","future":{"a":1}}}}"#,
+        )
+        .expect("registry with unknown fields");
+        assert_eq!(registry.updated_at, 7);
+        assert_eq!(registry.models["m"].id, "m");
+        assert_eq!(registry.models["m"].vendor, "v");
+        let cache: PriceCache = serde_json::from_str(r#"{"fetched_at":9,"future":true}"#)
+            .expect("price cache with unknown fields");
+        assert_eq!(cache.fetched_at, 9);
+    }
 
     #[test]
     fn codex_cache_fixture_is_parsed_with_retirement_and_visibility() {
