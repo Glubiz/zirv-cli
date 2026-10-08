@@ -69,7 +69,9 @@ pub struct Seat {
     pub reason: String,
     pub result_schema: String,
     pub consumer: String,
-    pub route_tier: ModelTier,
+    /// Manifest-derived and not recoverable from the seat's own fields; `None` means unknown.
+    #[serde(default)]
+    pub route_tier: Option<ModelTier>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,7 +248,7 @@ fn resolve_seat(
         reason: spec.reason,
         result_schema: result_schema_for(&spec.manifest_id).to_string(),
         consumer: spec.consumer,
-        route_tier: agent.manifest.model_tier,
+        route_tier: Some(agent.manifest.model_tier),
     })
 }
 
@@ -1439,6 +1441,32 @@ mod tests {
     ) -> ExecutionProfile {
         let classification = classification_with(intent, complexity, risk, changed_files);
         ExecutionProfile::derive(text, &classification)
+    }
+
+    #[test]
+    fn a_stored_seat_without_route_tier_loads_as_unknown() {
+        let profile = profile_for(
+            Intent::Feature,
+            Complexity::Substantial,
+            RiskBand::Low,
+            8,
+            "implement the feature",
+        );
+        let plan = compile(
+            "implement the feature",
+            &profile,
+            &registry(),
+            &skills(),
+            &always_eligible,
+        )
+        .expect("plan compiles");
+        let seat = plan.seats.first().expect("a seat");
+        assert!(seat.route_tier.is_some());
+        let mut value = serde_json::to_value(seat).expect("serialize");
+        value.as_object_mut().expect("object").remove("route_tier");
+        let loaded: Seat = serde_json::from_value(value).expect("loads without route_tier");
+        assert_eq!(loaded.route_tier, None);
+        assert_eq!(loaded.id, seat.id);
     }
 
     #[test]
