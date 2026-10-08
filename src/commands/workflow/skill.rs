@@ -343,7 +343,8 @@ impl SkillRegistry {
         let mut skills = BTreeMap::new();
         let mut warnings = Vec::new();
         for manifest in builtin_manifests()? {
-            let content_hash = compute_content_hash(&manifest, &[])?;
+            let resources = embedded_skill_resources(&manifest.id);
+            let content_hash = compute_content_hash(&manifest, &resources)?;
             skills.insert(
                 manifest.id.clone(),
                 RegisteredSkill {
@@ -351,7 +352,7 @@ impl SkillRegistry {
                     source: SkillSource::BuiltIn,
                     source_path: None,
                     bundle_root: None,
-                    resources: Vec::new(),
+                    resources,
                     content_hash,
                 },
             );
@@ -507,13 +508,21 @@ impl SkillRegistry {
     /// Re-check loader trust rules when reading a resource because its path may have changed since discovery. (#539)
     pub fn read_resource(&self, id: &str, relative: &str) -> CtxResult<String> {
         let skill = self.get(id)?;
-        let bundle_root = skill
-            .bundle_root
-            .as_ref()
-            .ok_or_else(|| format!("skill '{id}' has no bundle resources"))?;
         if relative.contains("..") || relative.contains('\\') || Path::new(relative).is_absolute() {
             return Err(format!("refusing resource path '{relative}' for skill '{id}'").into());
         }
+        let Some(bundle_root) = skill.bundle_root.as_ref() else {
+            let body = embedded_bodies(id)
+                .iter()
+                .find(|(path, _)| *path == relative)
+                .filter(|_| {
+                    skill.source == SkillSource::BuiltIn
+                        && skill.resources.iter().any(|r| r.path == relative)
+                })
+                .ok_or_else(|| format!("skill '{id}' has no resource '{relative}'"))?
+                .1;
+            return Ok(truncate_tool_output(body));
+        };
         let resource = skill
             .resources
             .iter()
@@ -1382,15 +1391,20 @@ pub fn export_bundle(skill: &RegisteredSkill, out_dir: &Path) -> CtxResult<PathB
     document.push('\n');
     std::fs::write(bundle_dir.join("SKILL.md"), document)?;
 
-    if let Some(bundle_root) = &skill.bundle_root {
-        for resource in &skill.resources {
-            let from = bundle_root.join(&resource.path);
-            let to = bundle_dir.join(&resource.path);
-            if let Some(parent) = to.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::copy(&from, &to)?;
+    for resource in &skill.resources {
+        let to = bundle_dir.join(&resource.path);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
         }
+        if let Some(bundle_root) = &skill.bundle_root {
+            std::fs::copy(bundle_root.join(&resource.path), &to)?;
+            continue;
+        }
+        let (_, body) = embedded_bodies(&skill.manifest.id)
+            .iter()
+            .find(|(path, _)| *path == resource.path)
+            .ok_or_else(|| format!("no embedded body for resource '{}'", resource.path))?;
+        std::fs::write(&to, body)?;
     }
 
     Ok(bundle_dir)
@@ -2069,6 +2083,83 @@ Inspect the built result, not the implementation story. Review all captures toge
     Ok(skills)
 }
 
+/// Compiled-in reference files per built-in skill id: (bundle-relative path,
+/// body). Works for Rust `manifest(...)` built-ins and CATALOGUE bundles alike.
+const EMBEDDED_RESOURCES: &[(&str, &[(&str, &str)])] = &[
+    (
+        "frontend-craft",
+        &[
+            (
+                "references/color-and-surface.md",
+                include_str!("skills/frontend-craft/references/color-and-surface.md"),
+            ),
+            (
+                "references/critique.md",
+                include_str!("skills/frontend-craft/references/critique.md"),
+            ),
+            (
+                "references/interface-motion.md",
+                include_str!("skills/frontend-craft/references/interface-motion.md"),
+            ),
+            (
+                "references/layout-and-composition.md",
+                include_str!("skills/frontend-craft/references/layout-and-composition.md"),
+            ),
+            (
+                "references/typography.md",
+                include_str!("skills/frontend-craft/references/typography.md"),
+            ),
+        ],
+    ),
+    (
+        "motion-graphics",
+        &[
+            (
+                "references/motion-principles.md",
+                include_str!("skills/motion-graphics/references/motion-principles.md"),
+            ),
+            (
+                "references/transitions-and-rhythm.md",
+                include_str!("skills/motion-graphics/references/transitions-and-rhythm.md"),
+            ),
+            (
+                "references/video-composition.md",
+                include_str!("skills/motion-graphics/references/video-composition.md"),
+            ),
+        ],
+    ),
+];
+
+fn embedded_bodies(id: &str) -> &'static [(&'static str, &'static str)] {
+    EMBEDDED_RESOURCES
+        .iter()
+        .find(|(skill_id, _)| *skill_id == id)
+        .map_or(&[], |(_, bodies)| bodies)
+}
+
+/// Resource metadata for a built-in's compiled-in files, sorted by path.
+fn embedded_skill_resources(id: &str) -> Vec<SkillResource> {
+    let mut resources: Vec<SkillResource> = embedded_bodies(id)
+        .iter()
+        .filter_map(|(path, body)| {
+            let kind = match path.split('/').next()? {
+                "scripts" => SkillResourceKind::Script,
+                "references" => SkillResourceKind::Reference,
+                "assets" => SkillResourceKind::Asset,
+                _ => return None,
+            };
+            Some(SkillResource {
+                kind,
+                path: (*path).to_string(),
+                bytes: body.len(),
+                sha256: crate::commands::ctx::safety::sha256_hex(body.as_bytes()),
+            })
+        })
+        .collect();
+    resources.sort_by(|a, b| a.path.cmp(&b.path));
+    resources
+}
+
 #[derive(Debug, Args)]
 pub struct SkillArgs {
     #[command(subcommand)]
@@ -2430,15 +2521,11 @@ fn write_load_text(
         for resource in &loaded.resources {
             writeln!(
                 writer,
-                "  {}\t{}\t{} B",
-                resource.path, resource.kind, resource.bytes
+                "  {}\t{}\t{}\t{} B",
+                resource.skill_id, resource.path, resource.kind, resource.bytes
             )?;
         }
-        writeln!(
-            writer,
-            "read one with: zirv skill read {} <path>",
-            loaded.id
-        )?;
+        writeln!(writer, "read one with: zirv skill read <skill-id> <path>")?;
     }
     Ok(())
 }
@@ -2658,6 +2745,12 @@ mod tests {
             assert_eq!(
                 reloaded, skill.manifest,
                 "{id}: exported bundle does not round-trip to an identical manifest"
+            );
+            let reloaded_resources = scan_bundle_resources(&bundle_dir.canonicalize().unwrap())
+                .unwrap_or_else(|err| panic!("rescan {id}: {err}"));
+            assert_eq!(
+                reloaded_resources, skill.resources,
+                "{id}: exported bundle lost or altered its resources"
             );
         }
     }
@@ -3832,6 +3925,126 @@ mod tests {
             0
         );
         assert_eq!(String::from_utf8(ok_out).unwrap(), "small body\n");
+    }
+
+    #[test]
+    fn embedded_builtin_resource_is_readable_and_keeps_the_path_refusals() {
+        let repo = tempdir().unwrap();
+        let registry = SkillRegistry::load(repo.path(), None, false, false).unwrap();
+        let body = registry
+            .read_resource("frontend-craft", "references/typography.md")
+            .unwrap();
+        assert!(body.starts_with("# Typography"));
+        let catalogue = registry
+            .read_resource("motion-graphics", "references/motion-principles.md")
+            .unwrap();
+        assert!(catalogue.starts_with("# Motion principles"));
+        for bad in [
+            "../SKILL.md",
+            "references\\typography.md",
+            "/references/typography.md",
+            "SKILL.md",
+            "docs/typography.md",
+            "references/missing.md",
+        ] {
+            assert!(
+                registry.read_resource("frontend-craft", bad).is_err(),
+                "{bad} must be refused"
+            );
+        }
+        assert!(
+            registry
+                .read_resource("implement", "references/x.md")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn embedded_resource_reads_through_the_skill_read_cli_path() {
+        let repo = tempdir().unwrap();
+        let args = SkillArgs {
+            command: SkillCommand::Read(SkillReadArgs {
+                id: "frontend-craft".into(),
+                path: "references/critique.md".into(),
+                built_in_only: true,
+                repo: Some(repo.path().to_path_buf()),
+            }),
+        };
+        let mut out = Vec::new();
+        assert_eq!(run(&args, &mut out).unwrap(), 0);
+        assert!(String::from_utf8(out).unwrap().starts_with("# Critique"));
+    }
+
+    #[test]
+    fn embedded_resources_respect_the_bundle_size_and_count_caps() {
+        let mut ids = BTreeSet::new();
+        for (id, bodies) in EMBEDDED_RESOURCES {
+            assert!(ids.insert(*id), "{id} listed twice");
+            assert!(bodies.len() <= MAX_BUNDLE_RESOURCES, "{id}: too many");
+            let total: usize = bodies.iter().map(|(_, body)| body.len()).sum();
+            assert!(total <= MAX_BUNDLE_RESOURCE_BYTES, "{id}: {total} bytes");
+            for (path, body) in *bodies {
+                assert!(body.len() <= MAX_RESOURCE_BYTES, "{id}/{path} too large");
+                assert!(
+                    ["scripts/", "references/", "assets/"]
+                        .iter()
+                        .any(|prefix| path.starts_with(prefix)),
+                    "{id}/{path} is outside the resource directories"
+                );
+            }
+            assert_eq!(embedded_skill_resources(id).len(), bodies.len());
+        }
+    }
+
+    #[test]
+    fn builtin_content_hash_includes_its_embedded_resources() {
+        let repo = tempdir().unwrap();
+        let registry = SkillRegistry::load(repo.path(), None, false, false).unwrap();
+        let skill = registry.get("frontend-craft").unwrap();
+        assert_eq!(skill.resources.len(), 5);
+        assert_eq!(
+            skill.content_hash,
+            compute_content_hash(&skill.manifest, &skill.resources).unwrap()
+        );
+        assert_ne!(
+            skill.content_hash,
+            compute_content_hash(&skill.manifest, &[]).unwrap()
+        );
+    }
+
+    #[test]
+    fn loading_frontend_implement_lists_the_craft_floor_resources_with_their_owner() {
+        let repo = tempdir().unwrap();
+        let registry = SkillRegistry::load(repo.path(), None, false, false).unwrap();
+        let report = CapabilityReport::for_repo(capability::NATIVE_ADAPTER, repo.path()).unwrap();
+        let loaded = skill_tools::skill_load(&registry, "frontend-implement", &report).unwrap();
+        let owned: Vec<&str> = loaded
+            .resources
+            .iter()
+            .filter(|resource| resource.skill_id == "frontend-craft")
+            .map(|resource| resource.path.as_str())
+            .collect();
+        assert_eq!(owned.len(), 5, "{:?}", loaded.resources);
+        assert!(owned.contains(&"references/typography.md"));
+        let mut out = Vec::new();
+        write_load_text(&mut out, &loaded).unwrap();
+        let printed = String::from_utf8(out).unwrap();
+        assert!(printed.contains("frontend-craft\treferences/typography.md"));
+    }
+
+    #[test]
+    fn exporting_a_rust_manifest_builtin_keeps_its_embedded_references() {
+        let repo = tempdir().unwrap();
+        let registry = SkillRegistry::load(repo.path(), None, false, false).unwrap();
+        let skill = registry.get("frontend-craft").unwrap();
+        let out_dir = tempdir().unwrap();
+        let bundle_dir = export_bundle(skill, out_dir.path()).unwrap();
+        for (path, body) in embedded_bodies("frontend-craft") {
+            assert_eq!(
+                &std::fs::read_to_string(bundle_dir.join(path)).unwrap(),
+                body
+            );
+        }
     }
 
     /// Points `StateDir::resolve` at a fresh, isolated tempdir for the

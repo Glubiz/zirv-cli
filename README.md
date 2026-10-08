@@ -2028,7 +2028,7 @@ zirv skill list --match "production outage, paging alert" --limit 3
 zirv skill show systematic-debugging --agent codex
 zirv skill load incident-investigation
 zirv skill export systematic-debugging --dir ./bundles
-zirv skill read my-skill references/checklist.md   # a bundle resource; built-ins carry no resources
+zirv skill read frontend-craft references/typography.md   # a bundle resource, incl. a built-in's compiled-in references
 zirv workflow classify --task "fix authentication race"
 zirv workflow start bugfix --task "fix authentication race" --agent codex
 zirv workflow start feature --task "use only shipped methodology" --built-in-only
@@ -2822,7 +2822,11 @@ pre-issue-#539 full-manifest `--json` shape. `zirv skill export <id> --dir
 <path>` writes a portable bundle directory (for another host, or to seed
 `~/.zirv/skills/`); `zirv skill read <id> <path>` reads one bundle resource
 body on demand, refusing a `..`/absolute escape the same way the registry's
-own loader does.
+own loader does. Built-ins can carry compiled-in reference files (one table
+in `skill.rs`), served and exported like bundle resources. `zirv skill load`,
+the `skill_load` tool and the MCP tool list the resources of every skill in
+the resolved stack, each with its owning `skill_id` (`zirv skill read
+<skill-id> <path>`); the existing `resources` JSON field now spans the stack.
 
 On Claude Code, zirv also registers its built-in and operator-global skills
 (implicit-activation ones only) as native Claude Code skills, namespaced

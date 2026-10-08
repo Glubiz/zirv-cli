@@ -99,6 +99,8 @@ pub struct SkillInstructionPart {
 /// [`skill_read_resource`]).
 #[derive(Debug, Clone, Serialize)]
 pub struct SkillLoadResource {
+    /// The skill that owns this resource; pass it as the id when reading.
+    pub skill_id: String,
     pub path: String,
     pub kind: String,
     pub bytes: usize,
@@ -126,8 +128,8 @@ pub struct SkillLoadResult {
     /// first, matching `instructions`'s own order one-to-one.
     pub dependency_order: Vec<String>,
     pub instructions: Vec<SkillInstructionPart>,
-    /// The requested skill's own bundle resources; a dependency's resources
-    /// are read with `skill_read_resource` against that dependency's own id.
+    /// Bundle resources of every skill in the stack, each with its owning
+    /// `skill_id`; read one with `skill_read_resource` against that id.
     pub resources: Vec<SkillLoadResource>,
 }
 
@@ -183,10 +185,16 @@ pub fn skill_load(
             instructions: skill.manifest.instructions.clone(),
         })
         .collect();
-    let resources = root
-        .resources
+    let resources = stack
         .iter()
-        .map(|resource| SkillLoadResource {
+        .flat_map(|skill| {
+            skill
+                .resources
+                .iter()
+                .map(move |resource| (skill.manifest.id.as_str(), resource))
+        })
+        .map(|(owner, resource)| SkillLoadResource {
+            skill_id: owner.to_string(),
             path: resource.path.clone(),
             kind: resource.kind.to_string(),
             bytes: resource.bytes,
