@@ -70,9 +70,13 @@ with one small element in the middle of a dark field is dead space.
   artefacts large and cropped by the frame edge (cropping implies scale and
   continuation). Centre only a single statement, and even then consider an
   asymmetric lock-up.
-- Show UI by cropping to the 3-6 lines that matter and scaling them 2-3x
-  (terminal text 32-44px). Move between regions with a camera push instead
-  of shrinking a whole window into the frame.
+- UI is a prop, on screen for at most a third of the film
+  (concept-and-world.md). When it appears, crop to the 3-6 lines that
+  matter and scale them 2-3x (terminal text 32-44px). Move between regions
+  with the camera instead of shrinking a whole window into the frame.
+- Vary the composition beat to beat: a full-frame statement, an object
+  cropped by two edges, type wrapped around an object, a split. The same
+  split in every scene is a slideshow.
 - Borders 2-4px, padding 60-140px, radii 12-24px.
 - Real content from the brief in every artefact: the actual commands,
   scores, names and states. No lorem, no fake chrome clutter.
@@ -103,30 +107,33 @@ with one small element in the middle of a dark field is dead space.
 
 ## Show the subject's world
 
-Each scene's hero is an artefact from the subject: a transcript, a score,
-a chart, a document, a tool, a place. Pick the most characteristic one and
-make it big. Metaphors work when built from the world's own objects (a
-filling context window, a handoff note passed between hands), not from
-generic shapes.
+Each scene's hero is an object from the subject's world or a line of type
+that performs, not a screen. Pick the most characteristic object and make
+it big. Metaphors work when built from the world's own objects (paper that
+piles up, a lock that clicks, a jar that fills), not from generic shapes;
+concept-and-world.md has the method.
 
 ## End card
 
-- It arrives as the consequence of the last beat: the carrier from the
-  final scene becomes the wordmark, the line or the lock-up.
+- It is built, not shown: the carrier from the final beat becomes the
+  wordmark, letters land or strokes draw, and the line lands with weight
+  on a beat (concept-and-world.md).
 - Wordmark in the embedded display face at 180-280px (30-45% of frame
   width); the line at 56-80px, 7 words or fewer.
 - Lock it up asymmetrically on a margin, or compose it with the final
-  artefact. A centred wordmark with an accent dot and an underline rule on
+  object. A centred wordmark with an accent dot and an underline rule on
   a radial gradient is the default to avoid.
-- Hold fully still for 1.5-2.5 s after the last element lands. For a looping
-  GIF, either hold or make the last frame flow into the first.
+- After the build, a final settle of 1-1.5 s ending on a still poster
+  frame. For a looping GIF, either settle or make the last frame flow into
+  the first.
 
 ## Proof frames
 
-Snapshot the opening frame, each scene's hold, the midpoint of every
-transition, the signature move in flight and the final hold. Judge them at
-full size and at the size they will be watched. Check type size against the
-table above, empty space, contrast and the pause test.
+Snapshot every 0.5 s plus the midpoint of every transition and the
+signature move in flight. Judge them at full size and at the size they will
+be watched: type size against the table above, empty space, contrast, the
+pause test, and the density check (neighbouring frames differ
+meaningfully).
 
 ## Cliches and the better move
 
@@ -137,6 +144,8 @@ table above, empty space, contrast and the pause test.
   world, with light and grain.
 - Centred wordmark with an accent dot -> an end card built from the film's
   carrier.
+- Text left, panel right in every scene -> one world, camera travel,
+  compositions that change on the beat.
 - Identical card grids, neon cyan and purple, gradient text, left-edge
   accent stripes -> one artefact, one accent, solid type.
 

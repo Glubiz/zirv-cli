@@ -37,6 +37,54 @@ action and at least part of the artefact are visible in both the 1440 and
 - Anchor to a strong left edge (inline-start). Centre only single short
   statements.
 
+## Layers, overlap and full-bleed
+
+A page of flat bands, each with text on the left and an empty right half,
+has no depth. Compose in three planes -- atmosphere (light, colour field,
+scene), content (type, the artefact), foreground (an artefact or detail that
+crosses a boundary) -- and let them overlap.
+
+```css
+.page {
+  display: grid;
+  grid-template-columns:
+    [full-start] minmax(20px, 1fr)
+    [content-start] min(100% - 40px, 1280px) [content-end]
+    minmax(20px, 1fr) [full-end];
+}
+.page > * { grid-column: content; }
+.page > .bleed { grid-column: full; }
+
+/* stack layers in one cell instead of positioning them absolutely */
+.stage { display: grid; }
+.stage > * { grid-area: 1 / 1; }
+.stage .atmosphere { z-index: 0; }
+.stage .copy { z-index: 1; align-self: end; }
+
+/* the artefact crosses into the next band */
+.artefact { position: relative; z-index: 2;
+  margin-block-end: clamp(-160px, -10vw, -48px); }
+```
+
+- One full-bleed moment per page: a scene, a colour field or the artefact
+  running edge to edge.
+- Overlap a band boundary by 48-160px with the artefact or the display
+  line, and crop at least one element with the viewport edge.
+- Fill the empty half: if a section's right half is empty at 1440, the
+  artefact, a scene or a pull figure belongs there -- or the text column
+  moves and the section becomes a full-width statement.
+- Check every overlap at 390 and 768: overlapping elements must not cover
+  text or controls, and text over a layer keeps 4.5:1.
+
+## Rhythm across sections
+
+- Write each section's composition in one word (statement, split,
+  full-bleed, track, table, scene, grid). No two neighbours share one.
+- Alternate loud sections (one huge element, generous space) with quiet
+  ones (dense, smaller, informative). Two loud sections in a row cancel out.
+- Change surface with the role (color-and-surface.md): the turn in the
+  story is where a contrast flip or a colour field lands.
+
 ## Scale and hierarchy
 
 - One dominant element per viewport, at least 3x the visual weight of the
@@ -64,10 +112,10 @@ Four to six sections, each a different composition:
 
 1. Arrival: claim, artefact, primary action.
 2. Demonstration: the product doing its job, interactive where it is cheap
-   (a slider that moves a computed window, a toggle between two real
+   (a slider that recomputes a real result, a toggle between two real
    states).
-3. Mechanism: how it works, drawn in the world's own form (a route on a
-   chart, a timeline, a document passing between hands).
+3. Mechanism: how it works, drawn in the world's own form (a plan, a
+   timeline, a document passing between hands).
 4. Assurance: real constraints and safety features shown as concrete
    scenes, not an icon grid.
 5. Action: the primary action again, with the context that makes it
@@ -90,17 +138,22 @@ what data? Put that data first and make the decision one step.
 - Alignment: text left, numbers right with tabular numerals, one date
   format; headers aligned like their data; sticky header; the identifying
   column first and pinned on narrow screens.
-- Urgency lives in the data: group or sort by what needs action
-  ("Overdue 2", "Due today 4", "Later 8") with group headers that carry a
-  count and the bulk action. A separate alert card that repeats table rows
+- Urgency lives in the data: group or sort by what needs action (for a
+  bike workshop: "Promised today 3", "Waiting for parts 2", "Ready for
+  pickup 5") with group headers that carry a count and the bulk action. A separate alert card that repeats table rows
   doubles the reading and splits the action.
 - Status: icon or shape plus word plus colour, in a fixed-width column.
   Pills on every value turn the table into confetti.
 - Inline assignment: an "Assign" text button in the cell opens a combobox
   popover -- type to filter, arrows to move, Enter assigns, Esc cancels,
-  focus returns to the cell. Show each option's current load ("Sofie, 2 due
-  today") so the choice is informed. Update optimistically with a 5-8 s
-  undo. A full select element on every row is heavy, noisy and slow to scan.
+  focus returns to the cell. Show each option's current load ("Ana, 1 bike
+  promised today") so the choice is informed, and put the suggested choice
+  first with its reason. Update optimistically with a 5-8 s undo, and let
+  the row travel to its new group (interface-motion.md). A full select
+  element on every row is heavy, noisy and slow to scan.
+- Time made visible: where work is time-bound, draw it against a now-line
+  (a day strip per row or a lane per person) so lateness is seen, not
+  computed.
 - Filters: segmented views with counts, reflected in the URL.
 - Use the canvas: at 1440 a 900px table leaves half the screen empty. Add a
   second region that serves the job -- an assignment or detail panel, a
@@ -142,7 +195,8 @@ browser recorded in the render report, for example:
 Repeat at 390 wide. Elements sized in vh or dvh stretch in a tall window:
 judge the hero from the normal capture and the flow from the tall one.
 Content hidden until it scrolls into view will look missing -- make content
-visible by default (see interface-motion.md).
+visible by default (see interface-motion.md). Hover, focus, mid-arrival and
+scroll states need the life captures in critique.md.
 
 ## Cliches and the better move
 
@@ -152,12 +206,15 @@ visible by default (see interface-motion.md).
   encodes importance.
 - Icon tile above every heading -> no icon, or an inline glyph that
   disambiguates.
-- The same section shape repeated -> a composition per content shape.
+- The same section shape repeated -> a composition per content shape, no
+  two neighbours alike.
+- Bands of left-aligned text with an empty right half -> layers, overlap,
+  a full-bleed moment.
 - Everything centred -> a strong edge and an asymmetric split.
 - Half an operate screen empty -> a second region that serves the job.
 - Big number, small label stat strip -> only numbers the product owns, in
   context.
-- Middle-dot meta strings ("12 open . 6 unassigned") -> make the counts the
+- Middle-dot meta strings ("12 open . 3 waiting") -> make the counts the
   filters they describe.
 
 Informed by impeccable (Apache-2.0), the Hyperframes skills (Apache-2.0) and

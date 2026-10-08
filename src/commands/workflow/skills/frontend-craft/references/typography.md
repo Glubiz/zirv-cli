@@ -28,8 +28,9 @@ habitual face (Inter, system-ui, Roboto) says "template" before a word is read.
 
 Models converge on any name they are shown. Treat each family below as a
 pointer to its neighbourhood; if your first pick appears here, look at two
-alternatives before committing. All are SIL Open Font License and available
-as @fontsource packages.
+alternatives before committing. Picking a good family is the easy half;
+using it expressively (next sections) is the job. All are SIL Open Font
+License and available as @fontsource packages.
 
 - Instrument and engineering: B612 and B612 Mono (drawn for cockpit
   displays), Overpass (highway-sign lineage), Barlow and Barlow Condensed,
@@ -74,6 +75,39 @@ Serif on cream. The detector flags Inter, Arial and system-ui as advisory.
 - Size contrast beats weight contrast: adjacent levels differ by at least
   1.25x; the headline is at least 3x body on persuade pages and 1.5-2x on
   operate surfaces.
+- Persuade pages read at arm's length: body 18-20px, lede 22-28px,
+  call-to-action labels 18px or more on buttons 52-60px tall with 28-36px
+  of horizontal padding. Small buttons say "optional".
+
+## One display moment with tension
+
+A page with every heading in the same light weight is quiet, not elegant.
+Give each persuade page one typographic moment that could be a poster,
+and keep the other headings calmer so it lands.
+
+- Size: 8-14vw for a short line (2-5 words), leading 0.85-0.95, tracking
+  -0.02 to -0.035em. The detector flags 7rem and up as advisory: keep it and
+  say it is the display moment.
+- Contrast inside the line: heavy against light in one variable family
+  (900 next to 250), roman against italic, condensed against wide on the
+  width axis, or a serif word set into a sans line -- one device, not all.
+- Placement: crop the line with the viewport edge, let it overlap the
+  artefact or a band boundary (layout-and-composition.md), or set it
+  vertically along an edge on wide screens. Check the overlap keeps 4.5:1.
+- Emphasis inside the line comes from that contrast, never from colouring
+  one word.
+- At 390 the moment still exists: 14-18vw, broken by hand into deliberate
+  lines with a max-width in ch, not shrunk until it is ordinary.
+
+```css
+.display { font: 900 clamp(3.5rem, 2rem + 9vw, 11rem)/0.9 var(--display);
+  letter-spacing: -0.03em; max-width: 9ch; text-wrap: balance; }
+.display em { font-style: italic; font-weight: 300; }
+```
+
+Rhythm across the page: alternate loud sections (one huge line, space) with
+quiet ones (small, dense, informative). Two loud sections in a row cancel
+each other out.
 
 ## Setting
 
@@ -160,8 +194,10 @@ connection) and send no visitor data to a third party.
   into a label that carries information (a step in a real sequence, a unit).
 - Default system or Inter type -> a family whose letterforms you can defend
   in one sentence about the world.
-- Every heading the same heavy weight -> a scale with real steps and one
-  extreme display moment.
+- Every heading the same weight, heavy or light -> a scale with real steps
+  and one display moment with tension.
+- 16px body and small buttons on a persuade page -> 18-20px body and
+  actions that invite a press.
 - Mono everywhere for a technical feel -> mono only for data compared by
   character.
 - Gradient-filled text -> solid ink; if the headline needs more, change its
