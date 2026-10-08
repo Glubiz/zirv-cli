@@ -11,7 +11,7 @@ metadata:
   x-zirv-phases: implement,present
   x-zirv-required-capabilities: repo.read,repo.write,shell.exec
   x-zirv-optional-capabilities: artifact.render
-  x-zirv-context-budget-bytes: "7600"
+  x-zirv-context-budget-bytes: "7900"
 ---
 
 A motion graphics request asks for a finished film, directed like one and
@@ -37,8 +37,11 @@ Between steps 2 and 3 below, once the project folder exists, write
    except a final 1-1.5 s settle; an end card that is built, not shown.
 4. Style frame: when the repository has a brand guide (`brand/BRAND.md`),
    take colours, type, logo and film rules from it and copy
-   `brand/tokens.css` and `brand/assets/` into the project; a product film
-   without one first establishes it with the brand-guide skill. Otherwise:
+   `brand/tokens.css` and `brand/assets/` into the project. A product film
+   without one takes the style frame from the product's own evidence (site,
+   app, terminal UI) as brand-guide's Establish mode does, writes it to
+   `brand/` with identity items marked [proposed], proceeds with those
+   values and reports the proposals for approval; it never waits. Otherwise:
    background, foreground and one accent from the subject's
    world (never pure black or white, not near-black with an acid accent by
    reflex); two families embedded from local woff2 files with `@font-face`,
