@@ -1450,6 +1450,37 @@ struct EffectRecord<'a> {
     attribution: Attribution,
 }
 
+/// Whether an effect row records a changed outcome (`acted`). An allow-list: a new or unknown
+/// action is not counted, so a gate is never labelled `active` on evidence nobody checked.
+fn effect_changed_behaviour(effect: &JevEffect<'_>) -> bool {
+    match effect.action {
+        "retry_decision" => effect.outcome == Some("auto_block"),
+        "escalated"
+        | "lowered"
+        | "semantic_convergence"
+        | "reviewer_launch_reused"
+        | "helper_skipped"
+        | "items_pruned"
+        | "items_kept"
+        | "description_removed"
+        | "report_bytes_removed"
+        | "description_bytes_removed"
+        | "worker_launch_prevented"
+        | "retry_auto_blocked"
+        | "task_unblocked"
+        | "effort_high"
+        | "stop_blocked"
+        | "gate_skipped"
+        | "tier_selected"
+        | "llm_turn_avoided"
+        | "optional_seat_omitted"
+        | "deferred"
+        | "flagged"
+        | "requested" => true,
+        _ => false,
+    }
+}
+
 /// Appends an effect only for an active site, without reading an answer cache.
 pub(crate) fn record_effect(
     cfg: &CtxConfig,
@@ -1464,7 +1495,7 @@ pub(crate) fn record_effect(
     jev_counters::count(
         state,
         jev_counters::gate_for_site(effect.site),
-        true,
+        effect_changed_behaviour(effect),
         jev_counters::Stage::Acted,
         None,
     );
@@ -2895,6 +2926,44 @@ pub(crate) mod tests {
             let row: serde_json::Value = serde_json::from_str(line).expect("json");
             assert_eq!(row["v"], jev_counters::VERSION);
         }
+    }
+
+    #[test]
+    fn only_effects_that_changed_behaviour_count_as_acted() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(state_dir.path().to_path_buf());
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_ACTED".to_string();
+        with_credential("JEV_TEST_KEY_ACTED", "secret", || {
+            record_effect(&cfg, &state, true, &JevEffect::new("approve", "unchanged"));
+            record_effect(
+                &cfg,
+                &state,
+                true,
+                &JevEffect::new("approve", "some_new_action"),
+            );
+            let mut baseline = JevEffect::new("crash", "retry_decision");
+            baseline.outcome = Some("baseline_retry");
+            record_effect(&cfg, &state, true, &baseline);
+            let counts = jev_counters::rollup(&state, state::now_secs());
+            assert!(counts.values().all(|gate| gate.acted == 0), "{counts:?}");
+            let rows = jev_counters::gate_rows(
+                &JevConfig {
+                    approve: true,
+                    ..JevConfig::default()
+                },
+                &counts,
+            );
+            assert!(
+                rows.iter()
+                    .all(|row| row.label != jev_counters::Label::Active),
+                "a gate with only no-change effects is not active"
+            );
+
+            record_effect(&cfg, &state, true, &JevEffect::new("approve", "escalated"));
+            let counts = jev_counters::rollup(&state, state::now_secs());
+            assert_eq!(counts["approve"].acted, 1);
+        });
     }
 
     #[test]
