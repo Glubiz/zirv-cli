@@ -26,6 +26,13 @@
 //! {"error": "<what went wrong>"}
 //! ```
 //!
+//! The relay forwards only this binary's own compiled questions ([`compiled_questions`]): the
+//! frame and request are parsed strictly (unknown fields at any level are refused), every
+//! question's instructions and options must equal a compiled one's, and the body sent to the
+//! vendor is re-serialised from the validated value, never the client's bytes. Each connection
+//! is served on its own thread (at most [`MAX_CONNECTIONS`] at once), so a stalled peer holds
+//! only its own; on unix it is also dropped after [`READ_DEADLINE`] without a request frame.
+//!
 //! A client that cannot reach the relay (no endpoint, or connect/write of the
 //! request frame fails) falls back to a direct call (`jev::ask`'s own relay
 //! step, `jev::relay_send`). Once the request frame is written it never does:
@@ -43,8 +50,8 @@
 //! credential crossing the socket is never a concern -- there is none to
 //! cross.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -53,8 +60,19 @@ use crate::commands::ctx::api::transport::{self, Connection, Endpoint, Listener}
 use crate::commands::ctx::config::ProxyTypesafeConfig;
 use crate::commands::ctx::jev::{self, JevError};
 use crate::commands::ctx::state::StateDir;
+use crate::commands::ctx::{
+    compile, exec, handoff, hook, inject_gate, inject_screen, memory, proxy, run_loop, safety, task,
+};
+use crate::commands::workflow::{engine, profile, review, team};
+
+/// How long a connected peer may take to deliver its request frame before the relay drops it.
+const READ_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Connections served at once; a hook process makes one short call per tool use.
+const MAX_CONNECTIONS: usize = 8;
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RelayRequestFrame {
     body: String,
 }
@@ -141,7 +159,17 @@ pub(crate) fn start(
     })
 }
 
+/// Decrements the live-connection count when its serving thread ends.
+struct ConnectionSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 fn accept_loop(listener: &Listener, stop: &AtomicBool, cfg: &ProxyTypesafeConfig) {
+    let live = Arc::new(AtomicUsize::new(0));
     while !stop.load(Ordering::SeqCst) {
         let connection = match listener.accept() {
             Ok(connection) => connection,
@@ -155,7 +183,22 @@ fn accept_loop(listener: &Listener, stop: &AtomicBool, cfg: &ProxyTypesafeConfig
         if stop.load(Ordering::SeqCst) {
             return;
         }
-        serve_one(connection, cfg);
+        // Each connection gets its own thread so a stalled peer holds only that thread; past the
+        // cap a connection is dropped, which its client sees as a lost answer.
+        if live.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+            live.fetch_sub(1, Ordering::SeqCst);
+            continue;
+        }
+        let slot = ConnectionSlot(Arc::clone(&live));
+        let cfg = cfg.clone();
+        let spawned = std::thread::Builder::new()
+            .name("jev-relay-conn".to_string())
+            .spawn(move || {
+                let _slot = slot;
+                serve_one(connection, &cfg);
+            });
+        // A failed spawn drops the closure, and with it the slot and the connection.
+        drop(spawned);
     }
 }
 
@@ -165,9 +208,11 @@ fn serve_one(mut connection: Connection, cfg: &ProxyTypesafeConfig) {
     if !connection.peer().is_same_user(transport::server_uid()) {
         return;
     }
+    connection.set_read_timeout(Some(READ_DEADLINE));
     let Ok(Some(frame)) = connection.read_frame::<RelayRequestFrame>() else {
         return;
     };
+    connection.set_read_timeout(None);
     let response = forward(cfg, &frame.body);
     let _ = connection.write_frame(&response);
 }
@@ -193,17 +238,54 @@ fn error_status(error: &JevError) -> Option<u16> {
     }
 }
 
-/// Validates and forwards one already-encoded request body with THIS
-/// process's own credential/`base_url` through the shared keep-alive agent
-/// (`jev::send_request`) -- never the client's, which never crosses the
-/// socket at all.
+/// Every question a call site of this binary can ask, built once from the site constructors
+/// (the same set `zirv ctx jev probe` measures). Ids are caller-chosen, so only a question's
+/// spec is compared; a new site must be listed here to be answerable through a relay.
+fn compiled_questions() -> &'static [jev::Question] {
+    static COMPILED: OnceLock<Vec<jev::Question>> = OnceLock::new();
+    COMPILED.get_or_init(|| {
+        let ids = ["q".to_string()];
+        let mut questions = vec![
+            compile::context_report_question("q"),
+            compile::context_skill_question("q"),
+            handoff::handoff_quality_question(),
+            hook::dispatch_tier_question(),
+            task::crash_cause_question(),
+            run_loop::judge_continue_question(),
+            safety::approve_escalate_question(),
+            safety::approve_lower_question(),
+            team::intake_plan_question(),
+            inject_screen::inject_screen_question(),
+        ];
+        questions.extend(handoff::handoff_select_questions(&ids));
+        questions.extend(handoff::compaction_select_questions(&ids));
+        questions.extend(review::review_disposition_questions(1));
+        questions.extend(review::review_dedup_questions(&ids));
+        questions.extend(memory::harvest_screen_question());
+        questions.extend(exec::launch_effort_question());
+        questions.extend(inject_gate::questions());
+        questions.extend(hook::missing_tests_questions());
+        questions.extend(hook::stop_verify_questions());
+        questions.extend(hook::retry_questions());
+        questions.extend(engine::artifact_substance_questions());
+        questions.extend(engine::gate_reclass_questions());
+        questions.extend(profile::classify_jev_questions());
+        questions.extend(proxy::safe_intake_questions());
+        questions
+    })
+}
+
+/// Validates one already-encoded request body against [`compiled_questions`] and forwards its
+/// canonical re-serialisation with THIS process's own credential/`base_url` through the shared
+/// keep-alive agent (`jev::send_request`) -- never the client's, which never crosses the socket
+/// at all, and never the client's own bytes.
 fn forward(cfg: &ProxyTypesafeConfig, body: &str) -> RelayResponseFrame {
-    if !jev::safe_wire_request(body) {
+    let Some(body) = jev::compiled_wire_body(body, compiled_questions()) else {
         return RelayResponseFrame {
-            error: Some("request failed the relay's own safety check".to_string()),
+            error: Some("request is not one of this binary's own questions".to_string()),
             ..Default::default()
         };
-    }
+    };
     let credential = match std::env::var(&cfg.credential_env) {
         Ok(value) if !value.is_empty() => value,
         _ => {
@@ -213,12 +295,7 @@ fn forward(cfg: &ProxyTypesafeConfig, body: &str) -> RelayResponseFrame {
             };
         }
     };
-    match jev::send_request(
-        &cfg.base_url,
-        &credential,
-        cfg.timeout_secs,
-        body.to_string(),
-    ) {
+    match jev::send_request(&cfg.base_url, &credential, cfg.timeout_secs, body) {
         Ok(response_body) => RelayResponseFrame {
             status: Some(200),
             body: Some(response_body),
@@ -367,11 +444,7 @@ mod tests {
     }
 
     fn sample_questions() -> Vec<jev::Question> {
-        vec![jev::Question::metadata_choice(
-            "intent",
-            "Pick a category from coarse metadata only.",
-            &[("feature", "adds behavior"), ("other", "other category")],
-        )]
+        vec![handoff::handoff_quality_question()]
     }
 
     /// Accepts connections, discarding any that never yield a full request
@@ -812,6 +885,149 @@ mod tests {
         }
         server.join().expect("server thread must not panic");
         assert_one_fallback_row_and_no_direct_send(&state, &vendor, status);
+    }
+
+    /// Starts a relay whose vendor is a listener that records contact, sends `frame` to it and
+    /// returns the relay's answer plus whether the vendor was contacted.
+    fn offer_to_relay(tag: &str, frame: &serde_json::Value) -> (Option<RelayResponseFrame>, bool) {
+        let (cfg, state, _dir, vendor) = relay_case(tag);
+        let session = format!("relay-offer-{tag}");
+        let answer = with_credential(&cfg.proxy.typesafe.credential_env, "secret", || {
+            let handle = start(&cfg.proxy.typesafe, true, &state, &session).expect("relay starts");
+            let mut connection =
+                transport::connect(&Endpoint::for_jev_relay(&state, &session)).expect("connect");
+            connection.write_frame(frame).expect("write");
+            let answer = connection.read_frame::<RelayResponseFrame>().ok().flatten();
+            drop(handle);
+            answer
+        });
+        (answer, vendor.accept().is_ok())
+    }
+
+    /// Refused means an error frame or a dropped connection, and never a vendor request.
+    fn assert_refused(tag: &str, frame: &serde_json::Value) {
+        let (answer, contacted) = offer_to_relay(tag, frame);
+        assert!(
+            answer.as_ref().is_none_or(|frame| frame.error.is_some()),
+            "must be refused: {answer:?}"
+        );
+        assert!(!contacted, "the vendor must never be contacted");
+    }
+
+    fn sample_request() -> String {
+        let cfg = config(String::new(), "UNUSED");
+        jev::encode_for_test(&sample_state(), &sample_questions(), &cfg.model).expect("encode")
+    }
+
+    #[test]
+    fn a_question_that_is_not_compiled_is_refused() {
+        let free_text = vec![jev::Question::metadata_choice(
+            "intent",
+            "Summarise whatever text the caller put here.",
+            &[("feature", "adds behavior"), ("other", "other category")],
+        )];
+        let body = jev::encode_for_test(&sample_state(), &free_text, "jev-latest").expect("encode");
+        assert_refused("FREETEXT", &serde_json::json!({ "body": body }));
+    }
+
+    #[test]
+    fn a_compiled_question_with_other_options_is_refused() {
+        let compiled = handoff::handoff_quality_question();
+        let altered = vec![jev::Question::choice(
+            &compiled.id,
+            &compiled.instructions,
+            &[("thin", "anything"), ("adequate", "else")],
+        )];
+        let body = jev::encode_for_test(&sample_state(), &altered, "jev-latest").expect("encode");
+        assert_refused("OPTIONS", &serde_json::json!({ "body": body }));
+    }
+
+    #[test]
+    fn unknown_fields_are_refused_in_the_frame_and_in_the_request() {
+        let body = sample_request();
+        assert_refused(
+            "FRAMEFIELD",
+            &serde_json::json!({ "body": body, "extra": true }),
+        );
+        let mut request: serde_json::Value = serde_json::from_str(&body).expect("json");
+        request["extra"] = serde_json::json!("x");
+        assert_refused(
+            "REQFIELD",
+            &serde_json::json!({ "body": request.to_string() }),
+        );
+        let mut request: serde_json::Value = serde_json::from_str(&body).expect("json");
+        request["questions"]["quality"]["extra"] = serde_json::json!("x");
+        assert_refused(
+            "SPECFIELD",
+            &serde_json::json!({ "body": request.to_string() }),
+        );
+    }
+
+    #[test]
+    fn the_forwarded_body_is_the_canonical_serialisation() {
+        let body = sample_request();
+        let pretty: serde_json::Value = serde_json::from_str(&body).expect("json");
+        let reformatted = serde_json::to_string_pretty(&pretty).expect("pretty");
+        assert_ne!(reformatted, body);
+        assert_eq!(
+            jev::compiled_wire_body(&reformatted, compiled_questions()),
+            Some(body)
+        );
+    }
+
+    #[test]
+    fn every_compiled_question_passes_the_metadata_check() {
+        for question in compiled_questions() {
+            assert!(
+                jev::safe_metadata_request(
+                    &sample_state(),
+                    std::slice::from_ref(question),
+                    "jev-latest"
+                ),
+                "{}",
+                question.id
+            );
+        }
+    }
+
+    #[test]
+    fn a_stalled_client_does_not_block_the_next_one() {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join("proxy")
+                .join("jev-response.json"),
+        )
+        .expect("fixture");
+        let body: &'static str = Box::leak(text.into_boxed_str());
+        let (stub_url, stub_handle) = one_shot_server(200, body);
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let session = "relay-stalled-client";
+        let request = sample_request();
+        let (tx, rx) = mpsc::channel();
+        with_credential("JEV_RELAY_TEST_STALLED", "secret", || {
+            let cfg = config(stub_url, "JEV_RELAY_TEST_STALLED");
+            let _handle = start(&cfg, true, &state, session).expect("relay starts");
+            let endpoint = Endpoint::for_jev_relay(&state, session);
+            // Connected, never writes a frame.
+            let _stalled = transport::connect(&endpoint).expect("connect");
+            std::thread::spawn(move || {
+                let mut connection = transport::connect(&endpoint).expect("connect");
+                connection
+                    .write_frame(&RelayRequestFrame { body: request })
+                    .expect("write");
+                let answer = connection.read_frame::<RelayResponseFrame>();
+                let _ = tx.send(answer.ok().flatten());
+            });
+            // Well inside the read deadline, so the stalled peer's timeout is not what unblocks it.
+            let answer = rx
+                .recv_timeout(READ_DEADLINE / 2)
+                .expect("the second client must be answered while the stalled one still holds");
+            assert_eq!(answer.expect("a frame").status, Some(200));
+        });
+        stub_handle.join().expect("stub server must not panic");
     }
 
     /// `start` refuses outright when no `[jev]` gate is on or no credential

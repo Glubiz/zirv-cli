@@ -61,6 +61,7 @@ pub(crate) use self::pretool_tier::dispatch_tier_question;
 pub(crate) use self::stop_verify::STOP_VERIFY_DEFAULT_FLOOR;
 pub(crate) use self::stop_verify::stop_verify_action;
 pub(crate) use self::stop_verify::stop_verify_questions;
+pub(crate) use self::tool_failure::retry_questions;
 
 #[derive(Debug, clap::Args)]
 pub struct HookArgs {

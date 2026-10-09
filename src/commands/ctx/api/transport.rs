@@ -148,7 +148,11 @@ pub struct Connection {
     reader: BufReader<Box<dyn Read + Send>>,
     writer: Box<dyn Write + Send>,
     peer: Peer,
+    read_timeout: ReadTimeoutSetter,
 }
+
+/// Applies a read deadline to the underlying stream; a no-op where the platform cannot.
+type ReadTimeoutSetter = Box<dyn Fn(Option<std::time::Duration>) + Send>;
 
 impl std::fmt::Debug for Connection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -164,7 +168,19 @@ impl Connection {
             reader: BufReader::new(reader),
             writer,
             peer,
+            read_timeout: Box::new(|_| {}),
         }
+    }
+
+    #[cfg(unix)]
+    fn with_read_timeout(mut self, setter: ReadTimeoutSetter) -> Self {
+        self.read_timeout = setter;
+        self
+    }
+
+    /// Bounds how long a read may block; a read that exceeds it errors. Enforced on unix only.
+    pub fn set_read_timeout(&self, timeout: Option<std::time::Duration>) {
+        (self.read_timeout)(timeout);
     }
 
     pub fn peer(&self) -> Peer {
@@ -280,7 +296,14 @@ mod imp {
             uid: peer_uid(&stream),
         };
         let reader = stream.try_clone()?;
-        Ok(Connection::new(Box::new(reader), Box::new(stream), peer))
+        let timeout_stream = stream.try_clone()?;
+        Ok(
+            Connection::new(Box::new(reader), Box::new(stream), peer).with_read_timeout(Box::new(
+                move |timeout| {
+                    let _ = timeout_stream.set_read_timeout(timeout);
+                },
+            )),
+        )
     }
 
     #[derive(Debug)]

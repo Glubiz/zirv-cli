@@ -263,7 +263,7 @@ fn safe_intake_metadata(request: &str, baseline: &ProxyDecision) -> serde_json::
     })
 }
 
-fn safe_intake_questions() -> Vec<Question> {
+pub(crate) fn safe_intake_questions() -> Vec<Question> {
     vec![
         Question::metadata_noul(
             "needs_clarification",
