@@ -30,10 +30,9 @@
 //! before any Jev call is made. The output's own `floor` object always
 //! reports the post-override effective values.
 //!
-//! Six more sites complete the probe contract: `missing-tests`,
-//! `stop-verify`, `review-disposition`, `review-dedup`, `artifact-substance`,
-//! `gate-reclass`. Every site's state is metadata-only: `artifact-substance`
-//! sends `state::artifact_jev_facts` and `gate-reclass` sends
+//! Five more sites complete the probe contract: `missing-tests`,
+//! `stop-verify`, `review-disposition`, `review-dedup`, `gate-reclass`.
+//! Every site's state is metadata-only: `gate-reclass` sends
 //! `profile::gate_jev_facts`.
 //! `gate-reclass` additionally has PER-QUESTION floors (`work_domain` uses
 //! a different default than its other six items) -- the output's optional
@@ -86,7 +85,6 @@ enum Site {
     ContextReport,
     ContextSkill,
     HarvestScreen,
-    HandoffThin,
     HandoffSelect,
     CompactionSelect,
     Dispatch,
@@ -103,7 +101,6 @@ enum Site {
     StopVerify,
     ReviewDisposition,
     ReviewDedup,
-    ArtifactSubstance,
     GateReclass,
 }
 
@@ -113,7 +110,6 @@ impl Site {
             "context-report" => Self::ContextReport,
             "context-skill" => Self::ContextSkill,
             "harvest-screen" => Self::HarvestScreen,
-            "handoff-thin" => Self::HandoffThin,
             "handoff-select" => Self::HandoffSelect,
             "compaction-select" => Self::CompactionSelect,
             "dispatch" => Self::Dispatch,
@@ -130,7 +126,6 @@ impl Site {
             "stop-verify" => Self::StopVerify,
             "review-disposition" => Self::ReviewDisposition,
             "review-dedup" => Self::ReviewDedup,
-            "artifact-substance" => Self::ArtifactSubstance,
             "gate-reclass" => Self::GateReclass,
             _ => return None,
         })
@@ -145,7 +140,6 @@ impl Site {
             Self::ContextReport => "context-parent-reports",
             Self::ContextSkill => "context-skill-descriptions",
             Self::HarvestScreen => "harvest",
-            Self::HandoffThin => "handoff",
             Self::HandoffSelect => "handoff_select",
             Self::CompactionSelect => "compaction_select",
             Self::Dispatch => "dispatch",
@@ -161,7 +155,6 @@ impl Site {
             Self::StopVerify => "stop_verify",
             Self::ReviewDisposition => review::REVIEW_DISPOSITION_LABEL,
             Self::ReviewDedup => review::REVIEW_DEDUP_LABEL,
-            Self::ArtifactSubstance => engine::ARTIFACT_SUBSTANCE_LABEL,
             Self::GateReclass => engine::GATE_RECLASS_LABEL,
         }
     }
@@ -177,9 +170,7 @@ impl Site {
         match self {
             Self::ContextReport | Self::ContextSkill => (Some(jev::FloorSite::Context), "context"),
             Self::HarvestScreen => (Some(jev::FloorSite::HarvestScreen), "harvest_screen"),
-            Self::HandoffThin | Self::HandoffSelect => {
-                (Some(jev::FloorSite::HandoffSelect), "handoff_select")
-            }
+            Self::HandoffSelect => (Some(jev::FloorSite::HandoffSelect), "handoff_select"),
             Self::CompactionSelect => (Some(jev::FloorSite::CompactionSelect), "compaction_select"),
             Self::Dispatch => (Some(jev::FloorSite::Dispatch), "dispatch"),
             Self::LaunchEffort => (Some(jev::FloorSite::LaunchEffort), "launch_effort"),
@@ -195,7 +186,6 @@ impl Site {
             Self::StopVerify => (None, "stop_verify"),
             Self::ReviewDisposition => (None, "review_disposition"),
             Self::ReviewDedup => (None, "review_dedup"),
-            Self::ArtifactSubstance => (None, "artifact_substance"),
             Self::GateReclass => (None, "gate_reclass"),
         }
     }
@@ -211,7 +201,6 @@ impl Site {
                 memory::HARVEST_SCREEN_MIN_CONFIDENCE,
                 jev::DEFAULT_MIN_MARGIN,
             ),
-            Self::HandoffThin => (handoff::HANDOFF_THIN_FLOOR, jev::DEFAULT_MIN_MARGIN),
             Self::HandoffSelect => handoff::HANDOFF_SELECT_DEFAULT_FLOOR,
             Self::CompactionSelect => handoff::COMPACTION_SELECT_DEFAULT_FLOOR,
             Self::Dispatch => (hook::DISPATCH_TIER_FLOOR, jev::DEFAULT_MIN_MARGIN),
@@ -240,7 +229,6 @@ impl Site {
             Self::StopVerify => hook::STOP_VERIFY_DEFAULT_FLOOR,
             Self::ReviewDisposition => review::REVIEW_DISPOSITION_DEFAULT_FLOOR,
             Self::ReviewDedup => review::REVIEW_DEDUP_DEFAULT_FLOOR,
-            Self::ArtifactSubstance => engine::ARTIFACT_SUBSTANCE_DEFAULT_FLOOR,
             // The representative/majority default: six of `gate-reclass`'s
             // seven items (every item but `work_domain`) use this floor --
             // see [`Site::item_default_floor`] for the per-item picture.
@@ -305,10 +293,6 @@ impl Site {
             Self::HarvestScreen => Ok((
                 memory::harvest_screen_question().to_vec(),
                 vec!["novel".to_string()],
-            )),
-            Self::HandoffThin => Ok((
-                vec![handoff::handoff_quality_question()],
-                vec!["quality".to_string()],
             )),
             Self::HandoffSelect => {
                 let ids = numbered_ids("c", require_n(case)?);
@@ -379,10 +363,6 @@ impl Site {
                 let questions = review::review_dedup_questions(&ids);
                 Ok((questions, ids))
             }
-            Self::ArtifactSubstance => Ok((
-                engine::artifact_substance_questions().to_vec(),
-                vec!["substance".to_string()],
-            )),
             Self::GateReclass => {
                 let questions = engine::gate_reclass_questions();
                 let ids = questions
@@ -425,7 +405,6 @@ impl Site {
                     "run"
                 }
             }
-            Self::HandoffThin => handoff::handoff_thin_action(answer, min_confidence, min_margin),
             Self::HandoffSelect => {
                 handoff::handoff_select_action(answer, min_confidence, min_margin)
             }
@@ -474,9 +453,6 @@ impl Site {
                 review::review_disposition_action(answer, min_confidence, min_margin)
             }
             Self::ReviewDedup => review::review_dedup_action(answer, min_confidence, min_margin),
-            Self::ArtifactSubstance => {
-                engine::artifact_substance_action(answer, min_confidence, min_margin)
-            }
             Self::GateReclass => match id {
                 "sensitive_surface" => {
                     engine::gate_sensitive_surface_action(answer, min_confidence, min_margin)
@@ -497,9 +473,7 @@ impl Site {
     /// rather than re-derived per rep.
     fn fallback_action(self) -> &'static str {
         match self {
-            Self::ContextReport | Self::ContextSkill | Self::HandoffSelect | Self::HandoffThin => {
-                "keep"
-            }
+            Self::ContextReport | Self::ContextSkill | Self::HandoffSelect => "keep",
             Self::HarvestScreen => "run",
             Self::CompactionSelect => "omit",
             Self::Dispatch => "deny",
@@ -516,7 +490,6 @@ impl Site {
             Self::StopVerify => "allow",
             Self::ReviewDisposition => "unchanged",
             Self::ReviewDedup => "distinct",
-            Self::ArtifactSubstance => "pass",
             Self::GateReclass => "none",
         }
     }
@@ -1531,9 +1504,8 @@ mod tests {
         );
     }
 
-    // -- Probe-contract extension, remaining six sites: missing-tests,
-    // stop-verify, review-disposition, review-dedup, artifact-substance,
-    // gate-reclass -------------------------------------------------------
+    // -- Probe-contract extension, remaining five sites: missing-tests,
+    // stop-verify, review-disposition, review-dedup, gate-reclass --------
 
     fn noul_case(facts: Vec<u32>) -> serde_json::Value {
         serde_json::json!({
@@ -1728,32 +1700,6 @@ mod tests {
             },
         );
         handle.join().expect("server thread");
-    }
-
-    /// A failed `artifact-substance` call (closed port) reports the `"pass"` fallback and a counted error.
-    #[test]
-    fn artifact_substance_failed_call_falls_back_to_pass() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let case_state = serde_json::json!({
-            "id": "c1",
-            "state": {"_zirv_metadata_only": true, "facts": [[5, 0, 1, 1, 4, 1, 1, 0, 0, 0, 0, 1]]},
-        });
-        let case = write_case(dir.path(), "case.json", &case_state);
-        with_env(
-            &base_env(dir.path(), "http://127.0.0.1:1", "ARTIFACT_SUBSTANCE_1091"),
-            || {
-                let mut out = Vec::new();
-                let code = run_probe("artifact-substance", &case, 2, Some(dir.path()), &mut out)
-                    .expect("run");
-                assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
-                let value: serde_json::Value = serde_json::from_slice(&out).expect("json");
-                assert_eq!(value["calls"], 2);
-                assert_eq!(value["errors"], 2);
-                for rep in value["reps"].as_array().expect("reps") {
-                    assert_eq!(rep["actions"]["substance"], "pass");
-                }
-            },
-        );
     }
 
     /// A failed `gate-reclass` call (closed port) reports every one of the seven

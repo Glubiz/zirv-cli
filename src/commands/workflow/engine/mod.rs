@@ -23,12 +23,10 @@ pub use lifecycle::{
 pub use session_context::{
     AbandonedWorkflow, abandoned_workflows, changed_step_context, step_context_note,
 };
-pub(crate) use state::{
-    ARTIFACT_SUBSTANCE_DEFAULT_FLOOR, ARTIFACT_SUBSTANCE_LABEL, artifact_substance_action,
-    artifact_substance_questions, hash_bytes, load_active_read_only, read_accepted_artifact, save,
-    save_preserving_active,
-};
 pub use state::{WorkflowState, load, load_active, load_active_for_session, state_mtime_secs};
+pub(crate) use state::{
+    hash_bytes, load_active_read_only, read_accepted_artifact, save, save_preserving_active,
+};
 pub(crate) use transition::{
     GATE_RECLASS_LABEL, GATE_RECLASS_NOUL_DEFAULT_FLOOR, GATE_RECLASS_WORK_DOMAIN_DEFAULT_FLOOR,
     gate_reclass_questions, gate_sensitive_surface_action, gate_tag_action,
@@ -145,8 +143,7 @@ mod tests {
         git(&["commit", "-q", "-m", "base"]);
     }
 
-    /// Shared by `state::tests` (`artifact_substance_action`'s own edge test)
-    /// and `transition::tests` (`gate_work_domain_action`'s own edge test):
+    /// Used by `transition::tests` (`gate_work_domain_action`'s own edge test):
     /// a decisive `Choice` answer at the given confidence.
     pub(super) fn choice_answer(choice: &str, confidence: f32) -> jev::Answer {
         jev::Answer {

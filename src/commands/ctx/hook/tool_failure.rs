@@ -211,8 +211,9 @@ fn tool_failure_advisory_with(
     payload: &ToolFailurePayload,
     supervisor_fire: &dyn Fn(&ToolFailurePayload) -> bool,
 ) -> Option<&'static str> {
-    let jev_on = cfg.jev.retry && jev::available(&cfg.proxy.typesafe);
+    let jev_on = jev::gate_open(cfg, state, "retry", cfg.jev.retry);
     if !(jev_on || cfg.supervisor.enabled) || payload.is_interrupt {
+        jev::exit(state, "retry", jev_on, "interrupt");
         return None;
     }
     let path = streak_path(state, &payload.session_id)?;
@@ -233,6 +234,7 @@ fn tool_failure_advisory_with(
     }
     drop(lock);
     if !ask_now {
+        jev::exit(state, "retry", jev_on, "streak_not_at_threshold");
         return None;
     }
     if cfg.supervisor.enabled {
@@ -448,7 +450,11 @@ mod tests {
         let no_credential = fail_times(&state, &cfg, 3);
         assert_eq!(off, None);
         assert_eq!(no_credential, None);
-        assert!(!state.root().exists(), "no streak file, no decision log");
+        assert!(!state.root().join(STREAK_DIR).exists(), "no streak file");
+        assert!(
+            !state.root().join(jev::JEV_DECISIONS_FILE).exists(),
+            "no decision log"
+        );
     }
 
     #[test]
@@ -624,7 +630,8 @@ mod tests {
                 assert_eq!(tool_failure_advisory(&state, &cfg, &payload), None);
             }
         });
-        assert!(!state.root().exists());
+        assert!(!state.root().join(STREAK_DIR).exists());
+        assert!(!state.root().join(jev::JEV_DECISIONS_FILE).exists());
     }
 
     #[test]

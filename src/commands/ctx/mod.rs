@@ -50,6 +50,7 @@ pub(crate) mod hook_project;
 pub(crate) mod inject_gate;
 pub mod inject_screen;
 pub mod jev;
+pub(crate) mod jev_counters;
 pub mod jev_feed;
 pub(crate) mod jev_probe;
 pub mod jev_relay;

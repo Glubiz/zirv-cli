@@ -700,7 +700,7 @@ fn jev_approve_escalate(
     scratchpad_roots: &[String],
     outcome: Outcome,
 ) -> Outcome {
-    if !super::jev::available(&cfg.proxy.typesafe) {
+    if !super::jev::gate_open(cfg, state, "approve", cfg.jev.approve) {
         return outcome;
     }
     let advise_state = JevApproveState {
@@ -787,7 +787,7 @@ fn jev_approve_lower(
     scratchpad_roots: &[String],
     outcome: Outcome,
 ) -> Outcome {
-    if !super::jev::available(&cfg.proxy.typesafe) {
+    if !super::jev::gate_open(cfg, state, "approve_allow", cfg.jev.approve_allow) {
         return outcome;
     }
     let advise_state = JevApproveState {
@@ -795,7 +795,8 @@ fn jev_approve_lower(
         facts: vec![jev_approve_facts(command, scratchpad_roots)],
     };
     let questions = [approve_lower_question()];
-    match super::jev::advise_detailed(
+    match super::jev::advise_gated(
+        "approve_allow",
         cfg,
         state,
         "approve",

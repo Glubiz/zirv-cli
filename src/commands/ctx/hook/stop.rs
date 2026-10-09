@@ -401,7 +401,11 @@ fn stop_rot_advisory_deferred(
     capacity: Option<u64>,
 ) -> bool {
     use crate::commands::ctx::inject_gate::{self, Decision, InjectFacts, InjectKind};
-    if supervised || score.verdict == Verdict::Healthy || !inject_gate::enabled(cfg) {
+    if supervised || score.verdict == Verdict::Healthy {
+        crate::commands::ctx::jev::exit(state, "inject", cfg.jev.inject, "no_rot_advisory_due");
+        return false;
+    }
+    if !crate::commands::ctx::jev::gate_open(cfg, state, "inject", cfg.jev.inject) {
         return false;
     }
     let facts = InjectFacts {

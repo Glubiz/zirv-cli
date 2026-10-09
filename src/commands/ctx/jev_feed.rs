@@ -126,9 +126,6 @@ fn floor_of(site: &str, cfg: &CtxConfig) -> f32 {
         "intake" | "proxy" => cfg.proxy.min_confidence,
         site if site == review::REVIEW_DISPOSITION_LABEL => review::JEV_DISPOSITION_CONFIDENCE,
         site if site == review::REVIEW_DEDUP_LABEL => review::JEV_DEDUP_PROBABILITY as f32,
-        site if site == engine::ARTIFACT_SUBSTANCE_LABEL => {
-            engine::ARTIFACT_SUBSTANCE_DEFAULT_FLOOR.0
-        }
         site if site == engine::GATE_RECLASS_LABEL => engine::GATE_RECLASS_NOUL_DEFAULT_FLOOR.0,
         _ => DEFAULT_FLOOR,
     }
@@ -193,7 +190,8 @@ fn jev_verdict(site: &str, row: &Value) -> (String, f64) {
             format!("ranked {all} notes, top {best:.2}")
         }
         site if site == engine::GATE_RECLASS_LABEL => format!("gate risk: {id} {confidence:.2}"),
-        site if site == engine::ARTIFACT_SUBSTANCE_LABEL => {
+        // The retired artifact-substance site: rows written before it was removed still render.
+        "workflow-artifact-substance" => {
             let verdict = value
                 .get("Choice")
                 .and_then(Value::as_str)

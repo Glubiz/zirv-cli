@@ -1,13 +1,12 @@
 //! [`WorkflowState`] and its durable, on-disk persistence (issue #542-split).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::commands::ctx::CtxResult;
-use crate::commands::ctx::jev::{self, AnswerValue, Question};
 use crate::commands::ctx::state::{
     StateDir, create_private_dir_all, now_secs, repo_slug, write_private,
 };
@@ -22,18 +21,6 @@ pub const WORKFLOW_SCHEMA_VERSION: u32 = 5;
 const WORKFLOW_SCHEMA_VERSION_V4: u32 = 4;
 
 const MAX_WORK_ARTIFACT_CONTEXT_BYTES: usize = 24 * 1024;
-
-/// Minimum artifact-substance confidence from the 2026-09-18 probe.
-const JEV_ARTIFACT_CONFIDENCE: f32 = 0.9;
-
-/// [`pin_current_artifact_with_config`]'s own production advise-site LABEL.
-pub(crate) const ARTIFACT_SUBSTANCE_LABEL: &str = "workflow-artifact-substance";
-
-/// [`pin_current_artifact_with_config`]'s own default `(min_confidence,
-/// min_margin)` `decisive()` floor -- named (issue: `zirv ctx jev probe`) so
-/// a later retune targets exactly this constant.
-pub(crate) const ARTIFACT_SUBSTANCE_DEFAULT_FLOOR: (f32, f32) =
-    (JEV_ARTIFACT_CONFIDENCE, jev::DEFAULT_MIN_MARGIN);
 
 fn default_true() -> bool {
     true
@@ -394,7 +381,7 @@ pub(super) fn workflow_artifact_path(
 /// runs in a blind review) despite nobody having written anything into it.
 /// The path and template text stay discoverable without writing anything
 /// (`render_current_context`'s own doc comment), and every reader of the
-/// artifact (`pin_current_artifact_with_config`, `artifact_drift`,
+/// artifact (`pin_current_artifact`, `artifact_drift`,
 /// `read_accepted_artifact`, `workflow_artifact_statuses`) already treats a
 /// missing file as "not filled"/"not accepted", not an error. Kept
 /// `#[cfg(test)]`-only as a fixture-setup helper: a test that wants to
@@ -454,113 +441,7 @@ pub(super) fn rfc3339_now() -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
-/// Metadata-only facts for the artifact substance advisory; must satisfy `jev::safe_metadata_request`. No artifact text is sent.
-/// Row: [site=5, stage, size bucket, template size bucket, lines, lines absent from the template, headings, bullets,
-/// checkboxes, code fences, placeholder hits, prose lines].
-pub(crate) fn artifact_jev_facts(stage: ArtifactStage, body: &str) -> serde_json::Value {
-    let template = stage.template();
-    let template_lines: BTreeSet<&str> = template.lines().map(str::trim).collect();
-    let lines: Vec<&str> = body.lines().map(str::trim).collect();
-    let count = |predicate: &dyn Fn(&str) -> bool| {
-        lines.iter().filter(|line| predicate(line)).count() as u64
-    };
-    let headings = count(&|line| line.starts_with('#'));
-    let bullets = count(&|line| line.starts_with("- ") || line.starts_with("* "));
-    let checkboxes = count(&|line| line.starts_with("- [") || line.starts_with("* ["));
-    let fences = count(&|line| line.starts_with("```"));
-    let lower = body.to_ascii_lowercase();
-    let placeholders = ["todo", "tbd", "fixme", "<describe", "lorem"]
-        .iter()
-        .map(|needle| lower.matches(needle).count() as u64)
-        .sum::<u64>();
-    let prose = count(&|line| {
-        !line.is_empty()
-            && !line.starts_with('#')
-            && !line.starts_with("- ")
-            && !line.starts_with("* ")
-    });
-    let new_lines = count(&|line| !line.is_empty() && !template_lines.contains(line));
-    serde_json::json!({
-        "_zirv_metadata_only": true,
-        "facts": [[
-            5,
-            stage as u64,
-            (body.len() as u64 / 256).min(1000),
-            (template.len() as u64 / 256).min(1000),
-            (lines.len() as u64).min(10_000),
-            new_lines.min(10_000),
-            headings.min(1000),
-            bullets.min(1000),
-            checkboxes.min(1000),
-            fences.min(1000),
-            placeholders.min(1000),
-            prose.min(10_000),
-        ]],
-    })
-}
-
-macro_rules! artifact_facts {
-    () => {
-        "From facts [site=5, artifact stage (0 intent, 1 spec, 2 plan), size and template size in 256-byte units, line count, lines absent from the template, heading count, bullet count, checkbox count, code fence count, placeholder hits (todo/tbd/fixme), prose line count]"
-    };
-}
-
-/// [`pin_current_artifact_with_config`]'s own single Choice question,
-/// factored out so `zirv ctx jev probe` can ask the exact same question from
-/// a fixture's own state.
-pub(crate) fn artifact_substance_questions() -> [Question; 1] {
-    [Question::metadata_choice(
-        "substance",
-        concat!(
-            artifact_facts!(),
-            ", assess whether this artifact has substantive content for its section headings. Choose substantive if the metadata is insufficient."
-        ),
-        &[
-            ("template_copy", "the template with only trivial edits"),
-            (
-                "thin",
-                "has content but no substance for its section headings",
-            ),
-            (
-                "substantive",
-                "substantive content for its section headings",
-            ),
-        ],
-    )]
-}
-
-/// [`pin_current_artifact_with_config`]'s own per-call decision: `"refuse"`
-/// for a decisive `template_copy`, `"warn"` for a decisive `thin`, `"pass"`
-/// otherwise (missing answer, indecisive, or a decisive `substantive`) --
-/// `pin_current_artifact_with_config`'s own fallback outcome (pin with no
-/// warning). Shared with `zirv ctx jev probe`, which reports exactly this
-/// outcome.
-pub(crate) fn artifact_substance_action(
-    answer: Option<&jev::Answer>,
-    min_confidence: f32,
-    min_margin: f32,
-) -> &'static str {
-    let Some(answer) = answer else {
-        return "pass";
-    };
-    if !answer.decisive(min_confidence, min_margin) {
-        return "pass";
-    }
-    let AnswerValue::Choice(choice) = &answer.value else {
-        return "pass";
-    };
-    match choice.as_str() {
-        "template_copy" => "refuse",
-        "thin" => "warn",
-        _ => "pass",
-    }
-}
-
-pub(super) fn pin_current_artifact_with_config(
-    state_dir: &StateDir,
-    state: &mut WorkflowState,
-    cfg: Option<&crate::commands::ctx::config::CtxConfig>,
-) -> CtxResult<(ArtifactStage, Option<String>)> {
+pub(super) fn pin_current_artifact(state: &mut WorkflowState) -> CtxResult<ArtifactStage> {
     let stage = state
         .current()
         .and_then(|step| step.artifact)
@@ -575,41 +456,6 @@ pub(super) fn pin_current_artifact_with_config(
         )
         .into());
     }
-    let mut warning = None;
-    if let Some(cfg) = cfg {
-        let advice_state = artifact_jev_facts(stage, &body);
-        let questions = artifact_substance_questions();
-        if let Some(answers) = jev::advise(
-            cfg,
-            state_dir,
-            ARTIFACT_SUBSTANCE_LABEL,
-            cfg.jev.gates,
-            &advice_state,
-            &questions,
-        ) {
-            let answer = answers.get("substance");
-            let (min_confidence, min_margin) = ARTIFACT_SUBSTANCE_DEFAULT_FLOOR;
-            match artifact_substance_action(answer, min_confidence, min_margin) {
-                "refuse" => {
-                    let confidence = answer.map_or(0.0, |answer| answer.confidence);
-                    return Err(format!(
-                        "{stage} artifact refused by the template_copy advisory at {:.2} confidence: {}",
-                        confidence,
-                        path.display()
-                    )
-                    .into());
-                }
-                "warn" => {
-                    let confidence = answer.map_or(0.0, |answer| answer.confidence);
-                    warning = Some(format!(
-                        "{stage} artifact substance advisory is thin at {:.2} confidence; pinning anyway",
-                        confidence
-                    ));
-                }
-                _ => {}
-            }
-        }
-    }
     let hash = hash_bytes(body.as_bytes());
     let record = state
         .artifacts
@@ -617,7 +463,7 @@ pub(super) fn pin_current_artifact_with_config(
         .ok_or("workflow artifact record disappeared")?;
     record.accepted_hash = Some(hash);
     record.accepted_at = Some(rfc3339_now());
-    Ok((stage, warning))
+    Ok(stage)
 }
 
 pub(super) fn load_workflow_jev_config(
@@ -979,7 +825,7 @@ mod tests {
 
     use super::super::lifecycle::*;
 
-    use super::super::tests::{choice_answer, jev_gate_config, low_classification, review_finding};
+    use super::super::tests::{low_classification, review_finding};
     use super::super::transition::*;
 
     /// A repo-wide active pointer must not make an unrelated, registered
@@ -1571,197 +1417,26 @@ mod tests {
     }
 
     #[test]
-    fn artifact_metadata_state_refuses_a_decisive_template_copy() {
-        let body = r#"{"model":"jev-latest","answers":{"substance":{"type":"choice","choice":"template_copy","probabilities":{"template_copy":0.95,"substantive":0.05},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
-        let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
-            200,
-            body,
-            "application/json",
-        );
-        let cfg = jev_gate_config(url, "JEV_TEST_ARTIFACT_COPY");
-        let _credential = crate::commands::ctx::testenv::VarGuard::set(&[(
-            "JEV_TEST_ARTIFACT_COPY",
-            Some("secret"),
-        )]);
-        let repo = tempdir().unwrap();
-        let root = tempdir().unwrap();
-        let state_dir = StateDir::from_root(root.path().to_path_buf());
-        let mut state = artifact_gate_state(repo.path());
-        ensure_current_artifact_template(&state).unwrap();
-        let path = workflow_artifact_path(&state, ArtifactStage::Intent).unwrap();
-        std::fs::write(&path, "# Intent\n\n## Problem\nChanged wording\n").unwrap();
-
-        let error = pin_current_artifact_with_config(&state_dir, &mut state, Some(&cfg))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("template_copy advisory"), "{error}");
-        let sent = request
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("the metadata state reaches Jev");
-        assert!(
-            !sent.contains("Changed wording") && !sent.contains("A sentence"),
-            "{sent}"
-        );
-        assert!(state.artifacts["intent"].accepted_hash.is_none());
-    }
-
-    #[test]
-    fn artifact_metadata_state_pins_on_a_thin_margin() {
-        let body = r#"{"model":"jev-latest","answers":{"substance":{"type":"choice","choice":"template_copy","probabilities":{"template_copy":0.51,"substantive":0.49},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
-        let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
-            200,
-            body,
-            "application/json",
-        );
-        let cfg = jev_gate_config(url, "JEV_TEST_ARTIFACT_THIN_MARGIN");
-        let _credential = crate::commands::ctx::testenv::VarGuard::set(&[(
-            "JEV_TEST_ARTIFACT_THIN_MARGIN",
-            Some("secret"),
-        )]);
-        let repo = tempdir().unwrap();
-        let root = tempdir().unwrap();
-        let state_dir = StateDir::from_root(root.path().to_path_buf());
-        let mut state = artifact_gate_state(repo.path());
-        ensure_current_artifact_template(&state).unwrap();
-        let path = workflow_artifact_path(&state, ArtifactStage::Intent).unwrap();
-        let body_text = "# Intent\n\n## Problem\nChanged wording\n";
-        std::fs::write(&path, body_text).unwrap();
-
-        let (stage, warning) =
-            pin_current_artifact_with_config(&state_dir, &mut state, Some(&cfg)).unwrap();
-        let sent = request
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("the metadata state reaches Jev");
-        assert!(
-            !sent.contains("Changed wording") && !sent.contains("A sentence"),
-            "{sent}"
-        );
-
-        assert_eq!(stage, ArtifactStage::Intent);
-        assert!(warning.is_none(), "{warning:?}");
-        assert_eq!(
-            state.artifacts["intent"].accepted_hash.as_deref(),
-            Some(hash_bytes(body_text.as_bytes()).as_str())
-        );
-    }
-
-    #[test]
-    fn artifact_metadata_state_warns_on_decisive_thin_content() {
-        let body = r#"{"model":"jev-latest","answers":{"substance":{"type":"choice","choice":"thin","probabilities":{"thin":0.95,"substantive":0.05},"confidence":0.95}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
-        let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
-            200,
-            body,
-            "application/json",
-        );
-        let cfg = jev_gate_config(url, "JEV_TEST_ARTIFACT_THIN");
-        let _credential = crate::commands::ctx::testenv::VarGuard::set(&[(
-            "JEV_TEST_ARTIFACT_THIN",
-            Some("secret"),
-        )]);
-        let repo = tempdir().unwrap();
-        let root = tempdir().unwrap();
-        let state_dir = StateDir::from_root(root.path().to_path_buf());
-        let mut state = artifact_gate_state(repo.path());
-        ensure_current_artifact_template(&state).unwrap();
-        let path = workflow_artifact_path(&state, ArtifactStage::Intent).unwrap();
-        std::fs::write(&path, "# Intent\n\nA sentence.\n").unwrap();
-
-        let (_, warning) =
-            pin_current_artifact_with_config(&state_dir, &mut state, Some(&cfg)).unwrap();
-        let sent = request
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("the metadata state reaches Jev");
-        assert!(
-            !sent.contains("Changed wording") && !sent.contains("A sentence"),
-            "{sent}"
-        );
-        assert!(warning.expect("thin advisory").contains("thin"));
-        assert!(state.artifacts["intent"].accepted_hash.is_some());
-    }
-
-    #[test]
-    fn deterministic_template_equality_refuses_before_substantive_advice() {
-        let body = r#"{"model":"jev-latest","answers":{"substance":{"type":"choice","choice":"substantive","probabilities":{"substantive":0.99,"other":0.01},"confidence":0.99}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
-        let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
-            200,
-            body,
-            "application/json",
-        );
-        let cfg = jev_gate_config(url, "JEV_TEST_ARTIFACT_EQUALITY");
-        let _credential = crate::commands::ctx::testenv::VarGuard::set(&[(
-            "JEV_TEST_ARTIFACT_EQUALITY",
-            Some("secret"),
-        )]);
+    fn an_untouched_template_is_refused_and_a_filled_artifact_is_pinned() {
         let repo = tempdir().unwrap();
         let root = tempdir().unwrap();
         let state_dir = StateDir::from_root(root.path().to_path_buf());
         let mut state = artifact_gate_state(repo.path());
         ensure_current_artifact_template(&state).unwrap();
 
-        let error = pin_current_artifact_with_config(&state_dir, &mut state, Some(&cfg))
-            .unwrap_err()
-            .to_string();
-
+        let error = pin_current_artifact(&mut state).unwrap_err().to_string();
         assert!(error.contains("untouched template"), "{error}");
-        assert!(
-            request
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_err(),
-            "deterministic equality must refuse before calling Jev"
-        );
-    }
 
-    #[test]
-    fn artifact_request_passes_the_metadata_only_guard_without_text() {
-        let facts = artifact_jev_facts(
-            ArtifactStage::Intent,
-            "# Intent\n\n## Problem\nSECRET_TOKEN_TEXT\n",
-        );
-        assert!(crate::commands::ctx::jev::safe_metadata_request(
-            &facts,
-            &artifact_substance_questions(),
-            "jev-latest"
-        ));
-        assert!(!facts.to_string().contains("SECRET_TOKEN_TEXT"));
-    }
-
-    #[test]
-    fn artifact_metadata_state_http_error_still_pins() {
-        let (url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
-            500,
-            "{}",
-            "application/json",
-        );
-        let cfg = jev_gate_config(url, "JEV_TEST_ARTIFACT_500");
-        let _credential = crate::commands::ctx::testenv::VarGuard::set(&[(
-            "JEV_TEST_ARTIFACT_500",
-            Some("secret"),
-        )]);
-        let repo = tempdir().unwrap();
-        let root = tempdir().unwrap();
-        let state_dir = StateDir::from_root(root.path().to_path_buf());
-        let mut state = artifact_gate_state(repo.path());
-        ensure_current_artifact_template(&state).unwrap();
         let path = workflow_artifact_path(&state, ArtifactStage::Intent).unwrap();
         let body = "# Intent\n\n## Problem\nConcrete problem\n";
         std::fs::write(&path, body).unwrap();
-
-        let (stage, warning) =
-            pin_current_artifact_with_config(&state_dir, &mut state, Some(&cfg)).unwrap();
-        let sent = request
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("the metadata state reaches Jev");
-        assert!(
-            !sent.contains("Changed wording") && !sent.contains("A sentence"),
-            "{sent}"
-        );
-
+        let stage = pin_current_artifact(&mut state).unwrap();
         assert_eq!(stage, ArtifactStage::Intent);
-        assert!(warning.is_none());
         assert_eq!(
             state.artifacts["intent"].accepted_hash.as_deref(),
             Some(hash_bytes(body.as_bytes()).as_str())
         );
+        assert!(!state_dir.root().join("jev-decisions.jsonl").exists());
     }
 
     /// Mirrors `skill::symlinked_manifests_are_refused` / `agents::load_dir`'s
@@ -2452,34 +2127,6 @@ mod tests {
         assert!(
             text.contains("selected: adaptive-work (a made-up reason for this test)"),
             "{text}"
-        );
-    }
-
-    /// A decisive `template_copy` refuses and a decisive `thin` warns; the
-    /// same confidence one step below [`JEV_ARTIFACT_CONFIDENCE`], and a
-    /// missing answer, both fall back to "pass" -- proves the `>=` edge, not
-    /// just a comfortably-clear case.
-    #[test]
-    fn artifact_substance_action_decides_on_the_confidence_edge() {
-        let (_, min_margin) = ARTIFACT_SUBSTANCE_DEFAULT_FLOOR;
-        let refuse = choice_answer("template_copy", JEV_ARTIFACT_CONFIDENCE);
-        assert_eq!(
-            artifact_substance_action(Some(&refuse), JEV_ARTIFACT_CONFIDENCE, min_margin),
-            "refuse"
-        );
-        let warn = choice_answer("thin", JEV_ARTIFACT_CONFIDENCE);
-        assert_eq!(
-            artifact_substance_action(Some(&warn), JEV_ARTIFACT_CONFIDENCE, min_margin),
-            "warn"
-        );
-        let just_below = choice_answer("template_copy", JEV_ARTIFACT_CONFIDENCE - 0.01);
-        assert_eq!(
-            artifact_substance_action(Some(&just_below), JEV_ARTIFACT_CONFIDENCE, min_margin),
-            "pass"
-        );
-        assert_eq!(
-            artifact_substance_action(None, JEV_ARTIFACT_CONFIDENCE, min_margin),
-            "pass"
         );
     }
 }

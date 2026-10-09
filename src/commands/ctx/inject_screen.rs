@@ -133,11 +133,12 @@ pub fn screen_for_injection(
     source: InjectSource,
     text: &str,
 ) -> Option<&'static str> {
-    if !cfg.jev.inject_screen || !jev::available(&cfg.proxy.typesafe) {
+    if !jev::gate_open(cfg, state, "inject_screen", cfg.jev.inject_screen) {
         return None;
     }
     let facts = screen::injection_facts(text);
     if facts.is_all_zero() {
+        jev::exit(state, "inject_screen", true, "no_injection_facts");
         return None;
     }
     let mut row = facts.as_row();

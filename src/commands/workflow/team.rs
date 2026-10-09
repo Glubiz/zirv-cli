@@ -814,7 +814,7 @@ pub(crate) fn intake_plan_action(
 /// caller stores this returned plan, so omitting the planner also omits its
 /// later brief and dispatch from the compiled team path.
 fn maybe_advise_team_plan(cfg: &CtxConfig, state: &StateDir, plan: TeamPlan) -> TeamPlan {
-    if !cfg.jev.intake_savings || !jev::available(&cfg.proxy.typesafe) {
+    if !jev::gate_open(cfg, state, "intake_savings", cfg.jev.intake_savings) {
         return plan;
     }
     if plan.profile.execution != ExecutionMode::Orchestrated
@@ -825,6 +825,7 @@ fn maybe_advise_team_plan(cfg: &CtxConfig, state: &StateDir, plan: TeamPlan) -> 
             .iter()
             .any(|seat| seat.id == "planner-1" && seat.manifest_id == "planner")
     {
+        jev::exit(state, "intake_savings", true, "plan_not_eligible");
         return plan;
     }
 
@@ -847,6 +848,7 @@ fn maybe_advise_team_plan(cfg: &CtxConfig, state: &StateDir, plan: TeamPlan) -> 
     .iter()
     .any(|term| objective_lower.contains(term))
     {
+        jev::exit(state, "intake_savings", true, "explicit_delegation_term");
         return plan;
     }
 
@@ -925,7 +927,7 @@ fn advise_compiled_plan(repo: &Path, plan: TeamPlan) -> TeamPlan {
     let Ok(cfg) = CtxConfig::load(repo, &env) else {
         return plan;
     };
-    if !cfg.jev.intake_savings || !jev::available(&cfg.proxy.typesafe) {
+    if !cfg.jev.intake_savings {
         return plan;
     }
     let Ok(state) = StateDir::resolve(&env) else {
@@ -1654,6 +1656,14 @@ mod tests {
         .expect("baseline plan");
         assert!(baseline.seats.iter().any(|seat| seat.id == "planner-1"));
         assert!(baseline.seats.iter().any(|seat| seat.id == "reviewer-1"));
+        assert!(
+            jev::safe_metadata_request(
+                &plan_advisory_state(&baseline),
+                &[intake_plan_question()],
+                "jev-latest"
+            ),
+            "the intake-plan request must pass the egress guard"
+        );
 
         let mut cfg = crate::commands::ctx::config::CtxConfig::default();
         cfg.jev.intake_savings = true;

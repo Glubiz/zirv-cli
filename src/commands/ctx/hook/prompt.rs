@@ -75,7 +75,7 @@ fn mail_note_deferred(
     env: EnvLookup<'_>,
 ) -> bool {
     use crate::commands::ctx::inject_gate::{self, Decision, InjectFacts, InjectKind};
-    if !inject_gate::enabled(cfg) {
+    if !crate::commands::ctx::jev::gate_open(cfg, state, "inject", cfg.jev.inject) {
         return false;
     }
     let now = now_secs();
@@ -641,11 +641,44 @@ fn admin_dispatch_block(
     env: EnvLookup<'_>,
     prompt: &str,
 ) -> Option<String> {
-    if !cfg.jev.admin_dispatch || !crate::commands::ctx::jev::available(&cfg.proxy.typesafe) {
+    if !cfg.jev.admin_dispatch {
         return None;
     }
-    let op = AdminOp::matching(&normalize_admin_prompt(prompt))?;
-    let rendered = op.render(cfg, repo, env)?;
+    admin_dispatch_decide(cfg, repo, env, prompt, StateDir::resolve(env).ok().as_ref())
+}
+
+/// The decision itself. `state` only carries the best-effort counters and effect row: without it
+/// the prompt is still answered and blocked exactly the same.
+fn admin_dispatch_decide(
+    cfg: &CtxConfig,
+    repo: &Path,
+    env: EnvLookup<'_>,
+    prompt: &str,
+    state: Option<&StateDir>,
+) -> Option<String> {
+    use crate::commands::ctx::jev;
+    let open = match state {
+        Some(state) => jev::gate_open(cfg, state, "admin_dispatch", true),
+        None => jev::available(&cfg.proxy.typesafe),
+    };
+    if !open {
+        return None;
+    }
+    let Some(op) = AdminOp::matching(&normalize_admin_prompt(prompt)) else {
+        if let Some(state) = state {
+            jev::exit(state, "admin_dispatch", true, "not_an_admin_request");
+        }
+        return None;
+    };
+    let Some(rendered) = op.render(cfg, repo, env) else {
+        if let Some(state) = state {
+            jev::exit(state, "admin_dispatch", true, "render_failed");
+        }
+        return None;
+    };
+    if let Some(state) = state {
+        jev::pass(state, "admin_dispatch");
+    }
     let body =
         crate::utils::truncate_bytes(String::from_utf8_lossy(&rendered).into_owned(), Some(8192));
     let reason = format!(
@@ -654,13 +687,13 @@ fn admin_dispatch_block(
         body.trim_end()
     );
 
-    if let Ok(state) = StateDir::resolve(env) {
-        let effect = crate::commands::ctx::jev::JevEffect {
+    if let Some(state) = state {
+        let effect = jev::JevEffect {
             item_id: Some(op.name()),
             reason: Some(op.name()),
-            ..crate::commands::ctx::jev::JevEffect::new("admin_dispatch", "llm_turn_avoided")
+            ..jev::JevEffect::new("admin_dispatch", "llm_turn_avoided")
         };
-        crate::commands::ctx::jev::record_effect(cfg, &state, cfg.jev.admin_dispatch, &effect);
+        jev::record_effect(cfg, state, true, &effect);
     }
 
     Some(
@@ -1251,6 +1284,32 @@ mod tests {
             !state.join("jev-cache").exists(),
             "an exact-match admin dispatch makes no Jev call, so no cache entry can exist"
         );
+    }
+
+    /// Counting is best-effort: with the gate on and no state dir to count into, the prompt is
+    /// still answered and blocked.
+    #[test]
+    fn admin_dispatch_still_blocks_when_the_state_dir_cannot_be_resolved() {
+        let repo = tempfile::tempdir().expect("repo");
+        let state = repo.path().join("state");
+        let credential_var = "JEV_TEST_ADMIN_DISPATCH_NO_STATE";
+        let _cred =
+            crate::commands::ctx::testenv::VarGuard::set(&[(credential_var, Some("secret"))]);
+        let env = admin_dispatch_env(&state, credential_var, true);
+        let mut cfg = CtxConfig::default();
+        cfg.jev.admin_dispatch = true;
+        cfg.proxy.typesafe.credential_env = credential_var.to_string();
+
+        let block = admin_dispatch_decide(
+            &cfg,
+            repo.path(),
+            &|k| env.get(k).cloned(),
+            "/zirv jev status",
+            None,
+        )
+        .expect("the prompt is still blocked");
+        assert!(block.contains("\"decision\":\"block\""), "{block}");
+        assert!(!state.exists(), "nothing counted without a state handle");
     }
 
     /// Same contract, the `zirv jev status` operation.
