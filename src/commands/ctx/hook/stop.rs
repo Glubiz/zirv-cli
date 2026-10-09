@@ -91,9 +91,9 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
 
     let session = env(SESSION_ENV).unwrap_or_else(|| payload.session_id.clone());
 
-    if let Some(path) = socket.as_deref() {
+    let forward_error = socket.as_deref().and_then(|path| {
         let turn = score.signals.turns as u64;
-        let _ = signal::send(
+        signal::send(
             path,
             &signal::TurnSignal {
                 session_id: session.clone(),
@@ -104,8 +104,10 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
                 // session file it chose, so the hook has to say.
                 transcript_path: Some(payload.transcript_path.clone()),
             },
-        );
-    }
+        )
+        .err()
+        .map(|err| err.to_string())
+    });
 
     // Load config once so Stop output and scoring use the same thresholds.
     let cfg = cfg_or_operator_only_gate(&repo, env);
@@ -148,6 +150,21 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
                 observed_at: None,
             },
         );
+        if let Some(error) = forward_error.as_deref() {
+            let _ = log::append(
+                &state,
+                &log::Decision {
+                    ts: now_secs(),
+                    session: &session,
+                    verb: "hook",
+                    verdict: score.verdict.as_str(),
+                    score: score.score,
+                    action: "forward-failed",
+                    detail: error,
+                    observed_at: None,
+                },
+            );
+        }
         // Record both zirv and harness session identities at lifecycle hooks;
         // they can differ after a harness-minted conversation starts (#462).
         if let Some(agent) = env(adapters::AGENT_ENV) {
@@ -486,6 +503,35 @@ mod tests {
 
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log written");
         assert!(log.contains("\"verb\":\"hook\""), "got {log}");
+    }
+
+    #[test]
+    fn a_forward_to_a_dead_socket_logs_one_failure_row_and_the_hook_still_exits_zero() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+        let transcript = rotting_transcript(dir.path());
+        let state = dir.path().join("state");
+        let dead_socket = dir.path().join("no-supervisor.sock");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state.display().to_string(),
+            ),
+            (SOCKET_ENV.to_string(), dead_socket.display().to_string()),
+        ]
+        .into();
+
+        let stdin = stop_payload(&transcript, dir.path());
+        let mut out = Vec::new();
+        let code = run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
+        assert_eq!(code, 0);
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log written");
+        let failures = log
+            .lines()
+            .filter(|line| line.contains("\"action\":\"forward-failed\""))
+            .count();
+        assert_eq!(failures, 1, "got {log}");
     }
 
     /// Hook start-up overhead fix (wrapper-overhead benchmark, 2026-09-24):

@@ -738,6 +738,7 @@ fn run_dashboard_inner(
         }
         for pane in panes.iter_mut() {
             pane.on_turn_signal();
+            pane.auto_compact(cfg);
         }
         // Read native multi-agent UI facts from durable runtime records (#490).
         {
