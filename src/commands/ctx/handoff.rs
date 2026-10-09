@@ -780,7 +780,10 @@ pub(crate) fn request_as_task(request: &str) -> String {
 pub fn structural(ctx: &StructuralContext) -> Handoff {
     let task = ctx
         .user_messages
-        .last()
+        .iter()
+        .iter()
+        .rev()
+        .find(|m| !super::adapters::is_injected_user_text(m))
         .map(|m| request_as_task(m))
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| "Unknown task (no user prompt found in the transcript)".to_string());
@@ -4496,6 +4499,21 @@ mod tests {
             handoff.task,
             "the bounded task must survive the markdown round trip unchanged"
         );
+    }
+
+    /// Supervisor and hook feedback land in the user role; the task stays the operator's request.
+    #[test]
+    fn structural_task_skips_injected_supervisor_and_hook_prompts() {
+        let ctx = StructuralContext {
+            user_messages: vec![
+                "build the page".to_string(),
+                "Supervisor ruling abc123 from the supervisor (zirv, kind: done): not_done."
+                    .to_string(),
+                "Stop hook feedback: tests missing".to_string(),
+            ],
+            ..StructuralContext::default()
+        };
+        assert_eq!(structural(&ctx).task, "build the page");
     }
 
     #[test]

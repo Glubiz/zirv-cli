@@ -139,22 +139,35 @@ fn choice_head(line: &str) -> Option<(usize, &str)> {
     Some((number, tail))
 }
 
-/// One line that opens with an offered option's own text, case and emphasis marks aside, as
-/// that option's 1-based number and the text after it. The longest option wins, and the label
-/// must end the word: `done: verification complete` is not a prefix of `... completely`.
+/// A reply's first line as an offered option's pick: it opens with the option's own text (case
+/// and emphasis marks aside), then ends or continues after a separator (`:` `.` `,` ` -`), and
+/// names no other offered option. Returns the 1-based number and the text after the label.
+/// `Queue is slower; table.` is prose, not a pick of `queue`.
 fn option_label<'a>(line: &'a str, options: &[String]) -> Option<(usize, &'a str)> {
     let line = line.trim().trim_start_matches(is_mark);
-    options
+    let lower = line.to_ascii_lowercase();
+    let (at, rest) = options
         .iter()
         .enumerate()
         .filter(|(_, option)| !option.trim().is_empty())
         .filter_map(|(at, option)| {
             let label = option.trim();
             let (start, rest) = (line.get(..label.len())?, line.get(label.len()..)?);
-            let ends_the_word = !rest.chars().next().is_some_and(char::is_alphanumeric);
-            (start.eq_ignore_ascii_case(label) && ends_the_word).then_some((at + 1, rest))
+            let after = rest.trim_start_matches(is_mark);
+            let separated = after.is_empty()
+                || after.starts_with([':', '.', ','])
+                || ["-", "—", "–"]
+                    .iter()
+                    .any(|dash| after.trim_start().starts_with(dash) && after.starts_with(' '));
+            (start.eq_ignore_ascii_case(label) && separated).then_some((at, rest))
         })
-        .max_by_key(|(at, _)| options[at - 1].len())
+        .max_by_key(|(at, _)| options[*at].len())?;
+    let names_another = options.iter().enumerate().any(|(other, option)| {
+        other != at
+            && !option.trim().is_empty()
+            && lower.contains(&option.trim().to_ascii_lowercase())
+    });
+    (!names_another).then_some((at + 1, rest))
 }
 
 /// Parse one kind's strict reply into `(verdict, reason)`. Anything unparseable is `None`.
@@ -246,7 +259,7 @@ pub(crate) fn parse_reply(
             let following: Vec<&str> = lines.collect();
             if following
                 .iter()
-                .filter_map(|line| choice_head(line).or_else(|| option_label(line, options)))
+                .filter_map(|line| choice_head(line))
                 .any(|(other, _)| other != number)
             {
                 return None;
@@ -504,7 +517,7 @@ mod tests {
                 .expect("an echoed label with rationale");
         assert_eq!(verdict, options[0]);
         assert!(reason.contains("2,297 tests passed"), "{reason}");
-        let (verdict, _) = parse("**Not done: name the missing evidence** lint was not run")
+        let (verdict, _) = parse("**Not done: name the missing evidence.** lint was not run")
             .expect("case and emphasis marks");
         assert_eq!(verdict, options[1]);
         let (verdict, _) = parse("Ruling: 2 Flip the flag only.").expect("number after the label");
@@ -513,12 +526,25 @@ mod tests {
         assert_eq!(verdict, options[0]);
         // A label that is only the start of a longer word is not the option.
         assert_eq!(parse("done: verification completely unverified"), None);
-        // A second line that names another option makes the reply ambiguous.
-        assert_eq!(
-            parse("done: verification complete\nnot done: name the missing evidence"),
-            None
-        );
+        // Rationale on later lines is not an option label, so it cannot reject a valid reply.
+        let (verdict, _) = parse("done: verification complete\nnot done: only if lint is red")
+            .expect("later lines do not count");
+        assert_eq!(verdict, options[0]);
         assert_eq!(parse("Both options fit; pick whichever"), None);
+    }
+
+    /// A first word that merely equals an option is prose, not a pick; a pick is label plus
+    /// separator and names no other option.
+    #[test]
+    fn a_leading_option_word_in_prose_is_not_a_pick() {
+        let options = vec!["queue".to_string(), "table".to_string()];
+        let parse = |text: &str| parse_reply(RulingKind::Choice, text, &options).map(|p| p.0);
+        assert_eq!(parse("Queue is slower; table."), None);
+        assert_eq!(parse("Table is wrong, queue wins"), None);
+        assert_eq!(parse("queue: simpler to run").as_deref(), Some("queue"));
+        assert_eq!(parse("Table.").as_deref(), Some("table"));
+        assert_eq!(parse("queue - simpler").as_deref(), Some("queue"));
+        assert_eq!(parse("queue: simpler than table"), None);
     }
 
     #[test]

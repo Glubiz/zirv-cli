@@ -37,6 +37,33 @@ pub use env::{
     TurnSignalSetup, headless_marker_env, launch_mode_pin_env, seat_model_env, seat_role_env,
 };
 pub(crate) use env::{ModelFlagForm, classify_model_flag, last_model_flag, model_only_flags};
+
+/// Openers of user-role text a harness or zirv injects, as found in real Codex rollouts and
+/// Claude transcripts. Anything else, including a request that starts with `<Button>`, is the
+/// operator's.
+const INJECTED_USER_TEXT: &[&str] = &[
+    "# AGENTS.md instructions",
+    "<environment_context>",
+    "<recommended_plugins>",
+    "<turn_aborted>",
+    "<guardian_context_omission>",
+    "<system-reminder>",
+    "<task-notification>",
+    "<command-name>",
+    "<command-message>",
+    "<local-command-",
+    "<user-prompt-submit-hook>",
+    "Stop hook feedback",
+    "Supervisor ruling",
+];
+
+/// Whether `text` is context injected into a transcript's user role, not an operator request.
+pub(crate) fn is_injected_user_text(text: &str) -> bool {
+    let text = text.trim_start();
+    INJECTED_USER_TEXT
+        .iter()
+        .any(|opener| text.starts_with(opener))
+}
 pub(crate) use error::{
     ProviderErrorHints, classify_provider_error, provider_error_id, redacted_tool_summary,
 };

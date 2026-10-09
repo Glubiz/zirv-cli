@@ -363,7 +363,10 @@ pub(crate) fn fire(
     let mut next = before.clone();
     if let Some(unit) = unit {
         push_capped(&mut next.seen, unit.to_string(), SEEN_KEEP);
-        next.last_unit = unit.to_string();
+        // Only a before-done unit is what `stop_block` compares the current evidence against.
+        if request.trigger == Trigger::BeforeDone {
+            next.last_unit = unit.to_string();
+        }
     }
     push_capped(
         &mut next.triggers,
@@ -454,11 +457,13 @@ fn git_status_is_clean(repo: &Path) -> bool {
     git_stdout(repo, &["status", "--porcelain"]).is_some_and(|status| status.is_empty())
 }
 
-/// What a before-done consult is about: the diffstat, the commit and the untracked files, so a
-/// new commit or a new evidence file is new evidence and a repeat of the same state is not.
+/// What a before-done consult is about: the diffstat, the commit and the tracked changes, so a
+/// new commit or edit is new evidence and a repeat of the same state is not.
 fn done_unit(repo: &Path, stat: &str) -> String {
     let head = git_stdout(repo, &["rev-parse", "HEAD"]).unwrap_or_default();
-    let status = git_stdout(repo, &["status", "--porcelain"]).unwrap_or_default();
+    // Tracked changes only: a stray untracked file must not read as new evidence.
+    let status =
+        git_stdout(repo, &["status", "--porcelain", "--untracked-files=no"]).unwrap_or_default();
     format!(
         "done:{}",
         crate::commands::workflow::engine::hash_bytes(
@@ -477,13 +482,7 @@ fn work_in_flight(state: &StateDir, repo: &Path, session: &str, hook_session: &s
         .ok()
         .flatten()
         .and_then(|workflow| workflow.current().map(|step| step.phase))
-        .is_some_and(|phase| {
-            !matches!(
-                phase,
-                crate::commands::workflow::skill::WorkflowPhase::Verify
-                    | crate::commands::workflow::skill::WorkflowPhase::Deploy
-            )
-        })
+        .is_some_and(|phase| phase < crate::commands::workflow::skill::WorkflowPhase::Verify)
 }
 
 /// The task a before-done consult judges against, with where it came from: the active
@@ -505,11 +504,7 @@ pub(crate) fn done_task(
     }
     let context = adapter?.structural_context(transcript, usize::MAX);
     let request = context.user_messages.iter().rev().find(|message| {
-        let message = message.trim_start();
-        !message.is_empty()
-            && !message.starts_with('<')
-            && !message.starts_with("Stop hook feedback")
-            && !message.starts_with("Supervisor ruling")
+        !message.trim().is_empty() && !super::adapters::is_injected_user_text(message)
     })?;
     Some((
         "latest operator request".to_string(),
@@ -2478,6 +2473,94 @@ mod tests {
             None,
             "a new commit is new evidence: consult fresh instead of replaying"
         );
+    }
+
+    /// A new untracked file is not new evidence, and a plan consult does not move what a
+    /// before-done ruling is compared against.
+    #[test]
+    fn a_not_done_ruling_survives_an_untracked_file_and_a_plan_consult() {
+        let (dir, state) = fresh_state();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        let repo = committed_repo_with_change(dir.path());
+        let env = ruling_env(state.root());
+        let lookup = |k: &str| env.get(k).cloned();
+        on_stop_with(
+            &state,
+            &enabled_cfg(),
+            &no_env,
+            &repo,
+            "abcd1234",
+            &|| None,
+            &|_| true,
+        );
+        open_a(&state, RulingKind::Done, "not_done", "no tests yet");
+
+        std::fs::write(repo.join("scratch.txt"), "x\n").expect("write");
+        assert!(
+            stop_block(&lookup, &repo, "abcd1234", "hook1").is_some(),
+            "untracked file"
+        );
+
+        let mut plan = request(Trigger::BeforePlan);
+        plan.session = "abcd1234".to_string();
+        assert!(fire(
+            &state,
+            &enabled_cfg(),
+            &no_env,
+            plan,
+            Some("plan:wf:1"),
+            &|_| true
+        ));
+        assert!(
+            stop_block(&lookup, &repo, "abcd1234", "hook1").is_some(),
+            "plan consult"
+        );
+    }
+
+    /// Only phases before verify are in flight: delegate and present come after deploy.
+    #[test]
+    fn work_is_in_flight_only_before_the_verify_phase() {
+        use crate::commands::workflow::skill::WorkflowPhase;
+        let (dir, state) = fresh_state();
+        let repo = committed_repo_with_change(dir.path());
+        let classification = crate::commands::workflow::classify::classify(
+            &crate::commands::workflow::classify::ClassificationInput {
+                task: "build it".to_string(),
+                paths: Vec::new(),
+                changed_lines: 0,
+                tests_changed: true,
+                intent_override: None,
+                complexity_override: None,
+                risk_override: None,
+            },
+        )
+        .expect("classify");
+        let skills =
+            crate::commands::workflow::skill::SkillRegistry::load(&repo, None, false, false)
+                .expect("skills");
+        let registry = crate::commands::workflow::registry::WorkflowRegistry::load(
+            &repo, None, false, false, &skills,
+        )
+        .expect("registry");
+        let mut workflow = crate::commands::workflow::engine::WorkflowState::start_from_pack(
+            repo.clone(),
+            "build it".to_string(),
+            registry.get("feature").expect("feature pack"),
+            None,
+            true,
+            classification,
+        );
+        let mut in_flight = |phase: WorkflowPhase| {
+            let at = workflow.current_step;
+            workflow.steps[at].phase = phase;
+            crate::commands::workflow::engine::save(&state, &workflow, true).expect("save");
+            work_in_flight(&state, &repo, "abcd1234", "hook1")
+        };
+        assert!(in_flight(WorkflowPhase::Implement));
+        assert!(!in_flight(WorkflowPhase::Verify));
+        assert!(!in_flight(WorkflowPhase::Deploy));
+        assert!(!in_flight(WorkflowPhase::Delegate));
+        assert!(!in_flight(WorkflowPhase::Present));
     }
 
     /// #901: an ask whose ruling is `done` lifts the earlier before-done block.
