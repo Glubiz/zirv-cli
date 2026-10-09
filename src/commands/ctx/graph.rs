@@ -781,8 +781,14 @@ const RUNNING_SUBAGENT_STALE_SECS: u64 = 6 * 3600;
 
 /// How many native subagents of `session` are running now, from their durable records.
 pub(super) fn running_subagents(state: &StateDir, session: &str, now: u64) -> usize {
-    let dir = graph_root(state).join(sessions::short_id(session));
-    let Ok(files) = std::fs::read_dir(dir) else {
+    let short = sessions::short_id(session);
+    // A registered session whose process is gone cannot still be running a subagent.
+    if sessions::load_record(state, &short)
+        .is_some_and(|record| !sessions::record_is_alive(&record))
+    {
+        return 0;
+    }
+    let Ok(files) = std::fs::read_dir(graph_root(state).join(short)) else {
         return 0;
     };
     files
@@ -2522,6 +2528,46 @@ mod tests {
             serde_json::to_string(&record).expect("json"),
         )
         .expect("record");
+    }
+
+    /// A running subagent counts only while its registered session's process is alive.
+    #[test]
+    fn running_subagents_ignores_a_session_whose_process_is_gone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = state_for(dir.path());
+        let repo = dir.path().join("repo");
+        let session = "feed1111-0000-4000-8000-000000000001";
+        let start =
+            format!(r#"{{"session_id":"{session}","agent_id":"a1","agent_type":"worker"}}"#);
+        let env =
+            |key: &str| (key == "ZIRV_CTX_STATE_DIR").then(|| state.root().display().to_string());
+        run_subagent_start(&start, &env).expect("start");
+        assert_eq!(
+            running_subagents(&state, session, now_secs()),
+            1,
+            "no record: counted"
+        );
+
+        register_session(&state, session, "claude", &repo);
+        assert_eq!(
+            running_subagents(&state, session, now_secs()),
+            1,
+            "live process"
+        );
+
+        let mut record =
+            sessions::load_record(&state, &sessions::short_id(session)).expect("record");
+        record.pid = crate::commands::ctx::testenv::dead_pid();
+        std::fs::write(
+            state.sessions().join(format!("{}.json", record.short)),
+            serde_json::to_string(&record).expect("json"),
+        )
+        .expect("rewrite");
+        assert_eq!(
+            running_subagents(&state, session, now_secs()),
+            0,
+            "dead process"
+        );
     }
 
     fn write_native(dir: &Path, id: &str, meta: &str, rows: &[&str]) {
