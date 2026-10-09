@@ -1884,8 +1884,7 @@ pub(crate) fn advise_gated(
     if !enabled {
         return AdvisoryStatus::Disabled;
     }
-    count(state_dir, gate, true, Stage::Reached, None);
-    count(state_dir, gate, true, Stage::Eligible, None);
+    pass(state_dir, gate);
     if !available(&cfg.proxy.typesafe) {
         record_no_credential_skip(cfg, state_dir, site);
         count(state_dir, gate, true, Stage::Exit, Some("no_credential"));
@@ -1966,8 +1965,8 @@ pub(crate) fn exit(state: &StateDir, gate: &str, enabled: bool, reason: &'static
     );
 }
 
-/// A gated site with no [`advise`] call of its own (it only records effects) passed its
-/// preconditions: counts it as reached and eligible.
+/// A gated site passed its preconditions: counts it as reached and eligible. [`advise_gated`]
+/// does this for its own calls; a site with no [`advise`] call (it only records effects) calls it.
 pub(crate) fn pass(state: &StateDir, gate: &str) {
     jev_counters::count(state, gate, true, jev_counters::Stage::Reached, None);
     jev_counters::count(state, gate, true, jev_counters::Stage::Eligible, None);
