@@ -394,7 +394,7 @@ fn missing_tests_owed_jev_says_skip(
     repo: &Path,
     changed: &[PathBuf],
 ) -> bool {
-    if !cfg.jev.missing_tests || !crate::commands::ctx::jev::available(&cfg.proxy.typesafe) {
+    if !crate::commands::ctx::jev::gate_open(cfg, state, "missing_tests", cfg.jev.missing_tests) {
         return false;
     }
     let facts = missing_tests_owed_facts(repo, changed);

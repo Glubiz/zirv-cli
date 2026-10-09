@@ -122,10 +122,11 @@ pub(crate) fn task_context_with_selected_reports(
     cap: usize,
 ) -> String {
     let baseline = task::compile_task_prompt(card, parents, cap);
-    if !cfg.jev.context || !jev::available(&cfg.proxy.typesafe) {
+    if !jev::gate_open(cfg, state, "context", cfg.jev.context) {
         return baseline;
     }
     let Some(task_domain) = context_domain(&card.brief) else {
+        jev::exit(state, "context", true, "no_single_domain");
         return baseline;
     };
     let task_words: std::collections::BTreeSet<&str> = card
@@ -234,10 +235,11 @@ pub(super) fn selected_skill_index_text(
     task_text: Option<&str>,
 ) -> Option<(String, String, usize, Option<String>)> {
     let baseline = prompt::skill_index_text(repo, home, cfg.prompt.skill_index_repo_filter)?;
-    if !cfg.jev.context || !jev::available(&cfg.proxy.typesafe) {
+    if !jev::gate_open(cfg, state, "context", cfg.jev.context) {
         return Some((baseline, String::new(), 0, None));
     }
     let Some(task_text) = task_text else {
+        jev::exit(state, "context", true, "no_task_text");
         return Some((baseline, String::new(), 0, None));
     };
     let Some(entries) = prompt::skill_index_entries(repo, home, cfg.prompt.skill_index_repo_filter)
@@ -358,10 +360,15 @@ pub(crate) fn select_skill_descriptions_for_task(
     home: Option<&Path>,
     task: &str,
 ) {
-    if !cfg.jev.context || !jev::available(&cfg.proxy.typesafe) || task.is_empty() {
+    if !jev::gate_open(cfg, state, "context", cfg.jev.context) {
+        return;
+    }
+    if task.is_empty() {
+        jev::exit(state, "context", true, "no_task_text");
         return;
     }
     let Some(composed) = compiled.composed.as_mut() else {
+        jev::exit(state, "context", true, "no_composed_prompt");
         return;
     };
     if !composed.text.contains(prompt::SKILL_INDEX_HEADER) {

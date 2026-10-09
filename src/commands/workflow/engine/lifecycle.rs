@@ -76,11 +76,7 @@ pub fn approve(state_dir: &StateDir, mut state: WorkflowState) -> CtxResult<Work
         }
         let completed = state.current().expect("artifact step exists").clone();
         let jev_cfg = load_workflow_jev_config(&state.repo);
-        let (accepted, warning) =
-            pin_current_artifact_with_config(state_dir, &mut state, jev_cfg.as_ref())?;
-        if let Some(warning) = warning {
-            crate::output::warn(warning);
-        }
+        let accepted = pin_current_artifact(&mut state)?;
         // A re-approval without a new awaiting-approval span has no honest wait duration to report. (#699)
         let mut approval_wait_ms = None;
         if !state.completed_steps.contains(&completed.id) {

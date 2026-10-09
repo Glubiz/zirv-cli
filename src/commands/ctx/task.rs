@@ -876,7 +876,7 @@ fn jev_crash_cause(
     if !cfg.jev.supervisor {
         return CrashAdvice::Baseline("disabled");
     }
-    if !jev::available(&cfg.proxy.typesafe) {
+    if !jev::gate_open(cfg, state, "supervisor", true) {
         return CrashAdvice::Baseline("missing_credential");
     }
     let access_signal = signals.access;
@@ -884,6 +884,7 @@ fn jev_crash_cause(
     let missing_file_signal = signals.missing_file;
     let transient_signal = signals.transient;
     if transient_signal || !(access_signal || configuration_signal || missing_file_signal) {
+        jev::exit(state, "supervisor", true, "insufficient_repeatable_signal");
         return CrashAdvice::Baseline("insufficient_repeatable_signal");
     }
     let advise_state = CrashAdviseState {

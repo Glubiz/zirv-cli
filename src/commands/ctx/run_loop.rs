@@ -1142,13 +1142,14 @@ fn jev_judge_continue(
     if !cfg.jev.supervisor {
         return JudgeAdvice::Disabled;
     }
-    if !jev::available(&cfg.proxy.typesafe) {
+    if !jev::gate_open(cfg, state, "supervisor", true) {
         return JudgeAdvice::MissingCredential;
     }
     let lower = transcript_tail.to_ascii_lowercase();
     let has_tool_activity = lower.contains("\"tool_use\"");
     let has_successful_result = lower.contains("\"is_error\":false");
     if !gates_green || !has_tool_activity || !has_successful_result {
+        jev::exit(state, "supervisor", true, "judge_preconditions_unmet");
         return JudgeAdvice::Uncertain;
     }
     let budget_remaining_bucket = record

@@ -3039,17 +3039,22 @@ fn reusable_review_evidence<'a>(
     state_dir: &StateDir,
     state: &'a WorkflowState,
 ) -> Option<&'a ReviewRunEvidence> {
-    if args.fresh
-        || args.pr.is_some()
-        || !cfg.jev.review_reuse
-        || !jev::available(&cfg.proxy.typesafe)
-        || state
-            .review_findings
-            .iter()
-            .any(|finding| finding.disposition == FindingDisposition::Open)
-    {
+    if !jev::gate_open(cfg, state_dir, "review_reuse", cfg.jev.review_reuse) {
         return None;
     }
+    if args.fresh || args.pr.is_some() {
+        jev::exit(state_dir, "review_reuse", true, "fresh_or_pr_review");
+        return None;
+    }
+    if state
+        .review_findings
+        .iter()
+        .any(|finding| finding.disposition == FindingDisposition::Open)
+    {
+        jev::exit(state_dir, "review_reuse", true, "open_findings");
+        return None;
+    }
+    jev::pass(state_dir, "review_reuse");
     let base_sha = resolved_review_base_sha(&state.repo, args.base.as_deref()).ok()?;
     let fingerprint = verification::change_fingerprint(&state.repo).ok()?;
     let verification = verification::load_latest(state_dir, &state.repo)
@@ -3338,7 +3343,7 @@ fn run_independent_review(
             .collect();
         let jev_dedup_converged_for = if semantic_jev_convergence {
             review_cfg.as_ref().and_then(|cfg| {
-                if !cfg.jev.review || !jev::available(&cfg.proxy.typesafe) {
+                if !jev::gate_open(cfg, &state_dir, "review", cfg.jev.review) {
                     return None;
                 }
                 let before = reuse_cfg.as_ref().and_then(|before| {
@@ -5500,6 +5505,33 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
     /// margin (0.51/0.49) between its own top and runner-up probability,
     /// must never annotate the finding -- it falls through exactly like a
     /// low-confidence answer.
+    /// Both review requests must pass the egress guard, or the review gate goes quiet.
+    #[test]
+    fn the_review_disposition_and_dedup_requests_pass_the_egress_guard() {
+        let incoming = finding_at("src/a.rs", 1, "rename this variable");
+        let candidate = finding_at("src/b.rs", 2, "rename that variable");
+        let disposition = JevMetadataState {
+            metadata_only: true,
+            facts: vec![JevFindingState::from(&incoming).facts()],
+        };
+        assert!(jev::safe_metadata_request(
+            &serde_json::to_value(&disposition).expect("serializes"),
+            &review_disposition_questions(1),
+            "jev-latest"
+        ));
+        let mut candidate_row = JevFindingState::from(&candidate).facts();
+        candidate_row.extend(duplicate_comparison(&incoming, &candidate));
+        let dedup = JevMetadataState {
+            metadata_only: true,
+            facts: vec![JevFindingState::from(&incoming).facts(), candidate_row],
+        };
+        assert!(jev::safe_metadata_request(
+            &serde_json::to_value(&dedup).expect("serializes"),
+            &review_dedup_questions(&["p0".to_string()]),
+            "jev-latest"
+        ));
+    }
+
     #[test]
     fn jev_disposition_leaves_a_thin_margin_answer_unannotated() {
         let body = r#"{"model":"jev-latest","answers":{"f0":{"type":"choice","choice":"reject","probabilities":{"reject":0.51,"fix_now":0.49},"confidence":0.95}},"usage":{"input_tokens":5,"output_tokens":1}}"#;

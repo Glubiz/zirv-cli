@@ -157,10 +157,11 @@ pub(super) fn stop_verify_reason(
     verify_owed: bool,
     transcript: &Path,
 ) -> Option<&'static str> {
-    if !verify_owed
-        || !cfg.jev.stop_verify
-        || !crate::commands::ctx::jev::available(&cfg.proxy.typesafe)
-    {
+    if !crate::commands::ctx::jev::gate_open(cfg, state, "stop_verify", cfg.jev.stop_verify) {
+        return None;
+    }
+    if !verify_owed {
+        crate::commands::ctx::jev::exit(state, "stop_verify", true, "verification_not_owed");
         return None;
     }
     let adapter = adapters::select_for_identity(cfg.agent.as_deref(), &[], cfg).ok()?;

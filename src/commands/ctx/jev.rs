@@ -54,6 +54,7 @@ use crate::commands::ctx::adapters;
 use crate::commands::ctx::agent;
 use crate::commands::ctx::attribution::Attribution;
 use crate::commands::ctx::config::{CtxConfig, JevConfig, JevSiteFloor, ProxyTypesafeConfig};
+use crate::commands::ctx::jev_counters;
 use crate::commands::ctx::jev_relay;
 use crate::commands::ctx::log;
 use crate::commands::ctx::state::{self, StateDir};
@@ -1120,10 +1121,10 @@ pub(crate) fn any_gate_enabled(cfg: &JevConfig) -> bool {
 }
 
 pub(crate) const JEV_DECISIONS_FILE: &str = "jev-decisions.jsonl";
-const JEV_EFFECTS_FILE: &str = "jev-effects.jsonl";
+pub(crate) const JEV_EFFECTS_FILE: &str = "jev-effects.jsonl";
 /// `{site, ts, reason, session}` rows for an enabled site that never asked (no credential, or a
 /// state the metadata guard refused); a separate file so decision-log readers see only calls (#452).
-const JEV_SKIPS_FILE: &str = "jev-skips.jsonl";
+pub(crate) const JEV_SKIPS_FILE: &str = "jev-skips.jsonl";
 /// `{ts, from, to}` rows naming a launch's pre-minted session (`from`) that became another
 /// session (`to`); a separate file so decision-log readers never see a non-decision row (#827).
 const JEV_ALIASES_FILE: &str = "jev-session-aliases.jsonl";
@@ -1189,6 +1190,8 @@ struct AnswerRecord<'a> {
 struct DecisionRecord<'a> {
     site: &'a str,
     ts: u64,
+    /// The zirv version that wrote the row.
+    v: &'static str,
     answers: BTreeMap<&'a str, AnswerRecord<'a>>,
     usage: &'a Usage,
     wall_ms: u64,
@@ -1238,6 +1241,7 @@ pub(crate) fn record_decision_row(
     let record = DecisionRecord {
         site,
         ts,
+        v: jev_counters::VERSION,
         answers: answer_records,
         usage,
         wall_ms,
@@ -1291,6 +1295,7 @@ fn record_skip(state: &StateDir, site: &str, reason: &str) {
     let row = serde_json::json!({
         "site": site,
         "ts": state::now_secs(),
+        "v": jev_counters::VERSION,
         "reason": reason,
         "session": session_and_principal().0,
     });
@@ -1436,6 +1441,7 @@ impl JevEffect<'_> {
 #[derive(Serialize)]
 struct EffectRecord<'a> {
     ts: u64,
+    v: &'static str,
     session: &'a str,
     principal: &'a str,
     #[serde(flatten)]
@@ -1455,8 +1461,16 @@ pub(crate) fn record_effect(
         return;
     }
     let (session, principal) = session_and_principal();
+    jev_counters::count(
+        state,
+        jev_counters::gate_for_site(effect.site),
+        true,
+        jev_counters::Stage::Acted,
+        None,
+    );
     let record = EffectRecord {
         ts: state::now_secs(),
+        v: jev_counters::VERSION,
         session: &session,
         principal: &principal,
         effect,
@@ -1800,12 +1814,38 @@ pub(crate) fn advise_detailed(
     state: &impl Serialize,
     questions: &[Question],
 ) -> AdvisoryStatus {
+    advise_gated(
+        jev_counters::gate_for_site(site),
+        cfg,
+        state_dir,
+        site,
+        enabled,
+        state,
+        questions,
+    )
+}
+
+/// [`advise_detailed`] counting its funnel under an explicit `[jev]` gate key, for a site whose
+/// name does not identify the gate (`approve` asks under both `approve` and `approve_allow`).
+pub(crate) fn advise_gated(
+    gate: &str,
+    cfg: &CtxConfig,
+    state_dir: &StateDir,
+    site: &str,
+    enabled: bool,
+    state: &impl Serialize,
+    questions: &[Question],
+) -> AdvisoryStatus {
+    use jev_counters::{Stage, count};
     if !enabled {
         return AdvisoryStatus::Disabled;
     }
+    count(state_dir, gate, true, Stage::Reached, None);
+    count(state_dir, gate, true, Stage::Eligible, None);
     if !available(&cfg.proxy.typesafe) {
         let reason = JevError::NoCredential(cfg.proxy.typesafe.credential_env.clone());
         record_skip(state_dir, site, &reason.to_string());
+        count(state_dir, gate, true, Stage::Exit, Some("no_credential"));
         return AdvisoryStatus::MissingCredential;
     }
     let started = std::time::Instant::now();
@@ -1820,6 +1860,18 @@ pub(crate) fn advise_detailed(
         questions,
     ) {
         Ok((answers, usage, cached)) => {
+            count(
+                state_dir,
+                gate,
+                true,
+                if cached {
+                    Stage::SentCache
+                } else {
+                    Stage::SentNet
+                },
+                None,
+            );
+            count(state_dir, gate, true, Stage::Answered, None);
             record(
                 state_dir,
                 cfg,
@@ -1835,8 +1887,11 @@ pub(crate) fn advise_detailed(
         Err(error) => {
             if matches!(error, JevError::UnsafeState) {
                 record_skip(state_dir, site, &error.to_string());
+                count(state_dir, gate, true, Stage::Exit, Some("unsafe_state"));
                 return AdvisoryStatus::Failed;
             }
+            count(state_dir, gate, true, Stage::SentNet, None);
+            count(state_dir, gate, true, Stage::Exit, Some("request_failed"));
             record(
                 state_dir,
                 cfg,
@@ -1853,6 +1908,41 @@ pub(crate) fn advise_detailed(
             AdvisoryStatus::Failed
         }
     }
+}
+
+/// A gated site's caller-side early return: counts one pass with its reason code. Nothing for an
+/// off gate, so a gate that is off costs one branch.
+pub(crate) fn exit(state: &StateDir, gate: &str, enabled: bool, reason: &'static str) {
+    jev_counters::count(state, gate, enabled, jev_counters::Stage::Reached, None);
+    jev_counters::count(
+        state,
+        gate,
+        enabled,
+        jev_counters::Stage::Exit,
+        Some(reason),
+    );
+}
+
+/// A gated site with no [`advise`] call of its own (it only records effects) passed its
+/// preconditions: counts it as reached and eligible.
+pub(crate) fn pass(state: &StateDir, gate: &str) {
+    jev_counters::count(state, gate, true, jev_counters::Stage::Reached, None);
+    jev_counters::count(state, gate, true, jev_counters::Stage::Eligible, None);
+}
+
+/// The preamble of a gated site: false when its gate is off, or when Jev is unavailable (counted
+/// and recorded as a skip row). A site that passes this and still returns early calls [`exit`].
+pub(crate) fn gate_open(cfg: &CtxConfig, state: &StateDir, gate: &str, enabled: bool) -> bool {
+    if !enabled {
+        return false;
+    }
+    if available(&cfg.proxy.typesafe) {
+        return true;
+    }
+    let reason = JevError::NoCredential(cfg.proxy.typesafe.credential_env.clone());
+    record_skip(state, gate, &reason.to_string());
+    exit(state, gate, true, "no_credential");
+    false
 }
 
 /// Returns the environment variable name currently configured for the Jev
@@ -1948,7 +2038,24 @@ pub fn run_jev(args: &JevArgs, writer: &mut impl Write) -> crate::commands::ctx:
 
             if *json {
                 let rollup = usage_rollup(&state, ROLLUP_WINDOW_SECS, None);
-                let json_output = status_json(&cfg, &rollup.sites);
+                let now = state::now_secs();
+                let mut json_output = status_json(&cfg, &rollup.sites);
+                json_output["gate_status"] =
+                    jev_counters::gate_rows(&cfg.jev, &jev_counters::rollup(&state, now))
+                        .into_iter()
+                        .map(|row| {
+                            serde_json::json!({
+                                "gate": row.key,
+                                "on": row.on,
+                                "label": row.label.as_str(),
+                                "note": row.note,
+                                "idle_reason": row.idle_reason,
+                                "counts": row.counts,
+                            })
+                        })
+                        .collect();
+                json_output["warnings"] =
+                    version_warnings(&state, now, std::env::current_dir().ok().as_deref()).into();
                 writeln!(writer, "{}", serde_json::to_string_pretty(&json_output)?)?;
                 Ok(0)
             } else {
@@ -2001,6 +2108,28 @@ fn status_json(cfg: &CtxConfig, rollup: &BTreeMap<String, JevSiteUsage>) -> serd
             "sites": rollup,
         },
     })
+}
+
+/// Warnings that the ledger or the working tree was written by a zirv other than this binary.
+fn version_warnings(state: &StateDir, now: u64, cwd: Option<&Path>) -> Vec<String> {
+    let running = jev_counters::VERSION;
+    let mut warnings = Vec::new();
+    let foreign = jev_counters::foreign_versions(state, now, running);
+    if !foreign.is_empty() {
+        warnings.push(format!(
+            "ledger rows in the last {} days were written by zirv {} but this binary is {running}",
+            jev_counters::STATUS_WINDOW_DAYS,
+            foreign.into_iter().collect::<Vec<_>>().join(", "),
+        ));
+    }
+    if let Some(tree) = cwd.and_then(jev_counters::source_tree_version)
+        && tree != running
+    {
+        warnings.push(format!(
+            "this directory is the zirv source tree at {tree} but the running binary is {running}; hooks run the installed binary"
+        ));
+    }
+    warnings
 }
 
 /// Prints a read-only status report of whether Jev is enabled and why or why
@@ -2061,10 +2190,35 @@ pub fn status(
         "inactive"
     };
 
-    // Print gates
-    for (name, on) in &gates {
-        let status = if *on { "on" } else { "off" };
-        writeln!(writer, "jev.{:<12} {}", name, status)?;
+    let now = state::now_secs();
+    let counters = jev_counters::rollup(state, now);
+    for row in jev_counters::gate_rows(&cfg.jev, &counters) {
+        let counts = &row.counts;
+        writeln!(
+            writer,
+            "jev.{:<12} {:<3} {:<11} reached={} eligible={} sent={}net+{}cache answered={} acted={}",
+            row.key,
+            if row.on { "on" } else { "off" },
+            row.label.as_str(),
+            counts.reached,
+            counts.eligible,
+            counts.sent_net,
+            counts.sent_cache,
+            counts.answered,
+            counts.acted,
+        )?;
+        if let Some(note) = row.note {
+            writeln!(writer, "      {note}")?;
+        }
+        if let Some(idle) = row.idle_reason {
+            writeln!(writer, "      idle: waits on {idle}")?;
+        }
+        for (reason, n) in &counts.exits {
+            writeln!(writer, "      exit {reason}: {n}")?;
+        }
+    }
+    for warning in version_warnings(state, now, std::env::current_dir().ok().as_deref()) {
+        writeln!(writer, "warning: {warning}")?;
     }
 
     // Print credential info
@@ -2694,6 +2848,126 @@ pub(crate) mod tests {
                 .expect("fallbacks array")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn the_funnel_counts_one_call_from_reached_to_answered_then_a_cache_hit() {
+        let text = std::fs::read_to_string(fixture("proxy/jev-response.json")).expect("fixture");
+        let body: &'static str = Box::leak(text.into_boxed_str());
+        let (url, handle) = one_shot_server(200, body);
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(state_dir.path().to_path_buf());
+        with_credential("JEV_TEST_KEY_FUNNEL", "secret", || {
+            let mut cfg = CtxConfig::default();
+            cfg.proxy.typesafe = config(url, "JEV_TEST_KEY_FUNNEL", 5);
+            cfg.jev.cache_ttl_secs = 60;
+            let questions = vec![Question::metadata_choice(
+                "category",
+                "pick one",
+                &[("technical", "a technical question")],
+            )];
+            for _ in 0..2 {
+                assert!(
+                    advise(&cfg, &state, "classify", true, &sample_state(), &questions).is_some()
+                );
+            }
+        });
+        handle.join().expect("server thread must not panic");
+
+        let counts = jev_counters::rollup(&state, state::now_secs());
+        let classify = &counts["classify"];
+        assert_eq!(
+            (
+                classify.reached,
+                classify.eligible,
+                classify.sent_net,
+                classify.sent_cache,
+                classify.answered
+            ),
+            (2, 2, 1, 1, 2)
+        );
+        let decisions =
+            std::fs::read_to_string(state_dir.path().join(JEV_DECISIONS_FILE)).expect("rows");
+        for line in decisions.lines() {
+            let row: serde_json::Value = serde_json::from_str(line).expect("json");
+            assert_eq!(row["v"], jev_counters::VERSION);
+        }
+    }
+
+    #[test]
+    fn a_caller_side_exit_is_counted_with_its_reason_and_an_off_gate_is_not() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(state_dir.path().to_path_buf());
+        let mut cfg = CtxConfig::default();
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_EXIT_REASON".to_string();
+
+        assert!(!gate_open(&cfg, &state, "review", false));
+        exit(&state, "review", false, "open_findings");
+        assert!(!state_dir.path().join("jev-counters").exists());
+
+        assert!(!gate_open(&cfg, &state, "review", true));
+        exit(&state, "review", true, "open_findings");
+        let counts = jev_counters::rollup(&state, state::now_secs());
+        let review = &counts["review"];
+        assert_eq!(review.reached, 2);
+        assert_eq!(review.exits["no_credential"], 1);
+        assert_eq!(review.exits["open_findings"], 1);
+        let skips =
+            std::fs::read_to_string(state_dir.path().join(JEV_SKIPS_FILE)).expect("skip row");
+        let row: serde_json::Value =
+            serde_json::from_str(skips.lines().next().expect("row")).expect("json");
+        assert_eq!(
+            (row["site"].as_str(), row["v"].as_str()),
+            (Some("review"), Some(jev_counters::VERSION))
+        );
+    }
+
+    #[test]
+    fn status_lists_an_on_gate_with_zero_reach_as_dormant_and_warns_on_a_foreign_version() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(state_dir.path().to_path_buf());
+        let mut cfg = CtxConfig::default();
+        cfg.jev.review = true;
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_STATUS_DORMANT".to_string();
+        std::fs::write(
+            state_dir.path().join(JEV_DECISIONS_FILE),
+            format!(
+                "{{\"site\":\"x\",\"ts\":{},\"v\":\"0.0.1\"}}\n",
+                state::now_secs()
+            ),
+        )
+        .expect("old row");
+        let mut out = Vec::new();
+        status(&cfg, &state, &mut out).expect("status");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("jev.review"), "{text}");
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("jev.review") && line.contains("dormant")),
+            "{text}"
+        );
+        assert!(
+            text.contains("idle: waits on `zirv workflow review run`"),
+            "{text}"
+        );
+        assert!(text.contains("jev.memory       off retired"), "{text}");
+        assert!(text.contains("written by zirv 0.0.1"), "{text}");
+    }
+
+    #[test]
+    fn a_source_tree_at_another_version_than_the_binary_is_warned_about() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(state_dir.path().to_path_buf());
+        let tree = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tree.path().join("Cargo.toml"),
+            "[package]\nname = \"zirv\"\nversion = \"9.9.9\"\n",
+        )
+        .expect("manifest");
+        let warnings = version_warnings(&state, state::now_secs(), Some(tree.path()));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("9.9.9"), "{warnings:?}");
+        assert!(version_warnings(&state, state::now_secs(), None).is_empty());
     }
 
     #[test]
