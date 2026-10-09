@@ -697,8 +697,8 @@ healthy
         let code = run_with(&args, &mut out, tmp.path(), &|key| env.get(key).cloned());
         assert_eq!(
             code.expect("runs"),
-            EXIT_ROT_EXHAUSTED,
-            "compaction did not help: the run stops and the operator restarts"
+            0,
+            "compaction did not help: the same session is resumed and keeps running"
         );
 
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
@@ -707,11 +707,15 @@ healthy
                 && log.contains("\"detail\":\"compaction not verified\"")
         );
         assert!(
+            log.contains("\"action\":\"suggest-restart\""),
+            "the operator is told a restart is worth doing: {log}"
+        );
+        assert!(
             !log.contains("\"action\":\"restart\""),
             "zirv must never restart for rot: {log}"
         );
         let text = String::from_utf8(out).expect("utf8");
-        assert!(text.contains("restart suggested"), "{text}");
+        assert!(text.contains("resuming the same session"), "{text}");
         assert_eq!(
             transcripts_in(&home).len(),
             1,
