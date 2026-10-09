@@ -470,6 +470,7 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
             }
             let mut scorer = score::IncrementalScorer::new(transcript.clone());
             let mut rotted = false;
+            let mut suggestions = super::exec::SuggestionLatch::default();
             let mut compact_requested = false;
             let mut limit_hit = false;
             let mut limit_confirmation_detail = None;
@@ -543,9 +544,17 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
                 match poll_result {
                     Ok((Some(score), _)) => {
                         match super::exec::action_for_verdict(adapter.as_ref(), score.verdict) {
-                            super::exec::SignalAction::Stop => {
-                                rotted = true;
-                                Tick::Stop("rot")
+                            action @ (super::exec::SignalAction::SuggestRestart
+                            | super::exec::SignalAction::SuggestCompact) => {
+                                suggestions.note(
+                                    action,
+                                    score.score,
+                                    "loop",
+                                    &state,
+                                    session.as_str(),
+                                    &announcer,
+                                );
+                                Tick::Continue
                             }
                             super::exec::SignalAction::Compact
                                 if compact_budget.ready(Instant::now(), compact_window) =>
@@ -1939,7 +1948,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rotted_cycle_is_killed_without_counting_as_a_failure() {
+    fn a_rotted_cycle_is_only_suggested_a_restart_and_never_killed() {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");
@@ -1948,11 +1957,10 @@ mod tests {
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
             std::env::set_var("FAKE_AGENT_MODE", "rot");
-            std::env::set_var("FAKE_AGENT_SLEEP", "30");
+            std::env::set_var("FAKE_AGENT_SLEEP", "3");
         }
         let mut args = args_for(2);
         args.max_failures = Some(1);
-        let started = std::time::Instant::now();
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
         unsafe {
@@ -1960,19 +1968,18 @@ mod tests {
             std::env::remove_var("FAKE_AGENT_SLEEP");
         }
 
-        assert_eq!(
-            code.expect("runs"),
-            0,
-            "rot is session hygiene, not a cycle failure: the next cycle is the restart"
-        );
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(25),
-            "both cycles were killed early, not left to sleep 30s each"
-        );
+        assert_eq!(code.expect("runs"), 0, "rot is never a cycle failure");
         assert_eq!(transcripts_in(&home).len(), 2);
 
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
-        assert!(log.contains("\"action\":\"rot-kill\""), "got {log}");
+        assert!(
+            log.contains("\"action\":\"suggest-restart\""),
+            "the restart is suggested: {log}"
+        );
+        assert!(
+            !log.contains("\"action\":\"rot-kill\""),
+            "zirv never kills a cycle for rot: {log}"
+        );
         assert!(
             !log.contains("\"action\":\"give-up\""),
             "no failure escalation: {log}"

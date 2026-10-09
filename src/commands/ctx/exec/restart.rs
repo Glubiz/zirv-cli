@@ -1,7 +1,7 @@
 //! Supervisor exit outcomes, retry backoff, and nudge restart policy.
 
-/// The restart budget is spent and the session is still rotting. Callers apply
-/// their own policy from here.
+/// Compaction did not help the rotting session. Zirv never restarts it; a
+/// restart is only suggested and callers apply their own policy from here.
 pub const EXIT_ROT_EXHAUSTED: i32 = 75;
 
 /// Wall-clock timeout with no restarts left.
@@ -43,7 +43,11 @@ pub(crate) const EXIT_CODES: &[(i32, &str)] = &[
 /// Distinguish supervisor-owned exit codes from a child's identical code.
 pub fn describe_exit(code: i32) -> String {
     match code {
-        EXIT_ROT_EXHAUSTED => "the session kept rotting and the restart budget ran out".to_string(),
+        EXIT_ROT_EXHAUSTED => {
+            "compaction did not help the rotting session; a restart is suggested (zirv never \
+             restarts a session for rot)"
+                .to_string()
+        }
         EXIT_TIMEOUT => "the supervised run hit its wall-clock timeout".to_string(),
         EXIT_BUDGET_EXHAUSTED => {
             "the token/tool-call budget was spent and the run was stopped".to_string()
@@ -1407,7 +1411,7 @@ mod tests {
     /// codes read as outcomes, not agent failures.
     #[test]
     fn describe_exit_names_the_supervisors_own_outcomes() {
-        assert!(describe_exit(EXIT_ROT_EXHAUSTED).contains("restart budget"));
+        assert!(describe_exit(EXIT_ROT_EXHAUSTED).contains("restart is suggested"));
         assert!(describe_exit(EXIT_TIMEOUT).contains("wall-clock timeout"));
         assert_eq!(describe_exit(1), "exited with code 1");
     }

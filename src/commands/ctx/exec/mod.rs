@@ -48,7 +48,7 @@ use self::command::{build_command, headless_argv_len, headless_prompt_via_stdin}
 pub(crate) use self::command::{headless_resume_launch, prompt_delivery_via_stdin};
 use self::compact::protect_compaction_continuation;
 pub(crate) use self::compact::{
-    CompactBudget, action_for_verdict, compact_in_place, should_attempt_compact,
+    CompactBudget, SuggestionLatch, action_for_verdict, compact_in_place, should_attempt_compact,
 };
 pub use self::compact::{SignalAction, action_for_signal};
 use self::effort::apply_headless_cost_levers;
@@ -716,7 +716,7 @@ fn run_with_clock_inner<W: Write>(
         }
         // Fresh scorer per iteration, over the current session's transcript.
         let mut scorer = score::IncrementalScorer::new(transcript.clone());
-        let mut rotted = false;
+        let mut suggestions = compact::SuggestionLatch::default();
         let mut compact_requested = false;
         let mut limit_hit = false;
         let mut limit_confirmation_detail = None;
@@ -750,7 +750,7 @@ fn run_with_clock_inner<W: Write>(
             &mut session_guard,
             &announcer,
             &mut screening_announced,
-            &mut rotted,
+            &mut suggestions,
             &mut compact_requested,
             &mut compact_budget,
             compact_window,
@@ -1053,11 +1053,25 @@ fn run_with_clock_inner<W: Write>(
                             observed_at: None,
                         },
                     );
+                    // The compaction attempt already stopped the child; zirv
+                    // never restarts a session for rot, so hand the call to
+                    // the operator instead of relaunching with a handoff.
                     writeln!(
                         w,
-                        "zirv ctx exec: {reason}; falling back to restart with handoff"
+                        "zirv ctx exec: {reason}; compaction did not help, restart suggested -- \
+                         restart the session yourself (exit {EXIT_ROT_EXHAUSTED})"
                     )?;
-                    rotted = true;
+                    record_execution_segment(
+                        report,
+                        adapter.as_ref(),
+                        &session,
+                        &transcript,
+                        &prior_usage,
+                        execution_model.as_deref(),
+                        execution_started,
+                    );
+                    session_guard.release();
+                    return Ok(EXIT_ROT_EXHAUSTED);
                 }
             }
         }
@@ -1713,8 +1727,6 @@ fn run_with_clock_inner<W: Write>(
             "capacity"
         } else if stalled {
             "stalled"
-        } else if rotted {
-            "rot"
         } else {
             "timeout"
         };
@@ -1722,8 +1734,6 @@ fn run_with_clock_inner<W: Write>(
             EXIT_CAPACITY_EXHAUSTED
         } else if stalled {
             EXIT_STALLED
-        } else if rotted {
-            EXIT_ROT_EXHAUSTED
         } else {
             EXIT_TIMEOUT
         };

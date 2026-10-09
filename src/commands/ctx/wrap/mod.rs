@@ -1117,11 +1117,11 @@ mod tests {
         wait_or_kill(&mut h.child, Duration::from_secs(5));
     }
 
-    /// Same bug class as the exec one fixed in d3f0ede: after a relaunch the
-    /// old session's transcript is dead, and the new session reports its own.
+    /// A restart suggestion leaves the session alone, so a later turn signal
+    /// that reports a different transcript is still followed for compaction.
     #[cfg(unix)]
     #[test]
-    fn a_restart_reads_the_reported_transcript_and_then_follows_the_new_one() {
+    fn a_restart_suggestion_leaves_the_session_and_later_signals_are_still_followed() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = tmp.path().join("state");
 
@@ -1165,15 +1165,18 @@ mod tests {
         crate::commands::ctx::signal::send(&socket, &turn_signal_for(5, Verdict::Restart, &first))
             .expect("send");
 
-        let seen = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(20));
-        assert!(seen.contains("stub-tui ready"), "relaunched: {seen:?}");
-
-        let handoffs = walk_md(&state.join("handoffs"));
-        assert_eq!(handoffs.len(), 1, "one handoff per restart: {handoffs:?}");
-        let note = std::fs::read_to_string(&handoffs[0]).expect("handoff");
+        let log = wait_for_log(
+            &state,
+            "\"action\":\"suggest-restart\"",
+            Duration::from_secs(20),
+        );
         assert!(
-            note.contains("wire the webhook"),
-            "the handoff was distilled from the reported transcript, not from an empty read: {note}"
+            log.contains("\"action\":\"suggest-restart\""),
+            "the restart was suggested: {log}"
+        );
+        assert!(
+            walk_md(&state.join("handoffs")).is_empty(),
+            "a suggestion writes no handoff"
         );
 
         crate::commands::ctx::signal::send(&socket, &turn_signal_for(6, Verdict::Compact, &second))
@@ -1199,7 +1202,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_restart_verdict_writes_a_handoff_and_relaunches_within_the_same_wrap_session() {
+    fn a_restart_verdict_only_suggests_and_never_relaunches_or_touches_the_child() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = tmp.path().join("state");
         let transcript = tmp.path().join("t.jsonl");
@@ -1242,51 +1245,45 @@ mod tests {
         )
         .expect("send");
 
-        // A fresh agent greets again through the same outer terminal
-        // (h.reader/h.writer never change: the wrap session survives, only
-        // the inner pty is replaced). The old agent's own output, including
-        // its quit confirmation, is deliberately not forwarded once a
-        // restart is underway (see spawn_output_thread) so it can never
-        // interleave with the new generation's output on the same stdout;
-        // that the old child actually quit is verified via the decision
-        // log below instead of by watching for its suppressed text.
-        let seen = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(20));
-        assert!(seen.contains("stub-tui ready"), "relaunched: {seen:?}");
-
-        let log = wait_for_log(&state, "\"action\":\"restart\"", Duration::from_secs(10));
+        let log = wait_for_log(
+            &state,
+            "\"action\":\"suggest-restart\"",
+            Duration::from_secs(20),
+        );
         assert!(
-            log.contains("\"action\":\"restart\""),
-            "old child quit and relaunch succeeded: {log}"
+            log.contains("\"action\":\"suggest-restart\""),
+            "the suggestion is logged: {log}"
+        );
+        assert!(
+            !log.contains("\"action\":\"restart\"") && !log.contains("restart-failed"),
+            "zirv must never restart the session itself: {log}"
+        );
+        assert!(
+            walk_md(&state.join("handoffs")).is_empty(),
+            "a suggestion writes no handoff"
         );
 
-        let handoffs: Vec<_> = walk_md(&state.join("handoffs"));
-        assert_eq!(handoffs.len(), 1, "one handoff per restart: {handoffs:?}");
-        let note = std::fs::read_to_string(&handoffs[0]).expect("handoff");
-        assert!(note.contains("wire the webhook"), "structural task: {note}");
-
-        // The wrap session itself kept running: the user can still type into
-        // the new agent through the very same outer pty used before the restart.
+        // The same child keeps running and nothing was typed into it: the
+        // first thing it echoes is the operator's own line, and it greeted once.
         h.writer.write_all(b"still here\r").expect("write");
         h.writer.flush().expect("flush");
         let echoed = read_until(&mut h.reader, "echo: still here", Duration::from_secs(10));
         assert!(echoed.contains("echo: still here"), "got {echoed:?}");
+        assert!(
+            !echoed.contains("stub-tui ready"),
+            "the child was not relaunched: {echoed:?}"
+        );
+        assert!(
+            !echoed.contains("echo: ") || echoed.matches("echo: ").count() == 1,
+            "nothing but the operator's line reached the child: {echoed:?}"
+        );
 
         h.writer.write_all(b"/exit\r").expect("write");
-        // Plain cleanup, not an assertion: everything the restart contract
-        // promises was already checked above (log, handoff, echo through the
-        // same outer pty). On this platform a wrap process that has been
-        // through a relaunch can independently get stuck in the kernel's own
-        // exit-teardown path for a session-leader pty process (`ps` reports
-        // it with the documented "E" = "trying to exit" state flag; see
-        // batch10-report.md). That is orthogonal to whether the restart
-        // itself worked, so bound this wait rather than let an unrelated
-        // platform quirk hang the test.
         wait_or_kill(&mut h.child, Duration::from_secs(5));
     }
 
     /// Waits for a child to exit, killing it if it has not within `timeout`.
-    /// See the restart test's cleanup for why a plain `.wait()` is not safe
-    /// to use unconditionally on this platform.
+    /// A plain `.wait()` is not safe to use unconditionally on this platform.
     #[cfg(unix)]
     fn wait_or_kill(child: &mut Box<dyn portable_pty::Child + Send + Sync>, timeout: Duration) {
         let deadline = Instant::now() + timeout;
@@ -1297,79 +1294,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         let _ = child.kill();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_relaunch_that_cannot_spawn_degrades_the_session_cleanly() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let state = tmp.path().join("state");
-        let transcript = tmp.path().join("t.jsonl");
-        std::fs::write(
-            &transcript,
-            concat!(
-                r#"{"type":"user","message":{"content":"wire the webhook"}}"#,
-                "\n",
-                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"a","name":"Read","input":{"file_path":"/work/src/hook.rs"}}],"usage":{"input_tokens":180000}}}"#,
-                "\n"
-            ),
-        )
-        .expect("write");
-
-        // The initial spawn runs the wrapped argv directly (unaffected by
-        // ZIRV_CTX_AGENT_BIN), so it starts fine on relaunch-stub.sh. relaunch()
-        // instead goes through the adapter's interactive_cmd, which honors
-        // ZIRV_CTX_AGENT_BIN: pointing it at a path that cannot exist makes
-        // relaunch()'s own spawn_command fail, exactly like a real agent
-        // binary going missing between sessions.
-        let script = fixture("relaunch-stub.sh").display().to_string();
-        let mut h = spawn_wrap(
-            &[
-                ("ZIRV_CTX_TRANSCRIPT", transcript.display().to_string()),
-                ("ZIRV_CTX_DEBOUNCE_MS", "300".to_string()),
-                ("ZIRV_CTX_STATE_DIR", state.display().to_string()),
-                (
-                    "ZIRV_CTX_AGENT_BIN",
-                    "/nonexistent/zirv-ctx-test-agent-binary".to_string(),
-                ),
-            ],
-            &["sh", &script],
-        );
-        let _ = read_until(&mut h.reader, "stub-tui ready", Duration::from_secs(10));
-
-        let socket =
-            read_socket_path(&StateDir::from_root(state.clone()), None).expect("socket path");
-        crate::commands::ctx::signal::send(
-            std::path::Path::new(socket.trim()),
-            &turn_signal(5, Verdict::Restart),
-        )
-        .expect("send");
-
-        // relaunch() cannot spawn, so the session ends: no hang, no crash,
-        // and the process exits through the old (already-quit) child's own
-        // exit path rather than the fresh-generation one.
-        wait_or_kill(&mut h.child, Duration::from_secs(10));
-
-        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
-        assert!(
-            log.contains("\"action\":\"degrade\""),
-            "note_failure logged: {log}"
-        );
-        // "Item 6 audit" (see the comment at `relaunch_error`'s
-        // declaration) made `note_failure` name the *real* spawn error
-        // instead of the old generic "relaunch failed" placeholder, which
-        // that fallback string is now dead code for -- `relaunch_error` is
-        // always `Some` by the time this arm runs. The nonexistent
-        // `ZIRV_CTX_AGENT_BIN` path is what's actually stable across
-        // portable-pty's own wording for "the binary is missing".
-        assert!(
-            log.contains("zirv-ctx-test-agent-binary"),
-            "reason recorded: {log}"
-        );
-        assert!(
-            log.contains("\"action\":\"restart-failed\""),
-            "restart outcome logged: {log}"
-        );
     }
 
     #[test]
@@ -1404,31 +1328,6 @@ mod tests {
         let mut supervision = InjectionState::new();
         note_failure(&mut supervision, None, "no state dir", &Announcer::silent());
         assert!(supervision.degraded);
-    }
-
-    /// Issue #310 parity: `exec` records every respawn on the cross-process
-    /// restart chain and stands down once the breaker trips; `wrap`'s own
-    /// `Action::Restart` arm recorded nothing and asked nothing, so a session
-    /// that rots straight back into a restart relaunched forever, on no budget
-    /// at all.
-    #[test]
-    fn a_tripped_restart_chain_stops_wraps_own_relaunches() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(tmp.path().join("state"));
-        let repo = tmp.path().join("repo");
-        let cfg = CtxConfig::default();
-
-        assert_eq!(
-            tripped_restart_chain(&state, &repo, &cfg, 1_000),
-            None,
-            "the first restart is never the pattern"
-        );
-        assert_eq!(tripped_restart_chain(&state, &repo, &cfg, 1_010), None);
-        assert_eq!(
-            tripped_restart_chain(&state, &repo, &cfg, 1_020),
-            Some(cfg.supervise.chain_max_restarts),
-            "three restarts inside the configured gap is the loop the breaker exists for"
-        );
     }
 
     #[cfg(unix)]

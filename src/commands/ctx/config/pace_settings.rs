@@ -96,6 +96,7 @@ impl OrchestratorWrites {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SuperviseConfig {
+    /// Timeout, capacity and stall restarts; rot never restarts a session.
     pub max_restarts: u32,
     pub poll_ms: u64,
     pub interval_secs: u64,

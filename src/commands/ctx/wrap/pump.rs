@@ -36,7 +36,6 @@ pub(super) fn pump(
     grace: Duration,
     tx: mpsc::Sender<PumpEvent>,
     generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    extra: &[String],
     // `&mut Vec<_>`, not `&[_]`: a handover swap rebuilds this for the new
     // adapter/model, so a later rot restart relaunches with the right identity.
     turn_env: &mut Vec<(String, String)>,
@@ -478,12 +477,9 @@ pub(super) fn pump(
         redraw_bar_if_due(bar, supervision, state_dir, repo, Instant::now());
 
         let action = match action_for(supervision, Instant::now(), debounce) {
-            action @ (Action::Compact | Action::Restart) => {
+            action @ Action::Compact => {
                 let now = Instant::now();
-                let kind = match action {
-                    Action::Compact => super::inject_gate::InjectKind::Compact,
-                    _ => super::inject_gate::InjectKind::Restart,
-                };
+                let kind = super::inject_gate::InjectKind::Compact;
                 let facts = super::inject_gate::InjectFacts {
                     rot_score: Some(supervision.score),
                     restart_at: cfg.score.restart_at,
@@ -589,175 +585,12 @@ pub(super) fn pump(
                     },
                 );
             }
-            Action::Restart => 'restart: {
+            // Zirv never restarts a session because of rot: the operator does.
+            Action::SuggestRestart => {
+                announcer.emit(&Event::RestartSuggested {
+                    score: supervision.score,
+                });
                 supervision.cooldown_at_signal = Some(supervision.signals_seen);
-                inject_gate.injected(
-                    super::inject_gate::InjectKind::Restart,
-                    supervision.signals_seen,
-                );
-
-                // A tripped restart chain degrades to passthrough without
-                // touching the child or spending another distillation.
-                if let Some(boots) =
-                    tripped_restart_chain(state_dir, repo, cfg, super::state::now_secs())
-                {
-                    let _ = super::log::append(
-                        state_dir,
-                        &super::log::Decision {
-                            ts: super::state::now_secs(),
-                            session: session.as_str(),
-                            verb: "wrap",
-                            verdict: "restart",
-                            score: supervision.score,
-                            action: "chain-tripped",
-                            detail: &format!(
-                                "{boots} unplanned restarts within the configured gap; not \
-                                 relaunching"
-                            ),
-                            observed_at: None,
-                        },
-                    );
-                    note_failure(
-                        supervision,
-                        Some((state_dir, session.as_str())),
-                        &format!(
-                            "restart-chain breaker tripped ({boots} restarts within the \
-                             configured gap); supervising no further -- run `zirv ctx status`"
-                        ),
-                        announcer,
-                    );
-                    break 'restart;
-                }
-
-                // Park the record on zirv during restart; concurrent liveness
-                // sweeps must not delete a live session while its child exits.
-                session_guard.adopt_child_pid(std::process::id());
-
-                let jsonl = transcript
-                    .path()
-                    .map(|path| std::fs::read_to_string(path).unwrap_or_default())
-                    .unwrap_or_default();
-                let ctx = adapter.structural_context(&jsonl, tail_items);
-                let previous = handoff::latest_for_repo(state_dir, repo)
-                    .ok()
-                    .flatten()
-                    .map(|(_, h)| h);
-                let (note, source) = handoff::distill_or_structural_with_jev(
-                    cfg,
-                    state_dir,
-                    adapter.as_ref(),
-                    distiller_model.as_str(),
-                    &ctx,
-                    distiller_timeout,
-                    announcer.enabled,
-                    previous.as_ref(),
-                );
-                let stored = handoff::store(state_dir, repo, session.as_str(), &note);
-                // Harvest only enabled, genuinely distilled handoffs; failure
-                // cannot turn a successful restart into an error.
-                if source == "distilled" {
-                    let _ = super::memory::harvest_durable(
-                        adapter.as_ref(),
-                        distiller_model.as_str(),
-                        &note,
-                        repo,
-                        state_dir,
-                        memory_slug,
-                        cfg,
-                    );
-                }
-
-                // Lock the writer before advancing generation; a failed lock
-                // must leave the current child's reader active.
-                let (new_generation, quit) = match writer.lock() {
-                    Ok(mut sink) => {
-                        // Advance generation before quitting the old child so
-                        // its EOF cannot masquerade as the successor's.
-                        let bumped =
-                            generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                        let quit = quit_child(&mut *sink, child, adapter.quit_sequence(), grace)
-                            .map_err(|e| e.to_string());
-                        (Some(bumped), quit)
-                    }
-                    Err(_) => (None, Err("pty writer poisoned".to_string())),
-                };
-
-                // A replacement reports on its own transcript file.
-                transcript.forget();
-
-                // Preserve the relaunch failure reason for the announcement.
-                let mut relaunch_error = quit.as_ref().err().cloned();
-                let relaunched = match (new_generation, quit.is_ok()) {
-                    (Some(new_generation), true) => {
-                        match relaunch(
-                            adapter.as_ref(),
-                            repo,
-                            &note,
-                            extra,
-                            turn_env.as_slice(),
-                            relaunch_size(bar, last_size),
-                            &cfg.screen.thresholds(),
-                            state_dir,
-                            session.as_str(),
-                        ) {
-                            Ok((fresh_pair, fresh_child, fresh_reader, fresh_writer)) => {
-                                spawn_output_thread(
-                                    fresh_reader,
-                                    tx.clone(),
-                                    generation.clone(),
-                                    new_generation,
-                                    bar.stdout_lock.clone(),
-                                );
-                                if let Ok(mut sink) = writer.lock() {
-                                    *sink = fresh_writer;
-                                }
-                                // Do not send an owed submit to a replacement
-                                // that never received its text.
-                                mail_watch.clear_pending_submit();
-                                // Re-arm the console probe filter for this pty.
-                                if let Ok(mut filter) = cpr_filter.lock() {
-                                    filter.arm(Instant::now());
-                                }
-                                *pair = fresh_pair;
-                                *child = fresh_child;
-                                // Release the old guard before adopting the
-                                // new pid, which the OS may have recycled.
-                                child_guard.release();
-                                *child_guard =
-                                    super::supervise::ChildGuard::adopt(child.process_id());
-                                // Point the record at the fresh child before
-                                // a liveness sweep sees the old pid.
-                                if let Some(child_pid) = child.process_id() {
-                                    session_guard.adopt_child_pid(child_pid);
-                                }
-                                true
-                            }
-                            Err(e) => {
-                                relaunch_error = Some(e.to_string());
-                                false
-                            }
-                        }
-                    }
-                    _ => false,
-                };
-
-                if relaunched {
-                    announcer.emit(&Event::Restart {
-                        style: source.to_string(),
-                        stored: match &stored {
-                            Ok(path) => path.display().to_string(),
-                            Err(e) => format!("not stored: {e}"),
-                        },
-                    });
-                } else {
-                    let reason = relaunch_error.unwrap_or_else(|| "relaunch failed".to_string());
-                    note_failure(
-                        supervision,
-                        Some((state_dir, session.as_str())),
-                        &reason,
-                        announcer,
-                    );
-                }
                 let _ = super::log::append(
                     state_dir,
                     &super::log::Decision {
@@ -766,29 +599,11 @@ pub(super) fn pump(
                         verb: "wrap",
                         verdict: "restart",
                         score: supervision.score,
-                        action: if relaunched {
-                            "restart"
-                        } else {
-                            "restart-failed"
-                        },
-                        detail: &match stored {
-                            Ok(path) => format!("{source} handoff at {}", path.display()),
-                            Err(e) => format!("{source} handoff not stored: {e}"),
-                        },
+                        action: "suggest-restart",
+                        detail: "restart suggested to the operator; zirv does not restart sessions",
                         observed_at: None,
                     },
                 );
-                if !relaunched {
-                    let status = child.wait()?;
-                    let code = status.exit_code() as i32;
-                    // The prior announcement gave the failure reason; now
-                    // report session end.
-                    announcer.emit(&Event::SessionEnded {
-                        agent: adapter.name().to_string(),
-                        code,
-                    });
-                    return Ok(code);
-                }
             }
         }
 

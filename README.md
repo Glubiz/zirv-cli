@@ -304,7 +304,8 @@ having a separate one, not a bug in the alias routing itself.
   invocation starts.
 - **`zirv agent <name> <prompt> [-- flags]`** — delegates one task to a
   supervised worker on another enabled harness: the same pacing, rot
-  detection and restart-with-handoff behavior `zirv ctx exec` gives a
+  detection (compaction, then a restart suggestion) and timeout/capacity
+  restart-with-handoff behavior `zirv ctx exec` gives a
   hand-written invocation, as one command. It lands in a dashboard pane
   whenever a dashboard is live on this machine, and runs inline in this
   terminal (announced in one line) when none is. Pass `-` as the prompt to
@@ -383,8 +384,8 @@ restarted or killed. Run it from a plain terminal, or pass --allow-nested
 This is not a tidiness rule. A nested interactive supervisor shares the outer
 session's console, and if its own turn-signal socket fails to bind, its child
 would report turn boundaries into the **outer** supervisor's rot engine —
-which eventually verdicts a restart and ends the session the human was
-actually talking to. Pass `--allow-nested`, or set `ZIRV_ALLOW_NESTED=true`,
+which eventually verdicts a compaction or a restart suggestion for the session
+the human was actually talking to. Pass `--allow-nested`, or set `ZIRV_ALLOW_NESTED=true`,
 if you mean it.
 
 The **delegating** verbs — `zirv ctx exec`, `zirv ctx loop` and `zirv agent` —
@@ -1178,8 +1179,8 @@ even if the wake-up is missed), so the two pieces are decoupled on purpose: a
 nudge is a wake-up signal plus a payload, stored separately, and losing the
 wake-up never loses the message. For a headless session (`exec`), a nudge
 costs the in-flight turn — the session is stopped and relaunched with a
-handoff distilled from the transcript so far, the same recovery path a rot
-restart uses, just triggered by an operator instead of the rot engine. That
+handoff distilled from the transcript so far, the same recovery path a timeout
+or capacity restart uses, triggered by an operator. That
 restart is bounded by `[supervise] max_nudges` (default 3, `ZIRV_CTX_MAX_NUDGES`)
 so a session cannot be interrupted indefinitely; past the cap a nudge's
 message is still queued as mail but the session runs on untouched. The cap
@@ -1939,8 +1940,9 @@ straight through to the agent CLI. `operating_system`, `proceed_on_failure`,
 `capture` and `interactive` are not supported and fail the step if set.
 
 The step runs in-process through the same supervision `zirv ctx exec` uses:
-pacing against your usage windows, rot detection, and automatic restart with a
-distilled handoff if the session rots. A non-zero outcome fails the step like
+pacing against your usage windows, rot detection (compaction first, then a
+restart suggestion that zirv never performs itself), and automatic restart
+with a distilled handoff on a timeout or capacity error. A non-zero outcome fails the step like
 any other command. Only Claude Code is supported today (see [Context
 Management](#context-management-zirv-ctx) below); naming any other agent fails
 with that adapter's own error.
@@ -3267,8 +3269,9 @@ or adding patterns; it cannot disable masking, replace the operator's literals
 file, or add allow-list entries.
 
 `zirv ctx` watches Claude Code sessions for context rot and intervenes before
-quality drops: it advises, compacts early, or restarts the session with a
-distilled handoff. Scoring is deterministic, and every decision is logged.
+quality drops: it advises, compacts early, and suggests a restart when
+compaction does not help. Zirv never restarts a session because of rot; you
+restart it yourself. Scoring is deterministic, and every decision is logged.
 
 **Agent support.** Claude Code and Codex are both supported for supervised
 sessions, but not to the same depth. Claude Code gets the full feature set:
@@ -3370,7 +3373,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 |---|---|
 | `zirv ctx score --transcript <path>` | Rot-scores a transcript and prints JSON |
 | `zirv ctx loop --prompt <text>` | Runs a fresh headless session per cycle, so the orchestrator cannot rot |
-| `zirv ctx exec -- <agent command>` | Supervises one headless run: kill, distill, restart |
+| `zirv ctx exec -- <agent command>` | Supervises one headless run: compact on rot (restart only suggested); kill, distill, restart on timeout or capacity errors |
 | `zirv ctx wrap -- claude` | Supervises an interactive TUI through a PTY |
 | `zirv ctx handoff --transcript <path>` | Distills a handoff and stores it |
 | `zirv ctx resume` | Starts a clean session with the latest handoff injected |
@@ -4867,7 +4870,7 @@ classify = false    # intent refinement for `zirv workflow start`/`classify` (cl
 handoff_select = false # keep/drop scoring of handoff candidate items; ZIRV_CTX_JEV_HANDOFF_SELECT (#783)
 compaction_select = false # appends a short Jev-chosen keep list ("Keep in particular: ...") to a compaction's own focus text, from candidates (edited files, an unresolved failing test, first-prompt constraints, the latest plan) extracted deterministically from the transcript; ZIRV_CTX_JEV_COMPACTION_SELECT (#798)
 inject_screen = false # warns (never strips) mail/worker-result text Jev flags as likely injected; ZIRV_CTX_JEV_INJECT_SCREEN (#784)
-inject = false      # may only DEFER automatic compact/restart/mail/Stop-rot injections, within hard caps (operator mail and restart at the ceiling never wait); ZIRV_CTX_JEV_INJECT (#785)
+inject = false      # may only DEFER automatic compact/mail/Stop-rot injections, within hard caps (operator mail never waits); ZIRV_CTX_JEV_INJECT (#785)
 stop_verify = false # facts-only check that may block a Stop once when edits are unverified and the closing message claims completion; ZIRV_CTX_JEV_STOP_VERIFY (#786)
 missing_tests = false # when the deterministic `[missing_tests_gate]` is about to block, asks one metadata-only question from local numeric facts and skips that one block on a decisive "not owed" answer; ZIRV_CTX_JEV_MISSING_TESTS
 retry = false       # after 3 identical tool failures in a row, asks Jev ONE retry/stop_and_ask/change_approach question per streak (numeric facts only: failure count, tool class, locally classified error class; never error text); a decisive stop_and_ask or change_approach (confidence >= 0.9, constant floor) adds one advisory line via the `PostToolUseFailure` hook (`zirv ctx hook tool-failure`, registered by `zirv setup apply` only while this key is on; re-run it after enabling); retry, a split answer or any error adds nothing. NOT yet probed for this exact question -- probe before enabling; ZIRV_CTX_JEV_RETRY (#836)
@@ -6611,8 +6614,8 @@ begin with `-` or to look like a flag is still just a prompt.
 | Code | Meaning |
 |---|---|
 | the child's own code | the run finished on its own |
-| `75` | rot was detected and `exec` could not carry on, either because the restart budget was spent or because no prompt was available to restart with. `loop` also returns it when consecutive cycle failures hit `max_failures` |
-| `76` | the same, for a wall-clock timeout rather than rot |
+| `75` | rot was detected, compaction did not help, and `exec` stopped with a restart suggestion (zirv never restarts a session for rot). `loop` also returns it when consecutive cycle failures hit `max_failures` |
+| `76` | a wall-clock timeout that `exec` could not recover from, either because the restart budget was spent or because no prompt was available to restart with |
 | `77` | the token or tool-call budget was reached; the run checkpoints and stops without restarting |
 | `78` | provider capacity or overload errors persisted until the restart budget was spent |
 | `79` | the provider account ran out of credits or quota; the run stops without retrying |
@@ -6621,9 +6624,9 @@ begin with `-` or to look like a flag is still just a prompt.
 | `82` | the worker report failed its result contract or claimed deliverables that do not exist |
 <!-- zchk-doc-exit-codes:end -->
 
-The code names the reason, not which limit ran out: `75` means rot and `76`
-means timeout, whether the run stopped because the budget was exhausted or
-because there was no prompt to restart with. A usage-limit hit is neither, it
+The code names the reason, not which limit ran out: `75` means rot that
+compaction did not fix and `76` means timeout, whether the run stopped because
+the budget was exhausted or because there was no prompt to restart with. A usage-limit hit is neither, it
 parks and relaunches without consuming the restart budget.
 
 ### Migrating an existing loop
@@ -7138,9 +7141,8 @@ belong in memory, and a repository fact does not belong in a handoff.
 By default nothing is added to the bank automatically — `zirv ctx remember`
 is a deliberate act, by a session or a human. Set `[memory] harvest = true`
 (or `ZIRV_CTX_MEMORY_HARVEST=true`) to let zirv *also* try to extract durable
-facts on its own: right after a rot restart distills a handoff (`exec` or
-`wrap`, and only from a genuinely distilled handoff, never the mechanical
-fallback), one extra cheap-model call looks at the handoff's `Gotchas
+facts on its own: right after a restart distills a handoff (only from a
+genuinely distilled handoff, never the mechanical fallback), one extra cheap-model call looks at the handoff's `Gotchas
 learned` and `Files touched` sections and proposes zero or more `key: value`
 facts. Harvesting stays off by default because a cheap model can be
 confidently wrong: an unreviewed guess landing in a bank every future session

@@ -3523,7 +3523,7 @@ mod tests {
         assert!(
             exit_note(exec::EXIT_ROT_EXHAUSTED)
                 .expect("rot exhausted has a note")
-                .contains("restart budget")
+                .contains("restart is suggested")
         );
         assert!(
             exit_note(exec::EXIT_TIMEOUT)

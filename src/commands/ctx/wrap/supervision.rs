@@ -234,11 +234,12 @@ pub enum Action {
     None,
     Advise,
     Compact,
-    Restart,
+    /// Tell the operator a restart is worth doing; zirv never performs it.
+    SuggestRestart,
 }
 
-/// Advisories only print, so they need no injection window. Compaction and
-/// restart type into the agent, so both preconditions apply.
+/// Advisories and restart suggestions only print, so they need no injection
+/// window. Compaction types into the agent, so both preconditions apply.
 pub fn action_for(state: &InjectionState, now: Instant, debounce: Duration) -> Action {
     if state.degraded {
         return Action::None;
@@ -247,7 +248,7 @@ pub fn action_for(state: &InjectionState, now: Instant, debounce: Duration) -> A
         Verdict::Healthy => Action::None,
         Verdict::Advise if cooldown_cleared(state) => Action::Advise,
         Verdict::Compact if may_inject(state, now, debounce) => Action::Compact,
-        Verdict::Restart if may_inject(state, now, debounce) => Action::Restart,
+        Verdict::Restart if cooldown_cleared(state) => Action::SuggestRestart,
         _ => Action::None,
     }
 }
@@ -536,7 +537,26 @@ mod tests {
         assert_eq!(action_for(&state, now, DEBOUNCE), Action::Compact);
 
         state.verdict = Verdict::Restart;
-        assert_eq!(action_for(&state, now, DEBOUNCE), Action::Restart);
+        assert_eq!(action_for(&state, now, DEBOUNCE), Action::SuggestRestart);
+    }
+
+    #[test]
+    fn a_restart_verdict_only_suggests_and_needs_no_injection_window() {
+        let now = Instant::now();
+        let mut state = ready_state(now);
+        state.verdict = Verdict::Restart;
+        state.on_event(PumpEvent::Input(1), now);
+        assert_eq!(
+            action_for(&state, now, DEBOUNCE),
+            Action::SuggestRestart,
+            "a suggestion is printed to the terminal, never typed into the agent"
+        );
+        state.cooldown_at_signal = Some(state.signals_seen);
+        assert_eq!(
+            action_for(&state, now, DEBOUNCE),
+            Action::None,
+            "suggested once per turn"
+        );
     }
 
     #[test]
@@ -580,18 +600,16 @@ mod tests {
     }
 
     #[test]
-    fn compaction_and_restart_respect_the_injection_window() {
+    fn compaction_respects_the_injection_window() {
         let now = Instant::now();
-        for verdict in [Verdict::Compact, Verdict::Restart] {
-            let mut state = ready_state(now);
-            state.verdict = verdict;
-            state.on_event(PumpEvent::Input(1), now);
-            assert_eq!(
-                action_for(&state, now, DEBOUNCE),
-                Action::None,
-                "{verdict:?} must wait for an idle user"
-            );
-        }
+        let mut state = ready_state(now);
+        state.verdict = Verdict::Compact;
+        state.on_event(PumpEvent::Input(1), now);
+        assert_eq!(
+            action_for(&state, now, DEBOUNCE),
+            Action::None,
+            "Compact must wait for an idle user"
+        );
     }
 
     #[test]

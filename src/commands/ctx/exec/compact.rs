@@ -6,7 +6,10 @@ use super::*;
 pub enum SignalAction {
     Ignore,
     Compact,
-    Stop,
+    /// Compaction is warranted but this adapter cannot compact headlessly.
+    SuggestCompact,
+    /// Zirv never restarts a session for rot; it only tells the operator.
+    SuggestRestart,
 }
 
 pub(crate) fn action_for_verdict(
@@ -15,8 +18,62 @@ pub(crate) fn action_for_verdict(
 ) -> SignalAction {
     match verdict {
         Verdict::Compact if adapter.supports_headless_compact() => SignalAction::Compact,
-        Verdict::Compact | Verdict::Restart => SignalAction::Stop,
+        Verdict::Compact => SignalAction::SuggestCompact,
+        Verdict::Restart => SignalAction::SuggestRestart,
         Verdict::Healthy | Verdict::Advise => SignalAction::Ignore,
+    }
+}
+
+/// Reports each suggestion once per child so a persistent verdict does not
+/// repeat on every poll tick. Nothing is killed or relaunched.
+#[derive(Debug, Default)]
+pub(crate) struct SuggestionLatch {
+    last: Option<SignalAction>,
+}
+
+impl SuggestionLatch {
+    pub(crate) fn note(
+        &mut self,
+        action: SignalAction,
+        score: u32,
+        verb: &str,
+        state: &StateDir,
+        session: &str,
+        announcer: &super::announce::Announcer,
+    ) {
+        if self.last == Some(action) {
+            return;
+        }
+        let (event, verdict, label, detail) = match action {
+            SignalAction::SuggestRestart => (
+                super::announce::Event::RestartSuggested { score },
+                "restart",
+                "suggest-restart",
+                "restart suggested to the operator; zirv does not restart sessions",
+            ),
+            SignalAction::SuggestCompact => (
+                super::announce::Event::RotAdvisory { score, tokens: 0 },
+                "compact",
+                "suggest-compact",
+                "compaction suggested; this adapter cannot compact a headless session",
+            ),
+            SignalAction::Ignore | SignalAction::Compact => return,
+        };
+        self.last = Some(action);
+        announcer.emit(&event);
+        let _ = log::append(
+            state,
+            &log::Decision {
+                ts: now_secs(),
+                session,
+                verb,
+                verdict,
+                score,
+                action: label,
+                detail,
+                observed_at: None,
+            },
+        );
     }
 }
 
@@ -188,7 +245,7 @@ mod tests {
         let claude = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(None);
         assert_eq!(
             action_for_signal(&claude, &signal_with(Verdict::Restart, 95), "s"),
-            SignalAction::Stop
+            SignalAction::SuggestRestart
         );
         assert_eq!(
             action_for_signal(&claude, &signal_with(Verdict::Compact, 65), "s"),
@@ -208,10 +265,10 @@ mod tests {
     /// resume`), but deliberately left `supports_headless_compact` `false`:
     /// no verified in-place compaction directive exists to pair the resume
     /// with (see `CodexAdapter::compact_command`'s own doc comment). This
-    /// pins that a codex `Verdict::Compact` still restarts, unchanged by
-    /// that issue.
+    /// pins that a codex `Verdict::Compact` is only suggested: it neither
+    /// restarts the run nor arms the compact budget.
     #[test]
-    fn codex_compact_verdict_restarts_without_arming_the_compact_budget() {
+    fn codex_compact_verdict_only_suggests_without_arming_the_compact_budget() {
         let codex = crate::commands::ctx::adapters::codex::CodexAdapter::new(None);
         let now = Instant::now();
         let window = Duration::from_secs(60);
@@ -222,8 +279,37 @@ mod tests {
             budget.arm(now);
         }
 
-        assert_eq!(action, SignalAction::Stop);
+        assert_eq!(action, SignalAction::SuggestCompact);
         assert!(budget.attempted_at.is_none());
+    }
+
+    #[test]
+    fn a_suggestion_is_logged_once_per_kind_and_never_stops_anything() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let announcer = crate::commands::ctx::announce::Announcer::silent();
+        let mut latch = SuggestionLatch::default();
+
+        for _ in 0..3 {
+            latch.note(
+                SignalAction::SuggestRestart,
+                85,
+                "exec",
+                &state,
+                "s",
+                &announcer,
+            );
+        }
+        latch.note(SignalAction::Compact, 65, "exec", &state, "s", &announcer);
+        latch.note(SignalAction::Ignore, 0, "exec", &state, "s", &announcer);
+
+        let log = std::fs::read_to_string(state.logs().join("decisions.jsonl")).expect("log");
+        assert_eq!(
+            log.matches("\"action\":\"suggest-restart\"").count(),
+            1,
+            "{log}"
+        );
+        assert!(!log.contains("\"action\":\"kill\""), "{log}");
     }
 
     /// The socket path is derived from the first eight hex characters of a
@@ -571,7 +657,7 @@ healthy
     }
 
     #[test]
-    fn an_unverified_compaction_falls_through_to_restart_with_the_reason() {
+    fn an_unverified_compaction_suggests_a_restart_with_the_reason_and_never_restarts() {
         let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
@@ -609,18 +695,27 @@ healthy
         };
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|key| env.get(key).cloned());
-        assert_eq!(code.expect("runs"), 0);
+        assert_eq!(
+            code.expect("runs"),
+            EXIT_ROT_EXHAUSTED,
+            "compaction did not help: the run stops and the operator restarts"
+        );
 
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
         assert!(
             log.contains("\"action\":\"compact-failed\"")
                 && log.contains("\"detail\":\"compaction not verified\"")
         );
-        assert!(log.contains("\"action\":\"restart\""), "{log}");
+        assert!(
+            !log.contains("\"action\":\"restart\""),
+            "zirv must never restart for rot: {log}"
+        );
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("restart suggested"), "{text}");
         assert_eq!(
             transcripts_in(&home).len(),
-            2,
-            "restart mints a new session"
+            1,
+            "no restart means no new session"
         );
     }
 }

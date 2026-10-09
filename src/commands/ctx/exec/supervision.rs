@@ -35,7 +35,7 @@ pub(super) fn supervise_run(
     // Keep screening deduplication across restarts, not per poll. (#243)
     announcer: &super::announce::Announcer,
     screening_announced: &mut Option<String>,
-    rotted: &mut bool,
+    suggestions: &mut super::compact::SuggestionLatch,
     compact_requested: &mut bool,
     compact_budget: &mut CompactBudget,
     compact_window: Duration,
@@ -129,9 +129,8 @@ pub(super) fn supervise_run(
                 session_guard.clear_in_flight();
             }
             match action_for_signal(adapter, &received, session) {
-                SignalAction::Stop => {
-                    *rotted = true;
-                    return Tick::Stop("rot");
+                action @ (SignalAction::SuggestRestart | SignalAction::SuggestCompact) => {
+                    suggestions.note(action, received.score, "exec", state, session, announcer);
                 }
                 SignalAction::Compact if compact_budget.ready(Instant::now(), compact_window) => {
                     compact_budget.arm(Instant::now());
@@ -364,9 +363,9 @@ pub(super) fn supervise_run(
         }
         match poll_result {
             Ok((Some(score), _)) => match action_for_verdict(adapter, score.verdict) {
-                SignalAction::Stop => {
-                    *rotted = true;
-                    Tick::Stop("rot")
+                action @ (SignalAction::SuggestRestart | SignalAction::SuggestCompact) => {
+                    suggestions.note(action, score.score, "exec", state, session, announcer);
+                    Tick::Continue
                 }
                 SignalAction::Compact if compact_budget.ready(Instant::now(), compact_window) => {
                     compact_budget.arm(Instant::now());
