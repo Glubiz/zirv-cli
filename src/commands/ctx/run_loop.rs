@@ -639,6 +639,32 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
                     cfg.handoff.tail_items,
                     supervise::COMPACT_FOCUS,
                 );
+                // Resume the same session with the cycle prompt, with or
+                // without a compaction in front of it.
+                let build_continuation =
+                    |note: &str| -> Result<(std::process::Command, Option<String>), String> {
+                        let continuation = format!("{prompt}\n\n{note}");
+                        let session_ref = SessionRef {
+                            id: session.clone(),
+                            cwd: repo.to_path_buf(),
+                        };
+                        let (mut continued, stdin_prompt) = super::exec::headless_resume_launch(
+                            adapter.as_ref(),
+                            &continuation,
+                            &session_ref,
+                            &extra,
+                            prompt_via_stdin,
+                        )
+                        .ok_or_else(|| {
+                            format!(
+                                "adapter '{}' cannot resume a headless session in place",
+                                adapter.name()
+                            )
+                        })?;
+                        continued.current_dir(repo);
+                        apply_session_env(&mut continued);
+                        Ok((continued, stdin_prompt))
+                    };
                 let compact_result = super::exec::compact_in_place(
                     adapter.as_ref(),
                     Some(&transcript),
@@ -663,30 +689,10 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
                     },
                 )
                 .and_then(|()| {
-                    let continuation = format!(
-                        "{prompt}\n\nContinue the same loop cycle after the verified in-place \
-                         compaction without redoing completed work."
-                    );
-                    let session_ref = SessionRef {
-                        id: session.clone(),
-                        cwd: repo.to_path_buf(),
-                    };
-                    let (mut continued, stdin_prompt) = super::exec::headless_resume_launch(
-                        adapter.as_ref(),
-                        &continuation,
-                        &session_ref,
-                        &extra,
-                        prompt_via_stdin,
+                    build_continuation(
+                        "Continue the same loop cycle after the verified in-place compaction \
+                         without redoing completed work.",
                     )
-                    .ok_or_else(|| {
-                        format!(
-                            "adapter '{}' cannot resume a headless session in place",
-                            adapter.name()
-                        )
-                    })?;
-                    continued.current_dir(repo);
-                    apply_session_env(&mut continued);
-                    Ok((continued, stdin_prompt))
                 });
                 let verified = compact_result.is_ok();
                 announcer.emit(&super::announce::Event::Compact { verified });
@@ -723,6 +729,28 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
                                 observed_at: None,
                             },
                         );
+                        suggestions.note(
+                            super::exec::SignalAction::SuggestRestart,
+                            0,
+                            "loop",
+                            &state,
+                            session.as_str(),
+                            &announcer,
+                        );
+                        // Zirv never restarts for rot: resume the same session
+                        // without compaction while the operator is told.
+                        if let Ok((continued, continued_stdin)) = build_continuation(
+                            "Continue the same loop cycle without redoing completed work.",
+                        ) {
+                            writeln!(
+                                w,
+                                "zirv ctx loop: {reason}; compaction did not help, restart \
+                                 suggested -- resuming the same session"
+                            )?;
+                            command = continued;
+                            stdin_prompt = continued_stdin;
+                            continue;
+                        }
                         writeln!(
                             w,
                             "zirv ctx loop: {reason}; falling back to the next fresh cycle"
@@ -1902,6 +1930,49 @@ mod tests {
             transcripts_in(&home).len(),
             1,
             "in-place continuation keeps the cycle's session id"
+        );
+    }
+
+    #[test]
+    fn a_failed_loop_compaction_suggests_a_restart_and_resumes_the_same_session() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let modes = tmp.path().join("modes.txt");
+        std::fs::write(&modes, "compact-tier\nhealthy\n").expect("write modes");
+        let mut env = base_env(&state);
+        env.insert(
+            "ZIRV_CTX_SUPERVISE_COMPACT_TIMEOUT_MS".to_string(),
+            "300".to_string(),
+        );
+        env.insert("ZIRV_CTX_INTERVAL_SECS".to_string(), "0".to_string());
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+            ("FAKE_AGENT_MODE_FILE", modes.to_str()),
+            ("FAKE_AGENT_SLEEP", Some("3")),
+            ("FAKE_AGENT_COMPACTION_EVENT", Some("0")),
+        ]);
+        let mut out = Vec::new();
+        let code = run_with(&args_for(1), &mut out, tmp.path(), &|key| {
+            env.get(key).cloned()
+        });
+        assert_eq!(code.expect("runs"), 0);
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(log.contains("\"action\":\"compact-failed\""), "{log}");
+        assert!(
+            log.contains("\"action\":\"suggest-restart\""),
+            "the operator is told a restart is worth doing: {log}"
+        );
+        assert!(
+            !log.contains("\"action\":\"rot-kill\""),
+            "the same session is resumed, not abandoned: {log}"
+        );
+        assert_eq!(
+            transcripts_in(&home).len(),
+            1,
+            "resuming keeps the cycle's session id"
         );
     }
 

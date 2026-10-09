@@ -951,38 +951,12 @@ fn run_with_clock_inner<W: Write>(
                 cfg.handoff.tail_items,
                 supervise::COMPACT_FOCUS,
             );
-            let compact_result = compact_in_place(
-                adapter.as_ref(),
-                Some(&transcript),
-                Duration::from_millis(cfg.supervise.compact_timeout_ms),
-                poll,
-                &compact_focus,
-                |compact_prompt| {
-                    let session_ref = SessionRef {
-                        id: session.clone(),
-                        cwd: repo.to_path_buf(),
-                    };
-                    let (mut compact, stdin_prompt) = headless_resume_launch(
-                        adapter.as_ref(),
-                        compact_prompt,
-                        &session_ref,
-                        &extra,
-                        prompt_via_stdin,
-                    )?;
-                    compact.current_dir(repo);
-                    apply_headless_cost_levers(
-                        &mut compact,
-                        &cfg,
-                        adapter.name(),
-                        Some(compact_prompt),
-                        &state,
-                        &session,
-                    );
-                    apply_session_env(&mut compact, &session);
-                    Some((compact, stdin_prompt))
-                },
-            )
-            .and_then(|()| {
+            // Resume the same session with the original prompt, with or
+            // without a compaction in front of it.
+            let build_continuation = |env: &mut dyn FnMut(&mut Command, &SessionId)| -> Result<
+                (Command, Option<String>),
+                String,
+            > {
                 let prompt_text = prompt
                     .as_deref()
                     .ok_or_else(|| "no prompt available for continuation".to_string())?;
@@ -1014,9 +988,41 @@ fn run_with_clock_inner<W: Write>(
                     &state,
                     &session,
                 );
-                apply_session_env(&mut command, &session);
+                env(&mut command, &session);
                 Ok((command, stdin_prompt))
-            });
+            };
+            let compact_result = compact_in_place(
+                adapter.as_ref(),
+                Some(&transcript),
+                Duration::from_millis(cfg.supervise.compact_timeout_ms),
+                poll,
+                &compact_focus,
+                |compact_prompt| {
+                    let session_ref = SessionRef {
+                        id: session.clone(),
+                        cwd: repo.to_path_buf(),
+                    };
+                    let (mut compact, stdin_prompt) = headless_resume_launch(
+                        adapter.as_ref(),
+                        compact_prompt,
+                        &session_ref,
+                        &extra,
+                        prompt_via_stdin,
+                    )?;
+                    compact.current_dir(repo);
+                    apply_headless_cost_levers(
+                        &mut compact,
+                        &cfg,
+                        adapter.name(),
+                        Some(compact_prompt),
+                        &state,
+                        &session,
+                    );
+                    apply_session_env(&mut compact, &session);
+                    Some((compact, stdin_prompt))
+                },
+            )
+            .and_then(|()| build_continuation(&mut apply_session_env));
 
             let verified = compact_result.is_ok();
             announcer.emit(&super::announce::Event::Compact { verified });
@@ -1053,9 +1059,30 @@ fn run_with_clock_inner<W: Write>(
                             observed_at: None,
                         },
                     );
-                    // The compaction attempt already stopped the child; zirv
-                    // never restarts a session for rot, so hand the call to
-                    // the operator instead of relaunching with a handoff.
+                    // The compaction attempt already stopped the child. Zirv
+                    // never restarts a session for rot: resume the SAME
+                    // session without compaction and tell the operator a
+                    // restart is worth doing.
+                    suggestions.note(
+                        SignalAction::SuggestRestart,
+                        0,
+                        "exec",
+                        &state,
+                        session.as_str(),
+                        &announcer,
+                    );
+                    if let Ok((continued, continued_stdin)) =
+                        build_continuation(&mut apply_session_env)
+                    {
+                        writeln!(
+                            w,
+                            "zirv ctx exec: {reason}; compaction did not help, restart suggested -- \
+                             resuming the same session"
+                        )?;
+                        command = continued;
+                        stdin_prompt = continued_stdin;
+                        continue;
+                    }
                     writeln!(
                         w,
                         "zirv ctx exec: {reason}; compaction did not help, restart suggested -- \
