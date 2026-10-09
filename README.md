@@ -3395,7 +3395,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx permissions audit\|compile\|propose` | Audits, compiles, or (operator opt-in) proposes command-permission approvals from recent transcripts — see [Permission auditing](#permission-auditing-and-safe-list-proposals-issue-178) below |
 | `zirv ctx api schema [--json]` / `zirv ctx api serve` / `zirv ctx api call <method>` | Prints the local runtime protocol v1 contract, binds its endpoint, or calls one method over it — see [Runtime protocol v1](#runtime-protocol-v1-zirv-ctx-api) below |
 | `zirv ctx capabilities [--probe] [--require <id>] [--json]` | Reports every configured integration (MCP, web search/fetch, browser, diagnostics, artifact and frontend rendering) as available, unavailable or unverified, with the diagnosis for anything missing — see [Native configured capabilities](#native-configured-capabilities) below |
-| `zirv ctx jev status [--json]` | Reports whether Jev is enabled: the advisory gates, the credential env var name and presence (never the value), the endpoint and model, why it is or is not active, and a 7-day per-site usage rollup (calls, cache-hit rate, p50/p95 wall_ms, errors, effect size) folded from `jev-decisions.jsonl`/`jev-effects.jsonl`/`jev-skips.jsonl` — distinguishes "no gate enabled" from "gate enabled but credential missing" — see [`[jev]`](#jev) below |
+| `zirv ctx jev status [--json]` | Reports whether Jev is enabled: every advisory gate with its label and exact 14-day funnel counts (reached/eligible/sent/answered/acted, exit reasons, idle reason for a dormant gate) plus version-mismatch warnings, the credential env var name and presence (never the value), the endpoint and model, why it is or is not active, and a 7-day per-site usage rollup (calls, cache-hit rate, p50/p95 wall_ms, errors, effect size) folded from `jev-decisions.jsonl`/`jev-effects.jsonl`/`jev-skips.jsonl` — distinguishes "no gate enabled" from "gate enabled but credential missing" — see [`[jev]`](#jev) below |
 | `zirv ctx jev probe --site <SITE> --case <case.json> --reps <K> [--repo <dir>]` | Measurement only: asks one Jev site's real production question(s) for a fixture input `K` times (1..=20) with the cache disabled, applies that site's production floor and answer-to-action rule, and prints what production would have DONE on each rep — spends real Jev calls and writes the normal decision/spend log rows, never any other side effect — see [Measuring floor determinism](#jev) below |
 | `zirv ctx doctor [--role <role>] [--live] [--json]` | Diagnoses native readiness: the resolved backend and route per role, and every problem classified as missing auth material, inaccessible model, missing tool, unsupported isolation, service failure or upstream entitlement limit — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
 | `zirv ctx config get <key> [--json]` / `show [key] [--json]` | Prints one key's effective value, built-in default, winning source and reload timing exactly as `/settings get` does, or the stored `~/.zirv/ctx.toml` (optionally one key) as TOML or JSON |
@@ -4854,11 +4854,11 @@ timeout_secs = 10                         # ZIRV_CTX_PROXY_TYPESAFE_TIMEOUT_SECS
 # the shared Jev client; each is also gated on the `[proxy.typesafe]`
 # credential actually being set (see "Harness proxy" above)
 [jev]
-memory = false      # deprecated and ignored (the memory rerank and harvest gate were removed); still parsed so old configs load, never counts as an enabled gate; ZIRV_CTX_JEV_MEMORY
-supervisor = false  # judge pre-filter, crash triage, handoff quality (every stored handoff: wrap/exec restarts, handover swaps, pane rollovers, the harvest note, `zirv ctx handoff`; not the `--dry-run` preview); ZIRV_CTX_JEV_SUPERVISOR
+memory = false      # retired: deprecated and ignored (the memory rerank and harvest gate were removed); still parsed so old configs load, never counts as an enabled gate, listed as `retired` by `zirv ctx jev status`; ZIRV_CTX_JEV_MEMORY
+supervisor = false  # judge pre-filter, crash triage (the numeric handoff-thin check was retired); ZIRV_CTX_JEV_SUPERVISOR
 dispatch = false    # model tier for an omitted Agent model, from brief metadata only; ZIRV_CTX_JEV_DISPATCH
 review = false      # narrows review triage findings/effort; ZIRV_CTX_JEV_REVIEW
-gates = false       # narrows workflow gate reclassification; ZIRV_CTX_JEV_GATES
+gates = false       # narrows workflow gate reclassification (the numeric artifact-substance check was retired); ZIRV_CTX_JEV_GATES
 context = false     # selects optional skill/report descriptions; ZIRV_CTX_JEV_CONTEXT
 intake_savings = false # optional planner (clarification advice runs whenever decider=typesafe); ZIRV_CTX_JEV_INTAKE_SAVINGS
 review_reuse = false # reuses an eligible converged review; ZIRV_CTX_JEV_REVIEW_REUSE
@@ -4880,6 +4880,18 @@ cache_ttl_secs = 604800  # 0 disables the cache; ZIRV_CTX_JEV_CACHE_TTL_SECS
 
 Each gate defaults to `false`: Jev is operator-only (no repo config, only `~/.zirv/ctx.toml`, `ZIRV_CTX_JEV_*`, or CLI flags). Endpoint credentials come from `[proxy.typesafe]` (shared with the harness proxy); `zirv ctx jev status [--json]` reports whether Jev is active and why not, distinguishing "no gate enabled" from "gate enabled but credential missing".
 
+**Gate observability.** `zirv ctx jev status` lists every `[jev]` key (the retired `memory` key included) with on/off, a label, and the exact 14-day funnel counts `reached` (a call site was hit), `eligible` (it passed its own preconditions and reached `jev::advise`), `sent` (`net` = a request was dispatched, `cache` = served from the decision cache), `answered` (a valid answer came back) and `acted` (the answer changed behaviour, counted when the site records its effect). A caller-side early return of an enabled gate is counted as `reached` plus an `exit <reason>` line (a static reason code such as `no_credential`, `unsafe_state`, `open_findings`; never text). An enabled gate with zero reach in the window is labelled `dormant` and names the hook or command it waits on (`idle: waits on ...`). `--json` adds `gate_status` (the same rows) and `warnings`.
+
+| Label | Meaning |
+|---|---|
+| `active` | on, reached in the window, and at least one answer acted |
+| `unvalidated` | no recorded evidence the gate helps (the default for every gate not listed below) |
+| `dormant` | on, but never reached in the window (computed, never hardcoded) |
+| `falsified` | static: `approve`, `approve_allow`, `stop_verify`, `launch_effort` -- falsified on the operator's recorded data 2026-10-07 (the doomed-run `judge` check under `supervisor` too) |
+| `retired` | static: `memory` (parsed and ignored) |
+
+Counters live in `<state>/jev-counters/<day>.jsonl`, one `{ts, v, gate, stage, reason}` row per event appended with `O_APPEND` (exact under concurrent hook processes, no text payload, day files past 30 days are deleted, nothing is written for a gate that is off). Every Jev ledger row (`jev-decisions`, `jev-skips`, `jev-effects`, counters) carries `v`, the zirv version that wrote it; `status` warns when rows in the window were written by another version than the running binary, and when the current directory is the zirv source tree at a different version than the binary (hooks run the installed binary). Not counted: the `?`-returns inside the review-reuse candidate search, and the dashboard pane's own `inject` predicate.
+
 **Measuring floor determinism.** `zirv ctx jev probe --site <SITE> --case
 <case.json> --reps <K> [--repo <dir>]` (stdout is always JSON) asks one Jev
 site's real production question(s) for a fixture input `K` times (`1..=20`) with the
@@ -4888,20 +4900,18 @@ cache disabled, applies that site's production floor (honouring
 for the eight sites that have one -- the rest carry a fixed compiled
 constant, exactly as production does)
 and production answer-to-action rule, and prints what production would have
-DONE on each rep -- `SITE` is one of all twenty-two the probe contract
+DONE on each rep -- `SITE` is one of all twenty the probe contract
 names: `context-report`, `context-skill`,
-`harvest-screen`, `handoff-thin`, `handoff-select`, `compaction-select`,
+`harvest-screen`, `handoff-select`, `compaction-select`,
 `dispatch`, `launch-effort`, `classify-domain`, `inject`, `crash`, `judge`,
 `approve-escalate`, `approve-lower`, `intake-plan`, `inject-screen`,
 `missing-tests`, `stop-verify`, `review-disposition`, `review-dedup`,
-`artifact-substance`, `gate-reclass`. `case.json` is `{"id": "<case id>",
+`gate-reclass`. `case.json` is `{"id": "<case id>",
 "state": <the exact JSON state object production sends>, "n": <candidate
 count, required only for a per-candidate site>}`; `state` is sent verbatim
-(still subject to `jev::safe_metadata_request` -- except `artifact-substance`
-/`gate-reclass`, whose production state is text-bearing and so never clears
-that boundary either; every rep for these two reports its fallback action
-with an "unsafe Jev metadata projection" error, mirroring production
-exactly). An unknown site, `--reps` outside `1..=20`, a missing candidate
+(still subject to `jev::safe_metadata_request`; `gate-reclass` sends the
+numeric projection `profile::gate_jev_facts` builds, and the retired
+`artifact-substance` and `handoff-thin` sites are no longer probe sites). An unknown site, `--reps` outside `1..=20`, a missing candidate
 count, a missing Jev credential, or an invalid
 `ZIRV_CTX_JEV_PROBE_MIN_CONFIDENCE`/`ZIRV_CTX_JEV_PROBE_MIN_MARGIN` (below)
 all exit 2. Output is one JSON object: `{"site", "floor_site", "label",

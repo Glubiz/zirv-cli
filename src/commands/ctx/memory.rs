@@ -3019,7 +3019,11 @@ fn jev_harvest_prescreen<'a>(
     slug: &str,
     cfg: &CtxConfig,
 ) -> bool {
-    if !cfg.jev.harvest_screen || tool_errors_present || !jev::available(&cfg.proxy.typesafe) {
+    if !jev::gate_open(cfg, state, "harvest_screen", cfg.jev.harvest_screen) {
+        return false;
+    }
+    if tool_errors_present {
+        jev::exit(state, "harvest_screen", true, "tool_errors_present");
         return false;
     }
     let lines: Vec<String> = raw_lines

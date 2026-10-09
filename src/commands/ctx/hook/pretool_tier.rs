@@ -389,12 +389,19 @@ fn dispatch_tier_advise(
     tool_input: &serde_json::Value,
 ) -> Option<String> {
     if !omitted_model_on_generic_type(seat, &payload.tool_name, &payload.tool_input) {
+        crate::commands::ctx::jev::exit(
+            state,
+            "dispatch",
+            cfg.jev.dispatch,
+            "model_given_or_seat_not_gated",
+        );
         return None;
     }
     if is_review_dispatch(
         &payload.tool_input.subagent_type,
         &payload.tool_input.description,
     ) {
+        crate::commands::ctx::jev::exit(state, "dispatch", cfg.jev.dispatch, "review_dispatch");
         return None;
     }
     let advise_state = DispatchAdviseState {
@@ -462,6 +469,24 @@ pub(super) fn dispatch_tier_override(
 mod tests {
     use super::super::tests::{SEAT, decide, pretool_stdin};
     use super::*;
+
+    /// The dispatch-tier request must pass the egress guard, or the site goes quiet.
+    #[test]
+    fn the_dispatch_tier_request_passes_the_egress_guard() {
+        let state = serde_json::to_value(DispatchAdviseState {
+            metadata_only: true,
+            facts: vec![dispatch_brief_facts(
+                "Fix src/lib.rs and add a regression test for the parser",
+                "fable",
+            )],
+        })
+        .expect("serializes");
+        assert!(crate::commands::ctx::jev::safe_metadata_request(
+            &state,
+            &[dispatch_tier_question()],
+            "jev-latest"
+        ));
+    }
 
     // -- dispatch_tier_advise (issue #537 A5, metadata-only re-projection
     // issue #744) --------------------------------------------------------

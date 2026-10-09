@@ -531,12 +531,15 @@ pub(crate) fn refine_via_jev(repo: &Path, task: &str, profile: &mut ExecutionPro
     let Ok(cfg) = CtxConfig::load(repo, &env) else {
         return;
     };
-    if !cfg.jev.classify || !jev::available(&cfg.proxy.typesafe) {
+    if !cfg.jev.classify {
         return;
     }
     let Ok(state) = StateDir::resolve(&env) else {
         return;
     };
+    if !jev::gate_open(&cfg, &state, "classify", cfg.jev.classify) {
+        return;
+    }
     refine_profile_with_jev(&cfg, &state, task, profile);
 }
 
@@ -573,12 +576,15 @@ pub(crate) fn refine_intent_via_jev(repo: &Path, task: &str, classification: &mu
     let Ok(cfg) = CtxConfig::load(repo, &env) else {
         return;
     };
-    if !cfg.jev.classify || !jev::available(&cfg.proxy.typesafe) {
+    if !cfg.jev.classify {
         return;
     }
     let Ok(state) = StateDir::resolve(&env) else {
         return;
     };
+    if !jev::gate_open(&cfg, &state, "classify", cfg.jev.classify) {
+        return;
+    }
     refine_intent_with_jev(&cfg, &state, task, classification);
 }
 

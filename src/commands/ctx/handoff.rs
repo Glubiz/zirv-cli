@@ -1472,117 +1472,12 @@ fn carry_forward_undistillable(mut handoff: Handoff, previous: Option<&Handoff>)
     handoff
 }
 
-/// From a live 2026-09-18 probe (#537).
-pub(crate) const HANDOFF_THIN_FLOOR: f32 = 0.9;
-
-/// Bounded numeric-only metadata state (issue #759's re-projection onto the
-/// `jev::safe_metadata_request` egress boundary issue #746 established):
-/// one fact row, `[task text size in bytes, next-step text size in bytes,
-/// constraints text size in bytes, files-modified count, blocked/open-
-/// question count]`. Never the handoff's own task/next-step/constraint text.
-#[derive(Debug, serde::Serialize)]
-struct HandoffQualityState {
-    _zirv_metadata_only: bool,
-    facts: Vec<Vec<u32>>,
-}
-
-/// Static instructions naming the facts row order above -- see
-/// [`HandoffQualityState`]'s own doc comment.
-const HANDOFF_QUALITY_INSTRUCTIONS: &str = "Facts row 0 is [task text size in bytes, next \
-    step text size in bytes, constraints text size in bytes, files-modified count, blocked/\
-    open-question count]. A restarted session needs enough task, next-step, and constraint \
-    detail, plus at least one touched file, to continue without re-deriving everything from \
-    scratch or waiting on an open question. Based only on these counts, could a restarted \
-    session actually continue this task from this handoff alone?";
-
-/// Bounds any locally computed length into the `safe_metadata_request`
-/// numeric ceiling (1,000,000) the same way every other metadata-only call
-/// site in this crate already clamps its own counts.
-fn bounded_len(len: usize) -> u32 {
-    u32::try_from(len).unwrap_or(u32::MAX).min(1_000_000)
-}
-
-/// Use only bounded structural state at this authority boundary; free-form handoff text is
-/// rejected (#537).
-pub(crate) fn handoff_quality_question() -> jev::Question {
-    jev::Question::metadata_choice(
-        "quality",
-        HANDOFF_QUALITY_INSTRUCTIONS,
-        &[
-            (
-                "thin",
-                "a restarted session could not continue from this alone",
-            ),
-            ("adequate", "a restarted session could continue from this"),
-        ],
-    )
-}
-
-fn handoff_quality_request(handoff: &Handoff) -> (HandoffQualityState, [jev::Question; 1]) {
-    let facts = vec![vec![
-        bounded_len(handoff.task.len()),
-        bounded_len(handoff.next_step.len()),
-        bounded_len(handoff.constraints.iter().map(String::len).sum()),
-        bounded_len(handoff.files_modified.len()),
-        bounded_len(handoff.blocked.len()),
-    ]];
-    let advise_state = HandoffQualityState {
-        _zirv_metadata_only: true,
-        facts,
-    };
-    (advise_state, [handoff_quality_question()])
-}
-
-/// [`jev_handoff_is_thin`]'s per-call decision: `"demote"` only for a
-/// decisive `thin` choice, `"keep"` otherwise (`adequate`, indecisive, or no
-/// answer). Shared with `zirv ctx jev probe`, which reports exactly this
-/// outcome per call.
-pub(crate) fn handoff_thin_action(
-    answer: Option<&jev::Answer>,
-    min_confidence: f32,
-    min_margin: f32,
-) -> &'static str {
-    if answer.is_some_and(|answer| {
-        answer.as_choice() == Some("thin") && answer.decisive(min_confidence, min_margin)
-    }) {
-        "demote"
-    } else {
-        "keep"
-    }
-}
-
-// Only ever NARROWS `is_usable()`: a confident thin answer says no; adequate, low confidence or no
-// answer (gate off, transport/parse error) leaves the verdict unchanged.
-fn jev_handoff_is_thin(cfg: &CtxConfig, state: &StateDir, handoff: &Handoff) -> bool {
-    let (advise_state, questions) = handoff_quality_request(handoff);
-    let Some(answers) = jev::advise(
-        cfg,
-        state,
-        "handoff",
-        cfg.jev.supervisor,
-        &advise_state,
-        &questions,
-    ) else {
-        return false;
-    };
-    let (min_confidence, min_margin) = jev::floor(
-        cfg,
-        jev::FloorSite::HandoffSelect,
-        HANDOFF_THIN_FLOOR,
-        jev::DEFAULT_MIN_MARGIN,
-    );
-    handoff_thin_action(answers.get("quality"), min_confidence, min_margin) == "demote"
-}
-
 /// The gated wrapper around [`distill_or_structural`] every stored or delivered handoff goes
 /// through: wrap restarts and handover swaps, exec restarts, dashboard pane rollovers, the
 /// memory-harvest note and `zirv ctx handoff`. Only the read-only `zirv ctx handover --dry-run`
-/// preview keeps the plain call, so a preview never spends a Jev call or writes a row. When
-/// `distill_or_structural` returns a genuinely `"distilled"` handoff, one
-/// additional confident [`jev_handoff_is_thin`] verdict may demote it to the
-/// same structural fallback an `Err` from `distill` itself already takes;
-/// `"no data"`/`"structural"` results (nothing was distilled to begin with)
-/// and any non-thin or unanswered verdict pass through unchanged (#537).
+/// preview keeps the plain call, so a preview never spends a Jev call or writes a row. The
+/// numeric handoff-thin check that used to demote a distilled handoff was retired: it sent
+/// byte counts only and could not clear its 0.9 floor.
 #[allow(clippy::too_many_arguments)]
 pub fn distill_or_structural_with_jev(
     cfg: &CtxConfig,
@@ -1602,14 +1497,6 @@ pub fn distill_or_structural_with_jev(
         chrome_events_enabled,
         previous,
     );
-    let (handoff, source) = if source != "distilled" || !jev_handoff_is_thin(cfg, state, &handoff) {
-        (handoff, source)
-    } else {
-        (
-            carry_forward_undistillable(structural(ctx), previous),
-            "structural",
-        )
-    };
     (
         jev_select_optional_handoff_items(cfg, state, ctx, handoff),
         source,
@@ -1785,9 +1672,7 @@ struct HandoffSelectState {
 
 /// Builds the exact `(state, questions)` pair [`jev_select_optional_handoff_
 /// items`] sends to `jev::advise` -- factored out so a test can assert
-/// directly that this pair passes `jev::safe_metadata_request`, the same way
-/// [`handoff_quality_request`]'s own test does for the `[jev] supervisor`
-/// site.
+/// directly that this pair passes `jev::safe_metadata_request`.
 fn handoff_select_request(
     ids: &[String],
     candidates: &[OptionalCandidate<'_>],
@@ -2379,10 +2264,11 @@ pub(crate) fn compaction_focus_for_transcript(
     tail_items: usize,
     base_focus: &str,
 ) -> String {
-    if !cfg.jev.compaction_select || !jev::available(&cfg.proxy.typesafe) {
+    if !jev::gate_open(cfg, state, "compaction_select", cfg.jev.compaction_select) {
         return base_focus.to_string();
     }
     let Some(transcript) = transcript else {
+        jev::exit(state, "compaction_select", true, "no_transcript");
         return base_focus.to_string();
     };
     let Ok(jsonl) = std::fs::read_to_string(transcript) else {
@@ -3001,38 +2887,21 @@ mod tests {
         cfg
     }
 
-    /// Issue #759: since issue #746's `jev::safe_metadata_request` egress
-    /// boundary, the free-text state this call used to send (task/next-
-    /// step/constraints) was rejected before any cache read or network
-    /// call -- the old version of this test (`..._rejects_legacy_handoff_
-    /// without_egress`) proved exactly that rejection, which made the
-    /// `[jev] supervisor` gate a dead deny-only fallback end to end. This
-    /// is the success path re-projecting `jev_handoff_is_thin` onto
-    /// metadata-only facts makes reachable: a decisive "thin" verdict
-    /// demotes a `"distilled"` handoff to `"structural"`, and the request
-    /// actually reaching this fake server (the `.join()` below, plus the
-    /// recorded decision line) is what proves the request `jev_handoff_
-    /// is_thin` builds passes `safe_metadata_request` -- an unsafe state
-    /// returns `UnsafeState` before any connection is ever opened (`jev::
-    /// ask`'s own doc comment).
+    /// The numeric handoff-thin check is retired: with `supervisor` on and a credential present, a
+    /// distilled handoff is kept and nothing is sent to Jev.
     #[test]
-    fn distill_or_structural_with_jev_enabled_demotes_a_decisive_thin_verdict() {
+    fn distill_or_structural_with_jev_never_asks_jev_whether_a_handoff_is_thin() {
         let adapter = fake_model_adapter();
-        let body = r#"{"model": "jev-latest", "answers": {
-            "quality": {"type": "choice", "choice": "thin",
-                        "probabilities": {"thin": 0.95, "adequate": 0.05}, "confidence": 0.95}
-        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
-        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
-        let credential_env = "HANDOFF_TEST_JEV_METADATA_759";
+        let credential_env = "HANDOFF_TEST_JEV_THIN_RETIRED";
         // SAFETY (test-only): a unique env var name this test owns.
         unsafe {
             std::env::set_var(credential_env, "secret");
         }
-        let cfg = jev_test_cfg(url, credential_env);
+        let cfg = jev_test_cfg("http://127.0.0.1:9".to_string(), credential_env);
         let state_dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(state_dir.path().to_path_buf());
 
-        let (handoff, source) = distill_or_structural_with_jev(
+        let (_, source) = distill_or_structural_with_jev(
             &cfg,
             &state,
             &adapter,
@@ -3046,38 +2915,8 @@ mod tests {
         unsafe {
             std::env::remove_var(credential_env);
         }
-        handle.join().expect("server thread must not panic");
-        assert_eq!(source, "structural");
-        assert_eq!(
-            handoff.task, "ship the webhook",
-            "demoted to the structural fallback built from the last user prompt"
-        );
-        let decisions = std::fs::read_to_string(state_dir.path().join("jev-decisions.jsonl"))
-            .expect("a real call must have reached the fake server and been recorded");
-        assert!(
-            decisions.contains("\"site\":\"handoff\""),
-            "got {decisions}"
-        );
-    }
-
-    /// Issue #759: direct proof that the exact `(state, questions)` pair
-    /// [`jev_handoff_is_thin`] builds (via [`handoff_quality_request`])
-    /// passes `jev::safe_metadata_request` -- the egress boundary issue
-    /// #746 established, and the one the test above only exercises
-    /// indirectly through a fake-server round-trip. An unsafe state never
-    /// reaches `ask` at all (`jev::JevError::UnsafeState` before any
-    /// connection opens), so this is the check that actually matters for
-    /// whether the "handoff" site is reachable rather than a dead
-    /// deny-only fallback.
-    #[test]
-    fn handoff_quality_request_passes_safe_metadata_request() {
-        let (state, questions) = handoff_quality_request(&sample());
-        let value = serde_json::to_value(&state).expect("HandoffQualityState always serializes");
-        let model = CtxConfig::default().proxy.typesafe.model;
-        assert!(
-            crate::commands::ctx::jev::safe_metadata_request(&value, &questions, &model),
-            "got state {value}"
-        );
+        assert_eq!(source, "distilled");
+        assert!(!state_dir.path().join("jev-decisions.jsonl").exists());
     }
 
     /// The gate off must be byte-identical to calling `distill_or_structural`
@@ -3322,9 +3161,7 @@ mod tests {
     /// Direct proof that the exact `(state, questions)` pair
     /// [`jev_select_optional_handoff_items`] sends via [`handoff_select_
     /// request`] passes `jev::safe_metadata_request` -- the egress boundary
-    /// issue #746 established for every `[jev]`-gated site, the same way
-    /// [`handoff_quality_request_passes_safe_metadata_request`] proves it for
-    /// the `[jev] supervisor` site.
+    /// issue #746 established for every `[jev]`-gated site.
     #[test]
     fn handoff_select_request_passes_safe_metadata_request() {
         let handoff = handoff_select_sample();
@@ -5056,43 +4893,6 @@ mod tests {
         let mut out = Vec::new();
         run_with(&args, &mut out, tmp, &|k| env.get(k).cloned()).expect("runs");
         String::from_utf8(out).expect("utf8")
-    }
-
-    /// #452: a non-wrap path (`zirv ctx handoff`, like exec restarts and pane rollovers) reaches
-    /// the Jev thin check, so a decisive "thin" verdict demotes the distilled handoff.
-    #[test]
-    fn the_verb_demotes_a_handoff_jev_rules_thin() {
-        let home = tempfile::tempdir().expect("home");
-        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let body = r#"{"model": "jev-latest", "answers": {
-            "quality": {"type": "choice", "choice": "thin",
-                        "probabilities": {"thin": 0.95, "adequate": 0.05}, "confidence": 0.95}
-        }, "usage": {"input_tokens": 5, "output_tokens": 0}}"#;
-        let (url, handle) = crate::commands::ctx::jev::tests::one_shot_server(200, body);
-        let credential_env = "HANDOFF_TEST_JEV_VERB_452";
-        // SAFETY (test-only): a unique env var name this test owns.
-        unsafe { std::env::set_var(credential_env, "secret") };
-        let text = verb_handoff_markdown(
-            tmp.path(),
-            &[
-                ("ZIRV_CTX_JEV_SUPERVISOR", "true".to_string()),
-                ("ZIRV_CTX_PROXY_TYPESAFE_BASE_URL", url),
-                (
-                    "ZIRV_CTX_PROXY_TYPESAFE_CREDENTIAL_ENV",
-                    credential_env.to_string(),
-                ),
-            ],
-        );
-        unsafe { std::env::remove_var(credential_env) };
-        assert!(
-            text.contains("ship the webhook") && !text.contains("Ship the webhook"),
-            "demoted to the structural task: {text}"
-        );
-        handle.join().expect("server thread must not panic");
-        let decisions =
-            std::fs::read_to_string(tmp.path().join("state/jev-decisions.jsonl")).expect("row");
-        assert!(decisions.contains("\"site\":\"handoff\""), "{decisions}");
     }
 
     /// #452: with `jev.supervisor` off the verb never asks Jev and keeps the distilled handoff.

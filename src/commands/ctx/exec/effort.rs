@@ -165,7 +165,7 @@ fn jev_launch_effort(
     prompt: &str,
     complexity: Complexity,
 ) -> Option<String> {
-    if !cfg.jev.launch_effort || !jev::available(&cfg.proxy.typesafe) {
+    if !jev::gate_open(cfg, state, "launch_effort", cfg.jev.launch_effort) {
         return None;
     }
     let advise_state = LaunchEffortAdviseState {
@@ -250,6 +250,24 @@ fn headless_effort_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The launch-effort request must pass the egress guard, or the site goes quiet.
+    #[test]
+    fn the_launch_effort_request_passes_the_egress_guard() {
+        let state = serde_json::to_value(LaunchEffortAdviseState {
+            metadata_only: true,
+            facts: vec![launch_effort_facts(
+                "implement the export across several modules, then document it",
+                Complexity::Substantial,
+            )],
+        })
+        .expect("serializes");
+        assert!(jev::safe_metadata_request(
+            &state,
+            &launch_effort_question(),
+            "jev-latest"
+        ));
+    }
 
     /// With no operator config, a headless launch carries
     /// `CLAUDE_CODE_EFFORT_LEVEL=low` for every class (and no cache-TTL env);
