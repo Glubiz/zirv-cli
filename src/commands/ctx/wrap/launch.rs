@@ -572,7 +572,6 @@ pub fn run_with(
     }
 
     let debounce = Duration::from_millis(cfg.wrap.debounce_ms);
-    let inject_timeout = Duration::from_millis(cfg.wrap.inject_timeout_ms);
 
     // Own this model so a later swap can use the successor's distiller.
     let mut distiller_model =
@@ -594,7 +593,6 @@ pub fn run_with(
         &state_dir,
         &session,
         debounce,
-        inject_timeout,
         repo,
         env,
         cfg.handoff.tail_items,
