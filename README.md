@@ -663,8 +663,10 @@ are unchanged.
 **Decider chain.** `decide()` computes the deterministic baseline first. With
 `decider = "typesafe"` and a credential present, one metadata-only Jev call
 (coarse counts, classes and flags; never request text, repository names or
-paths) may advise clarification and its category; with no Jev credential the
-helper-model chokepoint runs, then the baseline. The
+paths) may advise clarification and its category; with no Jev credential, or a
+failed Jev call, the baseline stands. The helper-model chokepoint runs only
+under `decider = "helper"`, and receives the bounded, masked request text
+with its questions, then the baseline stands if it fails. The
 baseline measures no diff at intake, so it floors complexity by the request's
 own size: 120+ words or 3+ enumerated items is at least bounded, 300+ words
 or 8+ items at least substantial (never architectural) -- without it every
@@ -2748,7 +2750,9 @@ operator's own `~/.zirv/ctx.toml` or the matching
 
 `zirv workflow team plan "<objective>" [--workflow <id>|active] [--dry-run]
 [--seat <manifest-id>] [--json]` compiles the smallest capable team for a
-request: it classifies the objective exactly like `zirv workflow classify`,
+request: it classifies the objective exactly like `zirv workflow classify`
+(the objective's text can only raise complexity, and with no changed files the
+classification says it is text-only and the profile's confidence is low),
 derives the minimal execution profile (`intent`/`complexity`/`risk` →
 `Direct`/`Bounded`/`Orchestrated`, plus which independent-review/test/security
 gates apply), and deterministically selects seats from the agent roster
@@ -3283,8 +3287,10 @@ same contract `--agent claude` gives claude -- but with an honestly degraded
 surface, because the pieces below were never verified against an
 authenticated CLI:
 
-- No event parsing, so no rot score and no structural context for codex
-  sessions (`parse_events`/`structural_context` stay empty).
+- No rot score for codex sessions. `structural_context` carries only the
+  operator's requests (so a handoff keeps the task, whole up to 2 KB, else a
+  prefix marked with the original length) and the final replies, not files or
+  tool errors.
 - No usage source: a codex session's usage reads `openai: no usage source`
   rather than a real reading.
 - Lifecycle hooks are available and `zirv setup` registers them, but event
@@ -6389,7 +6395,7 @@ Hooks never call a model and never wait. A trigger checks local state and
 spawns one detached `zirv ctx supervisor consult` (evidence on its stdin) that runs a single
 `zirv ctx agent <harness> --mode read-only --quiet --json --task-class review` delegation with
 `-m <model>` (the delegation ledger records the spend). The reply must match the kind's strict
-format; one that does not produces no ruling, a logged fallback, and today's behaviour (`ask` reports a redacted, 500-byte excerpt of the reply in its error). A choice reply may wrap its `CHOICE: <n>` line in markdown, a code fence or prose and may name the option by letter (`B`); two different picks are no ruling. A ruling is
+format; one that does not produces no ruling, a logged fallback, and today's behaviour (`ask` reports a redacted, 500-byte excerpt of the reply in its error). A choice reply may wrap its `CHOICE: <n>` line in markdown, a code fence or prose, may name the option by letter (`B`), and may open with the offered option's own text (`done: verification complete. Diff inspected...`); two different picks are no ruling. A ruling is
 stored in `<state>/supervisor/rulings/rulings.json` (`id`, `session`, optional `workflow`, `kind`,
 `verdict`, `reason` redacted and capped at `max_advice_bytes`, `ts`, `status` open, resolved or
 overridden or lapsed) and mailed to the session (sender and topic `supervisor`). A consult's own child session
@@ -6399,7 +6405,7 @@ unit of work (a plan text, a diffstat) is consulted on once, and the helper's ow
 | Kind | Reply format | Where it bites |
 |---|---|---|
 | plan | `APPROVE` or `REVISE: <reasons>` | asked when `zirv workflow advance` completes the plan step; while a `revise` is open, advancing any later step is refused with the reason. Revising the plan artifact and re-advancing the plan step asks again, and the new ruling supersedes the old |
-| done | `DONE` or `NOT_DONE: <what is missing>` | asked at the Stop hook (once per distinct diffstat); while a `not_done` is open the Stop hook blocks with the reason, at most 3 times per ruling, and the workflow's final step is refused. A later `done` resolves it. Codex's Stop hook blocks the same way |
+| done | `DONE` or `NOT_DONE: <what is missing>` | asked at the Stop hook once per distinct evidence unit (diffstat, commit and untracked files), with the task (the active workflow's objective, else the latest operator request) in the evidence; the ruling's reason ends with the evidence sources it read. A turn end while the session has running native subagents or its active workflow is before the verify step is not a completion claim: no consult, no block. While a `not_done` is open the Stop hook blocks with the reason, at most 3 times per ruling, unless the evidence has moved since (a new commit or file), when the next stop consults fresh; the workflow's final step is refused. A later `done`, or an `ask` ruling whose option starts with `done`, resolves it. Codex's Stop hook blocks the same way |
 | retry | `RETRY` or `STOP: <reason>` | asked at the third failure of a tool-call streak, in place of the seat deciding; while a `stop` is open the tool-failure hook adds the ruling as context on each further failure, and a successful tool call ends it. It is advisory context, not a mechanical block (a hook cannot stop a tool), and a `retry` never lifts a Jev stop |
 | choice | `CHOICE: <n>` and an optional `REASON:` line | `zirv ctx supervisor ask` |
 
