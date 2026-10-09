@@ -54,7 +54,7 @@ impl Stage {
 /// The `[jev]` gate key a decision-log site name belongs to (several sites share a gate).
 pub(crate) fn gate_for_site(site: &str) -> &str {
     match site {
-        "judge" | "crash" | "handoff" => "supervisor",
+        "judge" | "crash" => "supervisor",
         "intake_plan" | "intake_clarification" => "intake_savings",
         "workflow-review-reuse" => "review_reuse",
         "harvest" => "harvest_screen",
@@ -93,8 +93,16 @@ pub(crate) fn count(
         "reason": reason,
     });
     if let Ok(mut file) = state::open_private_append(&path) {
-        let _ = writeln!(file, "{row}");
+        let _ = append_row(&mut file, &row);
     }
+}
+
+/// One row is exactly one `write`: an `O_APPEND` write of a single buffer is not interleaved with
+/// another process's, which several `write` calls (as `writeln!` of a `Value` makes) would be.
+fn append_row(out: &mut impl Write, row: &serde_json::Value) -> std::io::Result<()> {
+    let mut line = row.to_string();
+    line.push('\n');
+    out.write_all(line.as_bytes())
 }
 
 /// The day number a counter file is named for.
@@ -264,7 +272,7 @@ const GATES: [GateInfo; 21] = [
     GateInfo {
         key: "supervisor",
         fixed: None,
-        waits_on: "`zirv ctx loop` judge (doomed-run check, falsified 2026-10-07 E2), task-card crash triage, distilled handoff on restart",
+        waits_on: "`zirv ctx loop` judge (doomed-run check, falsified 2026-10-07 E2), task-card crash triage",
     },
     GateInfo {
         key: "dispatch",
@@ -437,6 +445,30 @@ mod tests {
         let row: serde_json::Value =
             serde_json::from_str(first.lines().next().expect("row")).expect("json");
         assert_eq!(row["v"], VERSION);
+    }
+
+    #[test]
+    fn one_row_is_exactly_one_write_call() {
+        struct CountingWriter {
+            writes: Vec<Vec<u8>>,
+        }
+        impl Write for CountingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.writes.push(buf.to_vec());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut out = CountingWriter { writes: Vec::new() };
+        append_row(
+            &mut out,
+            &serde_json::json!({"gate": "review", "stage": "reached"}),
+        )
+        .expect("write");
+        assert_eq!(out.writes.len(), 1, "{:?}", out.writes);
+        assert!(out.writes[0].ends_with(b"\n"));
     }
 
     #[test]
