@@ -4720,7 +4720,9 @@ Five signals over the trailing window (default 10 turns):
    100000/160000 fallbacks apply unchanged. `score.token_floor`/
    `token_ceiling` still pin an exact number outright, overriding the ratio.
    Below the floor the verdict is always `healthy`; at or above the ceiling
-   it is at least `compact`.
+   it is at least `compact`. Fill also adds pressure to the displayed score:
+   0 at the floor, rising linearly to `compact_at` at the ceiling and staying
+   there, so a nearly full session no longer reads as a low score.
 2. **Tool-failure rate** (weight 40).
 3. **Repetition loops**, three or more identical tool calls with identical input
    (weight 30).
@@ -4740,11 +4742,17 @@ Five signals over the trailing window (default 10 turns):
    other signal ramps, through the identical weighted-sum/threshold verdict
    below.
 
-Verdicts: score 40 or more is `advise`, 60 or more is `compact`, 80 or more is
-`restart`. At the token ceiling a score of 60 or more escalates to `restart`.
-Without the marker signal (Claude without the prompt hook, or any agent that
-cannot carry one) behavioral signals top out at 70, so a restart there comes
-only from the token ceiling.
+Verdicts (from the score, behavioural signals plus fill pressure): 40 or more
+is `advise`, 60 or more (or the token ceiling) is `compact`. `restart` needs
+behavioural evidence -- a behavioural score of 80 or more, or 60 or more at the
+token ceiling; fill alone never gets there. zirv never restarts a session
+itself: it compacts first, and `restart` is only a suggestion to start a fresh
+session, reachable only after the session has compacted at least once (rot
+that persists past a compaction). Before the first compaction every would-be
+`restart` (including two provider context overflows) is `compact`. Without the
+marker signal (Claude without the prompt hook, or any agent that cannot carry
+one) behavioral signals top out at 70, so a restart suggestion there comes only
+from the token ceiling.
 
 ### Configuration
 
