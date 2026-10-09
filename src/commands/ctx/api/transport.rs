@@ -148,11 +148,11 @@ pub struct Connection {
     reader: BufReader<Box<dyn Read + Send>>,
     writer: Box<dyn Write + Send>,
     peer: Peer,
-    read_timeout: ReadTimeoutSetter,
+    read_deadline: ReadDeadline,
 }
 
-/// Applies a read deadline to the underlying stream; a no-op where the platform cannot.
-type ReadTimeoutSetter = Box<dyn Fn(Option<std::time::Duration>) + Send>;
+/// The instant after which reads fail; shared with a reader that enforces it (unix only).
+type ReadDeadline = std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>;
 
 impl std::fmt::Debug for Connection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -168,19 +168,16 @@ impl Connection {
             reader: BufReader::new(reader),
             writer,
             peer,
-            read_timeout: Box::new(|_| {}),
+            read_deadline: ReadDeadline::default(),
         }
     }
 
-    #[cfg(unix)]
-    fn with_read_timeout(mut self, setter: ReadTimeoutSetter) -> Self {
-        self.read_timeout = setter;
-        self
-    }
-
-    /// Bounds how long a read may block; a read that exceeds it errors. Enforced on unix only.
-    pub fn set_read_timeout(&self, timeout: Option<std::time::Duration>) {
-        (self.read_timeout)(timeout);
+    /// Fails every read that would run past `limit` from now, however slowly bytes arrive; `None`
+    /// lifts it. Enforced on unix only.
+    pub fn set_read_deadline(&self, limit: Option<std::time::Duration>) {
+        if let Ok(mut deadline) = self.read_deadline.lock() {
+            *deadline = limit.map(|limit| std::time::Instant::now() + limit);
+        }
     }
 
     pub fn peer(&self) -> Peer {
@@ -295,15 +292,39 @@ mod imp {
         let peer = Peer {
             uid: peer_uid(&stream),
         };
-        let reader = stream.try_clone()?;
-        let timeout_stream = stream.try_clone()?;
-        Ok(
-            Connection::new(Box::new(reader), Box::new(stream), peer).with_read_timeout(Box::new(
-                move |timeout| {
-                    let _ = timeout_stream.set_read_timeout(timeout);
-                },
-            )),
-        )
+        let deadline = super::ReadDeadline::default();
+        let reader = DeadlineReader {
+            stream: stream.try_clone()?,
+            deadline: std::sync::Arc::clone(&deadline),
+        };
+        let mut connection = Connection::new(Box::new(reader), Box::new(stream), peer);
+        connection.read_deadline = deadline;
+        Ok(connection)
+    }
+
+    /// Reads from a socket, failing once the shared deadline has passed: each read is limited to
+    /// the time left, so a peer trickling bytes cannot extend it.
+    struct DeadlineReader {
+        stream: UnixStream,
+        deadline: super::ReadDeadline,
+    }
+
+    impl std::io::Read for DeadlineReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let deadline = self.deadline.lock().ok().and_then(|deadline| *deadline);
+            let left = match deadline {
+                None => None,
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        return Err(std::io::ErrorKind::TimedOut.into());
+                    }
+                    Some(left)
+                }
+            };
+            self.stream.set_read_timeout(left)?;
+            std::io::Read::read(&mut self.stream, buf)
+        }
     }
 
     #[derive(Debug)]

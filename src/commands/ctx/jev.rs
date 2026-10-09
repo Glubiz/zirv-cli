@@ -763,8 +763,9 @@ pub(crate) fn safe_metadata_request(
 /// provenance check, which hashes a question's own static instructions/
 /// criteria at construction time and has no wire-format equivalent to check
 /// against. A relay forwards only a body that passes this; anything else
-/// gets an `{"error": ...}` frame back, which `jev::ask`'s own relay step
-/// treats as "fall back to a direct call", never as a forwarded answer.
+/// gets an `{"error": ...}` frame back, which `jev::ask` turns into a
+/// `JevError` -- never a forwarded answer and, the request frame having been
+/// written, never a direct re-send.
 fn safe_wire_request(parsed: &SystemOneRequest) -> bool {
     if !safe_metadata_state(&parsed.state) {
         return false;
@@ -822,9 +823,15 @@ fn safe_wire_request(parsed: &SystemOneRequest) -> bool {
 /// The body the relay forwards for `payload`, or `None` unless it parses strictly (no unknown
 /// fields), passes [`safe_wire_request`], and every question's spec (instructions and options,
 /// whatever its id) equals one of the `compiled` questions. The body is re-serialised from the
-/// parsed value, so none of the client's bytes are forwarded.
-pub(crate) fn compiled_wire_body(payload: &str, compiled: &[Question]) -> Option<String> {
-    let parsed = serde_json::from_str::<SystemOneRequest>(payload).ok()?;
+/// parsed value, so none of the client's bytes are forwarded, and it carries `model` (the relay's
+/// own) whatever the client sent.
+pub(crate) fn compiled_wire_body(
+    payload: &str,
+    compiled: &[Question],
+    model: &str,
+) -> Option<String> {
+    let mut parsed = serde_json::from_str::<SystemOneRequest>(payload).ok()?;
+    parsed.model = model.to_string();
     if !safe_wire_request(&parsed) {
         return None;
     }

@@ -31,7 +31,9 @@
 //! question's instructions and options must equal a compiled one's, and the body sent to the
 //! vendor is re-serialised from the validated value, never the client's bytes. Each connection
 //! is served on its own thread (at most [`MAX_CONNECTIONS`] at once), so a stalled peer holds
-//! only its own; on unix it is also dropped after [`READ_DEADLINE`] without a request frame.
+//! only its own; on unix it is also dropped if the whole request frame has not arrived within
+//! [`READ_DEADLINE`] of acceptance, however slowly its bytes trickle in. The request's `model` is
+//! replaced by the relay's own configured one.
 //!
 //! A client that cannot reach the relay (no endpoint, or connect/write of the
 //! request frame fails) falls back to a direct call (`jev::ask`'s own relay
@@ -208,11 +210,11 @@ fn serve_one(mut connection: Connection, cfg: &ProxyTypesafeConfig) {
     if !connection.peer().is_same_user(transport::server_uid()) {
         return;
     }
-    connection.set_read_timeout(Some(READ_DEADLINE));
+    connection.set_read_deadline(Some(READ_DEADLINE));
     let Ok(Some(frame)) = connection.read_frame::<RelayRequestFrame>() else {
         return;
     };
-    connection.set_read_timeout(None);
+    connection.set_read_deadline(None);
     let response = forward(cfg, &frame.body);
     let _ = connection.write_frame(&response);
 }
@@ -280,7 +282,7 @@ fn compiled_questions() -> &'static [jev::Question] {
 /// keep-alive agent (`jev::send_request`) -- never the client's, which never crosses the socket
 /// at all, and never the client's own bytes.
 fn forward(cfg: &ProxyTypesafeConfig, body: &str) -> RelayResponseFrame {
-    let Some(body) = jev::compiled_wire_body(body, compiled_questions()) else {
+    let Some(body) = jev::compiled_wire_body(body, compiled_questions(), &cfg.model) else {
         return RelayResponseFrame {
             error: Some("request is not one of this binary's own questions".to_string()),
             ..Default::default()
@@ -970,9 +972,46 @@ mod tests {
         let reformatted = serde_json::to_string_pretty(&pretty).expect("pretty");
         assert_ne!(reformatted, body);
         assert_eq!(
-            jev::compiled_wire_body(&reformatted, compiled_questions()),
+            jev::compiled_wire_body(&reformatted, compiled_questions(), "jev-latest"),
             Some(body)
         );
+    }
+
+    #[test]
+    fn the_forwarded_body_carries_the_relays_own_model() {
+        let sent = jev::encode_for_test(&sample_state(), &sample_questions(), "client-chosen")
+            .expect("encode");
+        assert_eq!(
+            jev::compiled_wire_body(&sent, compiled_questions(), "jev-latest"),
+            Some(sample_request())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_client_trickling_bytes_is_cut_off_within_one_deadline() {
+        use std::io::Write;
+        let (cfg, state, _dir, _vendor) = relay_case("TRICKLE");
+        with_credential(&cfg.proxy.typesafe.credential_env, "secret", || {
+            let _handle =
+                start(&cfg.proxy.typesafe, true, &state, "relay-trickle").expect("starts");
+            let endpoint = Endpoint::for_jev_relay(&state, "relay-trickle");
+            let mut stream =
+                std::os::unix::net::UnixStream::connect(endpoint.path()).expect("connect");
+            let started = std::time::Instant::now();
+            // One byte every half second, never a newline: each read finishes inside the deadline.
+            while started.elapsed() < READ_DEADLINE * 2 {
+                if stream.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            assert!(
+                started.elapsed() < READ_DEADLINE + Duration::from_secs(2),
+                "the relay held a trickling peer for {:?}",
+                started.elapsed()
+            );
+        });
     }
 
     #[test]
