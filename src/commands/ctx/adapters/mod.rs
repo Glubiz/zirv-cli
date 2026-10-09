@@ -51,7 +51,12 @@ const INJECTED_USER_TEXT: &[&str] = &[
     "<task-notification>",
     "<command-name>",
     "<command-message>",
+    "<command-args>",
     "<local-command-",
+    "<bash-input>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+    "<ide_",
     "<user-prompt-submit-hook>",
     "Stop hook feedback",
     "Supervisor ruling",
@@ -1770,6 +1775,20 @@ pub(crate) fn git_dirs(path: &Path) -> Option<(PathBuf, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shell escapes and IDE context land in Claude's user role; they are not the request.
+    #[test]
+    fn shell_and_ide_wrappers_are_injected_but_markup_requests_are_not() {
+        for text in [
+            "<bash-input>ls</bash-input>",
+            "<bash-stdout>a.rs</bash-stdout><bash-stderr></bash-stderr>",
+            "<command-args>fix it</command-args>",
+            "<ide_opened_file>The user opened src/main.rs</ide_opened_file>",
+        ] {
+            assert!(is_injected_user_text(text), "{text}");
+        }
+        assert!(!is_injected_user_text("<Button> is misaligned"));
+    }
 
     /// A permissive `CtxConfig` (every agent enabled, no `agent_bin`
     /// override) for tests that only care about selection, not gating.
