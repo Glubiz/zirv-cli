@@ -37,14 +37,15 @@
   --cyan-ink: oklch(0.49 0.11 232);       /* #006a94 cyan as text, link underline, marks on paper; 5.7:1 on paper, 5.3:1 on paper-2 */
   --focus: oklch(0.55 0.15 235);          /* #007cbb focus ring on paper, 4.3:1 (UI needs 3:1); on night the ring is --cyan */
 
-  /* Logo gradient: the mark only (kept from the previous guide) */
+  /* Logo gradient values, for reference only. The logo is assets/logo.png, used as-is: never redraw,
+     re-vectorise, outline, recolour, rotate or animate it, and never rebuild it from these tokens. */
   --color-accent-hot: #11e2ff;
   --color-accent-mid: #1bb4ee;
   --color-accent-blue: #2191dd;
   --gradient-mark: linear-gradient(28deg, #11e2ff 0%, #1bb4ee 52%, #2191dd 100%);
 
   /* Verdicts: three warm steps, each in a fill/glyph (-g), a text (-t) and an on-night form.
-     Healthy has no colour: it is the unlit mark, in ink-2. */
+     Healthy has no colour: it is the unlit verdict glyph (strokes line-2 / night-line), word in ink-2. */
   --advise: oklch(0.83 0.15 82);          /* #f8bd40 on night */
   --compact: oklch(0.74 0.16 55);         /* #f68c36 on night */
   --restart: oklch(0.68 0.19 27);         /* #f75e54 on night */
@@ -103,13 +104,13 @@
   --ease-out-strong: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-in: cubic-bezier(0.5, 0, 0.75, 0);
   --ease-move: cubic-bezier(0.65, 0, 0.35, 1);
-  --ease-spring: linear(0, 0.066, 0.218, 0.402, 0.581, 0.736, 0.858, 0.946, 1.004, 1.037, 1.052, 1.054, 1.049, 1.04, 1.03, 1.02, 1.012, 1.006, 1.002, 0.999, 0.998, 0.997, 0.997, 0.997, 1);   /* small controls only: toggle, mark turn, verdict bump */
+  --ease-spring: linear(0, 0.066, 0.218, 0.402, 0.581, 0.736, 0.858, 0.946, 1.004, 1.037, 1.052, 1.054, 1.049, 1.04, 1.03, 1.02, 1.012, 1.006, 1.002, 0.999, 0.998, 0.997, 0.997, 0.997, 1);   /* small controls only: toggle, verdict bump; never the logo */
   --dur-instant: 60ms;                    /* pressed state */
   --dur-hover: 120ms;                     /* colour and border responses, linear */
   --dur-small: 160ms;
   --dur-medium: 260ms;                    /* panel and tab-panel arrival */
   --dur-move: 320ms;                      /* sliding tab indicator */
-  --dur-bar: 420ms;                       /* chart bars, mark turn */
+  --dur-bar: 420ms;                       /* chart bars */
   --dur-arrive: 520ms;
   --dur-rise: 720ms;                      /* headline lines */
   --ease-steps: steps(1);                 /* [kept] cursor blink */
