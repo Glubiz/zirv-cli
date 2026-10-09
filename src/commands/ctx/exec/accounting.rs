@@ -135,8 +135,8 @@ mod tests {
 
     /// The "restarts >= max_restarts" give-up exit used to return without
     /// ever calling `record_execution_segment`, silently dropping the
-    /// harvested spend for the child that just rotted from `ExecutionReport`.
-    /// `max_restarts: 0` means give-up fires on the very first rot, so
+    /// harvested spend for the child that just timed out from `ExecutionReport`.
+    /// `max_restarts: 0` means give-up fires on the very first timeout, so
     /// exactly one child ran and exactly one segment must be recorded for it.
     #[test]
     fn an_exhausted_restart_budget_still_records_its_final_segment() {
@@ -147,8 +147,7 @@ mod tests {
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
-            std::env::set_var("FAKE_AGENT_MODE", "rot");
-            std::env::set_var("FAKE_AGENT_SLEEP", "30");
+            std::env::set_var("FAKE_AGENT_MODE", "hang");
         }
         let args = ExecArgs {
             agent: Some("claude".to_string()),
@@ -159,7 +158,7 @@ mod tests {
             budget_tokens: None,
             max_tool_calls: None,
             objective: None,
-            timeout_secs: Some(60),
+            timeout_secs: Some(3),
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
@@ -169,15 +168,14 @@ mod tests {
         let result = run_with_report(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
         unsafe {
             std::env::remove_var("FAKE_AGENT_MODE");
-            std::env::remove_var("FAKE_AGENT_SLEEP");
         }
 
         let (code, report) = result.expect("runs");
-        assert_eq!(code, EXIT_ROT_EXHAUSTED);
+        assert_eq!(code, EXIT_TIMEOUT);
         assert_eq!(
             report.segments.len(),
             1,
-            "the rotted child's spend must still be recorded before giving up: {:?}",
+            "the timed-out child's spend must still be recorded before giving up: {:?}",
             report.segments
         );
     }
@@ -198,9 +196,7 @@ mod tests {
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
-            std::env::set_var("FAKE_AGENT_MODE", "rot");
-            // Keep the child alive past the first scoring tick so rot is seen.
-            std::env::set_var("FAKE_AGENT_SLEEP", "30");
+            std::env::set_var("FAKE_AGENT_MODE", "hang");
         }
         let mut command = fake_agent_command(session);
         command.retain(|a| a != "-p" && a != "do the work");
@@ -213,7 +209,7 @@ mod tests {
             budget_tokens: None,
             max_tool_calls: None,
             objective: None,
-            timeout_secs: Some(60),
+            timeout_secs: Some(3),
             simple: false,
             reservation_id: None,
             command,
@@ -223,11 +219,10 @@ mod tests {
         let result = run_with_report(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
         unsafe {
             std::env::remove_var("FAKE_AGENT_MODE");
-            std::env::remove_var("FAKE_AGENT_SLEEP");
         }
 
         let (code, report) = result.expect("runs");
-        assert_eq!(code, EXIT_ROT_EXHAUSTED);
+        assert_eq!(code, EXIT_TIMEOUT);
         assert_eq!(
             report.segments.len(),
             1,
@@ -518,15 +513,15 @@ mod tests {
     }
 
     /// Issue #285, the core acceptance criterion: `exec` reloads the durable
-    /// objective across a rot restart -- it is not part of the launch-time
+    /// objective across a restart -- it is not part of the launch-time
     /// `composed` prompt this restart path reuses untouched (see this
     /// module's own doc comment), so it has to be carried by hand, beside the
-    /// handoff. `rot` mode reports 170k cache-read tokens on its very first
-    /// turn, well past the tiny budget set below, so by the time the restart
-    /// fires the objective has already crossed its soft budget and the
-    /// injected text has switched to the fixed wrap-up instruction.
+    /// handoff. `hang` mode writes a transcript well past the tiny budget set
+    /// below, so by the time the timeout restart fires the objective has
+    /// already crossed its soft budget and the injected text has switched to
+    /// the fixed wrap-up instruction.
     #[test]
-    fn exec_carries_the_objective_across_a_rot_restart_and_swaps_in_the_wrap_up_text() {
+    fn exec_carries_the_objective_across_a_timeout_restart_and_swaps_in_the_wrap_up_text() {
         let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
@@ -555,12 +550,11 @@ mod tests {
         .expect("store objective");
 
         let modes = tmp.path().join("modes.txt");
-        std::fs::write(&modes, "rot\nhealthy\n").expect("write modes");
+        std::fs::write(&modes, "hang\nhealthy\n").expect("write modes");
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
             std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
-            std::env::set_var("FAKE_AGENT_SLEEP", "30");
             std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
         }
         let args = ExecArgs {
@@ -572,7 +566,7 @@ mod tests {
             budget_tokens: None,
             max_tool_calls: None,
             objective: None,
-            timeout_secs: Some(60),
+            timeout_secs: Some(3),
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
@@ -582,7 +576,6 @@ mod tests {
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
         unsafe {
             std::env::remove_var("FAKE_AGENT_MODE_FILE");
-            std::env::remove_var("FAKE_AGENT_SLEEP");
             std::env::remove_var("FAKE_AGENT_ARGV_LOG");
         }
         assert_eq!(code.expect("runs"), 0);

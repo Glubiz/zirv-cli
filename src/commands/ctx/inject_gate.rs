@@ -1,9 +1,9 @@
 //! Issue #785: the `[jev] inject` gate. Before an automatic injection
-//! (PTY `/compact`, restart+handoff, live mail line, hook mail note, Stop rot
+//! (PTY `/compact`, live mail line, hook mail note, Stop rot
 //! advisory) zirv may ask Jev, from bucketed numeric facts only, whether the
 //! agent is mid-unit and the injection should wait. Jev may only DEFER, never
 //! add: every kind has a hard deferral cap after which it injects as today,
-//! operator mail and restart at the hard ceiling are never deferred, and any
+//! operator mail is never deferred, and any
 //! error, timeout or indecisive answer injects as today. Safety/deny
 //! messages have no [`InjectKind`] at all, so they can never reach this gate.
 
@@ -33,12 +33,6 @@ pub(crate) const MAIL_MAX_DEFER_SECS: u64 = 600;
 pub(crate) const COMPACT_MAX_DEFER_TURNS: u32 = 3;
 /// ...or this many seconds.
 pub(crate) const COMPACT_MAX_DEFER_SECS: u64 = 900;
-/// A restart+handoff is held for at most one turn..
-pub(crate) const RESTART_MAX_DEFER_TURNS: u32 = 1;
-/// ...or this many seconds.
-pub(crate) const RESTART_MAX_DEFER_SECS: u64 = 300;
-/// Rot score at or above which a restart is the hard ceiling: never deferred.
-pub(crate) const RESTART_HARD_CEILING_SCORE: u32 = 90;
 /// The Stop rot advisory is never held past this many Stops..
 pub(crate) const STOP_ADVISORY_MAX_DEFER_TURNS: u32 = 3;
 /// ...or this many seconds.
@@ -47,7 +41,6 @@ pub(crate) const STOP_ADVISORY_MAX_DEFER_SECS: u64 = 1800;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InjectKind {
     Compact,
-    Restart,
     MailPty,
     MailNote,
     StopAdvisory,
@@ -57,7 +50,6 @@ impl InjectKind {
     fn code(self) -> u64 {
         match self {
             InjectKind::Compact => 0,
-            InjectKind::Restart => 1,
             InjectKind::MailPty => 2,
             InjectKind::MailNote => 3,
             InjectKind::StopAdvisory => 4,
@@ -67,7 +59,6 @@ impl InjectKind {
     fn label(self) -> &'static str {
         match self {
             InjectKind::Compact => "compact",
-            InjectKind::Restart => "restart",
             InjectKind::MailPty => "mail_pty",
             InjectKind::MailNote => "mail_note",
             InjectKind::StopAdvisory => "stop_advisory",
@@ -77,7 +68,6 @@ impl InjectKind {
     fn caps(self) -> (u32, u64) {
         match self {
             InjectKind::Compact => (COMPACT_MAX_DEFER_TURNS, COMPACT_MAX_DEFER_SECS),
-            InjectKind::Restart => (RESTART_MAX_DEFER_TURNS, RESTART_MAX_DEFER_SECS),
             InjectKind::MailPty | InjectKind::MailNote => {
                 (MAIL_MAX_DEFER_TURNS, MAIL_MAX_DEFER_SECS)
             }
@@ -165,9 +155,6 @@ pub(crate) fn cap_forces_inject(kind: InjectKind, facts: &InjectFacts) -> bool {
         InjectKind::Compact | InjectKind::StopAdvisory => facts
             .rot_score
             .is_some_and(|score| facts.restart_at > 0 && score >= facts.restart_at),
-        InjectKind::Restart => facts
-            .rot_score
-            .is_none_or(|score| score >= RESTART_HARD_CEILING_SCORE),
     }
 }
 
@@ -219,7 +206,7 @@ fn advise_state(kind: InjectKind, facts: &InjectFacts) -> InjectAdviseState {
 pub(crate) fn questions() -> [jev::Question; 1] {
     [jev::Question::metadata_noul(
         "defer",
-        "Facts [kind (0 compact, 1 restart, 2 mail line, 3 mail note, 4 stop advisory), context \
+        "Facts [kind (0 compact, 2 mail line, 3 mail note, 4 stop advisory), context \
 % /10, rot score /10, stale tool tokens bucket, unread, oldest unread age bucket, sender (1 \
 system, 2 worker, 3 operator), turns since last such injection, output idle bucket, tool in \
 flight, files edited this turn, tests run this turn, turns since user prompt, turns deferred, \
@@ -437,17 +424,16 @@ struct Deferral {
 /// that turn and is re-asked on the next.
 #[derive(Default)]
 pub(crate) struct AsyncGate {
-    pending: [Option<Pending>; 3],
-    settled: [Option<(u64, Decision)>; 3],
-    deferrals: [Option<Deferral>; 3],
-    last_injected: [Option<u64>; 3],
+    pending: [Option<Pending>; 2],
+    settled: [Option<(u64, Decision)>; 2],
+    deferrals: [Option<Deferral>; 2],
+    last_injected: [Option<u64>; 2],
 }
 
 fn slot(kind: InjectKind) -> usize {
     match kind {
         InjectKind::Compact => 0,
-        InjectKind::Restart => 1,
-        _ => 2,
+        _ => 1,
     }
 }
 
@@ -613,21 +599,6 @@ mod tests {
             ..compact.clone()
         };
         assert!(cap_forces_inject(InjectKind::Compact, &at_restart));
-
-        let restart = InjectFacts {
-            rot_score: Some(85),
-            ..InjectFacts::default()
-        };
-        assert!(!cap_forces_inject(InjectKind::Restart, &restart));
-        let ceiling = InjectFacts {
-            rot_score: Some(RESTART_HARD_CEILING_SCORE),
-            ..InjectFacts::default()
-        };
-        assert!(cap_forces_inject(InjectKind::Restart, &ceiling));
-        assert!(cap_forces_inject(
-            InjectKind::Restart,
-            &InjectFacts::default()
-        ));
     }
 
     #[test]
@@ -663,7 +634,6 @@ mod tests {
         };
         for kind in [
             InjectKind::Compact,
-            InjectKind::Restart,
             InjectKind::MailPty,
             InjectKind::MailNote,
             InjectKind::StopAdvisory,

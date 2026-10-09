@@ -513,9 +513,10 @@ mod tests {
     }
 
     /// `FAKE_AGENT_MODE` applies to every invocation, so both the original child
-    /// and the restarted one rot and the budget runs out.
+    /// and the restarted one hang past the wall clock and the budget runs out.
+    /// Rot is never a restart trigger; a timeout still is.
     #[test]
-    fn a_rotted_run_is_killed_restarted_and_capped() {
+    fn a_timed_out_run_is_killed_restarted_and_capped() {
         let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
@@ -525,8 +526,7 @@ mod tests {
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
-            std::env::set_var("FAKE_AGENT_MODE", "rot");
-            std::env::set_var("FAKE_AGENT_SLEEP", "30");
+            std::env::set_var("FAKE_AGENT_MODE", "hang");
         }
         let args = ExecArgs {
             agent: Some("claude".to_string()),
@@ -537,7 +537,7 @@ mod tests {
             budget_tokens: None,
             max_tool_calls: None,
             objective: None,
-            timeout_secs: Some(60),
+            timeout_secs: Some(3),
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
@@ -547,12 +547,11 @@ mod tests {
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
         unsafe {
             std::env::remove_var("FAKE_AGENT_MODE");
-            std::env::remove_var("FAKE_AGENT_SLEEP");
         }
 
         assert_eq!(
             code.expect("runs"),
-            EXIT_ROT_EXHAUSTED,
+            EXIT_TIMEOUT,
             "the caller applies its own policy after the budget is spent"
         );
 
@@ -575,6 +574,65 @@ mod tests {
         );
     }
 
+    /// Rot is never a restart trigger: the rotted child keeps running to its
+    /// own exit, and the operator is only told a restart is worth doing.
+    #[test]
+    fn a_rotted_run_is_never_killed_or_restarted_only_suggested() {
+        let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let session = "99999999-2222-4333-8444-555555555555";
+        let env = base_env(&state);
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "rot");
+            // Long enough to be scored while alive, short enough to exit on its own.
+            std::env::set_var("FAKE_AGENT_SLEEP", "4");
+        }
+        let args = ExecArgs {
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            transcript: Some(transcript_for(&home, tmp.path(), session)),
+            prompt: Some("do the work".to_string()),
+            max_restarts: Some(2),
+            budget_tokens: None,
+            max_tool_calls: None,
+            objective: None,
+            timeout_secs: Some(60),
+            simple: false,
+            reservation_id: None,
+            command: fake_agent_command(session),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+            std::env::remove_var("FAKE_AGENT_SLEEP");
+        }
+
+        assert_eq!(
+            code.expect("runs"),
+            0,
+            "the rotted child ran to its own exit; zirv did not kill it"
+        );
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
+        assert!(
+            log.contains("\"action\":\"suggest-restart\""),
+            "the restart was suggested: {log}"
+        );
+        assert!(
+            !log.contains("\"action\":\"kill\"") && !log.contains("\"action\":\"restart\""),
+            "rot must never kill or restart the run: {log}"
+        );
+        assert!(
+            walk_md(&state.join("handoffs")).is_empty(),
+            "no restart means no handoff"
+        );
+    }
+
     fn walk_md(dir: &std::path::Path) -> Vec<PathBuf> {
         let mut found = Vec::new();
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -593,8 +651,8 @@ mod tests {
 
     /// The restarted child is a new session writing to a new transcript, so
     /// supervision must follow it there. If the watcher kept polling the killed
-    /// child's rotted file, this healthy second child would be killed too and
-    /// the run would exit 75 instead of 0.
+    /// child's hung file, this healthy second child would be killed too and
+    /// the run would exit 76 instead of 0.
     #[test]
     fn a_restart_supervises_the_new_sessions_transcript() {
         let _isolated_state = crate::commands::ctx::testenv::isolated_state_dir();
@@ -603,14 +661,13 @@ mod tests {
         let session = "88888888-2222-4333-8444-555555555555";
         let env = base_env(&tmp.path().join("state"));
 
-        // First child rots, second is healthy.
+        // First child hangs past its wall clock, second is healthy.
         let modes = tmp.path().join("modes.txt");
-        std::fs::write(&modes, "rot\nhealthy\n").expect("write modes");
+        std::fs::write(&modes, "hang\nhealthy\n").expect("write modes");
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
             std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
-            std::env::set_var("FAKE_AGENT_SLEEP", "30");
             std::env::set_var("FAKE_AGENT_TURNS", "12");
         }
         let args = ExecArgs {
@@ -622,7 +679,7 @@ mod tests {
             budget_tokens: None,
             max_tool_calls: None,
             objective: None,
-            timeout_secs: Some(60),
+            timeout_secs: Some(3),
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
@@ -632,7 +689,6 @@ mod tests {
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
         unsafe {
             std::env::remove_var("FAKE_AGENT_MODE_FILE");
-            std::env::remove_var("FAKE_AGENT_SLEEP");
             std::env::remove_var("FAKE_AGENT_TURNS");
         }
 
@@ -664,9 +720,7 @@ mod tests {
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
-            std::env::set_var("FAKE_AGENT_MODE", "rot");
-            // Keep the child alive past the first scoring tick so rot is seen.
-            std::env::set_var("FAKE_AGENT_SLEEP", "30");
+            std::env::set_var("FAKE_AGENT_MODE", "hang");
         }
         let mut command = fake_agent_command(session);
         command.retain(|a| a != "-p" && a != "do the work");
@@ -679,7 +733,7 @@ mod tests {
             budget_tokens: None,
             max_tool_calls: None,
             objective: None,
-            timeout_secs: Some(60),
+            timeout_secs: Some(3),
             simple: false,
             reservation_id: None,
             command,
@@ -689,13 +743,12 @@ mod tests {
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
         unsafe {
             std::env::remove_var("FAKE_AGENT_MODE");
-            std::env::remove_var("FAKE_AGENT_SLEEP");
         }
 
         assert_eq!(
             code.expect("runs"),
-            EXIT_ROT_EXHAUSTED,
-            "rot was detected but no restart was possible"
+            EXIT_TIMEOUT,
+            "the run timed out but no restart was possible"
         );
         let text = String::from_utf8(out).expect("utf8");
         assert!(
@@ -769,13 +822,12 @@ mod tests {
         let seen = tmp.path().join("sessions.txt");
 
         let modes = tmp.path().join("modes.txt");
-        std::fs::write(&modes, "rot\nhealthy\n").expect("write modes");
+        std::fs::write(&modes, "hang\nhealthy\n").expect("write modes");
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
             std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
             std::env::set_var("FAKE_AGENT_SESSION_ENV_LOG", &seen);
-            std::env::set_var("FAKE_AGENT_SLEEP", "30");
             std::env::set_var("FAKE_AGENT_TURNS", "12");
         }
         let args = ExecArgs {
@@ -787,7 +839,7 @@ mod tests {
             budget_tokens: None,
             max_tool_calls: None,
             objective: None,
-            timeout_secs: Some(60),
+            timeout_secs: Some(3),
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
@@ -798,7 +850,6 @@ mod tests {
         unsafe {
             std::env::remove_var("FAKE_AGENT_MODE_FILE");
             std::env::remove_var("FAKE_AGENT_SESSION_ENV_LOG");
-            std::env::remove_var("FAKE_AGENT_SLEEP");
             std::env::remove_var("FAKE_AGENT_TURNS");
         }
         assert_eq!(code.expect("runs"), 0);
@@ -896,12 +947,11 @@ mod tests {
         env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
 
         let modes = tmp.path().join("modes.txt");
-        std::fs::write(&modes, "rot\nhealthy\n").expect("write modes");
+        std::fs::write(&modes, "hang\nhealthy\n").expect("write modes");
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
             std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
-            std::env::set_var("FAKE_AGENT_SLEEP", "30");
             std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
         }
         let args = ExecArgs {
@@ -913,7 +963,7 @@ mod tests {
             budget_tokens: None,
             max_tool_calls: None,
             objective: None,
-            timeout_secs: Some(60),
+            timeout_secs: Some(3),
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
@@ -923,14 +973,22 @@ mod tests {
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
         unsafe {
             std::env::remove_var("FAKE_AGENT_MODE_FILE");
-            std::env::remove_var("FAKE_AGENT_SLEEP");
             std::env::remove_var("FAKE_AGENT_ARGV_LOG");
         }
         assert_eq!(code.expect("runs"), 0);
 
         let argv = std::fs::read_to_string(&argv_log).expect("argv recorded");
+        let invocations: Vec<&str> = argv
+            .lines()
+            .filter(|line| line.contains("--session-id"))
+            .collect();
+        assert_eq!(
+            invocations.len(),
+            2,
+            "the first child hung and was restarted: {argv}"
+        );
         assert!(
-            argv.contains("--append-system-prompt"),
+            invocations[1].contains("--append-system-prompt"),
             "the restarted child must carry the prompt too: {argv}"
         );
     }
@@ -953,12 +1011,11 @@ mod tests {
         env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
 
         let modes = tmp.path().join("modes.txt");
-        std::fs::write(&modes, "rot\nhealthy\n").expect("write modes");
+        std::fs::write(&modes, "hang\nhealthy\n").expect("write modes");
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
             std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
-            std::env::set_var("FAKE_AGENT_SLEEP", "30");
             std::env::set_var("FAKE_AGENT_ARGV_LOG", &argv_log);
         }
         let mut command = fake_agent_command(session);
@@ -973,7 +1030,7 @@ mod tests {
             budget_tokens: None,
             max_tool_calls: None,
             objective: None,
-            timeout_secs: Some(60),
+            timeout_secs: Some(3),
             simple: false,
             reservation_id: None,
             command,
@@ -983,7 +1040,6 @@ mod tests {
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
         unsafe {
             std::env::remove_var("FAKE_AGENT_MODE_FILE");
-            std::env::remove_var("FAKE_AGENT_SLEEP");
             std::env::remove_var("FAKE_AGENT_ARGV_LOG");
         }
         assert_eq!(code.expect("runs"), 0);
@@ -1021,12 +1077,11 @@ mod tests {
         env.insert("ZIRV_CTX_PACE".to_string(), "false".to_string());
 
         let modes = tmp.path().join("modes.txt");
-        std::fs::write(&modes, "rot\nhealthy\n").expect("write modes");
+        std::fs::write(&modes, "hang\nhealthy\n").expect("write modes");
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         unsafe {
             std::env::set_var("FAKE_AGENT_MODE_FILE", &modes);
-            std::env::set_var("FAKE_AGENT_SLEEP", "30");
         }
         let args = ExecArgs {
             agent: Some("claude".to_string()),
@@ -1037,7 +1092,7 @@ mod tests {
             budget_tokens: None,
             max_tool_calls: None,
             objective: None,
-            timeout_secs: Some(60),
+            timeout_secs: Some(3),
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
@@ -1047,7 +1102,6 @@ mod tests {
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
         unsafe {
             std::env::remove_var("FAKE_AGENT_MODE_FILE");
-            std::env::remove_var("FAKE_AGENT_SLEEP");
         }
         assert_eq!(code.expect("runs"), 0);
 

@@ -574,15 +574,6 @@ pub fn run_with(
     let debounce = Duration::from_millis(cfg.wrap.debounce_ms);
     let inject_timeout = Duration::from_millis(cfg.wrap.inject_timeout_ms);
 
-    // Keep prompt injection across restarts, but strip conversation pins:
-    // a restart must leave the rotted conversation.
-    let relaunch_extra: Vec<String> = policy_extra
-        .iter()
-        .cloned()
-        .chain(restart_launch_flags(adapter.as_ref(), &launch_command))
-        .chain(prompt_args.iter().cloned())
-        .collect();
-
     // Own this model so a later swap can use the successor's distiller.
     let mut distiller_model =
         handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref());
@@ -614,7 +605,6 @@ pub fn run_with(
         QUIT_GRACE,
         tx,
         generation,
-        &relaunch_extra,
         &mut turn_env,
         &cpr_filter,
         &announcer,

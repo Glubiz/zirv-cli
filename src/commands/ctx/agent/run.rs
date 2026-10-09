@@ -3017,34 +3017,33 @@ mod tests {
     }
 
     #[test]
-    fn a_rot_exhausted_run_keeps_its_exit_code_and_explains_it_in_words() {
+    fn a_timed_out_run_keeps_its_exit_code_and_explains_it_in_words() {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         let env = base_env(&tmp.path().join("state"));
         unsafe {
-            std::env::set_var("FAKE_AGENT_MODE", "rot");
-            std::env::set_var("FAKE_AGENT_SLEEP", "30");
+            std::env::set_var("FAKE_AGENT_MODE", "hang");
         }
 
         let mut args = args_for("claude", "do the work");
         args.max_restarts = Some(0);
+        args.timeout_secs = Some(3);
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
         unsafe {
             std::env::remove_var("FAKE_AGENT_MODE");
-            std::env::remove_var("FAKE_AGENT_SLEEP");
         }
 
         assert_eq!(
             code.expect("runs"),
-            exec::EXIT_ROT_EXHAUSTED,
+            exec::EXIT_TIMEOUT,
             "the caller applies its own policy after the budget is spent"
         );
         assert!(
-            exit_note(exec::EXIT_ROT_EXHAUSTED)
+            exit_note(exec::EXIT_TIMEOUT)
                 .expect("a note exists")
-                .contains("restart budget")
+                .contains("wall-clock timeout")
         );
     }
 
@@ -3111,7 +3110,7 @@ mod tests {
         assert!(!text.contains("capability warning"), "got {text}");
     }
 
-    /// Issue #227: a headless delegation that FAILS (here, a rot-exhausted
+    /// Issue #227: a headless delegation that FAILS (here, a timeout
     /// give-up with the restart budget at zero) sends a report-back mail to
     /// the spawning session -- the worker's own self-report only ever fires
     /// for a dashboard pane and only on success, so without this the
@@ -3131,19 +3130,18 @@ mod tests {
             "aaaaaaaa-1111-4222-8333-444444444444".to_string(),
         );
         unsafe {
-            std::env::set_var("FAKE_AGENT_MODE", "rot");
-            std::env::set_var("FAKE_AGENT_SLEEP", "30");
+            std::env::set_var("FAKE_AGENT_MODE", "hang");
         }
 
         let mut args = args_for("claude", "do the work");
         args.max_restarts = Some(0);
+        args.timeout_secs = Some(3);
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
         unsafe {
             std::env::remove_var("FAKE_AGENT_MODE");
-            std::env::remove_var("FAKE_AGENT_SLEEP");
         }
-        assert_eq!(code.expect("runs"), exec::EXIT_ROT_EXHAUSTED);
+        assert_eq!(code.expect("runs"), exec::EXIT_TIMEOUT);
 
         let state_dir = crate::commands::ctx::state::StateDir::from_root(state);
         let repo_slug = crate::commands::ctx::state::repo_slug(tmp.path());
@@ -3162,7 +3160,7 @@ mod tests {
             "addressed to the requester's short id: {body}"
         );
         assert!(
-            body.contains("restart budget"),
+            body.contains("wall-clock timeout"),
             "carries the same structured reason as the stderr note: {body}"
         );
     }
@@ -4152,18 +4150,17 @@ mod tests {
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         let modes = tmp.path().join("modes.txt");
         let order = tmp.path().join("order.log");
-        std::fs::write(&modes, "bootstrap-ok\nrot\nhealthy\n").expect("modes");
+        std::fs::write(&modes, "bootstrap-ok\nhang\nhealthy\n").expect("modes");
         let _fake = crate::commands::ctx::testenv::VarGuard::set(&[
             ("FAKE_AGENT_MODE_FILE", modes.to_str()),
             ("FAKE_AGENT_MODE_LOG", order.to_str()),
-            ("FAKE_AGENT_SLEEP", Some("5")),
         ]);
         let mut env = base_env(&tmp.path().join("state"));
         env.insert("ZIRV_CTX_PACE".into(), "false".into());
         let mut args = args_for("claude", "main restarts once");
         args.goal = Some("prepare once".into());
         args.max_restarts = Some(1);
-        args.timeout_secs = Some(20);
+        args.timeout_secs = Some(5);
 
         let code = run_with(&args, &mut Vec::new(), tmp.path(), &|key| {
             env.get(key).cloned()
@@ -4173,7 +4170,7 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(
             std::fs::read_to_string(order).expect("order"),
-            "bootstrap-ok\nrot\nhealthy\n",
+            "bootstrap-ok\nhang\nhealthy\n",
             "the bootstrap must run once outside the main supervisor restart loop"
         );
     }

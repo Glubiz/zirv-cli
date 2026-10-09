@@ -189,28 +189,6 @@ pub fn note_failure(
     }
 }
 
-/// Refuse another rot restart once the repository restart chain trips;
-/// the caller then degrades to passthrough. (#310)
-pub(super) fn tripped_restart_chain(
-    state: &StateDir,
-    repo: &Path,
-    cfg: &CtxConfig,
-    now_secs: u64,
-) -> Option<u32> {
-    match super::chain::record_boot_and_evaluate(
-        state,
-        &super::state::repo_slug(repo),
-        super::chain::FailureClass::Crash,
-        false,
-        now_secs,
-        cfg.supervise.chain_max_restarts,
-        cfg.supervise.chain_max_gap_secs,
-    ) {
-        super::chain::ChainVerdict::Tripped { boots } => Some(boots),
-        super::chain::ChainVerdict::Ok => None,
-    }
-}
-
 fn wait_for_exit(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     deadline: Instant,
@@ -354,23 +332,6 @@ fn relaunch_command(
     let prompt =
         super::prompt::interactive_handoff_prompt(adapter, &[], &mut args, &prompt, state, session);
     adapter.interactive_cmd(Some(&prompt), &args)
-}
-
-/// Preserve operator flags but remove conversation pins through the same
-/// filter exec uses; a restart must leave the rotted conversation.
-pub(super) fn restart_launch_flags(
-    adapter: &dyn AgentAdapter,
-    launch_command: &[String],
-) -> Vec<String> {
-    let prefix = if launch_command
-        .first()
-        .is_none_or(|first| first.starts_with('-'))
-    {
-        0
-    } else {
-        adapter.launch_prefix_len()
-    };
-    super::exec::extra_launch_flags(launch_command, prefix, None, adapter.name())
 }
 
 /// Reserve the status-bar row on a fresh pty only while the bar is active;
@@ -1155,91 +1116,5 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         quit_child(&mut sink, &mut child, "/exit\r", Duration::from_secs(5)).expect("quit");
         assert!(child.try_wait().expect("try_wait").is_some());
-    }
-
-    /// A restart is an escape from the conversation that rotted, so nothing
-    /// that pins the launch back to it may survive into the relaunched argv.
-    /// Before this, `wrap -- claude --continue` relaunched as `claude
-    /// "<handoff>" --continue` and resumed the very session it was leaving.
-    mod restart_flags {
-        use super::*;
-        use crate::commands::ctx::adapters;
-
-        fn flags_for(argv: &[&str]) -> Vec<String> {
-            let command: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
-            let adapter = adapters::select(Some("claude"), &command, &CtxConfig::default())
-                .expect("claude adapter");
-            restart_launch_flags(adapter.as_ref(), &command)
-        }
-
-        #[test]
-        fn a_relaunch_drops_every_flag_that_would_resume_the_rotted_session() {
-            assert!(flags_for(&["claude", "--continue"]).is_empty());
-            assert!(flags_for(&["claude", "-c"]).is_empty());
-            assert!(flags_for(&["claude", "--fork-session"]).is_empty());
-            assert!(flags_for(&["claude", "--resume", "abc123"]).is_empty());
-            assert!(flags_for(&["claude", "--session-id", "abc123"]).is_empty());
-        }
-
-        /// The CLIs accept `--resume=abc` too, so stripping only the two-token
-        /// spelling would leave the other behind.
-        #[test]
-        fn the_joined_spelling_of_a_resume_flag_is_dropped_as_well() {
-            assert!(flags_for(&["claude", "--resume=abc123"]).is_empty());
-            assert!(flags_for(&["claude", "--session-id=abc123"]).is_empty());
-        }
-
-        /// Everything else the operator passed has to reach the restarted
-        /// child exactly as it reached the first one.
-        #[test]
-        fn a_relaunch_keeps_the_operator_flags_that_are_not_about_resuming() {
-            assert_eq!(
-                flags_for(&["claude", "--model", "opus", "--continue"]),
-                vec!["--model".to_string(), "opus".to_string()]
-            );
-            assert_eq!(
-                flags_for(&["claude", "--dangerously-skip-permissions"]),
-                vec!["--dangerously-skip-permissions".to_string()]
-            );
-        }
-
-        /// `relaunch_command` supplies the handoff positionally, so a
-        /// positional prompt from the original argv must not come back too --
-        /// the agent would read it as a second prompt.
-        #[test]
-        fn a_positional_prompt_is_not_replayed_into_the_relaunch() {
-            assert!(flags_for(&["claude", "fix the parser"]).is_empty());
-            assert_eq!(
-                flags_for(&["claude", "fix the parser", "--model", "opus"]),
-                vec!["--model".to_string(), "opus".to_string()]
-            );
-        }
-
-        /// Issue #143: `restart_launch_flags` delegates to `exec::
-        /// extra_launch_flags`, which used to strip a bare `-c` as claude's
-        /// own valueless resume flag regardless of adapter -- codex's own
-        /// `-c, --config <key>=<value>` shares that spelling for an unrelated,
-        /// value-carrying flag. A codex `wrap` restart must keep the pair
-        /// intact rather than dropping `-c` and leaving its value (e.g. the
-        /// shipped-default `approval_policy=never` sandbox posture) orphaned
-        /// on argv, which real codex-cli then rejects outright.
-        #[test]
-        fn a_codex_relaunch_keeps_its_own_c_flag_paired_with_its_value() {
-            let command: Vec<String> = ["codex", "-c", "approval_policy=never", "--model", "gpt"]
-                .iter()
-                .map(|arg| (*arg).to_string())
-                .collect();
-            let adapter = adapters::select(Some("codex"), &command, &CtxConfig::default())
-                .expect("codex adapter");
-            assert_eq!(
-                restart_launch_flags(adapter.as_ref(), &command),
-                vec![
-                    "-c".to_string(),
-                    "approval_policy=never".to_string(),
-                    "--model".to_string(),
-                    "gpt".to_string(),
-                ]
-            );
-        }
     }
 }

@@ -31,7 +31,10 @@ pub enum Event {
     /// A compaction was injected into the wrapped agent, and whether the
     /// transcript confirmed it actually happened.
     Compact { verified: bool },
-    /// A rotted session was restarted, naming the handoff style
+    /// The rot score reached the restart band after compaction did not help; zirv
+    /// only suggests a restart and never performs one.
+    RestartSuggested { score: u32 },
+    /// A session was restarted (never for rot), naming the handoff style
     /// (`"distilled"`, `"structural"`, or `"no data"` for an adapter with no
     /// verified event parsing at all, `handoff::distill_or_structural`'s own
     /// vocabulary) and where the handoff was stored.
@@ -386,6 +389,10 @@ impl Event {
                 } else {
                     "not verified"
                 }
+            ),
+            Event::RestartSuggested { score } => format!(
+                "context health is poor (score {score}) and compaction did not help; consider \
+                 restarting this session yourself with a handoff (zirv will not restart it)"
             ),
             Event::Restart { style, stored } => {
                 format!("session restarted with a {style} handoff, stored at {stored}")
@@ -1199,6 +1206,7 @@ mod tests {
                 score: 45,
             },
             Event::Compact { verified: true },
+            Event::RestartSuggested { score: 85 },
             Event::Restart {
                 style: "structural".to_string(),
                 stored: "x.md".to_string(),
