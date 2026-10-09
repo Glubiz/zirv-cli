@@ -184,6 +184,8 @@ struct SessionState {
     state: String,
     triggers: Vec<String>,
     seen: Vec<String>,
+    /// The evidence unit the newest consult was fired for; a ruling made under another unit is stale.
+    last_unit: String,
     /// One-shot permits `fire` writes and `consult` consumes, so only a fired consult runs.
     tickets: Vec<String>,
     /// Ask reservations their parent has not settled yet; a refund needs its id here, so it is idempotent.
@@ -361,6 +363,7 @@ pub(crate) fn fire(
     let mut next = before.clone();
     if let Some(unit) = unit {
         push_capped(&mut next.seen, unit.to_string(), SEEN_KEEP);
+        next.last_unit = unit.to_string();
     }
     push_capped(
         &mut next.triggers,
@@ -428,10 +431,10 @@ fn spawn_consult(request: &ConsultRequest) -> bool {
     true
 }
 
-/// `git diff --stat HEAD` only; never diff contents. Empty when clean or not a repository.
-fn git_diff_stat(repo: &Path) -> String {
+/// Trimmed stdout of a successful `git` call in `repo`; `None` when it failed or git is absent.
+fn git_stdout(repo: &Path, args: &[&str]) -> Option<String> {
     std::process::Command::new("git")
-        .args(["diff", "--stat", "HEAD"])
+        .args(args)
         .current_dir(repo)
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -439,18 +442,79 @@ fn git_diff_stat(repo: &Path) -> String {
         .ok()
         .filter(|out| out.status.success())
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .unwrap_or_default()
+}
+
+/// `git diff --stat HEAD` only; never diff contents. Empty when clean or not a repository.
+fn git_diff_stat(repo: &Path) -> String {
+    git_stdout(repo, &["diff", "--stat", "HEAD"]).unwrap_or_default()
 }
 
 /// Whether `git status --porcelain` succeeded and printed nothing.
 fn git_status_is_clean(repo: &Path) -> bool {
-    std::process::Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(repo)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .is_ok_and(|out| out.status.success() && out.stdout.iter().all(u8::is_ascii_whitespace))
+    git_stdout(repo, &["status", "--porcelain"]).is_some_and(|status| status.is_empty())
+}
+
+/// What a before-done consult is about: the diffstat, the commit and the untracked files, so a
+/// new commit or a new evidence file is new evidence and a repeat of the same state is not.
+fn done_unit(repo: &Path, stat: &str) -> String {
+    let head = git_stdout(repo, &["rev-parse", "HEAD"]).unwrap_or_default();
+    let status = git_stdout(repo, &["status", "--porcelain"]).unwrap_or_default();
+    format!(
+        "done:{}",
+        crate::commands::workflow::engine::hash_bytes(
+            format!("{stat}\n{head}\n{status}").as_bytes()
+        )
+    )
+}
+
+/// Whether this turn end may be a completion claim: not while the session has running native
+/// subagents or an active workflow whose step comes before verify and deploy (#894).
+fn work_in_flight(state: &StateDir, repo: &Path, session: &str, hook_session: &str) -> bool {
+    if super::graph::running_subagents(state, hook_session, now_secs()) > 0 {
+        return true;
+    }
+    crate::commands::workflow::engine::load_active_for_session(state, repo, session)
+        .ok()
+        .flatten()
+        .and_then(|workflow| workflow.current().map(|step| step.phase))
+        .is_some_and(|phase| {
+            !matches!(
+                phase,
+                crate::commands::workflow::skill::WorkflowPhase::Verify
+                    | crate::commands::workflow::skill::WorkflowPhase::Deploy
+            )
+        })
+}
+
+/// The task a before-done consult judges against, with where it came from: the active
+/// workflow's objective, else the latest operator request in the transcript.
+pub(crate) fn done_task(
+    state: &StateDir,
+    repo: &Path,
+    session: &str,
+    transcript: &str,
+    adapter: Option<&dyn super::adapters::AgentAdapter>,
+) -> Option<(String, String)> {
+    if let Ok(Some(workflow)) =
+        crate::commands::workflow::engine::load_active_for_session(state, repo, session)
+    {
+        return Some((
+            format!("workflow {} objective", workflow.id),
+            super::handoff::request_as_task(&workflow.task),
+        ));
+    }
+    let context = adapter?.structural_context(transcript, usize::MAX);
+    let request = context.user_messages.iter().rev().find(|message| {
+        let message = message.trim_start();
+        !message.is_empty()
+            && !message.starts_with('<')
+            && !message.starts_with("Stop hook feedback")
+            && !message.starts_with("Supervisor ruling")
+    })?;
+    Some((
+        "latest operator request".to_string(),
+        super::handoff::request_as_task(request),
+    ))
 }
 
 /// Error-repeats trigger: called by the tool-failure hook at the third failure of a streak.
@@ -472,16 +536,25 @@ pub(crate) fn error_repeats_request(
     }
 }
 
-/// Before-done trigger: the Stop hook, once per distinct diffstat. Reads `git diff --stat`
-/// only after the cheap enabled/in-consult check passes.
+/// Before-done trigger: the Stop hook, once per distinct evidence unit. Reads git state only
+/// after the cheap enabled/in-consult check passes. `hook_session` keys the native subagents;
+/// `task` is read only when a consult fires.
 pub(crate) fn on_stop(
     state: &StateDir,
     cfg: &CtxConfig,
     env: EnvLookup<'_>,
     repo: &Path,
     session: &str,
+    hook_session: &str,
+    task: &dyn Fn() -> Option<(String, String)>,
 ) {
-    let lapsed = on_stop_with(state, cfg, env, repo, session, &spawn_consult);
+    if !cfg.supervisor.enabled
+        || in_consult(env)
+        || work_in_flight(state, repo, session, hook_session)
+    {
+        return;
+    }
+    let lapsed = on_stop_with(state, cfg, env, repo, session, task, &spawn_consult);
     announce_lapsed(state, repo, &lapsed);
 }
 
@@ -522,6 +595,7 @@ fn on_stop_with(
     env: EnvLookup<'_>,
     repo: &Path,
     session: &str,
+    task: &dyn Fn() -> Option<(String, String)>,
     spawn: &dyn Fn(&ConsultRequest) -> bool,
 ) -> Vec<Ruling> {
     if !cfg.supervisor.enabled || in_consult(env) {
@@ -543,15 +617,19 @@ fn on_stop_with(
             &|_| true,
         );
     }
-    let unit = format!(
-        "done:{}",
-        crate::commands::workflow::engine::hash_bytes(stat.as_bytes())
-    );
+    let unit = done_unit(repo, &stat);
+    // `fire` re-checks under its lock; this keeps a repeated stop from reading the transcript.
+    if state_path(state, session).is_some_and(|path| load_state(&path).seen.contains(&unit)) {
+        return Vec::new();
+    }
+    let task_line = task()
+        .map(|(source, text)| format!("\nTask ({source}): {text}"))
+        .unwrap_or_default();
     let request = ConsultRequest {
         trigger: Trigger::BeforeDone,
         session: session.to_string(),
         repo: repo.to_path_buf(),
-        evidence: "The agent is about to declare the task done.".to_string(),
+        evidence: format!("The agent is about to declare the task done.{task_line}"),
         workflow: None,
     };
     fire(state, cfg, env, request, Some(&unit), spawn);
@@ -670,8 +748,15 @@ pub(crate) fn record_for_test(state: &StateDir, session: &str, reason: &str) {
 
 /// The Stop hook's block, for Claude and Codex alike: Codex continues the turn on a Stop hook's
 /// `decision: "block"` with the reason as the next prompt (https://learn.chatgpt.com/docs/hooks).
-/// Never errors; any failure means no block.
-pub(crate) fn stop_block(env: EnvLookup<'_>, repo: &Path, session: &str) -> Option<String> {
+/// Never errors; any failure means no block. No block either while the turn end is not a
+/// completion claim (`work_in_flight`), or once the evidence moved past what the ruling judged:
+/// the next stop consults fresh instead of replaying it (#894).
+pub(crate) fn stop_block(
+    env: EnvLookup<'_>,
+    repo: &Path,
+    session: &str,
+    hook_session: &str,
+) -> Option<String> {
     if in_consult(env) {
         return None;
     }
@@ -679,7 +764,16 @@ pub(crate) fn stop_block(env: EnvLookup<'_>, repo: &Path, session: &str) -> Opti
     if !CtxConfig::load_refusal_safe(repo, env).supervisor.enabled {
         return None;
     }
-    rulings::take_stop_block(&StateDir::resolve(env).ok()?, session)
+    let state = StateDir::resolve(env).ok()?;
+    rulings::find_open(&state, RulingKind::Done, Some(session), None)?;
+    if work_in_flight(&state, repo, session, hook_session) {
+        return None;
+    }
+    let judged = load_state(&state_path(&state, session)?).last_unit;
+    if !judged.is_empty() && judged != done_unit(repo, &git_diff_stat(repo)) {
+        return None;
+    }
+    rulings::take_stop_block(&state, session)
 }
 
 /// What the tool-failure hook adds while an open `stop` ruling stands for the session.
@@ -881,10 +975,20 @@ fn rule_with(
         );
         return Ok(None);
     };
+    // The cap includes the evidence note a done ruling ends with.
+    let note = if kind == RulingKind::Done {
+        let task_source = evidence
+            .lines()
+            .find_map(|line| line.strip_prefix("Task (")?.split_once("): "))
+            .map_or("none supplied", |(source, _)| source);
+        format!(" [evidence read: git diff --stat HEAD; task: {task_source}]")
+    } else {
+        String::new()
+    };
     let reason = crate::utils::truncate_bytes(
         super::snapshot::redact_text(&reason),
-        Some(cfg.supervisor.max_advice_bytes),
-    );
+        Some(cfg.supervisor.max_advice_bytes.saturating_sub(note.len())),
+    ) + &note;
     Ok(rulings::record(
         state, session, workflow, kind, &verdict, &reason,
     ))
@@ -1363,6 +1467,14 @@ fn run_ask_with<W: Write>(
         }
     };
     settle_ask_call(&state, &session, &ticket, false);
+    // A ruled `done` option lifts the earlier before-done block the same way a done ruling does.
+    let ruled = ruling.verdict.to_ascii_lowercase();
+    let rules_done = ruled
+        .strip_prefix("done")
+        .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric()));
+    if rules_done {
+        rulings::resolve_open(&state, RulingKind::Done, &session);
+    }
     writeln!(
         w,
         "ruling {}: {}\nreason: {}\nBinding unless the operator overrides it.",
@@ -1665,7 +1777,17 @@ mod tests {
             spawned.set(spawned.get() + 1);
             true
         };
-        let stop = || on_stop_with(&state, &cfg, &no_env, repo.path(), "abcd1234", &spawn);
+        let stop = || {
+            on_stop_with(
+                &state,
+                &cfg,
+                &no_env,
+                repo.path(),
+                "abcd1234",
+                &|| None,
+                &spawn,
+            )
+        };
         stop();
         assert_eq!(spawned.get(), 0, "a clean tree never consults");
         std::fs::write(repo.path().join("a.txt"), "two\n").expect("write");
@@ -1761,7 +1883,15 @@ mod tests {
             None,
             &spawn
         ));
-        on_stop_with(&state, &cfg, &no_env, repo.path(), "abcd1234", &spawn);
+        on_stop_with(
+            &state,
+            &cfg,
+            &no_env,
+            repo.path(),
+            "abcd1234",
+            &|| None,
+            &spawn,
+        );
         assert!(!state.root().exists());
     }
 
@@ -2248,6 +2378,147 @@ mod tests {
         assert!(gate_check(&state, "wf-1", Some("abcd1234"), false, true).is_ok());
     }
 
+    fn committed_repo_with_change(dir: &Path) -> PathBuf {
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("a.txt"), "one\n").expect("write");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "init"]);
+        std::fs::write(repo.join("a.txt"), "two\n").expect("write");
+        repo
+    }
+
+    /// #894: the done consult judges against the task, and its ruling says what it read.
+    #[test]
+    fn a_before_done_consult_carries_the_task_and_its_ruling_names_the_evidence_read() {
+        let (dir, state) = fresh_state();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        let repo = committed_repo_with_change(dir.path());
+        let seen = std::cell::RefCell::new(String::new());
+        let spawn = |request: &ConsultRequest| {
+            *seen.borrow_mut() = request.evidence.clone();
+            true
+        };
+        let task = || {
+            Some((
+                "latest operator request".to_string(),
+                "build the page".to_string(),
+            ))
+        };
+        on_stop_with(
+            &state,
+            &enabled_cfg(),
+            &no_env,
+            &repo,
+            "abcd1234",
+            &task,
+            &spawn,
+        );
+        let evidence = seen.borrow().clone();
+        assert!(
+            evidence.contains("Task (latest operator request): build the page"),
+            "{evidence}"
+        );
+        let mut tokens = 0;
+        let ruling = rule_with(
+            &state,
+            &enabled_cfg(),
+            RulingKind::Done,
+            "abcd1234",
+            &repo,
+            None,
+            &evidence,
+            &[],
+            &mut tokens,
+            &|_| Ok("NOT_DONE: no tests".to_string()),
+        )
+        .expect("ruled")
+        .expect("a ruling");
+        assert!(
+            ruling.reason.contains("no tests")
+                && ruling.reason.ends_with(
+                    "[evidence read: git diff --stat HEAD; task: latest operator request]"
+                ),
+            "{}",
+            ruling.reason
+        );
+    }
+
+    /// #894: a not_done ruling is not replayed while native subagents run, nor after a new
+    /// commit moved the evidence it judged.
+    #[test]
+    fn a_not_done_ruling_is_not_replayed_while_workers_run_or_after_new_evidence() {
+        let (dir, state) = fresh_state();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        let repo = committed_repo_with_change(dir.path());
+        let env = ruling_env(state.root());
+        let lookup = |k: &str| env.get(k).cloned();
+        on_stop_with(
+            &state,
+            &enabled_cfg(),
+            &no_env,
+            &repo,
+            "abcd1234",
+            &|| None,
+            &|_| true,
+        );
+        open_a(&state, RulingKind::Done, "not_done", "no tests yet");
+
+        let start = r#"{"session_id":"hook1","agent_id":"a1","agent_type":"worker"}"#;
+        super::super::graph::run_subagent_start(start, &lookup).expect("start");
+        assert_eq!(stop_block(&lookup, &repo, "abcd1234", "hook1"), None);
+        super::super::graph::record_subagent_stop(start, &lookup);
+        let replayed = stop_block(&lookup, &repo, "abcd1234", "hook1");
+        assert!(replayed.is_some_and(|reason| reason.contains("no tests yet")));
+
+        git(&repo, &["commit", "-qam", "tests"]);
+        assert_eq!(
+            stop_block(&lookup, &repo, "abcd1234", "hook1"),
+            None,
+            "a new commit is new evidence: consult fresh instead of replaying"
+        );
+    }
+
+    /// #901: an ask whose ruling is `done` lifts the earlier before-done block.
+    #[test]
+    fn an_ask_ruling_done_supersedes_the_before_done_not_done() {
+        let (dir, state) = fresh_state();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        let mut env = ruling_env(state.root());
+        env.insert(SESSION_ENV.to_string(), "abcd1234".to_string());
+        let lookup = |k: &str| env.get(k).cloned();
+        open_a(&state, RulingKind::Done, "not_done", "no tests yet");
+        let options = vec![
+            "done: verification complete".to_string(),
+            "not done: name the missing evidence".to_string(),
+        ];
+        let consult =
+            |session: &str, options: &[String], evidence: &str, _timeout: u64, _ticket: &str| {
+                let mut tokens = 0;
+                rule_with(
+                    &state,
+                    &enabled_cfg(),
+                    RulingKind::Choice,
+                    session,
+                    Path::new("."),
+                    None,
+                    evidence,
+                    options,
+                    &mut tokens,
+                    &|_| Ok("done: verification complete. All 2,297 tests passed.".to_string()),
+                )
+            };
+        let mut out = Vec::new();
+        let code =
+            run_ask_with("is it done?", &options, "", 5, &lookup, &consult, &mut out).expect("ask");
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+        assert!(
+            rulings::find_open(&state, RulingKind::Done, Some("abcd1234"), None).is_none(),
+            "the not_done ruling no longer stands"
+        );
+    }
+
     #[test]
     fn a_repo_forbidden_config_does_not_silence_the_stop_block() {
         let (dir, state) = fresh_state();
@@ -2262,7 +2533,7 @@ mod tests {
         )
         .expect("write");
         assert!(CtxConfig::load(&repo, &|k| env.get(k).cloned()).is_err());
-        let reason = stop_block(&|k| env.get(k).cloned(), &repo, "abcd1234");
+        let reason = stop_block(&|k| env.get(k).cloned(), &repo, "abcd1234", "hook1");
         assert!(reason.is_some_and(|reason| reason.contains("no tests yet")));
     }
 
@@ -2276,7 +2547,7 @@ mod tests {
         std::fs::create_dir_all(&repo).expect("repo");
         let blocks = |env: &std::collections::HashMap<String, String>| {
             (0..5)
-                .filter_map(|_| stop_block(&|k| env.get(k).cloned(), &repo, "abcd1234"))
+                .filter_map(|_| stop_block(&|k| env.get(k).cloned(), &repo, "abcd1234", "hook1"))
                 .collect::<Vec<_>>()
         };
         env.insert(AGENT_ENV.to_string(), "codex".to_string());
@@ -2719,7 +2990,15 @@ mod tests {
             "tests",
         );
         let spawn = |_: &ConsultRequest| -> bool { panic!("nothing to review") };
-        let lapsed = on_stop_with(&state, &cfg, &no_env, repo.path(), "abcd1234", &spawn);
+        let lapsed = on_stop_with(
+            &state,
+            &cfg,
+            &no_env,
+            repo.path(),
+            "abcd1234",
+            &|| None,
+            &spawn,
+        );
         assert_eq!(lapsed.len(), 1);
         assert_eq!(rulings::all(&state)[0].status, RulingStatus::Lapsed);
     }
@@ -2743,10 +3022,26 @@ mod tests {
         git(repo.path(), &["add", "."]);
         git(repo.path(), &["commit", "-qm", "init"]);
         std::fs::write(repo.path().join("new.txt"), "untracked\n").expect("write");
-        let lapsed = on_stop_with(&state, &cfg, &no_env, repo.path(), "abcd1234", &spawn);
+        let lapsed = on_stop_with(
+            &state,
+            &cfg,
+            &no_env,
+            repo.path(),
+            "abcd1234",
+            &|| None,
+            &spawn,
+        );
         assert!(lapsed.is_empty(), "an untracked file is work to review");
         let not_a_repo = tempfile::tempdir().expect("dir");
-        let lapsed = on_stop_with(&state, &cfg, &no_env, not_a_repo.path(), "abcd1234", &spawn);
+        let lapsed = on_stop_with(
+            &state,
+            &cfg,
+            &no_env,
+            not_a_repo.path(),
+            "abcd1234",
+            &|| None,
+            &spawn,
+        );
         assert!(lapsed.is_empty(), "a git failure proves nothing");
         assert_eq!(open_rulings(&state, None).len(), 1);
     }

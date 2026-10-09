@@ -864,6 +864,25 @@ fn delegates_work_to_harness(text: &str, name: &str) -> bool {
         })
 }
 
+/// Whether the request itself asks for parallel or multi-agent work, harness-agnostic.
+pub(crate) fn asks_for_parallel_or_multi_agent_work(request: &str) -> bool {
+    let text = request.to_ascii_lowercase();
+    [
+        "parallelize",
+        "parallelise",
+        "in parallel",
+        "parallel agents",
+        "parallel workers",
+        "multiple agents",
+        "multiple workers",
+        "multiple harnesses",
+        "spawn agents",
+        "spawn workers",
+    ]
+    .iter()
+    .any(|signal| phrase_is_asserted(&text, signal))
+}
+
 /// An explicit request for parallel or delegated multi-agent work is itself
 /// a coordination requirement, even when intake has no diff to measure and
 /// every model decider is unavailable. Without this floor, the text-only
@@ -873,24 +892,7 @@ fn delegates_work_to_harness(text: &str, name: &str) -> bool {
 /// called from the tail of both [`baseline`] and [`merge`].
 fn apply_orchestration_request_complexity_floor(decision: &mut ProxyDecision, request: &str) {
     let text = request.to_ascii_lowercase();
-    let explicitly_parallel = [
-        "parallelize",
-        "parallelise",
-        "in parallel",
-        "parallel agents",
-        "parallel workers",
-    ]
-    .iter()
-    .any(|signal| phrase_is_asserted(&text, signal));
-    let explicitly_multi_agent = [
-        "multiple agents",
-        "multiple workers",
-        "multiple harnesses",
-        "spawn agents",
-        "spawn workers",
-    ]
-    .iter()
-    .any(|signal| phrase_is_asserted(&text, signal));
+    let explicitly_parallel_or_multi_agent = asks_for_parallel_or_multi_agent_work(request);
     // A request that hands work to another harness by name: "have codex
     // handle the frontend part", "split this across claude and codex".
     let delegates_to_another_harness = adapters::ADAPTERS.iter().any(|(name, _)| {
@@ -907,8 +909,7 @@ fn apply_orchestration_request_complexity_floor(decision: &mut ProxyDecision, re
     });
 
     if decision.complexity < Complexity::Substantial
-        && (explicitly_parallel
-            || explicitly_multi_agent
+        && (explicitly_parallel_or_multi_agent
             || delegates_to_another_harness
             || (hands_off_a_share && names_another_harness))
     {

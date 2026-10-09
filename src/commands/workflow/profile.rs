@@ -68,8 +68,8 @@ pub enum WorkDomainTag {
 /// Mirrors [`RiskMeasurement`] and [`Classification::declared_scope`] rather
 /// than inventing a new signal: an unmeasured risk band (outside a
 /// repository, or one with no commits) can only ever produce `Low`
-/// confidence, and an operator-declared (not Git-measured) scope caps at
-/// `Medium`.
+/// confidence, an operator-declared (not Git-measured) scope caps at
+/// `Medium`, and a classification with no changed files (text only) is `Low`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Confidence {
@@ -243,6 +243,7 @@ impl ExecutionProfile {
 
         let confidence = match &classification.risk_measurement {
             RiskMeasurement::Unavailable { .. } => Confidence::Low,
+            RiskMeasurement::Measured if classification.changed_files == 0 => Confidence::Low,
             RiskMeasurement::Measured if classification.declared_scope => Confidence::Medium,
             RiskMeasurement::Measured => Confidence::High,
         };

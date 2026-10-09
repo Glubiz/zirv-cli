@@ -776,6 +776,26 @@ fn prune(state: &StateDir, now: u64) {
     }
 }
 
+/// A subagent recorded `running` this long ago without a SubagentStop is not counted as live.
+const RUNNING_SUBAGENT_STALE_SECS: u64 = 6 * 3600;
+
+/// How many native subagents of `session` are running now, from their durable records.
+pub(super) fn running_subagents(state: &StateDir, session: &str, now: u64) -> usize {
+    let dir = graph_root(state).join(sessions::short_id(session));
+    let Ok(files) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    files
+        .flatten()
+        .filter_map(|file| std::fs::read_to_string(file.path()).ok())
+        .filter_map(|text| serde_json::from_str::<SubagentRecord>(&text).ok())
+        .filter(|record| {
+            record.status == "running"
+                && now.saturating_sub(record.started_at) < RUNNING_SUBAGENT_STALE_SECS
+        })
+        .count()
+}
+
 fn read_subagent_records(state: &StateDir) -> Vec<SubagentRecord> {
     let mut found = Vec::new();
     let Ok(dirs) = std::fs::read_dir(graph_root(state)) else {

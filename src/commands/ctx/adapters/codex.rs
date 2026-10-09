@@ -1817,7 +1817,8 @@ impl AgentAdapter for CodexAdapter {
     /// `assistant_texts` is populated from verified
     /// `task_complete.last_agent_message` lines -- the one piece of real
     /// transcript content the rollout format gives a verified shape for
-    /// (see `parse_events`'s own doc comment). `user_messages`/`files_read`/
+    /// (see `parse_events`'s own doc comment). `user_messages` comes from user
+    /// `response_item` messages, minus injected context. `files_read`/
     /// `files_modified`/`tool_errors` stay empty: no verified rollout shape
     /// carries them, and inventing one would be exactly the
     /// fabricated-content class `handoff.rs`'s own eventless guard exists to
@@ -1867,6 +1868,7 @@ impl AgentAdapter for CodexAdapter {
         let mut call_seq: usize = 0;
         let mut tail_cut: Option<String> = None;
         let mut last_tool_name: Option<String> = None;
+        let mut user_messages: Vec<String> = Vec::new();
 
         for line in jsonl.lines() {
             let line = line.trim();
@@ -1899,6 +1901,26 @@ impl AgentAdapter for CodexAdapter {
                     Some("custom_tool_call_output") => {
                         if let Some(call_id) = payload.get("call_id").and_then(Value::as_str) {
                             pending_calls.remove(call_id);
+                        }
+                    }
+                    Some("message")
+                        if payload.get("role").and_then(Value::as_str) == Some("user") =>
+                    {
+                        // Injected context (AGENTS.md, environment) is not an operator request.
+                        let request = payload
+                            .get("content")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|part| part.get("text").and_then(Value::as_str))
+                            .filter(|text| {
+                                let text = text.trim_start();
+                                !text.starts_with('<') && !text.starts_with("# AGENTS.md")
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if !request.trim().is_empty() {
+                            user_messages.push(request);
                         }
                     }
                     _ => {}
@@ -1943,7 +1965,12 @@ impl AgentAdapter for CodexAdapter {
             .map(|(_, id, name, summary)| UnresolvedToolCall { name, id, summary })
             .collect();
 
+        if user_messages.len() > last_n {
+            user_messages.drain(..user_messages.len() - last_n);
+        }
+
         StructuralContext {
+            user_messages,
             assistant_texts,
             unresolved_tool_calls,
             tail_cut,
@@ -2443,6 +2470,29 @@ mod tests {
                 && ctx.files_modified.is_empty()
                 && ctx.tool_errors.is_empty(),
             "no verified rollout shape backs these fields yet: {ctx:?}"
+        );
+    }
+
+    /// A handoff built from a codex rollout must see the operator's request, not only the
+    /// injected AGENTS.md and environment context that precede it.
+    #[test]
+    fn structural_context_carries_operator_requests_but_not_injected_context() {
+        let user = |text: &str| {
+            serde_json::json!({"type": "response_item", "payload": {"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": text}]}})
+            .to_string()
+        };
+        let jsonl = [
+            user("# AGENTS.md instructions for /repo\n\nbe careful"),
+            user("<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>"),
+            user("first request"),
+            user("implement the frontend\nacross two files"),
+        ]
+        .join("\n");
+        let ctx = CodexAdapter::new(None).structural_context(&jsonl, 1);
+        assert_eq!(
+            ctx.user_messages,
+            vec!["implement the frontend\nacross two files".to_string()]
         );
     }
 

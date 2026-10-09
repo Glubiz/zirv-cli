@@ -963,28 +963,38 @@ pub fn from_args(args: &ClassifyArgs) -> CtxResult<Classification> {
     classify_args(args, true)
 }
 
-/// `zirv workflow classify` and team planning: like `workflow start`, untracked files (such as
-/// `.DS_Store`) are not part of the change.
+/// `zirv workflow start`, `classify` and team planning: nothing has been written yet, so
+/// untracked files (such as `.DS_Store`) are not part of the change, and the task text can
+/// only raise complexity (an explicit `--complexity` stands). With no diff evidence the
+/// classification says it is text-only.
 pub fn from_plan_args(args: &ClassifyArgs) -> CtxResult<Classification> {
-    classify_args(args, false)
-}
-
-/// `from_args` for `zirv workflow start`: nothing has been written yet, so
-/// untracked files are not part of the change, and the task text can only
-/// raise complexity (an explicit `--complexity` stands).
-pub fn from_start_args(args: &ClassifyArgs) -> CtxResult<Classification> {
     let mut classification = classify_args(args, false)?;
-    let text_only = crate::commands::ctx::proxy::decision::try_classify_request(&args.task);
-    if let Some(text_only) = text_only
-        && args.complexity.is_none()
-        && text_only.complexity > classification.complexity
+    if args.complexity.is_none() {
+        let text_only = crate::commands::ctx::proxy::decision::try_classify_request(&args.task)
+            .map(|text_only| text_only.complexity);
+        let asks_for_team =
+            crate::commands::ctx::proxy::decision::asks_for_parallel_or_multi_agent_work(
+                &args.task,
+            )
+            .then_some(Complexity::Substantial);
+        if let Some(floor) = text_only.max(asks_for_team)
+            && floor > classification.complexity
+        {
+            classification.complexity = floor;
+            classification
+                .reasons
+                .push(format!("task text complexity: {floor:?}"));
+        }
+    }
+    if classification.changed_files == 0
+        && !classification.declared_scope
+        && classification.risk_measurement == RiskMeasurement::Measured
     {
-        classification.complexity = text_only.complexity;
         classification
             .reasons
-            .push(format!("task text complexity: {:?}", text_only.complexity));
-        classification.reasons.sort();
+            .push("classification is text-only: no changed files measured".to_string());
     }
+    classification.reasons.sort();
     Ok(classification)
 }
 
@@ -1542,7 +1552,7 @@ mod tests {
         }
         let args = start_args(repo.path(), "fix the dashboard");
 
-        let at_start = from_start_args(&args).unwrap();
+        let at_start = from_plan_args(&args).unwrap();
         assert_eq!(at_start.complexity, Complexity::Trivial, "{at_start:?}");
         assert!(at_start.changed_paths.is_empty(), "{at_start:?}");
         let measured = from_args(&args).unwrap();
@@ -1558,13 +1568,39 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let classification = from_start_args(&start_args(repo.path(), &task)).unwrap();
+        let classification = from_plan_args(&start_args(repo.path(), &task)).unwrap();
         assert_eq!(classification.complexity, Complexity::Substantial);
 
         let mut explicit = start_args(repo.path(), &task);
         explicit.complexity = Some(Complexity::Trivial);
-        let classification = from_start_args(&explicit).unwrap();
+        let classification = from_plan_args(&explicit).unwrap();
         assert_eq!(classification.complexity, Complexity::Trivial);
+    }
+
+    /// #898: a plan with an empty diff is sized by its text and says so, never "measured".
+    #[test]
+    fn plan_classification_is_text_floored_and_labelled_text_only() {
+        let repo = repo_with_pending_file("src/lib.rs");
+        let task = (1..=8)
+            .map(|n| format!("- fix issue {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let classification = from_plan_args(&start_args(repo.path(), &task)).unwrap();
+        assert_eq!(classification.complexity, Complexity::Substantial);
+        assert!(
+            classification
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("text-only")),
+            "{classification:?}"
+        );
+        let profile =
+            crate::commands::workflow::profile::ExecutionProfile::derive(&task, &classification);
+        assert_ne!(
+            profile.confidence,
+            crate::commands::workflow::profile::Confidence::High
+        );
     }
 
     /// Risk is not the only band a declared scope could talk down: complexity

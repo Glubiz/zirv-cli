@@ -67,9 +67,13 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     // A binding supervisor ruling blocks before the `stop_hook_active` exit: its own cap of
     // three blocks per ruling is what stops the loop. The shape is the documented
     // `{"decision":"block","reason":...}` (https://code.claude.com/docs/en/hooks).
-    if let Some(reason) =
-        crate::commands::ctx::supervisor::stop_block(env, &payload.repo(), &stable_short)
-    {
+    let hook_session = env(SESSION_ENV).unwrap_or_else(|| payload.session_id.clone());
+    if let Some(reason) = crate::commands::ctx::supervisor::stop_block(
+        env,
+        &payload.repo(),
+        &stable_short,
+        &hook_session,
+    ) {
         let _ = writeln!(w, "{}", with_stop_block(None, &reason));
         return Ok(0);
     }
@@ -285,7 +289,30 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
             socket.is_some(),
             stop_capacity,
         );
-        crate::commands::ctx::supervisor::on_stop(&state, &cfg, env, &repo, &stable_short);
+        crate::commands::ctx::supervisor::on_stop(
+            &state,
+            &cfg,
+            env,
+            &repo,
+            &stable_short,
+            &session,
+            &|| {
+                let adapter = adapters::select_for_identity(
+                    env(adapters::AGENT_ENV).as_deref().or(cfg.agent.as_deref()),
+                    &[],
+                    &cfg,
+                )
+                .ok();
+                let jsonl = std::fs::read_to_string(transcript).unwrap_or_default();
+                crate::commands::ctx::supervisor::done_task(
+                    &state,
+                    &repo,
+                    &stable_short,
+                    &jsonl,
+                    adapter.as_deref(),
+                )
+            },
+        );
     }
 
     // Combine verify and adoption advice into the one Stop advisory line;

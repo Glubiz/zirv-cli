@@ -115,8 +115,10 @@ fn choice_head(line: &str) -> Option<(usize, &str)> {
             let letter = after.chars().next().filter(char::is_ascii_uppercase)?;
             let tail = &after[1..];
             // `Choice: A simpler store` is prose, not option A.
-            if !tail.is_empty() && !tail.starts_with(['.', ':', ')', '-', '—', '–', '*', '_', '`'])
-            {
+            let separated = tail
+                .trim_start()
+                .starts_with(['.', ':', ')', '-', '—', '–', '*', '_', '`']);
+            if !tail.is_empty() && !separated {
                 return None;
             }
             ((letter as u8 - b'A') as usize + 1, tail)
@@ -135,6 +137,24 @@ fn choice_head(line: &str) -> Option<(usize, &str)> {
         return None;
     }
     Some((number, tail))
+}
+
+/// One line that opens with an offered option's own text, case and emphasis marks aside, as
+/// that option's 1-based number and the text after it. The longest option wins, and the label
+/// must end the word: `done: verification complete` is not a prefix of `... completely`.
+fn option_label<'a>(line: &'a str, options: &[String]) -> Option<(usize, &'a str)> {
+    let line = line.trim().trim_start_matches(is_mark);
+    options
+        .iter()
+        .enumerate()
+        .filter(|(_, option)| !option.trim().is_empty())
+        .filter_map(|(at, option)| {
+            let label = option.trim();
+            let (start, rest) = (line.get(..label.len())?, line.get(label.len()..)?);
+            let ends_the_word = !rest.chars().next().is_some_and(char::is_alphanumeric);
+            (start.eq_ignore_ascii_case(label) && ends_the_word).then_some((at + 1, rest))
+        })
+        .max_by_key(|(at, _)| options[at - 1].len())
 }
 
 /// Parse one kind's strict reply into `(verdict, reason)`. Anything unparseable is `None`.
@@ -220,11 +240,13 @@ pub(crate) fn parse_reply(
                 let line = line.trim();
                 line.is_empty() || line.starts_with("```")
             });
-            let (number, tail) = choice_head(lines.next()?)?;
+            let head_line = lines.next()?;
+            let (number, tail) =
+                choice_head(head_line).or_else(|| option_label(head_line, options))?;
             let following: Vec<&str> = lines.collect();
             if following
                 .iter()
-                .filter_map(|line| choice_head(line))
+                .filter_map(|line| choice_head(line).or_else(|| option_label(line, options)))
                 .any(|(other, _)| other != number)
             {
                 return None;
@@ -462,6 +484,41 @@ mod tests {
 
     fn opts() -> Vec<String> {
         vec!["queue".to_string(), "table".to_string()]
+    }
+
+    /// #901 and the recorded parse-failure shapes: a reply that names one offered option, by its
+    /// label or by number, parses as it; one that names two options still fails.
+    #[test]
+    fn a_choice_reply_naming_one_option_parses_by_label_or_number() {
+        let options = vec![
+            "done: verification complete".to_string(),
+            "not done: name the missing evidence".to_string(),
+        ];
+        let parse = |text: &str| parse_reply(RulingKind::Choice, text, &options);
+        assert_eq!(
+            parse("done: verification complete"),
+            Some((options[0].clone(), String::new()))
+        );
+        let (verdict, reason) =
+            parse("done: verification complete. Diff inspected; all 2,297 tests passed.")
+                .expect("an echoed label with rationale");
+        assert_eq!(verdict, options[0]);
+        assert!(reason.contains("2,297 tests passed"), "{reason}");
+        let (verdict, _) = parse("**Not done: name the missing evidence** lint was not run")
+            .expect("case and emphasis marks");
+        assert_eq!(verdict, options[1]);
+        let (verdict, _) = parse("Ruling: 2 Flip the flag only.").expect("number after the label");
+        assert_eq!(verdict, options[1]);
+        let (verdict, _) = parse("Choice: A — tokens. Matches the model.").expect("letter");
+        assert_eq!(verdict, options[0]);
+        // A label that is only the start of a longer word is not the option.
+        assert_eq!(parse("done: verification completely unverified"), None);
+        // A second line that names another option makes the reply ambiguous.
+        assert_eq!(
+            parse("done: verification complete\nnot done: name the missing evidence"),
+            None
+        );
+        assert_eq!(parse("Both options fit; pick whichever"), None);
     }
 
     #[test]
