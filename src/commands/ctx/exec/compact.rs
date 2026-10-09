@@ -91,15 +91,19 @@ pub fn action_for_signal(
 }
 
 /// One bounded attempt per cooldown, followed by reported progress before
-/// another attempt.
+/// another attempt. A failed compaction ends attempts for the session.
 #[derive(Debug, Default)]
 pub(crate) struct CompactBudget {
     attempted_at: Option<Instant>,
     progressed_after_attempt: bool,
+    failed: bool,
 }
 
 impl CompactBudget {
     pub(crate) fn ready(&self, now: Instant, window: Duration) -> bool {
+        if self.failed {
+            return false;
+        }
         let Some(attempted_at) = self.attempted_at else {
             return true;
         };
@@ -109,6 +113,10 @@ impl CompactBudget {
     pub(crate) fn arm(&mut self, now: Instant) {
         self.attempted_at = Some(now);
         self.progressed_after_attempt = false;
+    }
+
+    pub(crate) fn fail(&mut self) {
+        self.failed = true;
     }
 
     pub(crate) fn observe_progress(&mut self) {
@@ -155,11 +163,9 @@ pub(super) fn protect_compaction_continuation(
     repo: &Path,
     cfg: &CtxConfig,
     prompt: &str,
+    note: &str,
 ) -> CtxResult<String> {
-    let continuation = format!(
-        "{prompt}\n\nContinue the same task after the verified in-place \
-         compaction without redoing completed work."
-    );
+    let continuation = format!("{prompt}\n\n{note}");
     Ok(super::obfuscate_store::protect_text(
         state,
         repo,
@@ -496,6 +502,20 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_compaction_exhausts_the_budget_for_good() {
+        let now = Instant::now();
+        let window = Duration::from_secs(60);
+        let mut budget = CompactBudget::default();
+        budget.arm(now);
+        budget.fail();
+        budget.observe_progress();
+        assert!(
+            !budget.ready(now + window * 10, window),
+            "progress and the window must never re-arm a failed compaction"
+        );
+    }
+
+    #[test]
     fn a_final_drain_limit_preempts_an_already_requested_compaction() {
         assert!(!should_attempt_compact(true, true));
         assert!(should_attempt_compact(true, false));
@@ -517,6 +537,8 @@ mod tests {
             tmp.path(),
             &cfg,
             &format!("finish the task with {secret}"),
+            "Continue the same task after the verified in-place compaction without redoing \
+             completed work.",
         )
         .expect("mask continuation");
 
@@ -664,19 +686,26 @@ healthy
         let state = tmp.path().join("state");
         let session = "acacacac-2222-4333-8444-555555555555";
         let modes = tmp.path().join("modes.txt");
-        std::fs::write(&modes, "compact-tier\nhealthy\n").expect("write modes");
+        let argv_log = tmp.path().join("argv.log");
+        // Both children stay in the compact tier: a second compaction would be
+        // attempted if a failed one could re-arm.
+        std::fs::write(&modes, "compact-tier\ncompact-tier\n").expect("write modes");
         let mut env = base_env(&state);
+        // One hard deadline covers spawn, exit and verification of the fake
+        // compact (which exits at once), so a wide value only bounds a loaded
+        // machine and costs the verification wait.
         env.insert(
             "ZIRV_CTX_SUPERVISE_COMPACT_TIMEOUT_MS".to_string(),
-            "300".to_string(),
+            "3000".to_string(),
         );
         env.insert("ZIRV_CTX_INTERVAL_SECS".to_string(), "0".to_string());
 
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
         let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
             ("FAKE_AGENT_MODE_FILE", modes.to_str()),
-            ("FAKE_AGENT_SLEEP", Some("30")),
+            ("FAKE_AGENT_SLEEP", Some("3")),
             ("FAKE_AGENT_COMPACTION_EVENT", Some("0")),
+            ("FAKE_AGENT_ARGV_LOG", argv_log.to_str()),
         ]);
         let args = ExecArgs {
             agent: Some("claude".to_string()),
@@ -714,12 +743,35 @@ healthy
             !log.contains("\"action\":\"restart\""),
             "zirv must never restart for rot: {log}"
         );
+        assert_eq!(
+            log.matches("\"action\":\"suggest-restart\"").count(),
+            1,
+            "the suggestion is logged once: {log}"
+        );
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("resuming the same session"), "{text}");
         assert_eq!(
             transcripts_in(&home).len(),
             1,
             "no restart means no new session"
+        );
+        let argv = std::fs::read_to_string(&argv_log).expect("argv log");
+        assert_eq!(
+            argv.matches("/compact").count(),
+            1,
+            "a failed compaction is never retried for this session: {argv}"
+        );
+        assert!(
+            argv.contains(&format!(
+                "do the work\n\nContinue the same task without redoing completed work. \
+                 --resume {session}"
+            )),
+            "the failed path resumes with a continuation note: {}",
+            argv.len()
+        );
+        assert!(
+            !argv.contains("after the verified in-place compaction"),
+            "a failed compaction must not be described as verified"
         );
     }
 }

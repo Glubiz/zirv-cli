@@ -953,15 +953,15 @@ fn run_with_clock_inner<W: Write>(
             );
             // Resume the same session with the original prompt, with or
             // without a compaction in front of it.
-            let build_continuation = |env: &mut dyn FnMut(&mut Command, &SessionId)| -> Result<
-                (Command, Option<String>),
-                String,
-            > {
+            let build_continuation = |env: &mut dyn FnMut(&mut Command, &SessionId),
+                                      note: &str|
+             -> Result<(Command, Option<String>), String> {
                 let prompt_text = prompt
                     .as_deref()
                     .ok_or_else(|| "no prompt available for continuation".to_string())?;
-                let continuation = protect_compaction_continuation(&state, repo, &cfg, prompt_text)
-                    .map_err(|error| format!("sensitive-data masking failed: {error}"))?;
+                let continuation =
+                    protect_compaction_continuation(&state, repo, &cfg, prompt_text, note)
+                        .map_err(|error| format!("sensitive-data masking failed: {error}"))?;
                 let session_ref = SessionRef {
                     id: session.clone(),
                     cwd: repo.to_path_buf(),
@@ -1022,7 +1022,13 @@ fn run_with_clock_inner<W: Write>(
                     Some((compact, stdin_prompt))
                 },
             )
-            .and_then(|()| build_continuation(&mut apply_session_env));
+            .and_then(|()| {
+                build_continuation(
+                    &mut apply_session_env,
+                    "Continue the same task after the verified in-place compaction without \
+                     redoing completed work.",
+                )
+            });
 
             let verified = compact_result.is_ok();
             announcer.emit(&super::announce::Event::Compact { verified });
@@ -1062,7 +1068,8 @@ fn run_with_clock_inner<W: Write>(
                     // The compaction attempt already stopped the child. Zirv
                     // never restarts a session for rot: resume the SAME
                     // session without compaction and tell the operator a
-                    // restart is worth doing.
+                    // restart is worth doing. No further compaction is tried.
+                    compact_budget.fail();
                     suggestions.note(
                         SignalAction::SuggestRestart,
                         0,
@@ -1071,9 +1078,10 @@ fn run_with_clock_inner<W: Write>(
                         session.as_str(),
                         &announcer,
                     );
-                    if let Ok((continued, continued_stdin)) =
-                        build_continuation(&mut apply_session_env)
-                    {
+                    if let Ok((continued, continued_stdin)) = build_continuation(
+                        &mut apply_session_env,
+                        "Continue the same task without redoing completed work.",
+                    ) {
                         writeln!(
                             w,
                             "zirv ctx exec: {reason}; compaction did not help, restart suggested -- \
