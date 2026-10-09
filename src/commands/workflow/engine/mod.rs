@@ -143,8 +143,7 @@ mod tests {
         git(&["commit", "-q", "-m", "base"]);
     }
 
-    /// Shared by `state::tests` (`artifact_substance_action`'s own edge test)
-    /// and `transition::tests` (`gate_work_domain_action`'s own edge test):
+    /// Used by `transition::tests` (`gate_work_domain_action`'s own edge test):
     /// a decisive `Choice` answer at the given confidence.
     pub(super) fn choice_answer(choice: &str, confidence: f32) -> jev::Answer {
         jev::Answer {

@@ -248,7 +248,6 @@ fn compiled_questions() -> &'static [jev::Question] {
         let mut questions = vec![
             compile::context_report_question("q"),
             compile::context_skill_question("q"),
-            handoff::handoff_quality_question(),
             hook::dispatch_tier_question(),
             task::crash_cause_question(),
             run_loop::judge_continue_question(),
@@ -267,7 +266,6 @@ fn compiled_questions() -> &'static [jev::Question] {
         questions.extend(hook::missing_tests_questions());
         questions.extend(hook::stop_verify_questions());
         questions.extend(hook::retry_questions());
-        questions.extend(engine::artifact_substance_questions());
         questions.extend(engine::gate_reclass_questions());
         questions.extend(profile::classify_jev_questions());
         questions.extend(proxy::safe_intake_questions());
@@ -444,7 +442,7 @@ mod tests {
     }
 
     fn sample_questions() -> Vec<jev::Question> {
-        vec![handoff::handoff_quality_question()]
+        vec![safety::approve_escalate_question()]
     }
 
     /// Accepts connections, discarding any that never yield a full request
@@ -932,11 +930,11 @@ mod tests {
 
     #[test]
     fn a_compiled_question_with_other_options_is_refused() {
-        let compiled = handoff::handoff_quality_question();
+        let compiled = safety::approve_escalate_question();
         let altered = vec![jev::Question::choice(
             &compiled.id,
             &compiled.instructions,
-            &[("thin", "anything"), ("adequate", "else")],
+            &[("safe", "anything"), ("risky", "else")],
         )];
         let body = jev::encode_for_test(&sample_state(), &altered, "jev-latest").expect("encode");
         assert_refused("OPTIONS", &serde_json::json!({ "body": body }));
@@ -956,7 +954,7 @@ mod tests {
             &serde_json::json!({ "body": request.to_string() }),
         );
         let mut request: serde_json::Value = serde_json::from_str(&body).expect("json");
-        request["questions"]["quality"]["extra"] = serde_json::json!("x");
+        request["questions"]["risk"]["extra"] = serde_json::json!("x");
         assert_refused(
             "SPECFIELD",
             &serde_json::json!({ "body": request.to_string() }),

@@ -1843,8 +1843,7 @@ pub(crate) fn advise_gated(
     count(state_dir, gate, true, Stage::Reached, None);
     count(state_dir, gate, true, Stage::Eligible, None);
     if !available(&cfg.proxy.typesafe) {
-        let reason = JevError::NoCredential(cfg.proxy.typesafe.credential_env.clone());
-        record_skip(state_dir, site, &reason.to_string());
+        record_no_credential_skip(cfg, state_dir, site);
         count(state_dir, gate, true, Stage::Exit, Some("no_credential"));
         return AdvisoryStatus::MissingCredential;
     }
@@ -1939,10 +1938,14 @@ pub(crate) fn gate_open(cfg: &CtxConfig, state: &StateDir, gate: &str, enabled: 
     if available(&cfg.proxy.typesafe) {
         return true;
     }
-    let reason = JevError::NoCredential(cfg.proxy.typesafe.credential_env.clone());
-    record_skip(state, gate, &reason.to_string());
+    record_no_credential_skip(cfg, state, gate);
     exit(state, gate, true, "no_credential");
     false
+}
+
+fn record_no_credential_skip(cfg: &CtxConfig, state: &StateDir, site: &str) {
+    let reason = JevError::NoCredential(cfg.proxy.typesafe.credential_env.clone());
+    record_skip(state, site, &reason.to_string());
 }
 
 /// Returns the environment variable name currently configured for the Jev

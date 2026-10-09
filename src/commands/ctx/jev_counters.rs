@@ -97,18 +97,17 @@ pub(crate) fn count(
     }
 }
 
+/// The day number a counter file is named for.
+fn day_of(path: &Path) -> Option<u64> {
+    path.file_stem()?.to_str()?.parse().ok()
+}
+
 fn prune(dir: &Path, today: u64) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
-        let old = entry
-            .path()
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .and_then(|stem| stem.parse::<u64>().ok())
-            .is_some_and(|day| day + RETAIN_DAYS < today);
-        if old {
+        if day_of(&entry.path()).is_some_and(|day| day + RETAIN_DAYS < today) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -142,18 +141,12 @@ pub(crate) fn rollup(state: &StateDir, now: u64) -> BTreeMap<String, GateCounts>
         return gates;
     };
     for entry in entries.flatten() {
-        let in_window = entry
-            .path()
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .and_then(|stem| stem.parse::<u64>().ok())
-            .is_some_and(|day| day >= first);
+        if !day_of(&entry.path()).is_some_and(|day| day >= first) {
+            continue;
+        }
         let Ok(text) = std::fs::read_to_string(entry.path()) else {
             continue;
         };
-        if !in_window {
-            continue;
-        }
         for row in text
             .lines()
             .filter_map(|line| serde_json::from_str::<CounterRow>(line).ok())
