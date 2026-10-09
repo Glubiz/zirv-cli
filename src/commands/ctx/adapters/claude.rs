@@ -530,6 +530,25 @@ pub fn model_hint(jsonl: &str) -> Option<String> {
     None
 }
 
+/// A main-thread reading above the default window proves the seat runs the long window:
+/// Claude Code never lets context exceed the window, so no interactive seat reports it.
+pub fn context_window_hint(jsonl: &str) -> Option<u64> {
+    let proven = jsonl.lines().any(|line| {
+        let Ok(row) = serde_json::from_str::<Value>(line.trim()) else {
+            return false;
+        };
+        row.get("type").and_then(Value::as_str) == Some("assistant")
+            && row.get("isSidechain").and_then(Value::as_bool) != Some(true)
+            && row
+                .get("message")
+                .and_then(|message| message.get("usage"))
+                .map(context_tokens_of)
+                .unwrap_or(0)
+                > DEFAULT_CONTEXT_WINDOW_TOKENS
+    });
+    proven.then_some(LONG_CONTEXT_WINDOW_TOKENS)
+}
+
 /// The identity of the API response an assistant row belongs to, for
 /// [`fold_assistant_usage`]'s dedup. Claude Code >= 2.1.209 splits one
 /// response across one transcript row per content block (thinking, text,
@@ -2983,6 +3002,10 @@ impl AgentAdapter for ClaudeAdapter {
 
     fn model_hint(&self, jsonl: &str) -> Option<String> {
         model_hint(jsonl)
+    }
+
+    fn context_window_hint(&self, jsonl: &str) -> Option<u64> {
+        context_window_hint(jsonl)
     }
 
     fn transcript_usage(&self, jsonl: &str) -> Option<TranscriptUsage> {
@@ -6869,6 +6892,44 @@ mod tests {
             Some("claude-opus-5[1m]".to_string()),
             "the LAST assistant model wins, not the first"
         );
+    }
+
+    fn assistant_row_with_context(tokens: u64, extra: &str) -> String {
+        format!(
+            r#"{{"type":"assistant"{extra},"message":{{"model":"claude-opus-5-5","usage":{{"input_tokens":1,"cache_read_input_tokens":{tokens},"output_tokens":5}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn context_window_hint_proves_a_long_window_from_a_reading_above_the_default() {
+        let adapter = ClaudeAdapter::new(None);
+        let jsonl = format!(
+            "{}\n{}",
+            assistant_row_with_context(120_000, ""),
+            assistant_row_with_context(300_000, "")
+        );
+        assert_eq!(
+            adapter.context_window_hint(&jsonl),
+            Some(LONG_CONTEXT_WINDOW_TOKENS)
+        );
+    }
+
+    #[test]
+    fn context_window_hint_is_none_when_every_reading_fits_the_default_window() {
+        let adapter = ClaudeAdapter::new(None);
+        let jsonl = format!(
+            "{}\n{}",
+            assistant_row_with_context(120_000, ""),
+            assistant_row_with_context(190_000, "")
+        );
+        assert_eq!(adapter.context_window_hint(&jsonl), None);
+    }
+
+    #[test]
+    fn context_window_hint_ignores_sidechain_readings() {
+        let adapter = ClaudeAdapter::new(None);
+        let jsonl = assistant_row_with_context(300_000, r#","isSidechain":true"#);
+        assert_eq!(adapter.context_window_hint(&jsonl), None);
     }
 
     #[test]
