@@ -1030,7 +1030,8 @@ mod tests {
     /// for a non-healthy verdict, which is what makes the hook forward at all.
     fn rotting_transcript(dir: &std::path::Path) -> std::path::PathBuf {
         let path = dir.join("t.jsonl");
-        let mut text = String::new();
+        // Already compacted once, so a rotting session earns a restart suggestion.
+        let mut text = String::from("{\"type\":\"system\",\"subtype\":\"compact_boundary\"}\n");
         for i in 0..12 {
             text.push_str("{\"type\":\"user\",\"message\":{\"content\":\"go\"}}\n");
             text.push_str("{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"content\":\"r\",\"is_error\":true}]}}\n");

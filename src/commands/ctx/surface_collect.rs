@@ -4513,7 +4513,11 @@ mod tests {
             &[
                 (
                     "rotten.jsonl",
-                    transcript(12, true, "no, do it properly", 170_000),
+                    // Already compacted once: a restart verdict needs that.
+                    format!(
+                        "{{\"type\":\"system\",\"subtype\":\"compact_boundary\"}}\n{}",
+                        transcript(12, true, "no, do it properly", 170_000)
+                    ),
                 ),
                 (
                     "healthy.jsonl",

@@ -3727,7 +3727,13 @@ fn build_tree_facts<'a>(
         seat_model: seat.and_then(|s| s.model.as_deref()),
         seat_role: seat.map(|s| s.role.as_str()),
         seat_session: seat.map(|s| s.session.as_str()),
-        rot: seat.and_then(|s| facts_cache.disk.scores.get(&s.short).copied()),
+        rot: seat.and_then(|s| {
+            facts_cache
+                .disk
+                .scores
+                .get(&s.short)
+                .map(|(score, _)| *score)
+        }),
         jev: facts_cache.disk.jev.as_ref(),
         workflow: facts_cache.disk.workflow.as_ref(),
         approvals: approvals_hub.map_or(0, super::approvals::Hub::count),
