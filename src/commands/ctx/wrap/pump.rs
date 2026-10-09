@@ -22,7 +22,6 @@ pub(super) fn pump(
     state_dir: &super::state::StateDir,
     session: &super::event::SessionId,
     debounce: Duration,
-    inject_timeout: Duration,
     repo: &Path,
     env: EnvLookup<'_>,
     tail_items: usize,
@@ -543,7 +542,8 @@ pub(super) fn pump(
                         let seen = verify_compaction(
                             &mut Watcher::new(path.to_path_buf()),
                             adapter.as_ref(),
-                            Instant::now() + inject_timeout,
+                            Instant::now()
+                                + Duration::from_millis(cfg.supervise.compact_timeout_ms),
                         )
                         .unwrap_or(false);
                         if seen {

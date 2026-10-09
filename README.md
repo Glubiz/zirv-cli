@@ -4781,7 +4781,7 @@ restart_at = 80
 
 [wrap]
 debounce_ms = 3000
-inject_timeout_ms = 20000
+inject_timeout_ms = 20000       # deprecated and ignored (compaction verification uses supervise.compact_timeout_ms); still parsed so old configs load
 
 [supervise]
 max_restarts = 2

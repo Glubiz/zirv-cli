@@ -772,6 +772,10 @@ struct AutoCompact {
     rot: wrap::InjectionState,
     transcript: Option<PathBuf>,
     verifying: Option<CompactVerify>,
+    /// The typed `/compact` still awaits its carriage return; a signal must not drop it.
+    submit_pending: bool,
+    /// The operator typed since their last Enter, so the composer holds their draft.
+    draft: bool,
 }
 
 /// The pane driver owns either a wrapped child or a native session (#490).
@@ -1583,6 +1587,7 @@ impl Pane {
             *retry_spent = true;
         }
         self.user_typed_since_turn = true;
+        self.auto_compact.draft = !matches!(bytes.last(), None | Some(b'\r' | b'\n'));
         self.last_local_input_at = Some(Instant::now());
         self.scroll_to_live();
         self.write_input(bytes)
@@ -1712,8 +1717,10 @@ impl Pane {
         {
             if signalled {
                 self.last_signal_at = Some(Instant::now());
-                self.pending_submit = None;
-                self.submit_confirmation = None;
+                if !self.auto_compact.submit_pending {
+                    self.pending_submit = None;
+                    self.submit_confirmation = None;
+                }
                 self.delivery_sender = None;
                 self.injected_awaiting_turn = false;
                 self.user_typed_since_turn = false;
@@ -2131,7 +2138,10 @@ impl Pane {
         let debounce = Duration::from_millis(cfg.wrap.debounce_ms);
         if wrap::action_for(&self.auto_compact.rot, Instant::now(), debounce)
             != wrap::Action::Compact
+            || self.auto_compact.draft
             || !self.injectable()
+            // Wrap defers to Jev here; a pane would block its render thread, so it only recommends.
+            || super::super::inject_gate::enabled(cfg)
         {
             return;
         }
@@ -2143,22 +2153,14 @@ impl Pane {
             return;
         };
         let transcript = self.auto_compact.transcript.clone();
-        let focus = super::super::handoff::compaction_focus_for_transcript(
-            cfg,
-            &self.state_dir,
-            adapter.as_ref(),
-            transcript.as_deref(),
-            cfg.handoff.tail_items,
-            supervise::COMPACT_FOCUS,
-        );
         // Prime past any compaction already in the transcript before typing.
         let watcher = transcript.as_ref().map(|path| {
             let mut watcher = supervise::Watcher::new(path.clone());
             let _ = watcher.read_appended();
             watcher
         });
-        let typed =
-            self.type_deferred_line(&scrub_controls(&supervise::compact_prompt(command, &focus)));
+        let typed = self.type_deferred_line(command);
+        self.auto_compact.submit_pending = typed.is_ok();
         // Arm the cooldown first so a failure cannot retry on every tick.
         self.auto_compact.rot.cooldown_at_signal = Some(self.auto_compact.rot.signals_seen);
         let failure = match (typed, watcher) {
@@ -2169,7 +2171,7 @@ impl Pane {
                     watcher,
                     deadline: Instant::now()
                         + INJECTION_SUBMIT_DELAY
-                        + Duration::from_millis(cfg.wrap.inject_timeout_ms),
+                        + Duration::from_millis(cfg.supervise.compact_timeout_ms),
                     adapter,
                     transcript,
                 });
@@ -2226,12 +2228,14 @@ impl Pane {
             write_submit_cr(sink)?;
         }
         self.pending_submit = None;
+        self.auto_compact.submit_pending = false;
         self.submit_confirmation = Some((Instant::now(), false));
         Ok(())
     }
 
     pub(crate) fn cancel_submission(&mut self) {
         self.pending_submit = None;
+        self.auto_compact.submit_pending = false;
         self.submit_confirmation = None;
     }
 
@@ -7333,7 +7337,7 @@ pub(crate) mod tests {
         .expect("spawn");
         let mut cfg = super::super::super::config::CtxConfig::default();
         cfg.wrap.debounce_ms = 100;
-        cfg.wrap.inject_timeout_ms = 400;
+        cfg.supervise.compact_timeout_ms = 400;
         CompactRig {
             _home: home,
             tmp,
@@ -7441,5 +7445,107 @@ pub(crate) mod tests {
         assert_eq!(rig.pane.state(), PaneState::Idle);
         assert!(rig.typed().is_empty(), "{:?}", rig.typed());
         assert!(rig.pane.last_local_input_at.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_pane_types_the_plain_compact_command_with_no_focus_body() {
+        use crate::commands::ctx::rot::Verdict;
+        let mut rig = compact_rig("echo ready; cat > TYPED");
+        rig.verdict(1, Verdict::Compact);
+        rig.tick_for(2500);
+        assert_eq!(rig.typed().trim(), "/compact");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_enabled_inject_gate_leaves_the_pane_suggestion_only() {
+        use crate::commands::ctx::rot::Verdict;
+        let mut rig = compact_rig("echo ready; cat > TYPED");
+        // SAFETY (test-only): a unique env var name this test owns.
+        unsafe { std::env::set_var("PANE_COMPACT_GATE_TEST_KEY", "secret") };
+        rig.cfg.jev.inject = true;
+        rig.cfg.proxy.typesafe.credential_env = "PANE_COMPACT_GATE_TEST_KEY".to_string();
+        rig.verdict(1, Verdict::Compact);
+        rig.tick_for(2500);
+        assert!(rig.typed().is_empty(), "{:?}", rig.typed());
+        assert!(rig.pane.last_local_input_at.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_slow_compaction_is_not_degraded_before_the_compact_timeout() {
+        use crate::commands::ctx::rot::Verdict;
+        let mut rig = compact_rig("echo ready; cat > TYPED");
+        std::fs::write(rig.tmp.path().join("t.jsonl"), "{}\n").expect("transcript");
+        rig.cfg.supervise.compact_timeout_ms = 20_000;
+        rig.verdict(1, Verdict::Compact);
+        rig.tick_for(2500);
+        assert_eq!(rig.typed().matches("/compact").count(), 1);
+        // Well past the rig's 400ms default timeout: still verifying, not degraded.
+        assert!(
+            !rig.log().contains("\"action\":\"degrade\""),
+            "{}",
+            rig.log()
+        );
+        let boundary = "{\"type\":\"system\",\"subtype\":\"compact_boundary\",\"content\":\"x\"}\n";
+        std::fs::write(rig.tmp.path().join("t.jsonl"), format!("{{}}\n{boundary}")).expect("write");
+        rig.tick_for(500);
+        let log = rig.log();
+        assert!(log.contains("\"action\":\"inject\""), "{log}");
+        assert!(!log.contains("\"action\":\"degrade\""), "{log}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_turn_signal_does_not_drop_the_pending_compact_submit() {
+        use crate::commands::ctx::rot::Verdict;
+        let mut rig = compact_rig("echo ready; cat > TYPED");
+        rig.verdict(1, Verdict::Compact);
+        let end = Instant::now() + Duration::from_secs(10);
+        while rig.pane.pending_submit.is_none() && Instant::now() < end {
+            rig.pane.on_turn_signal();
+            rig.pane.auto_compact(&rig.cfg);
+            rig.pane.drain();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            rig.pane.pending_submit.is_some(),
+            "compact line was not typed"
+        );
+        rig.verdict(2, Verdict::Healthy);
+        let end = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < end {
+            rig.pane.on_turn_signal();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            rig.pane.pending_submit.is_some(),
+            "a signal left /compact typed but never submitted"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_operator_draft_blocks_auto_compact_until_it_is_submitted() {
+        use crate::commands::ctx::rot::Verdict;
+        let mut rig = compact_rig("echo ready; cat > TYPED");
+        rig.tick_for(300);
+        rig.pane
+            .write_operator_input(b"half a thought")
+            .expect("type");
+        rig.verdict(1, Verdict::Compact);
+        rig.tick_for(2500);
+        assert!(
+            !rig.log().contains("\"verdict\":\"compact\""),
+            "{}",
+            rig.log()
+        );
+        rig.pane.write_operator_input(b"\r").expect("enter");
+        rig.verdict(2, Verdict::Compact);
+        rig.tick_for(2500);
+        let typed = rig.typed();
+        assert_eq!(typed.matches("/compact").count(), 1, "{typed:?}");
+        assert!(!typed.contains("half a thought/compact"), "{typed:?}");
     }
 }

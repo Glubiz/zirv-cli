@@ -1117,6 +1117,53 @@ mod tests {
         wait_or_kill(&mut h.child, Duration::from_secs(5));
     }
 
+    /// A real /compact of a large context is slow; it is verified against
+    /// `supervise.compact_timeout_ms`, not the ignored `inject_timeout_ms`.
+    #[cfg(unix)]
+    #[test]
+    fn a_slow_compaction_is_verified_against_the_compact_timeout() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let transcript = tmp.path().join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"user\",\"message\":{\"content\":\"go\"}}\n",
+        )
+        .expect("write");
+        let script = tmp.path().join("slow-tui.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "printf 'ready\\n'\nwhile IFS= read -r line; do\n  case \"$line\" in\n    /compact*) sleep 3; printf '{{\"type\":\"system\",\"subtype\":\"compact_boundary\",\"content\":\"x\"}}\\n' >> '{}'; printf 'compacted\\n';;\n    /exit) exit 0;;\n  esac\ndone\n",
+                transcript.display()
+            ),
+        )
+        .expect("script");
+        let script = script.display().to_string();
+        let mut h = spawn_wrap(
+            &[
+                ("ZIRV_CTX_DEBOUNCE_MS", "300".to_string()),
+                ("ZIRV_CTX_INJECT_TIMEOUT_MS", "500".to_string()),
+                ("ZIRV_CTX_STATE_DIR", state.display().to_string()),
+            ],
+            &["sh", &script],
+        );
+        let _ = read_until(&mut h.reader, "ready", Duration::from_secs(10));
+        let socket =
+            read_socket_path(&StateDir::from_root(state.clone()), None).expect("socket path");
+        crate::commands::ctx::signal::send(
+            std::path::Path::new(socket.trim()),
+            &turn_signal_for(3, Verdict::Compact, &transcript),
+        )
+        .expect("send turn signal");
+        let _ = read_until(&mut h.reader, "compacted", Duration::from_secs(15));
+        let decisions = wait_for_log(&state, "\"verdict\":\"compact\"", Duration::from_secs(20));
+        assert!(decisions.contains("\"action\":\"inject\""), "{decisions}");
+        assert!(!decisions.contains("\"action\":\"degrade\""), "{decisions}");
+        h.writer.write_all(b"/exit\r").expect("write");
+        wait_or_kill(&mut h.child, Duration::from_secs(5));
+    }
+
     /// A restart suggestion leaves the session alone, so a later turn signal
     /// that reports a different transcript is still followed for compaction.
     #[cfg(unix)]

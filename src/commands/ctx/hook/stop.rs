@@ -124,7 +124,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     if let Ok(state) = StateDir::resolve(env) {
         // Persist the current screening flag in the session registry row; clear
         // it after a clean later cycle (#243).
-        let detail = if screening.is_clean() {
+        let mut detail = if screening.is_clean() {
             payload.transcript_path.clone()
         } else {
             format!(
@@ -133,6 +133,9 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
                 screening.summary()
             )
         };
+        if let Some(error) = forward_error.as_deref() {
+            detail = format!("{detail} -- send failed: {error}");
+        }
         let _ = log::append(
             &state,
             &log::Decision {
@@ -141,8 +144,10 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
                 verb: "hook",
                 verdict: score.verdict.as_str(),
                 score: score.score,
-                action: if socket.is_some() {
+                action: if socket.is_some() && forward_error.is_none() {
                     "forward"
+                } else if socket.is_some() {
+                    "forward-failed"
                 } else {
                     "advise"
                 },
@@ -150,21 +155,6 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
                 observed_at: None,
             },
         );
-        if let Some(error) = forward_error.as_deref() {
-            let _ = log::append(
-                &state,
-                &log::Decision {
-                    ts: now_secs(),
-                    session: &session,
-                    verb: "hook",
-                    verdict: score.verdict.as_str(),
-                    score: score.score,
-                    action: "forward-failed",
-                    detail: error,
-                    observed_at: None,
-                },
-            );
-        }
         // Record both zirv and harness session identities at lifecycle hooks;
         // they can differ after a harness-minted conversation starts (#462).
         if let Some(agent) = env(adapters::AGENT_ENV) {
@@ -532,6 +522,10 @@ mod tests {
             .filter(|line| line.contains("\"action\":\"forward-failed\""))
             .count();
         assert_eq!(failures, 1, "got {log}");
+        assert!(
+            !log.contains("\"action\":\"forward\""),
+            "a failed send is not logged as forwarded: {log}"
+        );
     }
 
     /// Hook start-up overhead fix (wrapper-overhead benchmark, 2026-09-24):

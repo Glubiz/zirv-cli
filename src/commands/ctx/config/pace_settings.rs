@@ -58,6 +58,8 @@ impl Default for ScoreConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct WrapConfig {
     pub debounce_ms: u64,
+    /// Deprecated and ignored: compaction verification uses `supervise.compact_timeout_ms`.
+    /// Parsed so existing configs load.
     pub inject_timeout_ms: u64,
 }
 
