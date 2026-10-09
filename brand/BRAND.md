@@ -14,7 +14,8 @@ These are the operator's feedback, stated as rules. They beat any default.
 4. Present the whole product in proportion. Rot detection is one feature among peers (scripts, sessions, workflows, safety, pacing, benchmark), never the headline and shown once on a landing at the weight of pacing and handover.
 5. Claims carry their source. Benchmark figures come from README and the results write-up, with significance markers and caveats, never cherry-picked.
 6. Large display type never clips descenders (the headline "g" fix, section 6).
-Changed: new section; rules 1 and 3 to 6 are new, rule 2 hardens the old "do not fabricate terminal output".
+7. Never redraw, re-vectorise, outline, recolour, rotate or animate the logo; always use the logo file itself, `assets/logo.png`. The outline drawing `assets/zirv-mark.svg` is not the logo and never stands in for it.
+Changed: new section; rules 1 and 3 to 7 are new, rule 2 hardens the old "do not fabricate terminal output".
 
 ## 1. Identity and promise
 - What it is: one Rust binary around coding agents: a `.zirv/` script runner; supervision of 13 harnesses with a dashboard, delegation, mail and memory; the intent-to-deploy workflow with gates, skills and team composition; a harness-neutral command-safety policy and trust boundary; usage pacing, cross-harness fallback and handover; rot detection; setup and migration; `zirv benchmark`. [settled] (source: design-note.md "Subject"; README)
@@ -44,13 +45,15 @@ Changed: sharpened from "developers who already run Claude Code or Codex in a te
 Changed: voice summary and sample lines replaced; "It notices the rot before you do." and "Three layers. One install." retired as headlines (rule 4); source-citing section labels added; hype table kept and extended.
 
 ## 4. Logo
-The logo is unchanged. [settled by the operator: "the logo stays"]
-- Mark: pointy-top hexagon, three nested hexagons, gradient #11e2ff, #1bb4ee, #2191dd at 28deg. Files: `assets/zirv-mark.svg` (vector master; the mock's header mark is the same geometry) and `assets/logo.png` (600x600 raster, white gap rings baked in). [kept]
-- Wordmark: lowercase `zirv` in the display face (Schibsted Grotesk 800, 23px, tracking -0.025em) beside a 30px mark, 10px gap, in header and footer. [settled] (source: mock `.brand`). Changed from Archivo bold at 22-26px; the mark does not change.
-- Clear space: the inner hexagon's width. Minimum size: mark 22px on screen, 48px tall in a 1080p film. [kept]
-- Allowed backgrounds: now `--paper`, `--paper-2` and `--night`. Use the SVG on paper (the gradient's cyan end is low contrast on paper; a logo is exempt from text contrast, and the mock does this). Use the PNG only on night grounds, because its white rings are baked in. [changed; settled by what the mock does]
-- One live exception to "never rotate": in the site header the mark turns -30deg on hover with `--ease-spring` over 420ms; no other rotation, no other mark animation. The mark's three hexagons also serve as the verdict glyph (section 8). [settled] (source: mock `.brand:hover .mk`)
-- Misuse: never stretch, recolour outside the palette, add shadows or glows, outline, rebuild the wordmark in another typeface, or place on a busy ground. [kept; "light ground" removed from the misuse list]
+The logo is `assets/logo.png`, used as-is. It is unchanged. [settled by the operator: "the logo stays"]
+- Hard rule: never redraw, re-vectorise, outline, recolour, rotate or animate the logo; always use the `assets/logo.png` file itself.
+- Logo: `assets/logo.png`, 600x600 raster: the filled hexagon badge with white gaps, dark faces and an inner hexagon, in the #11e2ff, #1bb4ee, #2191dd gradient. [kept]
+- `assets/zirv-mark.svg` is a thin outline drawing, not the logo. It stays in the repo untouched and must not stand in for the logo anywhere. [corrected 2026-10-09]
+- Wordmark: lowercase `zirv` in the display face (Schibsted Grotesk 800, 23px, tracking -0.025em) beside the logo file at 30px, 10px gap, in header and footer. [settled for the wordmark] (source: mock `.brand`). Changed from Archivo bold at 22-26px; the logo does not change.
+- Clear space: the inner hexagon's width. Minimum size: logo 22px on screen, 48px tall in a 1080p film. [kept]
+- Grounds: the logo file is placed as it is on `--paper`, `--paper-2` or `--night`; never altered to suit the ground. If it does not sit well on a ground, change the ground. [changed; the file's behaviour on paper is not yet checked in a render]
+- No logo animation of any kind, including hover rotation. The mock's header mark turns on hover; that behaviour is dropped. The verdict glyph (section 8) is a separate UI glyph, not the logo.
+- Misuse: never stretch, recolour, add shadows or glows, outline, redraw, vectorise, rotate, animate, rebuild the wordmark in another typeface, or place on a busy ground. [kept; "light ground" removed from the misuse list]
 
 ## 5. Colour
 Two grounds: a cool light "paper" for reading and "night" panels for terminals, the benchmark band, install and footer. Values are oklch in tokens.css; hex below is the sRGB conversion, contrast is WCAG 2.x computed 2026-10-09. [settled] (source: mock `:root`)
@@ -75,12 +78,12 @@ Two grounds: a cool light "paper" for reading and "night" panels for terminals, 
 
 - Proportion: paper and ink carry the page; night panels give each page a few dark surfaces; cyan marks zirv's own signal; warm colours appear only where zirv intervenes or asks (a verdict, an approval, a worse-than-baseline bar). No decorative warm colour. [settled] (source: design-note.md "Type, palette, system")
 - Verdict colours always travel with their word and a glyph. The `-g` glyph colours of advise (2.8:1) fall below 3:1 for non-text, so a glyph in `-g` is never the only cue and always sits beside its word in `-t`. [settled as a rule; contrast figures computed]
-- Healthy has no colour: it is the unlit mark, its strokes `--line-2` on paper and `--night-line` on night; only the word "healthy" is set in `--ink-2` (`--night-ink-2` on night). The previous green is dropped on the web. [changed]
+- Healthy has no colour: it is the unlit verdict glyph, its strokes `--line-2` on paper and `--night-line` on night; only the word "healthy" is set in `--ink-2` (`--night-ink-2` on night). The previous green is dropped on the web. [changed]
 - Verdict thresholds: score 40 or more advise, 60 or more compact, 80 or more restart; at the token ceiling a score of 60 or more escalates to restart (source: README, "Verdicts"). The 2026-10-08 guide's bands 65 and 85 were from the stale site and are corrected. [settled by README]
 - Terminal renders carry zirv's own palette: foreground #d5d9e0 on #15181e, in a window body of #101216. These are the real dashboard colours and are not remapped to the tokens. [settled] (source: render/README.md)
-- Never: cyan as a large field on paper; verdict colours as decoration; pure black or white grounds; the Zirv Fitness indigo; a gradient anywhere except the mark. [kept, adapted]
-- Gradients: the only gradients are the logo's and the usage bar fill in the pacing instrument (`oklch` blend from a darker cyan to `--cyan`). [settled] (source: mock `.ubar .f`)
-Changed: dark-only palette (#080d13 ground and the old ink, accent #22d9f5, healthy green, four verdict colours) replaced by paper and night; compact and restart now carry separate colours with the mark; the "light theme: none" rule is gone (the page is light by default, with night panels); no dark-mode variant of the page is defined.
+- Never: cyan as a large field on paper; verdict colours as decoration; pure black or white grounds; the Zirv Fitness indigo; a gradient anywhere except inside the logo file. [kept, adapted]
+- Gradients: the only gradients are the one baked into the logo file and the usage bar fill in the pacing instrument (`oklch` blend from a darker cyan to `--cyan`). [settled] (source: mock `.ubar .f`)
+Changed: dark-only palette (#080d13 ground and the old ink, accent #22d9f5, healthy green, four verdict colours) replaced by paper and night; compact and restart now carry separate colours with the verdict glyph; the "light theme: none" rule is gone (the page is light by default, with night panels); no dark-mode variant of the page is defined.
 
 ## 6. Type
 - Families: Schibsted Grotesk for display and body (weights 400 to 900, variable, italic available); Fragment Mono for code, labels, keycaps and data; Cascadia Mono only inside terminal renders (frames keep 1ch glyph widths; the mock requests the full font with `&text=` so box-drawing, braille, block and geometric glyphs arrive, and wraps the three glyphs no font carries, ⚑ ✉ ✻, in a 1ch box). Fallbacks: Helvetica Neue, Helvetica, Arial; SF Mono, ui-monospace, Menlo, Consolas. [settled] (source: mock `--sans`, `--mono`, link tag)
@@ -108,7 +111,7 @@ Changed: Archivo, IBM Plex Sans and JetBrains Mono replaced by Schibsted Grotesk
 - Tables: hairline rows, header in paper-2, row hover to paper-2; yes and no are a filled and an outlined dot with their word, depth is a bar of small ticks. [settled]
 - Lifecycle track: eight steps on a line; gates are a short vertical bar, steps a ring; the gates named are real (artifacts, `zirv test changed`, reviewer seat, `zirv verify`, deploy tier). [settled]
 - Safety ladder: three rungs, runs silently / asks / refused, from README's shipped posture lists, marked by an outlined dot, an advise dot and a restart dot, each with its word. [settled]
-- Verdict glyph: the mark's three hexagons lit ring by ring (healthy none, advise innermost, compact two, restart all three), in the verdict colours. [settled] (source: mock `.hx`)
+- Verdict glyph: a UI glyph of three nested hexagon outlines lit ring by ring (healthy none, advise innermost, compact two, restart all three), in the verdict colours. It is its own small drawing, not the logo, and never appears in the logo's place. [settled] (source: mock `.hx`)
 - Benchmark band, as a pattern: README's three figures as display numerals with the paragraph verbatim; then a full-bleed night band charting every task group of the latest round (cost, time and judge side by side) from the results write-up's table, one shared scale, filled bar = significant and outline = within noise, `--cyan` better and `--advise` worse, both footnotes, the 15 s intake-timeout note, a Jev off (default) / Jev on toggle that carries the #869 correction, and links to the write-up and the protocol. The setup is stated beside it: 78 runs on Claude Sonnet 5, against Claude Code with the superpowers plugin (v6.4.1), a blind Claude Opus judge not told which setup produced the work, paired bootstrap 95% CI. Figures: about 20% cheaper on ten large coding tasks, up to 42% on a 9-step session, 9-11% higher rated; hidden-test pass rates matched and wall-clock speed was on par overall (README); round 7 shows XL time +19% worse for Jev off (significant; one ~15 s intake timeout, per the results write-up), stated beside the cost and quality figures, never omitted. Section label: `README.md: what wrapping costs (measured)`. Never show a figure without its denominator, marker and source; never pick the best subset. [settled] (source: mock, design-note.md, README section "What wrapping costs (measured)")
 - Imagery is the product, real and complete: the dashboard as a real render (command bar `~/project $ zirv chat`, size label "orchestrator view · 120x36", caption naming it a real render with example data), real script files and real `--help` output. Frame a (orchestrator view with a force-push approval pending) and frame b (after "allow") are byte-for-byte renders; answering with `y` or the card button swaps them, and reset restores. Below a 640px terminal width the window shows frame d, zirv's own 72x40 compact AGENT TREE page, scrolling sideways. [settled] (source: design-note.md "Refinement 3", render/README.md)
 - No illustration, stock photography or 3D. Alt text describes the content of the render or file. [kept]
@@ -120,7 +123,7 @@ Changed: the `●●●` terminal-mock chrome stays as window dots; terminal ren
 - Cause: answering the dashboard request resolves it in place; the tab indicator slides (320ms `--ease-move`); "Copied" grows from the button; doc pages swap with a view transition (120ms out, 260ms in, 8px rise). [settled]
 - Arrival: headline lines rise 130% over 720ms with `--ease-out-strong`, 90ms apart; the hero copy and the window rise 14px with fade over 520 and 640ms. [settled]
 - Ambient: braille spinners turn and the waiting card's border breathes, a few seconds only, as README documents for the dashboard. [settled]
-- Easing: `--ease-out` (0.22, 1, 0.36, 1) for arrivals, `--ease-move` for travel, `--ease-in` for exits; `--ease-spring` only for small controls (toggle, header mark, verdict bump). No springs on layout, text or page transitions. [changed from "no springs"]
+- Easing: `--ease-out` (0.22, 1, 0.36, 1) for arrivals, `--ease-move` for travel, `--ease-in` for exits; `--ease-spring` only for small controls (toggle, verdict bump). No springs on layout, text or page transitions. [changed from "no springs"]
 - Reduced motion: no rise, spinner, breathing, hover lift or transitions; the final state at once (durations 1ms). [settled]
 - Terminal: rollover pulse 1.6s, toast 5s, row flash 900ms, reduced motion honoured. [kept]
 Changed: from "two keyframes, no transitions" to a full response, cause, arrival and ambient layer; spring allowed for small controls.
@@ -138,8 +141,8 @@ Changed: ring colour and contrast table; forced-colors and prefers-contrast are 
 Timings, eases, transitions and the verdict-ladder beat are kept from 2026-10-08. [kept] Adaptations to the new look are [proposed], not read from the approved mock:
 - Ground `--night` instead of the old #080d13; hairlines `--night-line`; text `--night-ink`; cyan `--cyan` as the single accent; terminal scenes use real renders on #15181e.
 - Statements in Schibsted Grotesk 820 with the 0.93 line-height and the descender padding; labels in Fragment Mono; terminal text in the renders' own face.
-- The verdict ladder uses the verdict glyph (rings lit in order) and the three warm colours; healthy is the unlit mark. Bands 0-39, 40-59, 60-79, 80+ per README. Verdict colour changes remain hard cuts.
-- End card: mark with lowercase `zirv` in the display face, the real install line, hold 1.5 s. Silent by default.
+- The verdict ladder uses the verdict glyph (rings lit in order) and the three warm colours; healthy is the unlit glyph. Bands 0-39, 40-59, 60-79, 80+ per README. Verdict colour changes remain hard cuts.
+- End card: the logo file, unaltered and not animated, with lowercase `zirv` in the display face, the real install line, hold 1.5 s. Silent by default.
 - Terminals and dashboards in film are real renders, example data labelled (rule 2).
 
 ## 12. Don'ts
@@ -150,12 +153,11 @@ Timings, eases, transitions and the verdict-ladder beat are kept from 2026-10-08
 - No benchmark figure without source, significance marker and caveat; no cherry-picked subset. (rule 5)
 - No clipped descenders in display type. (rule 6)
 - No hype vocabulary, emoji, exclamation marks; no glow, blur, glassmorphism or decorative gradient; no pure black or white grounds.
-- Do not use Zirv Fitness colours, fonts or copy; do not claim a number the repo does not measure; do not re-mark the logo.
+- Do not use Zirv Fitness colours, fonts or copy; do not claim a number the repo does not measure; never redraw, re-vectorise, outline, recolour, rotate or animate the logo, and never substitute `assets/zirv-mark.svg` or the verdict glyph for it; always use `assets/logo.png` itself. (rule 7)
 
 ## 13. Open items
 - Fonts: Schibsted Grotesk and Fragment Mono need self-hosted woff2 files and licence texts in `assets/fonts/`; the mock loads them from Google Fonts. The old font files should then be removed.
-- The mock's docs blockquote and "current item" markers against rule 3 (section 7).
-- The mock lives in the design session's scratchpad; the render pipeline (patch and README) is not yet in the repo.
+- The mock's docs blockquote and "current item" markers against rule 3 (section 7).- The mock lives in the design session's scratchpad; the render pipeline (patch and README) is not yet in the repo.
 - The site shipped version (v4.58.0 in the mock header) against the live cli.zirv.io, which still shows an older release.
 - Film adaptations in section 11 and the contrast figures are [proposed] until the operator reads them.
 
@@ -165,3 +167,4 @@ Timings, eases, transitions and the verdict-ladder beat are kept from 2026-10-08
 | 2026-10-08 | Guide established (draft) from cli.zirv.io CSS/screens, src/style.rs, dash/ui.rs, README; fonts self-hosted from @fontsource 5.3.0 | operator asked for the brand guide | brand-evidence/evidence.md, wt-design-skills |
 | 2026-10-08 | All proposed items approved by the operator: vector master of the mark, logo rules, canonical accent, dark only, terminal-to-web colour mapping, four verdict colours, interface motion tokens, film motion, focus ring, line heights, voice rules, separation from Zirv Fitness | operator reply "approve all" | operator approval 2026-10-08 |
 | 2026-10-09 | New visual direction replaces the dark-only guide, logo unchanged: paper and night grounds (oklch), Schibsted Grotesk / Fragment Mono / Cascadia Mono (terminal), 12-column 1320px layout, new component and motion layers, descender fix, verdict colours as warm steps with the hexagon glyph (healthy unlit), README thresholds 40/60/80 replace 65/85, benchmark and real-render rules, the six design-session rules. Replaces: every colour, type, layout, elevation and motion token of 2026-10-08 except the logo gradient, film timings and spacing-independent film tokens | operator approval of the opus mock (refinement 3, "much better") and design-session feedback 2026-10-08/09 | mocks/opus/index.html, design-note.md, captures/v5, render/README.md, README.md |
+| 2026-10-09 | Correction: the logo is `assets/logo.png` used as-is; `assets/zirv-mark.svg` is a non-logo outline drawing; hover-rotate exception and "SVG on paper" guidance removed; hard rule 7 added | operator correction | coordinator message 2026-10-09 |
