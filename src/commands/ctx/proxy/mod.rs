@@ -175,7 +175,7 @@ pub fn activation(cfg: &CtxConfig) -> Result<(), String> {
     }
 }
 
-fn try_helper(cfg: &CtxConfig, questions: &[Question]) -> Result<Answers, String> {
+fn try_helper(cfg: &CtxConfig, request: &str, questions: &[Question]) -> Result<Answers, String> {
     let (adapter, _origin) = adapters::resolve_default(cfg)
         .map_err(|error| format!("helper: no adapter ready ({error})"))?;
     let model = super::handoff::resolve_distiller_model(None, adapter.as_ref());
@@ -187,6 +187,7 @@ fn try_helper(cfg: &CtxConfig, questions: &[Question]) -> Result<Answers, String
         helper::ROLE_PROXY,
         adapter.as_ref(),
         &model,
+        request,
         questions,
         timeout,
     )
@@ -441,8 +442,8 @@ pub fn decide(
         }
     }
 
-    if !ran_model && let Some(Ok((_, questions))) = &model_input {
-        match try_helper(cfg, questions) {
+    if !ran_model && let Some(Ok((intake, questions))) = &model_input {
+        match try_helper(cfg, &intake.request, questions) {
             Ok(answers) => {
                 result = decision::merge(
                     cfg,

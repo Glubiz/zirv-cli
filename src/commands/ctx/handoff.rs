@@ -756,13 +756,32 @@ fn protect_structural_fields_with_env(
     handoff
 }
 
+/// The operator's request on one line (the task section is a single line), kept whole when it
+/// fits the parse-time scalar cap, else a verbatim prefix plus a marker with the original length.
+pub(crate) fn request_as_task(request: &str) -> String {
+    const MARKER_ROOM_BYTES: usize = 64;
+    let line = request.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.len() <= PARSED_SCALAR_FIELD_CAP_BYTES {
+        return line;
+    }
+    let kept = crate::utils::truncate_bytes(
+        line.clone(),
+        Some(PARSED_SCALAR_FIELD_CAP_BYTES - MARKER_ROOM_BYTES),
+    );
+    format!(
+        "{kept} [truncated: first {} of {} bytes]",
+        kept.len(),
+        line.len()
+    )
+}
+
 /// Mechanical extraction used when the distiller is unavailable or unusable.
 /// Never fails and never returns something unusable.
 pub fn structural(ctx: &StructuralContext) -> Handoff {
     let task = ctx
         .user_messages
         .last()
-        .map(|m| m.lines().next().unwrap_or(m).trim().to_string())
+        .map(|m| request_as_task(m))
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| "Unknown task (no user prompt found in the transcript)".to_string());
 
@@ -4282,6 +4301,38 @@ mod tests {
         let handoff = sample();
         let merged = with_open_task_cards(handoff.clone(), &state, &repo);
         assert_eq!(merged, handoff);
+    }
+
+    /// The latest request survives whole as the task; an oversized one keeps a bounded
+    /// prefix that states the original length.
+    #[test]
+    fn structural_task_keeps_the_whole_request_or_a_marked_prefix() {
+        let ctx = |request: String| StructuralContext {
+            user_messages: vec![request],
+            ..StructuralContext::default()
+        };
+        let multiline = structural(&ctx("build the page\nwith search\n\nand docs".to_string()));
+        assert_eq!(multiline.task, "build the page with search and docs");
+
+        let huge = format!("start {}", "word ".repeat(2_000));
+        let handoff = structural(&ctx(huge.clone()));
+        assert!(
+            handoff.task.starts_with("start word word"),
+            "{}",
+            handoff.task
+        );
+        assert!(
+            handoff
+                .task
+                .ends_with(&format!("of {} bytes]", huge.trim().len())),
+            "{}",
+            handoff.task
+        );
+        assert_eq!(
+            parse_markdown(&handoff.to_markdown()).task,
+            handoff.task,
+            "the bounded task must survive the markdown round trip unchanged"
+        );
     }
 
     #[test]

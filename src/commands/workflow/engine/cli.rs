@@ -1009,7 +1009,7 @@ pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<Start
         branch: args.branch.clone(),
         json: false,
     };
-    let mut classification = classify::from_start_args(&classify_args)?;
+    let mut classification = classify::from_plan_args(&classify_args)?;
     // Refine intent before pack selection when enabled; start has no profile domain-tag surface. (#782)
     crate::commands::workflow::profile::refine_intent_via_jev(
         &repo,
