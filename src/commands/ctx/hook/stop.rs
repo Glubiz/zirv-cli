@@ -253,11 +253,14 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
             missing_tests_gate_reason(&state, &repo, &stable_short, &payload.session_id, &cfg, env);
         // Cost-driven compact advice is independent of rot verdict. Skip
         // prompt-byte work when the agent gate already excludes it (#312).
+        let mut stop_capacity = cfg.score.model_context_tokens;
         if let Ok(adapter) = adapters::select_for_identity(
             env(adapters::AGENT_ENV).as_deref().or(cfg.agent.as_deref()),
             &[],
             &cfg,
         ) {
+            stop_capacity =
+                score::resolved_capacity(&state, transcript, adapter.as_ref(), &cfg.score);
             compact_advisory_nudge = compact_advisory_stop_nudge(
                 &state,
                 &repo,
@@ -267,8 +270,14 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
                 adapter.as_ref(),
             );
         }
-        rot_advisory_deferred =
-            stop_rot_advisory_deferred(&state, &cfg, &stable_short, &score, socket.is_some());
+        rot_advisory_deferred = stop_rot_advisory_deferred(
+            &state,
+            &cfg,
+            &stable_short,
+            &score,
+            socket.is_some(),
+            stop_capacity,
+        );
         crate::commands::ctx::supervisor::on_stop(&state, &cfg, env, &repo, &stable_short);
     }
 
@@ -376,15 +385,14 @@ fn stop_rot_advisory_deferred(
     session_short: &str,
     score: &Score,
     supervised: bool,
+    capacity: Option<u64>,
 ) -> bool {
     use crate::commands::ctx::inject_gate::{self, Decision, InjectFacts, InjectKind};
     if supervised || score.verdict == Verdict::Healthy || !inject_gate::enabled(cfg) {
         return false;
     }
     let facts = InjectFacts {
-        context_pct: cfg
-            .score
-            .model_context_tokens
+        context_pct: capacity
             .filter(|window| *window > 0)
             .map(|window| score.context_tokens.saturating_mul(100) / window),
         rot_score: Some(score.score),
@@ -1668,7 +1676,8 @@ mod tests {
         cfg.jev.inject = false;
         let mut score = score_with_turns(3);
         score.verdict = Verdict::Compact;
-        let stop_deferred = stop_rot_advisory_deferred(&state, &cfg, "aaaa1111", &score, false);
+        let stop_deferred =
+            stop_rot_advisory_deferred(&state, &cfg, "aaaa1111", &score, false, None);
         let env = mail_waiting(tmp.path(), &state);
         let out = prompt_output("[zirv]", None, tmp.path(), &env, &cfg);
         unsafe { std::env::remove_var(credential_env) };
@@ -1693,7 +1702,7 @@ mod tests {
         let mut score = score_with_turns(3);
         score.verdict = Verdict::Compact;
         score.score = cfg.score.compact_at;
-        let deferred = stop_rot_advisory_deferred(&state, &cfg, "aaaa1111", &score, false);
+        let deferred = stop_rot_advisory_deferred(&state, &cfg, "aaaa1111", &score, false, None);
         unsafe { std::env::remove_var(credential_env) };
         handle.join().expect("server thread");
         assert!(deferred, "a decisive defer below restart_at is honoured");

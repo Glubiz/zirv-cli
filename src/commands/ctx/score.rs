@@ -215,6 +215,28 @@ fn caps_with_window(
     caps
 }
 
+/// The capacity the rot gate used for this transcript, for surfaces that have no transcript text
+/// in hand (Stop `context_pct`, compact advisory). Precedence: `score.model_context_tokens`, else
+/// the window hint and model the checkpoint recorded, else the adapter's capacity for no model.
+pub(super) fn resolved_capacity(
+    state: &StateDir,
+    transcript: &Path,
+    adapter: &dyn AgentAdapter,
+    cfg: &ScoreConfig,
+) -> Option<u64> {
+    if cfg.model_context_tokens.is_some() {
+        return cfg.model_context_tokens;
+    }
+    let checkpoint = load_checkpoint(
+        &checkpoint_path(state, transcript),
+        transcript,
+        fingerprint(adapter, cfg),
+        cfg,
+    );
+    let (model, window) = checkpoint.map_or((None, None), |c| (c.model, c.context_window));
+    caps_with_window(adapter, model.as_deref(), window).context_window_tokens
+}
+
 fn attach_model_change(
     mut score: Score,
     tracker: &ModelTracker,
@@ -2919,6 +2941,82 @@ mod tests {
         assert_eq!(
             score.context_tokens, expected,
             "a chunk boundary must never fabricate a zero token reading"
+        );
+    }
+
+    fn claude_row(context: u64) -> String {
+        format!(
+            "{{\"type\":\"user\",\"message\":{{\"content\":\"go\"}}}}\n\
+             {{\"type\":\"assistant\",\"message\":{{\"model\":\"claude-opus-5-5\",\"content\":[{{\"type\":\"text\",\"text\":\"ok\"}}],\"usage\":{{\"input_tokens\":1,\"cache_read_input_tokens\":{context},\"output_tokens\":5}}}}}}\n"
+        )
+    }
+
+    fn poll_claude(state: &StateDir, adapter: &dyn AgentAdapter, transcript: &Path) {
+        score_with_checkpoint(
+            state,
+            transcript,
+            adapter,
+            &ScoreConfig::default(),
+            &screen::Thresholds::default(),
+            &crate::commands::ctx::health::HealthPolicy::default(),
+        )
+        .expect("scores");
+    }
+
+    /// A 300k reading proves the 1M window; a later chunk of small readings must not narrow it,
+    /// and the surfaces that read the checkpoint resolve the same capacity as the rot gate.
+    #[test]
+    fn resolved_capacity_keeps_a_long_window_across_incremental_chunks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adapter = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(None)
+            .with_home(dir.path().to_path_buf());
+        let state = StateDir::from_root(dir.path().join("state"));
+        let transcript = dir.path().join("t.jsonl");
+        std::fs::write(&transcript, claude_row(300_000)).expect("write");
+        poll_claude(&state, &adapter, &transcript);
+        let cfg = ScoreConfig::default();
+        assert_eq!(
+            resolved_capacity(&state, &transcript, &adapter, &cfg),
+            Some(1_000_000)
+        );
+
+        let mut text = std::fs::read_to_string(&transcript).expect("read");
+        text.push_str(&claude_row(50_000));
+        std::fs::write(&transcript, text).expect("append");
+        poll_claude(&state, &adapter, &transcript);
+        assert_eq!(
+            resolved_capacity(&state, &transcript, &adapter, &cfg),
+            Some(1_000_000),
+            "a later small-reading chunk must not downgrade the proven window"
+        );
+    }
+
+    #[test]
+    fn resolved_capacity_prefers_pin_then_learned_model_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adapter = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(None)
+            .with_home(dir.path().to_path_buf());
+        let state = StateDir::from_root(dir.path().join("state"));
+        let transcript = dir.path().join("t.jsonl");
+        std::fs::write(&transcript, claude_row(50_000)).expect("write");
+        poll_claude(&state, &adapter, &transcript);
+        let mut cfg = ScoreConfig::default();
+        assert_eq!(
+            resolved_capacity(&state, &transcript, &adapter, &cfg),
+            Some(200_000)
+        );
+
+        crate::commands::ctx::model_window::record(dir.path(), &["claude-opus-5-5"], 1_000_000);
+        assert_eq!(
+            resolved_capacity(&state, &transcript, &adapter, &cfg),
+            Some(1_000_000),
+            "the model hint recorded in the checkpoint reaches the learned window"
+        );
+
+        cfg.model_context_tokens = Some(500_000);
+        assert_eq!(
+            resolved_capacity(&state, &transcript, &adapter, &cfg),
+            Some(500_000)
         );
     }
 

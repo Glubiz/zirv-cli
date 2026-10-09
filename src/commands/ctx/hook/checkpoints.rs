@@ -347,10 +347,8 @@ pub(super) fn compact_advisory_stop_nudge(
         checkpoint.consumed = consumed;
     }
 
-    let model_window = cfg
-        .score
-        .model_context_tokens
-        .or(adapter.capabilities_for_model(None).context_window_tokens);
+    let model_window =
+        crate::commands::ctx::score::resolved_capacity(state, transcript, adapter, &cfg.score);
     let advisory = model_window
         .filter(|window| *window > 0)
         .and_then(|window| {
@@ -997,6 +995,56 @@ mod tests {
         assert!(
             advisory.contains("Read"),
             "names the stale source: {advisory}"
+        );
+    }
+
+    /// A seat the rot gate resolved to a 1M window (a prior 300k reading proves it) must not get a
+    /// compact advisory at 75% of the default 200k window.
+    #[test]
+    fn compact_advisory_uses_the_seats_proven_long_window() {
+        let repo_dir = tempfile::tempdir().expect("tempdir");
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let transcript_dir = tempfile::tempdir().expect("tempdir");
+        let transcript = transcript_dir.path().join("session.jsonl");
+        let tokens = 150_000u64;
+        let proof = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"usage\":{\"input_tokens\":300000}}}\n";
+        std::fs::write(
+            &transcript,
+            format!("{proof}{}", stale_read_then_edit_transcript(50_000, tokens)),
+        )
+        .expect("write transcript");
+
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_tmp.path().display().to_string(),
+        )]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+        let (score, _, _) = crate::commands::ctx::score::score_transcript_cached(
+            &transcript,
+            Some("claude"),
+            repo_dir.path(),
+            &lookup,
+        )
+        .expect("scores");
+        let score = Score {
+            context_tokens: tokens,
+            ..score
+        };
+
+        let adapter = crate::commands::ctx::adapters::claude::ClaudeAdapter::new(None);
+        assert_eq!(
+            compact_advisory_stop_nudge(
+                &state,
+                repo_dir.path(),
+                &CtxConfig::default(),
+                &score,
+                &transcript,
+                &adapter,
+            ),
+            None,
+            "150k of a 1M window is 15%, below the advisory's window fraction"
         );
     }
 

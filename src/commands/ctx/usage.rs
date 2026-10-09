@@ -64,6 +64,23 @@ pub fn run_tee<W: Write>(
     state: Option<&StateDir>,
     now: u64,
 ) -> i32 {
+    // Interactive seats never run `-p --output-format json`, so the statusline payload is where
+    // their real window is learned; skipped when already known because this runs on every refresh.
+    if let Ok(payload) = serde_json::from_str::<Value>(stdin_text)
+        && let Some(model) = payload
+            .get("model")
+            .and_then(|m| m.get("id"))
+            .and_then(Value::as_str)
+        && let Some(size) = payload
+            .get("context_window")
+            .and_then(|c| c.get("context_window_size"))
+            .and_then(Value::as_u64)
+        && let Ok(home) = crate::utils::home_dir()
+        && super::model_window::lookup(&home, Some(model)) != Some(size)
+    {
+        super::model_window::record(&home, &[model], size);
+    }
+
     // Persisting is best-effort and happens first, so a broken statusline
     // script cannot cost us the reading.
     if let (Some(state), Some(fresh)) = (state, window::parse_statusline(stdin_text, now)) {
@@ -726,6 +743,39 @@ mod tests {
         let code = run_tee(&mut out, &json, &statusline_script(), Some(&state), 1);
         assert_eq!(code, 0);
         assert!(String::from_utf8_lossy(&out).contains("CHAINED-OK"));
+    }
+
+    #[test]
+    fn the_tee_learns_the_models_window_from_the_statusline_payload() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let json = r#"{"model":{"id":"claude-opus-5-5","display_name":"Opus"},"context_window":{"context_window_size":1000000,"used_percentage":8}}"#;
+        let mut out = Vec::new();
+        run_tee(&mut out, json, &[], None, 1);
+        assert_eq!(
+            super::super::model_window::lookup(home.path(), Some("claude-opus-5-5")),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            format!("{}\n", fallback_line(json)),
+            "the statusline output is unchanged"
+        );
+    }
+
+    #[test]
+    fn the_tee_records_nothing_when_the_payload_states_no_window() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let json = r#"{"model":{"id":"claude-opus-5-5"},"context_window":{"used_percentage":8}}"#;
+        run_tee(&mut Vec::new(), json, &[], None, 1);
+        assert!(
+            !home
+                .path()
+                .join(".zirv")
+                .join("model-windows.json")
+                .exists()
+        );
     }
 
     #[test]
