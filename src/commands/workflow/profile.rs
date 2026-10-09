@@ -300,8 +300,8 @@ fn domain_tag_for(id: &str) -> Option<WorkDomainTag> {
 /// own frontend text signal) for the per-domain hit counts, and
 /// `proxy::mod`'s own path-like-token/outcome/constraint predicates and
 /// word-count bucket -- the exact same local text signals the harness
-/// proxy's own metadata-only intake (`proxy::safe_intake_metadata`) already
-/// computes, reused rather than re-derived.
+/// proxy's own text helpers (formerly its metadata-only intake) compute, reused rather
+/// than re-derived.
 fn classify_jev_facts(task: &str, classification: &Classification) -> serde_json::Value {
     let lower = task.to_ascii_lowercase();
     let path_like_tokens = task
