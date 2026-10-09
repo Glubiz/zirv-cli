@@ -169,6 +169,20 @@ fn option_label<'a>(line: &'a str, options: &[String]) -> Option<(usize, &'a str
     (!names_another).then_some((at + 1, rest))
 }
 
+/// Whether a choice ruling picked `done` in a done-vs-not-done question: its verdict reads as a
+/// bare `done` to the done parser (so `done, but ...` hedges are not one) and the offered options
+/// include a not-done one, so an unrelated option that happens to start with "done" never counts.
+pub(crate) fn picks_done_over_not_done(verdict: &str, options: &[String]) -> bool {
+    let offers_not_done = options.iter().any(|option| {
+        let option = option.trim_start().to_ascii_lowercase();
+        ["not done", "not_done", "not-done"]
+            .iter()
+            .any(|word| option.starts_with(word))
+    });
+    offers_not_done
+        && parse_reply(RulingKind::Done, verdict, &[]).is_some_and(|(parsed, _)| parsed == "done")
+}
+
 /// Whether `text` contains `word` as a whole word or phrase, not inside a longer word.
 fn names_word(text: &str, word: &str) -> bool {
     !word.is_empty()
@@ -540,6 +554,22 @@ mod tests {
             .expect("later lines do not count");
         assert_eq!(verdict, options[0]);
         assert_eq!(parse("Both options fit; pick whichever"), None);
+    }
+
+    #[test]
+    fn a_done_pick_needs_a_not_done_option_and_no_hedge() {
+        let with_not_done = vec![
+            "done: ship it".to_string(),
+            "Not done: add tests".to_string(),
+        ];
+        assert!(picks_done_over_not_done("done: ship it", &with_not_done));
+        assert!(!picks_done_over_not_done(
+            "Not done: add tests",
+            &with_not_done
+        ));
+        assert!(!picks_done_over_not_done("done, but tests", &with_not_done));
+        let without = vec!["done: ship it".to_string(), "refactor first".to_string()];
+        assert!(!picks_done_over_not_done("done: ship it", &without));
     }
 
     /// A first word that merely equals an option is prose, not a pick; a pick is label plus
