@@ -365,6 +365,9 @@ pub struct RotState {
     /// only while the window still reaches back that far.
     segments: VecDeque<Segment>,
     turn_starts: usize,
+    /// Compactions seen; `Restart` is only reachable after the first.
+    #[serde(default)]
+    compactions: usize,
 }
 
 impl RotState {
@@ -386,6 +389,7 @@ impl RotState {
             last_tokens: 0,
             segments: VecDeque::from([Segment::default()]),
             turn_starts: 0,
+            compactions: 0,
         })
     }
 
@@ -484,7 +488,10 @@ impl RotState {
             // #312 siblings right above -- neither carries a rot signal.
             | NormalizedEvent::ToolCallRead { .. }
             | NormalizedEvent::ToolCallEdit { .. } => {}
-            NormalizedEvent::Compaction => self.reset_behavioral_window(),
+            NormalizedEvent::Compaction => {
+                self.compactions += 1;
+                self.reset_behavioral_window();
+            }
         }
     }
 
@@ -527,6 +534,7 @@ impl RotState {
         Some(score_from(
             self.signals(caps, cfg),
             self.last_tokens,
+            self.compactions,
             cfg,
             caps,
         ))
@@ -689,53 +697,76 @@ pub fn token_gates(cfg: &ScoreConfig, caps: Capabilities) -> (u64, u64) {
     (floor, ceiling)
 }
 
-/// The token gate is a gate, not a vote: below the floor nothing escalates, at
-/// or above the ceiling the verdict is at least `compact`, and at the ceiling a
-/// compact-level score becomes a restart.
-pub fn verdict_for(score: u32, tokens: u64, cfg: &ScoreConfig, caps: Capabilities) -> Verdict {
+/// `behavioural` is the failure/repetition score; `score` adds context-fill
+/// pressure to it. Below the floor nothing escalates. Restart needs
+/// behavioural evidence: `behavioural >= restart_at`, or at the ceiling
+/// `behavioural >= compact_at` -- fill alone never restarts. Otherwise the
+/// combined `score` picks compact/advise, and the ceiling forces compact.
+pub fn verdict_for(
+    behavioural: u32,
+    score: u32,
+    tokens: u64,
+    cfg: &ScoreConfig,
+    caps: Capabilities,
+) -> Verdict {
     let (floor, ceiling) = token_gates(cfg, caps);
     if tokens < floor {
         return Verdict::Healthy;
     }
-
-    let base = if score >= cfg.restart_at {
-        Verdict::Restart
-    } else if score >= cfg.compact_at {
-        Verdict::Compact
-    } else if score >= cfg.advise_at {
-        Verdict::Advise
-    } else {
-        Verdict::Healthy
-    };
-
-    if tokens < ceiling {
-        return base;
-    }
-    if score >= cfg.compact_at {
+    if behavioural >= cfg.restart_at || (tokens >= ceiling && behavioural >= cfg.compact_at) {
         return Verdict::Restart;
     }
-    base.max(Verdict::Compact)
+    if score >= cfg.compact_at || tokens >= ceiling {
+        return Verdict::Compact;
+    }
+    if score >= cfg.advise_at {
+        return Verdict::Advise;
+    }
+    Verdict::Healthy
 }
 
 pub fn score_events(events: &[NormalizedEvent], caps: Capabilities, cfg: &ScoreConfig) -> Score {
     score_from(
         signals(events, caps, cfg),
         context_tokens(events),
+        compactions(events),
         cfg,
         caps,
     )
 }
 
-/// The weighted sum and the gate, shared by the full-parse and incremental
-/// paths so the two can never drift apart.
-pub fn score_from(signals: Signals, tokens: u64, cfg: &ScoreConfig, caps: Capabilities) -> Score {
+/// How many compactions the session has been through.
+pub fn compactions(events: &[NormalizedEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, NormalizedEvent::Compaction))
+        .count()
+}
+
+/// The weighted behavioural sum plus context-fill pressure (0 at the token
+/// floor, `compact_at` at the ceiling, saturating), and the gate. Shared by the
+/// full-parse and incremental paths so the two can never drift apart.
+/// `Restart` only suggests a fresh session and needs a prior compaction
+/// (`compactions >= 1`); before one, it is capped at `Compact`.
+pub fn score_from(
+    signals: Signals,
+    tokens: u64,
+    compactions: usize,
+    cfg: &ScoreConfig,
+    caps: Capabilities,
+) -> Score {
     let raw = cfg.weight_tool_failure * signals.tool_failure_rate
         + cfg.weight_repetition
             * repetition_component(signals.max_repeat, cfg.repetition_threshold)
         + cfg.weight_marker * signals.marker_miss_rate.unwrap_or(0.0)
         + cfg.same_error_weight
             * repetition_component(signals.same_error_repeats, cfg.same_error_threshold);
-    let score = raw.round().clamp(0.0, 100.0) as u32;
+    let behavioural = raw.round().clamp(0.0, 100.0) as u32;
+    let (floor, ceiling) = token_gates(cfg, caps);
+    let fill = (tokens.saturating_sub(floor) as f64 / (ceiling - floor) as f64).clamp(0.0, 1.0);
+    let score = (f64::from(behavioural) + f64::from(cfg.compact_at) * fill)
+        .round()
+        .clamp(0.0, 100.0) as u32;
 
     let overflow_verdict = match signals.provider_overflows {
         0 => Verdict::Healthy,
@@ -743,9 +774,14 @@ pub fn score_from(signals: Signals, tokens: u64, cfg: &ScoreConfig, caps: Capabi
         _ => Verdict::Restart,
     };
 
+    let mut verdict = verdict_for(behavioural, score, tokens, cfg, caps).max(overflow_verdict);
+    if compactions == 0 {
+        verdict = verdict.min(Verdict::Compact);
+    }
+
     Score {
         score,
-        verdict: verdict_for(score, tokens, cfg, caps).max(overflow_verdict),
+        verdict,
         signals,
         context_tokens: tokens,
         model_change: None,
@@ -1370,8 +1406,8 @@ mod tests {
             ..base.clone()
         };
 
-        let a = score_from(base, 120_000, &cfg, full_caps());
-        let b = score_from(heavy_repeat, 120_000, &cfg, full_caps());
+        let a = score_from(base, 120_000, 1, &cfg, full_caps());
+        let b = score_from(heavy_repeat, 120_000, 1, &cfg, full_caps());
         assert_eq!(
             a.score, b.score,
             "same_error_repeats must not move the score once an operator sets the weight back \
@@ -1405,7 +1441,8 @@ mod tests {
             marker_miss_rate: Some(0.0),
         };
 
-        let result = score_from(signals, 120_000, &cfg, full_caps());
+        // At the token floor, so context-fill pressure does not add to the behavioural 40.
+        let result = score_from(signals, 100_000, 1, &cfg, full_caps());
         assert_eq!(result.score, 40, "got {result:?}");
         assert_eq!(
             result.verdict,
@@ -1720,6 +1757,159 @@ mod tests {
         assert_eq!(verdict_for(59, 850_000, &cfg, million), Verdict::Compact);
     }
 
+    /// The gate for a score carrying no fill pressure (behavioural == score).
+    fn verdict_for(score: u32, tokens: u64, cfg: &ScoreConfig, caps: Capabilities) -> Verdict {
+        super::verdict_for(score, score, tokens, cfg, caps)
+    }
+
+    fn fill_caps() -> Capabilities {
+        Capabilities {
+            context_window_tokens: Some(1_000_000),
+            ..Default::default()
+        }
+    }
+
+    /// Signals whose behavioural score is exactly `behavioural` under a
+    /// config that puts the whole weight on the tool-failure rate.
+    fn behavioural_only(behavioural: u32) -> (Signals, ScoreConfig) {
+        let cfg = ScoreConfig {
+            weight_tool_failure: 100.0,
+            ..ScoreConfig::default()
+        };
+        let signals = Signals {
+            turns: 10,
+            tool_failure_rate: f64::from(behavioural) / 100.0,
+            repetition_hits: 0,
+            max_repeat: 0,
+            same_error_repeats: 0,
+            provider_overflows: 0,
+            marker_miss_rate: None,
+        };
+        (signals, cfg)
+    }
+
+    /// A session that has already compacted once.
+    fn score_at(behavioural: u32, tokens: u64) -> Score {
+        score_after(behavioural, tokens, 1)
+    }
+
+    fn score_after(behavioural: u32, tokens: u64, compactions: usize) -> Score {
+        let (signals, cfg) = behavioural_only(behavioural);
+        score_from(signals, tokens, compactions, &cfg, fill_caps())
+    }
+
+    #[test]
+    fn context_fill_alone_raises_the_score_but_never_restarts() {
+        let at_floor = score_at(0, 500_000);
+        assert_eq!((at_floor.score, at_floor.verdict), (0, Verdict::Healthy));
+        let below = score_at(0, 499_999);
+        assert_eq!((below.score, below.verdict), (0, Verdict::Healthy));
+        let two_thirds = score_at(0, 700_000);
+        assert_eq!(
+            (two_thirds.score, two_thirds.verdict),
+            (40, Verdict::Advise)
+        );
+        let at_ceiling = score_at(0, 800_000);
+        assert_eq!(
+            (at_ceiling.score, at_ceiling.verdict),
+            (60, Verdict::Compact)
+        );
+        let far_above = score_at(0, 5_000_000);
+        assert_eq!((far_above.score, far_above.verdict), (60, Verdict::Compact));
+    }
+
+    #[test]
+    fn a_mildly_unhealthy_session_at_75_percent_fill_compacts() {
+        // pressure 50 + behavioural 20 = 70 >= compact_at (old rule: Healthy).
+        let scored = score_at(20, 750_000);
+        assert_eq!((scored.score, scored.verdict), (70, Verdict::Compact));
+    }
+
+    #[test]
+    fn restart_still_needs_behavioural_evidence() {
+        assert_eq!(score_at(60, 800_000).verdict, Verdict::Restart);
+        assert_eq!(score_at(80, 600_000).verdict, Verdict::Restart);
+        assert_eq!(score_at(59, 800_000).verdict, Verdict::Compact);
+        assert_eq!(score_at(79, 600_000).verdict, Verdict::Compact);
+    }
+
+    #[test]
+    fn restart_is_capped_at_compact_until_the_session_has_compacted() {
+        for tokens in [600_000, 800_000] {
+            assert_eq!(score_after(80, tokens, 0).verdict, Verdict::Compact);
+            assert_eq!(score_after(80, tokens, 1).verdict, Verdict::Restart);
+        }
+        let (mut signals, cfg) = behavioural_only(0);
+        signals.provider_overflows = 2;
+        let before = score_from(signals.clone(), 100, 0, &cfg, fill_caps());
+        assert_eq!(before.verdict, Verdict::Compact);
+        let after = score_from(signals, 100, 1, &cfg, fill_caps());
+        assert_eq!(after.verdict, Verdict::Restart);
+    }
+
+    #[test]
+    fn full_parse_and_incremental_state_agree_on_the_compaction_count() {
+        let cfg = ScoreConfig::default();
+        let mut events = turns(12, "", "[zirv] ok", false, 170_000);
+        events.push(NormalizedEvent::Compaction);
+        events.extend(turns(12, "", "[zirv] ok", true, 170_000));
+        events.push(NormalizedEvent::Compaction);
+        assert_eq!(compactions(&events), 2);
+        let mut state = RotState::new(&cfg).expect("bounded");
+        state.feed_all(&events);
+        assert_eq!(state.compactions, 2);
+        assert_eq!(
+            state.score(full_caps(), &cfg).expect("score"),
+            score_events(&events, full_caps(), &cfg)
+        );
+    }
+
+    #[test]
+    fn the_verdict_never_drops_and_restarts_exactly_where_they_did() {
+        let cfg = ScoreConfig::default();
+        let old_rule = |score: u32, tokens: u64| {
+            let (floor, ceiling) = token_gates(&cfg, fill_caps());
+            if tokens < floor {
+                return Verdict::Healthy;
+            }
+            let base = if score >= cfg.restart_at {
+                Verdict::Restart
+            } else if score >= cfg.compact_at {
+                Verdict::Compact
+            } else if score >= cfg.advise_at {
+                Verdict::Advise
+            } else {
+                Verdict::Healthy
+            };
+            if tokens < ceiling {
+                return base;
+            }
+            if score >= cfg.compact_at {
+                return Verdict::Restart;
+            }
+            base.max(Verdict::Compact)
+        };
+        for behavioural in (0..=100).step_by(5) {
+            for tokens in (0..=1_000_000u64).step_by(25_000) {
+                let old = old_rule(behavioural, tokens);
+                let compacted = score_after(behavioural, tokens, 1).verdict;
+                assert!(
+                    compacted >= old,
+                    "b={behavioural} t={tokens}: {compacted:?} < {old:?}"
+                );
+                assert_eq!(
+                    compacted == Verdict::Restart,
+                    old == Verdict::Restart,
+                    "b={behavioural} t={tokens}: new {compacted:?} old {old:?}"
+                );
+                // Before the first compaction a would-be Restart is a Compact.
+                let fresh = score_after(behavioural, tokens, 0).verdict;
+                assert_eq!(fresh, compacted.min(Verdict::Compact));
+                assert!(fresh >= old.min(Verdict::Compact));
+            }
+        }
+    }
+
     #[test]
     fn verdicts_are_ordered_for_escalation_comparisons() {
         assert!(Verdict::Restart > Verdict::Compact);
@@ -1742,8 +1932,9 @@ mod tests {
         let events = turns(12, "", "[zirv] ok", true, 120_000);
         let result = score_events(&events, full_caps(), &cfg);
         assert_eq!(result.signals.tool_failure_rate, 1.0);
-        assert_eq!(result.score, 40);
-        assert_eq!(result.verdict, Verdict::Advise);
+        // 40 behavioural + 20 fill pressure (120k of the 100k..160k gate).
+        assert_eq!(result.score, 60);
+        assert_eq!(result.verdict, Verdict::Compact);
     }
 
     #[test]
@@ -1752,10 +1943,10 @@ mod tests {
         // Same tool and input every turn, every result an error, marker intact.
         let events = looping_turns(12, "", "[zirv] ok", true, 120_000);
         let result = score_events(&events, full_caps(), &cfg);
-        // 40 (failures) + 30 (repetition maxed) + 0 (marker clean) = 70
+        // 40 (failures) + 30 (repetition maxed) + 0 (marker clean) = 70, + 20 fill pressure
         assert_eq!(result.signals.max_repeat, 10, "window bounded");
         assert_eq!(result.signals.marker_miss_rate, Some(0.0));
-        assert_eq!(result.score, 70);
+        assert_eq!(result.score, 90);
         assert_eq!(result.verdict, Verdict::Compact);
     }
 
@@ -1766,7 +1957,11 @@ mod tests {
         events.extend(looping_turns(10, "", "sloppy", true, 120_000));
         let result = score_events(&events, full_caps(), &cfg);
         assert_eq!(result.score, 100);
-        assert_eq!(result.verdict, Verdict::Restart);
+        assert_eq!(
+            result.verdict,
+            Verdict::Compact,
+            "a restart is only suggested after a compaction"
+        );
     }
 
     #[test]
@@ -1786,7 +1981,8 @@ mod tests {
         let mut events = looping_turns(2, "", "[zirv] ok", true, 120_000);
         events.extend(looping_turns(10, "", "sloppy", true, 120_000));
         let result = score_events(&events, caps, &cfg);
-        assert_eq!(result.score, 70, "weights are not redistributed");
+        // 70 behavioural (weights are not redistributed) + 20 fill pressure.
+        assert_eq!(result.score, 90);
         assert_eq!(
             result.verdict,
             Verdict::Compact,
@@ -1810,9 +2006,18 @@ mod tests {
         };
         let events = looping_turns(12, "", "sloppy", true, 175_000);
         let result = score_events(&events, caps, &cfg);
-        assert_eq!(result.score, 70);
+        // 70 behavioural + 60 fill pressure, clamped.
+        assert_eq!(result.score, 100);
         assert_eq!(result.context_tokens, 175_000);
-        assert_eq!(result.verdict, Verdict::Restart);
+        assert_eq!(
+            result.verdict,
+            Verdict::Compact,
+            "the ceiling restart is suggested only after a compaction"
+        );
+        let mut compacted = vec![NormalizedEvent::Compaction];
+        compacted.extend(looping_turns(12, "", "sloppy", true, 175_000));
+        let after = score_events(&compacted, caps, &cfg);
+        assert_eq!(after.verdict, Verdict::Restart);
     }
 
     #[test]
@@ -1850,9 +2055,24 @@ mod tests {
         assert_eq!(once.signals.provider_overflows, 1);
         assert_eq!(once.verdict, Verdict::Compact);
 
-        let twice = score_events(&[overflow.clone(), overflow], full_caps(), &cfg);
+        let twice = score_events(&[overflow.clone(), overflow.clone()], full_caps(), &cfg);
         assert_eq!(twice.signals.provider_overflows, 2);
-        assert_eq!(twice.verdict, Verdict::Restart);
+        assert_eq!(
+            twice.verdict,
+            Verdict::Compact,
+            "no restart suggestion before a compaction"
+        );
+
+        let after_compaction = score_events(
+            &[
+                NormalizedEvent::Compaction,
+                overflow.clone(),
+                overflow.clone(),
+            ],
+            full_caps(),
+            &cfg,
+        );
+        assert_eq!(after_compaction.verdict, Verdict::Restart);
     }
 
     #[test]
@@ -1954,7 +2174,7 @@ mod tests {
         events.extend(turns(7, "", "sloppy", false, 120_000));
         let result = score_events(&events, full_caps(), &ScoreConfig::default());
         assert_eq!(result.signals.marker_miss_rate, None);
-        assert_eq!(result.score, 0);
+        assert_eq!(result.score, 20, "fill pressure only (120k of 100k..160k)");
         assert_eq!(result.verdict, Verdict::Healthy);
     }
 
@@ -1977,7 +2197,7 @@ mod tests {
         let mut events = turns(2, "", "[zirv] ok", false, 170_000);
         events.extend(turns(10, "", "sloppy", false, 170_000));
         let result = score_events(&events, full_caps(), &ScoreConfig::default());
-        assert_eq!(result.score, 30);
+        assert_eq!(result.score, 90, "30 behavioural + 60 fill pressure");
         assert_eq!(
             result.verdict,
             Verdict::Compact,
@@ -2003,7 +2223,10 @@ mod tests {
         let events = turns(12, "", "no marker at all", false, 170_000);
         let result = score_events(&events, full_caps(), &ScoreConfig::default());
         assert_eq!(result.signals.marker_miss_rate, None);
-        assert_eq!(result.score, 0);
+        assert_eq!(
+            result.score, 60,
+            "fill pressure only, saturated at the ceiling"
+        );
         assert_eq!(
             result.verdict,
             Verdict::Compact,
@@ -2017,7 +2240,7 @@ mod tests {
         events.extend(turns(4, "", "sloppy", false, 120_000));
         let result = score_events(&events, full_caps(), &ScoreConfig::default());
         assert_eq!(result.signals.marker_miss_rate, Some(0.4));
-        assert_eq!(result.score, 12);
+        assert_eq!(result.score, 32, "12 behavioural + 20 fill pressure");
         assert_eq!(result.verdict, Verdict::Healthy);
     }
 

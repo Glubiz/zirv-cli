@@ -313,6 +313,7 @@ pub fn evaluate(
     let score = rot::score_from(
         signals.clone(),
         observation.measured_input_tokens,
+        rot::compactions(&observation.events),
         cfg,
         caps,
     );
