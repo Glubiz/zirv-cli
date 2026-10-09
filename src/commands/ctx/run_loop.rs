@@ -449,7 +449,7 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
         let mut compact_budget = super::exec::CompactBudget::default();
         let compact_window = Duration::from_secs(cfg.supervise.interval_secs);
 
-        let (outcome, rotted, limit_hit, limit_confirmation_detail) = loop {
+        let (outcome, compact_unresumed, limit_hit, limit_confirmation_detail) = loop {
             // Hold each child in the console-close registry and kill-on-close
             // job for its own lifetime.
             let (mut child, tap, _child_guard) =
@@ -469,7 +469,7 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
                 );
             }
             let mut scorer = score::IncrementalScorer::new(transcript.clone());
-            let mut rotted = false;
+            let mut compact_unresumed = false;
             let mut suggestions = super::exec::SuggestionLatch::default();
             let mut compact_requested = false;
             let mut limit_hit = false;
@@ -729,6 +729,7 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
                                 observed_at: None,
                             },
                         );
+                        compact_budget.fail();
                         suggestions.note(
                             super::exec::SignalAction::SuggestRestart,
                             0,
@@ -755,26 +756,19 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
                             w,
                             "zirv ctx loop: {reason}; falling back to the next fresh cycle"
                         )?;
-                        rotted = true;
+                        compact_unresumed = true;
                     }
                 }
             }
-            break (outcome, rotted, limit_hit, limit_confirmation_detail);
+            break (
+                outcome,
+                compact_unresumed,
+                limit_hit,
+                limit_confirmation_detail,
+            );
         };
 
-        let (action, failed) = match outcome {
-            // A usage limit is the window's fault, not the cycle's: park and
-            // let the next cycle do the work.
-            Outcome::StoppedByTick(_) if limit_hit => ("limit-park", false),
-            // Rot is hygiene, not failure: the next cycle is the restart.
-            Outcome::StoppedByTick(_) if rotted => ("rot-kill", false),
-            Outcome::StoppedByTick(reason) => (reason, true),
-            Outcome::TimedOut => ("timeout-kill", true),
-            Outcome::Exited(0) if !limit_hit => ("ok", false),
-            Outcome::Exited(0) => ("limit-park", false),
-            Outcome::Exited(_) if limit_hit => ("limit-park", false),
-            Outcome::Exited(_) => ("nonzero-exit", true),
-        };
+        let (action, failed, verdict) = cycle_label(outcome, limit_hit, compact_unresumed);
 
         let decision_detail = limit_confirmation_detail
             .as_deref()
@@ -791,7 +785,7 @@ pub(crate) fn run_with_clock_and_presence<W: Write>(
                 ts: now_secs(),
                 session: session.as_str(),
                 verb: "loop",
-                verdict: if rotted { "restart" } else { "n/a" },
+                verdict,
                 score: 0,
                 action,
                 detail: &decision_detail,
@@ -956,6 +950,30 @@ const MAX_PARK_SECS: u64 = 3600;
 
 /// Resolve the literal zirv gate word to its executable and optional
 /// interpreter prefix.
+/// The cycle's logged action, whether it counts as a failure, and the
+/// verdict. Zirv never restarts for rot, so only a limit park, a failed
+/// compaction that could not be resumed, or the child's own end is named.
+fn cycle_label(
+    outcome: Outcome,
+    limit_hit: bool,
+    compact_unresumed: bool,
+) -> (&'static str, bool, &'static str) {
+    match outcome {
+        // A usage limit is the window's fault, not the cycle's: park and
+        // let the next cycle do the work.
+        Outcome::StoppedByTick(_) if limit_hit => ("limit-park", false, "n/a"),
+        Outcome::StoppedByTick(_) if compact_unresumed => {
+            ("compact-failed-no-resume", false, "compact")
+        }
+        Outcome::StoppedByTick(reason) => (reason, true, "n/a"),
+        Outcome::TimedOut => ("timeout-kill", true, "n/a"),
+        Outcome::Exited(0) if !limit_hit => ("ok", false, "n/a"),
+        Outcome::Exited(_) if limit_hit => ("limit-park", false, "n/a"),
+        Outcome::Exited(0) => ("limit-park", false, "n/a"),
+        Outcome::Exited(_) => ("nonzero-exit", true, "n/a"),
+    }
+}
+
 fn zirv_invocation(env: EnvLookup<'_>) -> CtxResult<Vec<String>> {
     if let Some(bin) = env(GATE_BIN_ENV) {
         return Ok(bin.split_whitespace().map(str::to_string).collect());
@@ -1943,7 +1961,7 @@ mod tests {
         let mut env = base_env(&state);
         env.insert(
             "ZIRV_CTX_SUPERVISE_COMPACT_TIMEOUT_MS".to_string(),
-            "300".to_string(),
+            "3000".to_string(),
         );
         env.insert("ZIRV_CTX_INTERVAL_SECS".to_string(), "0".to_string());
 
@@ -1973,6 +1991,22 @@ mod tests {
             transcripts_in(&home).len(),
             1,
             "resuming keeps the cycle's session id"
+        );
+    }
+
+    #[test]
+    fn a_compaction_that_failed_without_a_resume_is_labelled_as_that_never_as_a_rot_restart() {
+        let (action, failed, verdict) = cycle_label(Outcome::StoppedByTick("compact"), false, true);
+        assert_eq!(action, "compact-failed-no-resume");
+        assert!(!failed);
+        assert_eq!(verdict, "compact");
+        assert_ne!(action, "rot-kill");
+        assert_ne!(verdict, "restart");
+
+        // A plain tick stop with no failed compaction keeps its own reason.
+        assert_eq!(
+            cycle_label(Outcome::StoppedByTick("cancelled"), false, false),
+            ("cancelled", true, "n/a")
         );
     }
 

@@ -377,6 +377,12 @@ pub(super) fn with_stop_block(line: Option<&str>, reason: &str) -> String {
     serde_json::Value::Object(object).to_string()
 }
 
+fn stop_context_pct(capacity: Option<u64>, score: &Score) -> Option<u64> {
+    capacity
+        .filter(|window| *window > 0)
+        .map(|window| score.context_tokens.saturating_mul(100) / window)
+}
+
 /// Call Jev only when a rot advisory would be emitted; otherwise its answer
 /// cannot affect Stop output and would add needless hot-hook latency (#785).
 fn stop_rot_advisory_deferred(
@@ -392,9 +398,7 @@ fn stop_rot_advisory_deferred(
         return false;
     }
     let facts = InjectFacts {
-        context_pct: capacity
-            .filter(|window| *window > 0)
-            .map(|window| score.context_tokens.saturating_mul(100) / window),
+        context_pct: stop_context_pct(capacity, score),
         rot_score: Some(score.score),
         restart_at: cfg.score.restart_at,
         turns_since_user_prompt: Some(0),
@@ -1943,5 +1947,19 @@ mod tests {
             !out.contains("found-not-changed"),
             "disabled must never block: {out}"
         );
+    }
+
+    #[test]
+    fn the_inject_gate_context_pct_comes_from_the_resolved_capacity_not_the_pinned_config() {
+        let mut score = score_with_turns(3);
+        score.context_tokens = 50_000;
+        let cfg = CtxConfig::default();
+        assert!(
+            cfg.score.model_context_tokens.is_none(),
+            "the config must be unpinned for this test to mean anything"
+        );
+        assert_eq!(stop_context_pct(Some(200_000), &score), Some(25));
+        assert_eq!(stop_context_pct(None, &score), None);
+        assert_eq!(stop_context_pct(Some(0), &score), None);
     }
 }
