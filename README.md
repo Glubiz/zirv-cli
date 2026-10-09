@@ -4951,8 +4951,10 @@ The relay forwards only zirv's own compiled questions: frames and requests are
 parsed strictly (unknown fields are refused), every question's instructions and
 options must equal one a `[jev]` site of this binary builds, and the body sent
 to TypeSafe is re-serialised from the validated request rather than the
-client's bytes. A peer that has not delivered its request frame within 3
-seconds is dropped (enforced on unix), so one stalled client cannot hold the
+client's bytes, with the relay's own configured model in place of the client's.
+A peer whose whole request frame has not arrived within 3 seconds of
+acceptance is dropped (enforced on unix), however slowly it sends, and each
+connection is served on its own thread, so stalled clients cannot hold the
 relay. A site added to the binary must also be listed in the relay's question
 registry (`jev_relay::compiled_questions`) to be answerable through it.
 
