@@ -409,7 +409,8 @@ impl std::fmt::Display for JevError {
 
 impl std::error::Error for JevError {}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NoulCriteria {
     #[serde(rename = "true", skip_serializing_if = "Option::is_none")]
     when_true: Option<String>,
@@ -417,8 +418,8 @@ struct NoulCriteria {
     when_false: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 enum QuestionSpec {
     Choice {
         instructions: String,
@@ -441,6 +442,7 @@ enum QuestionSpec {
 /// to cheaply re-validate it (see [`safe_wire_request`]) before spending its
 /// own credential forwarding it anywhere.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SystemOneRequest {
     state: serde_json::Value,
     model: String,
@@ -487,35 +489,38 @@ struct SystemOneResponse {
     usage: SystemOneUsage,
 }
 
-fn build_request(state: &impl Serialize, questions: &[Question], model: &str) -> SystemOneRequest {
-    let mut mapped = BTreeMap::new();
-    for question in questions {
-        let spec = match &question.criteria {
-            Criteria::Choice(options) => QuestionSpec::Choice {
-                instructions: question.instructions.clone(),
-                criteria: options.iter().cloned().collect(),
+fn question_spec(question: &Question) -> QuestionSpec {
+    match &question.criteria {
+        Criteria::Choice(options) => QuestionSpec::Choice {
+            instructions: question.instructions.clone(),
+            criteria: options.iter().cloned().collect(),
+        },
+        Criteria::Score(levels) => QuestionSpec::Score {
+            instructions: question.instructions.clone(),
+            criteria: levels.clone(),
+        },
+        Criteria::Noul {
+            when_true,
+            when_false,
+        } => QuestionSpec::Noul {
+            instructions: question.instructions.clone(),
+            criteria: if when_true.is_some() || when_false.is_some() {
+                Some(NoulCriteria {
+                    when_true: when_true.clone(),
+                    when_false: when_false.clone(),
+                })
+            } else {
+                None
             },
-            Criteria::Score(levels) => QuestionSpec::Score {
-                instructions: question.instructions.clone(),
-                criteria: levels.clone(),
-            },
-            Criteria::Noul {
-                when_true,
-                when_false,
-            } => QuestionSpec::Noul {
-                instructions: question.instructions.clone(),
-                criteria: if when_true.is_some() || when_false.is_some() {
-                    Some(NoulCriteria {
-                        when_true: when_true.clone(),
-                        when_false: when_false.clone(),
-                    })
-                } else {
-                    None
-                },
-            },
-        };
-        mapped.insert(question.id.clone(), spec);
+        },
     }
+}
+
+fn build_request(state: &impl Serialize, questions: &[Question], model: &str) -> SystemOneRequest {
+    let mapped = questions
+        .iter()
+        .map(|question| (question.id.clone(), question_spec(question)))
+        .collect();
     SystemOneRequest {
         state: serde_json::to_value(state).unwrap_or(serde_json::Value::Null),
         model: model.to_string(),
@@ -760,10 +765,7 @@ pub(crate) fn safe_metadata_request(
 /// against. A relay forwards only a body that passes this; anything else
 /// gets an `{"error": ...}` frame back, which `jev::ask`'s own relay step
 /// treats as "fall back to a direct call", never as a forwarded answer.
-pub(crate) fn safe_wire_request(payload: &str) -> bool {
-    let Ok(parsed) = serde_json::from_str::<SystemOneRequest>(payload) else {
-        return false;
-    };
+fn safe_wire_request(parsed: &SystemOneRequest) -> bool {
     if !safe_metadata_state(&parsed.state) {
         return false;
     }
@@ -815,6 +817,22 @@ pub(crate) fn safe_wire_request(payload: &str) -> bool {
                 }
             }
     })
+}
+
+/// The body the relay forwards for `payload`, or `None` unless it parses strictly (no unknown
+/// fields), passes [`safe_wire_request`], and every question's spec (instructions and options,
+/// whatever its id) equals one of the `compiled` questions. The body is re-serialised from the
+/// parsed value, so none of the client's bytes are forwarded.
+pub(crate) fn compiled_wire_body(payload: &str, compiled: &[Question]) -> Option<String> {
+    let parsed = serde_json::from_str::<SystemOneRequest>(payload).ok()?;
+    if !safe_wire_request(&parsed) {
+        return None;
+    }
+    let specs: Vec<QuestionSpec> = compiled.iter().map(question_spec).collect();
+    if !parsed.questions.values().all(|spec| specs.contains(spec)) {
+        return None;
+    }
+    serde_json::to_string(&parsed).ok()
 }
 
 #[cfg(test)]

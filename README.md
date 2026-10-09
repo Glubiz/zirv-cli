@@ -4947,6 +4947,15 @@ twice. Caching, decision recording and error mapping are identical either
 way. A relay is always an optimisation: it is never required, and its absence
 never changes an answer, only how fast it arrives.
 
+The relay forwards only zirv's own compiled questions: frames and requests are
+parsed strictly (unknown fields are refused), every question's instructions and
+options must equal one a `[jev]` site of this binary builds, and the body sent
+to TypeSafe is re-serialised from the validated request rather than the
+client's bytes. A peer that has not delivered its request frame within 3
+seconds is dropped (enforced on unix), so one stalled client cannot hold the
+relay. A site added to the binary must also be listed in the relay's question
+registry (`jev_relay::compiled_questions`) to be answerable through it.
+
 Jev requests now accept only a bounded numeric metadata envelope with static
 questions. The shared client rejects text, paths, diffs, secrets, dynamic
 question content, and legacy text-bearing advisory states before checking its
@@ -5235,7 +5244,7 @@ keep only your own.
 | `ZIRV_CTX_OBFUSCATE_EMAIL_DOMAIN` | operator environment | selects whether an email placeholder retains its domain; a repository may only narrow to `mask` |
 | `prompt.intake_discipline` | operator home or environment; repository may narrow | a repository may only turn the first-prompt discipline note off, never back on for an operator who disabled it |
 | Approvals inbox "always allow" (`^A Y`) | operator, by key on a request the dashboard drew in full | applies only a `permission_suggestions` entry Claude itself sent for that call (an allow-rule addition); a repository, a hook payload field, mail, the CLI and MCP have no way to choose or trigger it, and a request carrying no suggestion refuses it |
-| `[jev]` token-savings gates | operator home or environment only | off by default; each site also needs the named nonempty TypeSafe credential, or a live relay to the supervisor that holds it (scrubbed `exec` and dashboard Worker sessions), before reading cached advice or writing Jev records; repository/model-authored material may only remove optional context or prevent a permitted launch, never grant or waive a required check |
+| `[jev]` token-savings gates | operator home or environment only | off by default; each site also needs the named nonempty TypeSafe credential, or a live relay to the supervisor that holds it (scrubbed `exec` and dashboard Worker sessions; the relay forwards only the binary's own compiled questions), before reading cached advice or writing Jev records; repository/model-authored material may only remove optional context or prevent a permitted launch, never grant or waive a required check |
 | Native `/settings` writes | operator, by keyboard in the pane | the same validation and atomic write as `zirv ctx config`; session scope is an in-memory, journaled override of live-reload keys only and never touches a file; project scope refuses every `REPO_FORBIDDEN` key and any value that would not narrow before writing, credential-like keys are never rendered, journaled or accepted |
 | `[sandbox] scrub_worker_secrets` | operator home or environment only | on by default; a delegated worker (`zirv agent`, `zirv ctx exec`/`loop`) launches without secret-shaped environment variables, never a repository's call to turn off; its hook-side `[jev]` gates reach Jev through the supervisor's relay (`exec`, dashboard Worker panes), and a `loop` cycle with a gate on keeps `credential_env` |
 | `[headless]` cost levers | operator home or environment only | a headless (`-p`) Claude Code launch only -- prompt-cache TTL, per-complexity effort (defaults to `low`) and a lean/`--disallowedTools` tool surface (lean on by default) -- with every key unset the launch differs from before this table existed only by `CLAUDE_CODE_EFFORT_LEVEL=low`, `CLAUDE_CODE_PROMPT_CACHE_TTL=5m` and the lean settings layer and unused-tool (`Workflow`, `ScheduleWakeup`, `ShareOnboardingGuide`, `ListAgents`, `ReportFindings`, `Agent` for worker/single) deny; an interactive `wrap`/`chat`/dash session is never narrowed by it |
