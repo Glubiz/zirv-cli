@@ -12,6 +12,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 
+use crate::commands::ctx::rot::Verdict;
 use crate::style;
 
 use super::super::attention::{Attention, Projection, SessionStatus, Visibility};
@@ -298,6 +299,8 @@ pub struct SidebarRow {
     pub harness: String,
     pub age_secs: Option<u64>,
     pub score: Option<u32>,
+    /// The rot verdict behind `score`; the band and recommendation follow it.
+    pub verdict: Option<Verdict>,
     pub state: RowState,
     /// Set for every row: the pane header reads the focused row, which may
     /// differ from the selected row. Fall back to `RowState` without status.
@@ -2034,6 +2037,8 @@ pub struct FooterAliveFacts {
     /// the same `✻ –` unknown placeholder the wrap bar's own `BarState`
     /// uses for the identical case.
     pub score: Option<u32>,
+    /// The rot verdict behind `score`; the band and recommendation follow it.
+    pub verdict: Option<Verdict>,
     /// Ease track fill while the numeric score stays immediate; absent with no score.
     pub eased_score: Option<f64>,
     /// Total unread mail (broadcast + direct) for this session. The mock's
@@ -2164,7 +2169,7 @@ fn footer_alive_spans(
 
     let (verdict_full, verdict_reduced): (FooterSeg, FooterSeg) = match facts.score {
         Some(score) => {
-            let band = rot_band_for(score, advise_at, compact_at);
+            let band = rot_band_of(facts.verdict, score, advise_at, compact_at);
             let word = match band {
                 RotBand::Fresh => "fresh",
                 RotBand::Warming => "warming",
@@ -2191,7 +2196,7 @@ fn footer_alive_spans(
         .unwrap_or_default();
     let recommendation: FooterSeg = facts
         .score
-        .and_then(|score| rot_recommendation(score, compact_at, restart_at))
+        .and_then(|score| rot_recommendation_of(facts.verdict, score, compact_at, restart_at))
         .map(|(text, style)| vec![(text.to_string(), style)])
         .unwrap_or_default();
     let rollover: FooterSeg = facts
@@ -2457,6 +2462,16 @@ pub fn rot_band_for(score: u32, advise_at: u32, compact_at: u32) -> RotBand {
     }
 }
 
+/// The band a row or footer shows: the verdict's when known, else the score's.
+fn rot_band_of(verdict: Option<Verdict>, score: u32, advise_at: u32, compact_at: u32) -> RotBand {
+    match verdict {
+        Some(Verdict::Healthy) => RotBand::Fresh,
+        Some(Verdict::Advise) => RotBand::Warming,
+        Some(Verdict::Compact | Verdict::Restart) => RotBand::Rotting,
+        None => rot_band_for(score, advise_at, compact_at),
+    }
+}
+
 /// The sidebar's own rot-glyph style: warming is yellow, rotting is
 /// red-bold, and -- per the approved mock (§03) -- fresh gets no colour of
 /// its own at all, inheriting whatever tone the row it sits in already
@@ -2534,6 +2549,21 @@ fn rot_recommendation(
         Some(("/compact recommended", style::tui::warning()))
     } else {
         None
+    }
+}
+
+/// The recommendation for a known verdict, else the score's own thresholds.
+fn rot_recommendation_of(
+    verdict: Option<Verdict>,
+    score: u32,
+    compact_at: u32,
+    restart_at: u32,
+) -> Option<(&'static str, Style)> {
+    match verdict {
+        Some(Verdict::Restart) => Some(("fresh session recommended", style::tui::error())),
+        Some(Verdict::Compact) => Some(("/compact recommended", style::tui::warning())),
+        Some(Verdict::Healthy | Verdict::Advise) => None,
+        None => rot_recommendation(score, compact_at, restart_at),
     }
 }
 
@@ -2648,7 +2678,7 @@ fn sidebar_row_parts(
     let rot = row
         .score
         .filter(|_| row.state != RowState::Dead)
-        .map(|score| sidebar_rot_style(rot_band_for(score, advise_at, compact_at)))
+        .map(|score| sidebar_rot_style(rot_band_of(row.verdict, score, advise_at, compact_at)))
         .unwrap_or_else(style::tui::muted)
         .patch(base);
     // `name` is `orch` for the orchestrator (`display_role` already shortens
@@ -4294,6 +4324,7 @@ mod tests {
                         harness: if i % 2 == 0 { "claude" } else { "codex" }.to_string(),
                         age_secs: Some(90 + i * 60),
                         score: Some(12 + i as u32 * 9),
+                        verdict: None,
                         state: if scenario == "nine-panes" && i == 7 {
                             RowState::Dead
                         } else if i == 2 {
@@ -5604,6 +5635,7 @@ mod tests {
             harness: harness.to_string(),
             age_secs: Some(90),
             score: None,
+            verdict: None,
             state,
             status: None,
             exit_code: None,
@@ -6136,6 +6168,7 @@ mod tests {
                 harness: "claude".to_string(),
                 age_secs: Some(5),
                 score: None,
+                verdict: None,
                 state: RowState::Working,
                 status: None,
                 exit_code: None,
@@ -6162,6 +6195,7 @@ mod tests {
                 harness: "codex".to_string(),
                 age_secs: Some(5),
                 score: None,
+                verdict: None,
                 state: RowState::Unknown,
                 status: None,
                 exit_code: None,
@@ -6218,6 +6252,7 @@ mod tests {
             harness: String::new(),
             age_secs: None,
             score: None,
+            verdict: None,
             state: RowState::Idle,
             status: None,
             exit_code: None,
@@ -6571,6 +6606,7 @@ mod tests {
     fn alive_footer_facts() -> FooterAliveFacts {
         FooterAliveFacts {
             score: Some(12),
+            verdict: None,
             eased_score: Some(12.0),
             unread_mail: 0,
             supervised: true,
@@ -6633,6 +6669,7 @@ mod tests {
     fn footer_renders_the_attention_example() {
         let facts = FooterFacts::Alive(FooterAliveFacts {
             score: Some(47),
+            verdict: None,
             eased_score: Some(47.0),
             unread_mail: 2,
             supervised: true,
@@ -6659,6 +6696,52 @@ mod tests {
         });
         assert!(text.contains("rotting"), "got {text:?}");
         assert!(text.contains(style::PLACEHOLDER), "got {text:?}");
+    }
+
+    /// The band and the recommendation follow the verdict, not the score
+    /// thresholds: a Compact verdict below `compact_at` still reads rotting.
+    #[test]
+    fn footer_band_and_recommendation_follow_the_verdict() {
+        let capture = |score: u32, verdict: Verdict| {
+            let mut alive = alive_footer_facts();
+            alive.score = Some(score);
+            alive.verdict = Some(verdict);
+            let facts = FooterFacts::Alive(alive);
+            render_and_capture_text(Rect::new(0, 0, 100, 1), |f, area| {
+                render_footer(f, area, &facts, 40, 60, 80, 0, utc(), 0, Motion::Reduced)
+            })
+        };
+        let compact = capture(30, Verdict::Compact);
+        assert!(compact.contains("rotting"), "got {compact:?}");
+        assert!(compact.contains("/compact recommended"), "got {compact:?}");
+        let restart = capture(30, Verdict::Restart);
+        assert!(
+            restart.contains("fresh session recommended"),
+            "got {restart:?}"
+        );
+        let advise = capture(90, Verdict::Advise);
+        assert!(advise.contains("warming"), "got {advise:?}");
+        assert!(!advise.contains("recommended"), "got {advise:?}");
+        let healthy = capture(90, Verdict::Healthy);
+        assert!(healthy.contains("fresh"), "got {healthy:?}");
+        assert!(!healthy.contains("recommended"), "got {healthy:?}");
+    }
+
+    #[test]
+    fn sidebar_rot_style_follows_the_verdict() {
+        let mut row = sidebar_row("aaa11111", "claude", RowState::Idle);
+        row.score = Some(30);
+        row.verdict = Some(Verdict::Compact);
+        let backend = TestBackend::new(40, 4);
+        let mut term = Terminal::new(backend).expect("terminal");
+        term.draw(|f| render_sidebar(f, Rect::new(0, 0, 40, 4), &[row], 0, 40, 60))
+            .expect("draw");
+        let name_width = 40usize.saturating_sub(SIDEBAR_FIXED_COLS);
+        let rot_x = (1 + 1 + 1 + name_width + 1 + 6 + 1) as u16;
+        assert_eq!(
+            term.backend().buffer()[(rot_x, 0)].fg,
+            style::tui::error().fg.expect("error has a fg")
+        );
     }
 
     /// The mock's own "dead pane focused" example: a different message
@@ -6886,6 +6969,7 @@ mod tests {
     fn rollover_alive_facts(rollover: Option<RolloverFooterFact>) -> FooterAliveFacts {
         FooterAliveFacts {
             score: Some(22),
+            verdict: None,
             eased_score: Some(22.0),
             unread_mail: 0,
             supervised: true,

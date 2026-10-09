@@ -9,7 +9,7 @@ use super::config::{CtxConfig, EnvLookup, ScoreConfig, env_from_process};
 use super::event::{
     Capabilities, ModelChange, NormalizedEvent, SessionId, SessionRef, SpeedMetrics, input_hash,
 };
-use super::rot::{self, RotState, Score};
+use super::rot::{self, RotState, Score, Verdict};
 use super::screen::{self, ScreenReport};
 use super::state::StateDir;
 use super::supervise::Watcher;
@@ -949,7 +949,7 @@ impl IncrementalScorer {
 
 /// Increment when checkpoint or `RotState` shape changes; reject and rebuild
 /// older files so missing fields cannot silently alter scoring (#155).
-const CHECKPOINT_VERSION: u32 = 6;
+const CHECKPOINT_VERSION: u32 = 7;
 
 /// What a fresh process needs to carry on folding where the last one stopped.
 #[derive(Debug, Serialize, Deserialize)]
@@ -1263,7 +1263,7 @@ struct CachedScore {
     transcript: PathBuf,
     /// The stamp that was actually scored, and its score. `None` until the
     /// transcript first becomes readable.
-    scored: Option<(TranscriptStamp, u32)>,
+    scored: Option<(TranscriptStamp, u32, Verdict)>,
     /// Polls answered off this path since it was resolved, counted only while
     /// the transcript is missing -- see [`RESOLVE_RETRY_POLLS`].
     polls_since_resolve: u32,
@@ -1348,10 +1348,16 @@ static RESOLVE_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// claude's transcript path, found nothing, and reported the session as
 /// permanently unscorable. `breakdown_for_session` already reads the
 /// record's own agent for the same reason.
-pub fn cached_score(state: &StateDir, repo: &Path, session_id: &str, agent: &str) -> Option<u32> {
-    cached_score_with(state, repo, session_id, agent, &env_from_process())
+pub fn cached_score(
+    state: &StateDir,
+    repo: &Path,
+    session_id: &str,
+    agent: &str,
+) -> Option<(u32, Verdict)> {
+    cached_rot_with(state, repo, session_id, agent, &env_from_process())
 }
 
+#[cfg(test)]
 fn cached_score_with(
     state: &StateDir,
     repo: &Path,
@@ -1359,6 +1365,16 @@ fn cached_score_with(
     agent: &str,
     env: EnvLookup<'_>,
 ) -> Option<u32> {
+    cached_rot_with(state, repo, session_id, agent, env).map(|(score, _)| score)
+}
+
+fn cached_rot_with(
+    state: &StateDir,
+    repo: &Path,
+    session_id: &str,
+    agent: &str,
+    env: EnvLookup<'_>,
+) -> Option<(u32, Verdict)> {
     let cached = {
         let cache = score_cache().lock().unwrap_or_else(|e| e.into_inner());
         cache.get(session_id).cloned()
@@ -1373,10 +1389,10 @@ fn cached_score_with(
         match stamp_of(&entry.transcript) {
             // The whole fast path: one stat, no config load, no parse.
             Some(stamp) => {
-                if let Some((scored, score)) = &entry.scored
+                if let Some((scored, score, verdict)) = &entry.scored
                     && *scored == stamp
                 {
-                    return Some(*score);
+                    return Some((*score, *verdict));
                 }
             }
             // Nothing written there (yet, or any more). Keep answering
@@ -1442,7 +1458,7 @@ fn cached_score_with(
         .ok()
         .map(|(score, _, _)| {
             SCORE_RECOMPUTES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            (stamp, score.score)
+            (stamp, score.score, score.verdict)
         }),
         None => None,
     };
@@ -1457,7 +1473,7 @@ fn cached_score_with(
             polls_since_resolve: 0,
         },
     );
-    scored.map(|(_, score)| score)
+    scored.map(|(_, score, verdict)| (score, verdict))
 }
 
 pub fn run_with<W: Write>(
@@ -3053,9 +3069,9 @@ mod tests {
         assert_eq!(score.context_tokens, 200_000);
         assert_eq!(
             score.verdict,
-            rot::Verdict::Healthy,
-            "200k of a 258k window is below the derived ceiling; only the 160k absolute \
-             fallback would force a compaction here"
+            rot::Verdict::Advise,
+            "200k of a 258k window is below the derived 206k ceiling, so fill pressure only \
+             advises (score 55); only the 160k absolute fallback would force a compaction here"
         );
     }
 
@@ -3217,7 +3233,8 @@ mod tests {
         assert_eq!(text.lines().count(), 1, "exactly one JSON line");
         let parsed: serde_json::Value = serde_json::from_str(text.trim()).expect("valid json");
         assert!(parsed["score"].is_u64());
-        assert_eq!(parsed["verdict"], "restart");
+        // A restart is only reached after a compaction; this transcript has none.
+        assert_eq!(parsed["verdict"], "compact");
         assert_eq!(parsed["context_tokens"], 170_000);
         assert_eq!(parsed["signals"]["turns"], 12);
         assert_eq!(parsed["signals"]["tool_failure_rate"], 1.0);

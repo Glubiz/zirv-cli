@@ -1929,33 +1929,40 @@ mod tests {
     #[test]
     fn a_tool_failure_spike_alone_reaches_advise() {
         let cfg = ScoreConfig::default();
-        let events = turns(12, "", "[zirv] ok", true, 120_000);
+        // Tokens at the floor (100k): no fill pressure, the behavioural signal alone.
+        let events = turns(12, "", "[zirv] ok", true, 100_000);
         let result = score_events(&events, full_caps(), &cfg);
         assert_eq!(result.signals.tool_failure_rate, 1.0);
-        // 40 behavioural + 20 fill pressure (120k of the 100k..160k gate).
-        assert_eq!(result.score, 60);
-        assert_eq!(result.verdict, Verdict::Compact);
+        assert_eq!(result.score, 40);
+        assert_eq!(result.verdict, Verdict::Advise);
     }
 
     #[test]
     fn tool_failures_plus_repetition_reach_compact() {
         let cfg = ScoreConfig::default();
         // Same tool and input every turn, every result an error, marker intact.
-        let events = looping_turns(12, "", "[zirv] ok", true, 120_000);
+        let events = looping_turns(12, "", "[zirv] ok", true, 100_000);
         let result = score_events(&events, full_caps(), &cfg);
-        // 40 (failures) + 30 (repetition maxed) + 0 (marker clean) = 70, + 20 fill pressure
+        // 40 (failures) + 30 (repetition maxed) + 0 (marker clean) = 70; tokens at the floor
         assert_eq!(result.signals.max_repeat, 10, "window bounded");
         assert_eq!(result.signals.marker_miss_rate, Some(0.0));
-        assert_eq!(result.score, 90);
+        assert_eq!(result.score, 70);
         assert_eq!(result.verdict, Verdict::Compact);
     }
 
     #[test]
     fn all_three_signals_together_reach_restart() {
         let cfg = ScoreConfig::default();
-        let mut events = looping_turns(2, "", "[zirv] ok", true, 120_000);
-        events.extend(looping_turns(10, "", "sloppy", true, 120_000));
+        // A prior compaction: a restart is only suggested once compacting did not help.
+        let mut events = vec![NormalizedEvent::Compaction];
+        events.extend(looping_turns(2, "", "[zirv] ok", true, 100_000));
+        events.extend(looping_turns(10, "", "sloppy", true, 100_000));
         let result = score_events(&events, full_caps(), &cfg);
+        assert_eq!(result.score, 100);
+        assert_eq!(result.verdict, Verdict::Restart);
+
+        let uncompacted: Vec<_> = events[1..].to_vec();
+        let result = score_events(&uncompacted, full_caps(), &cfg);
         assert_eq!(result.score, 100);
         assert_eq!(
             result.verdict,
@@ -1978,11 +1985,10 @@ mod tests {
             pre_tool_hook: false,
             post_tool_hook: false,
         };
-        let mut events = looping_turns(2, "", "[zirv] ok", true, 120_000);
-        events.extend(looping_turns(10, "", "sloppy", true, 120_000));
+        let mut events = looping_turns(2, "", "[zirv] ok", true, 100_000);
+        events.extend(looping_turns(10, "", "sloppy", true, 100_000));
         let result = score_events(&events, caps, &cfg);
-        // 70 behavioural (weights are not redistributed) + 20 fill pressure.
-        assert_eq!(result.score, 90);
+        assert_eq!(result.score, 70, "weights are not redistributed");
         assert_eq!(
             result.verdict,
             Verdict::Compact,

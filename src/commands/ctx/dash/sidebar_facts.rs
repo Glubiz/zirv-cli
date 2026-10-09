@@ -218,7 +218,8 @@ pub(super) fn assemble_sidebar(
             Some(ended) => ended.age_secs,
             None => age_of(&p.short),
         },
-        score: scores.get(&p.short).copied(),
+        score: scores.get(&p.short).map(|(score, _)| *score),
+        verdict: scores.get(&p.short).map(|(_, verdict)| *verdict),
         state: p.state,
         status: None,
         exit_code: p.ended.map(|e| e.exit_code),
@@ -269,7 +270,8 @@ pub(super) fn assemble_sidebar(
             short: record.short.clone(),
             harness: record.agent.clone(),
             age_secs: Some(now_secs.saturating_sub(record.started_at)),
-            score: scores.get(&record.short).copied(),
+            score: scores.get(&record.short).map(|(score, _)| *score),
+            verdict: scores.get(&record.short).map(|(_, verdict)| *verdict),
             state: ui::RowState::Unknown,
             status: None,
             exit_code: None,
@@ -932,6 +934,7 @@ pub(super) fn assemble_footer_facts(
 
     ui::FooterFacts::Alive(ui::FooterAliveFacts {
         score: row.score,
+        verdict: row.verdict,
         eased_score,
         unread_mail,
         // Render unsupervised when the pane's turn-signal socket did not bind (#209).
@@ -945,7 +948,7 @@ pub(super) fn assemble_footer_facts(
 /// unknown case (`score::cached_score` returned `None`: no transcript yet, an
 /// unreadable one, an unresolvable agent), which the sidebar renders as
 /// `rot --`. Nothing here ever stores a placeholder zero.
-pub(super) type ScoreMap = HashMap<String, u32>;
+pub(super) type ScoreMap = HashMap<String, (u32, crate::commands::ctx::rot::Verdict)>;
 
 /// Read unread mail per session short ID; direct counts depend on the recipient.
 pub(super) type MailMap = HashMap<String, (usize, usize)>;
@@ -1058,6 +1061,7 @@ where
 mod tests {
     use super::super::tests::*;
     use super::*;
+    use crate::commands::ctx::rot::Verdict;
 
     #[test]
     fn assemble_sidebar_marks_the_focused_pane_separately_from_the_selection() {
@@ -1217,12 +1221,17 @@ mod tests {
         record.started_at = 100;
         let registry = vec![(record, sessions::Liveness::Live)];
         let mut scores: ScoreMap = HashMap::new();
-        scores.insert("aaa11111".to_string(), 47);
-        scores.insert("ccc33333".to_string(), 12);
+        scores.insert("aaa11111".to_string(), (47, Verdict::Advise));
+        scores.insert("ccc33333".to_string(), (12, Verdict::Healthy));
 
         let rows = assemble_sidebar(&panes, &registry, &scores, 0, 0, DASHBOARD_PID, 160);
 
         assert_eq!(rows[0].score, Some(47), "own pane, scored");
+        assert_eq!(
+            rows[0].verdict,
+            Some(Verdict::Advise),
+            "verdict travels with it"
+        );
         assert_eq!(rows[1].score, None, "own pane, no cached score");
         assert_eq!(rows[2].score, Some(12), "view-only registry row, scored");
     }
@@ -1605,6 +1614,7 @@ mod tests {
             harness: "claude".to_string(),
             age_secs: Some(90),
             score,
+            verdict: None,
             state: ui::RowState::Idle,
             status: None,
             exit_code: None,
