@@ -781,20 +781,52 @@ const RUNNING_SUBAGENT_STALE_SECS: u64 = 6 * 3600;
 
 /// How many native subagents of `session` are running now, from their durable records.
 pub(super) fn running_subagents(state: &StateDir, session: &str, now: u64) -> usize {
+    running_subagents_in(state, session, now, None)
+}
+
+/// The subagent graph's own view of the session (`read_session_records` liveness, claude's
+/// `subagents/` files through `native_subagents`, a finished native agent overriding a hook
+/// record left `running`), so this count and the graph cannot disagree.
+fn running_subagents_in(
+    state: &StateDir,
+    session: &str,
+    now: u64,
+    claude_home: Option<&Path>,
+) -> usize {
     let short = sessions::short_id(session);
-    // A registered session whose process is gone cannot still be running a subagent.
-    if sessions::load_record(state, &short)
-        .is_some_and(|record| !sessions::record_is_alive(&record))
+    // The graph's liveness for this one record; a Stop hook must not probe every session.
+    let registered = sessions::load_record(state, &short).map(|record| {
+        let alive = sessions::record_is_alive(&record);
+        (record, alive)
+    });
+    // A session with no record is counted as live.
+    let alive = registered.as_ref().is_none_or(|(_, alive)| *alive);
+    let mut agents: BTreeMap<String, SubagentRecord> = BTreeMap::new();
+    if let Some((record, _)) = registered.as_ref().filter(|(r, _)| r.agent == "claude")
+        && let Some(dir) = session_subagents_dir(state, &claude_adapter(claude_home), record)
     {
-        return 0;
+        for found in native_subagents(&dir, &record.session, alive) {
+            agents.insert(found.agent_id.clone(), found);
+        }
     }
-    let Ok(files) = std::fs::read_dir(graph_root(state).join(short)) else {
-        return 0;
-    };
-    files
-        .flatten()
-        .filter_map(|file| std::fs::read_to_string(file.path()).ok())
-        .filter_map(|text| serde_json::from_str::<SubagentRecord>(&text).ok())
+    if let Ok(files) = std::fs::read_dir(graph_root(state).join(&short)) {
+        for mut hooked in files
+            .flatten()
+            .filter_map(|file| std::fs::read_to_string(file.path()).ok())
+            .filter_map(|text| serde_json::from_str::<SubagentRecord>(&text).ok())
+        {
+            if hooked.status == "running" {
+                match agents.remove(&hooked.agent_id) {
+                    Some(native) if native.status != "running" => hooked.status = native.status,
+                    _ if !alive => hooked.status = "stopped".to_string(),
+                    _ => {}
+                }
+            }
+            agents.insert(hooked.agent_id.clone(), hooked);
+        }
+    }
+    agents
+        .values()
         .filter(|record| {
             record.status == "running"
                 && now.saturating_sub(record.started_at) < RUNNING_SUBAGENT_STALE_SECS
@@ -1427,6 +1459,30 @@ pub(super) fn native_subagent_path(
     Some(dir.join(format!("agent-{}.jsonl", file_safe(agent_id))))
 }
 
+fn claude_adapter(claude_home: Option<&Path>) -> super::adapters::claude::ClaudeAdapter {
+    let adapter = super::adapters::claude::ClaudeAdapter::new(None);
+    match claude_home {
+        Some(home) => adapter.with_home(home.to_path_buf()),
+        None => adapter,
+    }
+}
+
+fn session_subagents_dir(
+    state: &StateDir,
+    adapter: &super::adapters::claude::ClaudeAdapter,
+    record: &sessions::Record,
+) -> Option<PathBuf> {
+    let transcript = super::adapters::claude::session_transcript(
+        adapter,
+        state,
+        &super::event::SessionRef {
+            id: super::event::SessionId::parse(&record.session),
+            cwd: record.repo.clone(),
+        },
+    );
+    super::adapters::claude::subagents_dir(&transcript)
+}
+
 /// Native subagents: claude's own `subagents/` files merged with the hook records (the hook
 /// record wins), each parented on the caller of its dispatching `Agent` call, else the session.
 fn place_subagents(
@@ -1436,10 +1492,7 @@ fn place_subagents(
     resolve: &dyn Fn(&str) -> String,
     nodes: &mut BTreeMap<String, Node>,
 ) {
-    let mut adapter = super::adapters::claude::ClaudeAdapter::new(None);
-    if let Some(home) = claude_home {
-        adapter = adapter.with_home(home.to_path_buf());
-    }
+    let adapter = claude_adapter(claude_home);
     let mut agents: BTreeMap<String, SubagentRecord> = BTreeMap::new();
     let mut agent_dirs: BTreeMap<String, PathBuf> = BTreeMap::new();
     let cutoff = now_secs().saturating_sub(NATIVE_WINDOW_SECS);
@@ -1447,15 +1500,7 @@ fn place_subagents(
         if record.agent != "claude" || (!alive && record.started_at < cutoff) {
             continue;
         }
-        let transcript = super::adapters::claude::session_transcript(
-            &adapter,
-            state,
-            &super::event::SessionRef {
-                id: super::event::SessionId::parse(&record.session),
-                cwd: record.repo.clone(),
-            },
-        );
-        let Some(dir) = super::adapters::claude::subagents_dir(&transcript) else {
+        let Some(dir) = session_subagents_dir(state, &adapter, record) else {
             continue;
         };
         for found in native_subagents(&dir, &record.session, *alive) {
@@ -2528,6 +2573,49 @@ mod tests {
             serde_json::to_string(&record).expect("json"),
         )
         .expect("record");
+    }
+
+    /// The count follows the graph: a hook record left `running` is not counted once claude's own
+    /// subagent file shows the agent finished, and a native agent with no hook record is counted.
+    #[test]
+    fn running_subagents_agrees_with_the_graph_on_a_finished_or_unhooked_agent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = state_for(dir.path());
+        let home = dir.path().join("home");
+        let repo = dir.path().join("repo");
+        let session = "feed2222-0000-4000-8000-000000000002";
+        register_session(&state, session, "claude", &repo);
+        let start = |id: &str| {
+            format!(r#"{{"session_id":"{session}","agent_id":"{id}","agent_type":"worker"}}"#)
+        };
+        let env =
+            |key: &str| (key == "ZIRV_CTX_STATE_DIR").then(|| state.root().display().to_string());
+        for id in ["done1", "done2", "busy1"] {
+            run_subagent_start(&start(id), &env).expect("start");
+        }
+        let subagents = home
+            .join(".claude/projects")
+            .join(super::super::adapters::claude::project_slug(&repo))
+            .join(session)
+            .join("subagents");
+        let meta = r#"{"agentType":"worker","description":"d"}"#;
+        for id in ["done1", "done2"] {
+            write_native(
+                &subagents,
+                id,
+                meta,
+                &[
+                    r#"{"type":"user","timestamp":"2026-10-01T10:00:00.000Z"}"#,
+                    r#"{"type":"user","timestamp":"2026-10-01T10:01:00.000Z","toolEndsTurn":true}"#,
+                ],
+            );
+        }
+        write_native(&subagents, "native1", meta, &[r#"{"type":"user"}"#]);
+        assert_eq!(
+            running_subagents_in(&state, session, now_secs(), Some(&home)),
+            2,
+            "busy1 (hook only) and native1 (native only) run; done1 finished"
+        );
     }
 
     /// A running subagent counts only while its registered session's process is alive.

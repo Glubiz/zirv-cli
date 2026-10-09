@@ -485,6 +485,16 @@ fn work_in_flight(state: &StateDir, repo: &Path, session: &str, hook_session: &s
         .is_some_and(|phase| phase < crate::commands::workflow::skill::WorkflowPhase::Verify)
 }
 
+/// The evidence line that names the active workflow's work folder to a before-done consult.
+const JOURNAL_LABEL: &str = "Work journal: ";
+
+/// The active workflow's work folder (repo-relative), where its artifacts and journal live.
+fn work_journal(state: &StateDir, repo: &Path, session: &str) -> Option<String> {
+    let workflow =
+        crate::commands::workflow::engine::load_active_for_session(state, repo, session).ok()??;
+    Some(format!(".zirv/work/{}/", workflow.id))
+}
+
 /// The task a before-done consult judges against, with where it came from: the active
 /// workflow's objective, else the latest operator request in the transcript.
 pub(crate) fn done_task(
@@ -620,11 +630,14 @@ fn on_stop_with(
     let task_line = task()
         .map(|(source, text)| format!("\nTask ({source}): {text}"))
         .unwrap_or_default();
+    let journal_line = work_journal(state, repo, session)
+        .map(|path| format!("\n{JOURNAL_LABEL}{path}"))
+        .unwrap_or_default();
     let request = ConsultRequest {
         trigger: Trigger::BeforeDone,
         session: session.to_string(),
         repo: repo.to_path_buf(),
-        evidence: format!("The agent is about to declare the task done.{task_line}"),
+        evidence: format!("The agent is about to declare the task done.{task_line}{journal_line}"),
         workflow: None,
     };
     fire(state, cfg, env, request, Some(&unit), spawn);
@@ -976,7 +989,13 @@ fn rule_with(
             .lines()
             .find_map(|line| line.strip_prefix("Task (")?.split_once("): "))
             .map_or("none supplied", |(source, _)| source);
-        format!(" [evidence read: git diff --stat HEAD; task: {task_source}]")
+        let journal = evidence
+            .lines()
+            .find_map(|line| line.strip_prefix(JOURNAL_LABEL))
+            .unwrap_or("none");
+        format!(
+            " [evidence read: git diff --stat HEAD; work journal: {journal}; task: {task_source}]"
+        )
     } else {
         String::new()
     };
@@ -1463,11 +1482,7 @@ fn run_ask_with<W: Write>(
     };
     settle_ask_call(&state, &session, &ticket, false);
     // A ruled `done` option lifts the earlier before-done block the same way a done ruling does.
-    let ruled = ruling.verdict.to_ascii_lowercase();
-    let rules_done = ruled
-        .strip_prefix("done")
-        .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric()));
-    if rules_done {
+    if rulings::picks_done_over_not_done(&ruling.verdict, options) {
         rulings::resolve_open(&state, RulingKind::Done, &session);
     }
     writeln!(
@@ -2433,8 +2448,38 @@ mod tests {
         assert!(
             ruling.reason.contains("no tests")
                 && ruling.reason.ends_with(
-                    "[evidence read: git diff --stat HEAD; task: latest operator request]"
+                    "[evidence read: git diff --stat HEAD; work journal: none; task: latest operator request]"
                 ),
+            "{}",
+            ruling.reason
+        );
+    }
+
+    /// An active workflow's work folder rides in the evidence and is named in the ruling's note.
+    #[test]
+    fn a_done_ruling_names_the_work_journal_it_was_given() {
+        let (dir, state) = fresh_state();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        let repo = committed_repo_with_change(dir.path());
+        let mut tokens = 0;
+        let ruling = rule_with(
+            &state,
+            &enabled_cfg(),
+            RulingKind::Done,
+            "abcd1234",
+            &repo,
+            None,
+            "The agent is about to declare the task done.\nWork journal: .zirv/work/wf-1/",
+            &[],
+            &mut tokens,
+            &|_| Ok("NOT_DONE: no tests".to_string()),
+        )
+        .expect("ruled")
+        .expect("a ruling");
+        assert!(
+            ruling.reason.ends_with(
+                "[evidence read: git diff --stat HEAD; work journal: .zirv/work/wf-1/; task: none supplied]"
+            ),
             "{}",
             ruling.reason
         );
@@ -2600,6 +2645,45 @@ mod tests {
             rulings::find_open(&state, RulingKind::Done, Some("abcd1234"), None).is_none(),
             "the not_done ruling no longer stands"
         );
+    }
+
+    /// An ask that is not done-vs-not-done never lifts the before-done block, even when the ruled
+    /// option starts with "done".
+    #[test]
+    fn an_unrelated_ask_ruled_done_leaves_the_not_done_ruling_open() {
+        let (dir, state) = fresh_state();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        let mut env = ruling_env(state.root());
+        env.insert(SESSION_ENV.to_string(), "abcd1234".to_string());
+        let lookup = |k: &str| env.get(k).cloned();
+        open_a(&state, RulingKind::Done, "not_done", "no tests yet");
+        let ask = |options: &[&str], reply: &'static str| {
+            let options: Vec<String> = options.iter().map(|o| o.to_string()).collect();
+            let consult = |session: &str,
+                           options: &[String],
+                           evidence: &str,
+                           _timeout: u64,
+                           _ticket: &str| {
+                let mut tokens = 0;
+                rule_with(
+                    &state,
+                    &enabled_cfg(),
+                    RulingKind::Choice,
+                    session,
+                    Path::new("."),
+                    None,
+                    evidence,
+                    options,
+                    &mut tokens,
+                    &|_| Ok(reply.to_string()),
+                )
+            };
+            let mut out = Vec::new();
+            run_ask_with("which?", &options, "", 5, &lookup, &consult, &mut out).expect("ask");
+        };
+        let open = || rulings::find_open(&state, RulingKind::Done, Some("abcd1234"), None);
+        ask(&["done: ship it", "refactor first"], "done: ship it");
+        assert!(open().is_some(), "no not-done option was offered");
     }
 
     #[test]
