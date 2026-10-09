@@ -61,7 +61,7 @@ use crate::commands::ctx::config::ProxyTypesafeConfig;
 use crate::commands::ctx::jev::{self, JevError};
 use crate::commands::ctx::state::StateDir;
 use crate::commands::ctx::{
-    compile, exec, handoff, hook, inject_gate, inject_screen, memory, proxy, run_loop, safety, task,
+    compile, exec, handoff, hook, inject_gate, inject_screen, memory, run_loop, safety, task,
 };
 use crate::commands::workflow::{engine, profile, review, team};
 
@@ -270,7 +270,6 @@ fn compiled_questions() -> &'static [jev::Question] {
         questions.extend(engine::artifact_substance_questions());
         questions.extend(engine::gate_reclass_questions());
         questions.extend(profile::classify_jev_questions());
-        questions.extend(proxy::safe_intake_questions());
         questions
     })
 }

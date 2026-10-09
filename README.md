@@ -660,13 +660,14 @@ to `zirv chat`. It implements part of the execution-profile seam tracked in
 classifier, team compiler, workflow definitions and gates it sits in front of
 are unchanged.
 
-**Decider chain.** `decide()` computes the deterministic baseline first. With
-`decider = "typesafe"` and a credential present, one metadata-only Jev call
-(coarse counts, classes and flags; never request text, repository names or
-paths) may advise clarification and its category; with no Jev credential, or a
-failed Jev call, the baseline stands. The helper-model chokepoint runs only
-under `decider = "helper"`, and receives the bounded, masked request text
-with its questions, then the baseline stands if it fails. The
+**Decider chain.** `decide()` computes the deterministic baseline first. The
+helper-model chokepoint runs only under `decider = "helper"`, and receives the
+bounded, masked request text with its questions; the baseline stands if it
+fails. `decider = "typesafe"` (the default) and `"deterministic"` both answer
+from the baseline: the TypeSafe intake leg was retired, because its only
+output was a clarification flag and category that never cleared the 0.7
+confidence floor (every category answer was `other` at 0.48-0.57) and its
+11 recorded rows were all trivial/direct. The
 baseline measures no diff at intake, so it floors complexity by the request's
 own size: 120+ words or 3+ enumerated items is at least bounded, 300+ words
 or 8+ items at least substantial (never architectural) -- without it every
@@ -736,14 +737,8 @@ winning decision is then validated against the live roster (an unready
 harness falls back to the baseline harness, its model re-derived for the
 decision's own seat tier; an unknown workflow id falls back to the baseline)
 before it is applied. The committed `tests/fixtures/proxy/jev-battery.json`
-documents the expected ruling (execution, complexity, workflow, seat tier)
-per request class, verified against the real API; `TYPESAFE_API_KEY=...
-cargo nextest run --run-ignored only jev_live_battery` replays it against Jev
-directly (it is `#[ignore]`d by default, like every other live provider
-contract), running each case TWICE and asserting the two merged decisions are
-identical to each other as well as to the recorded ruling — a flip between
-the two runs is reported as an instability, distinct from an outright
-mismatch.
+documents the rulings Jev gave per request class before the intake leg was
+retired; nothing replays it any more.
 
 **Domain tags.** A substring keyword match (the deterministic classifier's
 own security-domain detection) misses phrasing that never uses one of its
@@ -4866,7 +4861,7 @@ dispatch = false    # model tier for an omitted Agent model, from brief metadata
 review = false      # narrows review triage findings/effort; ZIRV_CTX_JEV_REVIEW
 gates = false       # narrows workflow gate reclassification; ZIRV_CTX_JEV_GATES
 context = false     # selects optional skill/report descriptions; ZIRV_CTX_JEV_CONTEXT
-intake_savings = false # optional planner (clarification advice runs whenever decider=typesafe); ZIRV_CTX_JEV_INTAKE_SAVINGS
+intake_savings = false # optional team-planner intake advice (`workflow team plan`); ZIRV_CTX_JEV_INTAKE_SAVINGS
 review_reuse = false # reuses an eligible converged review; ZIRV_CTX_JEV_REVIEW_REUSE
 harvest_screen = false # may skip an optional memory-harvest generation call; ZIRV_CTX_JEV_HARVEST_SCREEN
 admin_dispatch = false # closed-set read-only status/inbox answered without a model turn; ZIRV_CTX_JEV_ADMIN_DISPATCH

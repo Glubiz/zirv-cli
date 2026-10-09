@@ -21,7 +21,6 @@ use ratatui::{TerminalOptions, Viewport};
 use unicode_width::UnicodeWidthChar;
 
 use crate::commands::ctx::config::CtxConfig;
-use crate::commands::ctx::jev::{self, JevEffect};
 use crate::commands::ctx::proxy::decision::{ProxyDecision, Roster, SeatRole};
 use crate::commands::ctx::proxy::{self, CLARIFY_THRESHOLD};
 use crate::commands::ctx::state::StateDir;
@@ -120,16 +119,14 @@ fn run_flow(
         if decision.needs_clarification >= CLARIFY_THRESHOLD
             && decision.needs_clarification_decisive
         {
-            record_clarification(cfg, state, &decision, "requested");
             match run_clarify(terminal, &decision)? {
                 ClarifyOutcome::Abandon => {
                     return Ok(IntakeOutcome::Unplanned {
                         request: Some(request),
                     });
                 }
-                ClarifyOutcome::Skip => record_clarification(cfg, state, &decision, "unanswered"),
+                ClarifyOutcome::Skip => {}
                 ClarifyOutcome::Answer(addition) => {
-                    record_clarification(cfg, state, &decision, "answered");
                     let combined = format!("{request}\n\n{addition}");
                     let Some(redecided) = run_sizing(terminal, cfg, state, repo, &combined)? else {
                         return Ok(IntakeOutcome::Unplanned {
@@ -167,27 +164,6 @@ fn none_if_empty(text: String) -> Option<String> {
     } else {
         Some(text)
     }
-}
-
-/// Measure clarification outcomes only when Typesafe advice requested the round (#537).
-fn record_clarification(
-    cfg: &CtxConfig,
-    state: &StateDir,
-    decision: &ProxyDecision,
-    action: &'static str,
-) {
-    if !matches!(decision.decider, proxy::decision::Decider::Typesafe) {
-        return;
-    }
-    let mut effect = JevEffect::new("intake_clarification", action);
-    effect.subject_id = Some(&decision.request_sha256);
-    effect.reason = Some(match decision.clarification_category.as_deref() {
-        Some("target") => "target",
-        Some("behavior") => "behavior",
-        Some("constraint") => "constraint",
-        _ => "generic",
-    });
-    jev::record_effect(cfg, state, cfg.jev.intake_savings, &effect);
 }
 
 // Pure buffer and key mappings; no terminal access.

@@ -34,7 +34,6 @@ const PROXY_DECISIONS_FILE: &str = "proxy-decisions.jsonl";
 /// The catalogue id `log::Delegation`/`price::price` key the proxy's own
 /// spend row on -- see `catalogue.rs`'s `typesafe` vendor.
 const TYPESAFE_MODEL_ID: &str = "jev-latest";
-const CLARIFICATION_CATEGORY_ID: &str = "clarification_category";
 
 /// Clarification at this confidence floor may interrupt an interactive launch or guide an unattended session. (#537)
 pub(crate) const CLARIFY_THRESHOLD: f32 = 0.5;
@@ -241,73 +240,6 @@ pub(crate) fn word_count_bucket(word_count: usize) -> u64 {
     word_count.div_ceil(8).min(4) as u64
 }
 
-fn safe_intake_metadata(request: &str, baseline: &ProxyDecision) -> serde_json::Value {
-    let lower = request.to_ascii_lowercase();
-    let has_target = request.split_whitespace().any(is_path_like_token);
-    let has_outcome = text_has_outcome_terms(&lower);
-    let has_constraint = text_has_constraint_terms(&lower);
-    serde_json::json!({
-        "_zirv_metadata_only": true,
-        // [site=2, intent, complexity, risk, word-count bucket, named
-        // target, stated outcome, stated constraint]. No request text,
-        // repository name, workflow description, path, or secret is sent.
-        "facts": [[
-            2,
-            baseline.intent as u8,
-            baseline.complexity as u8,
-            baseline.risk as u8,
-            word_count_bucket(request.split_whitespace().count()),
-            has_target as u8,
-            has_outcome as u8,
-            has_constraint as u8,
-        ]],
-    })
-}
-
-pub(crate) fn safe_intake_questions() -> Vec<Question> {
-    vec![
-        Question::metadata_noul(
-            "needs_clarification",
-            "From facts [site=2, intent (0 feature, 1 bugfix, 2 refactor, 3 spike, 4 review, 5 other), complexity (0 trivial to 3 architectural), risk (0 low to 3 critical), word-count bucket (0 to 4), target/outcome/constraint flags (0 absent, 1 present)], is material information missing before implementation? Answer false if the metadata is insufficient to judge.",
-            "material information is missing",
-            "clear enough to start or insufficient evidence",
-        ),
-        Question::metadata_choice(
-            CLARIFICATION_CATEGORY_ID,
-            "Given the same coarse facts, which single category of missing information should be clarified? Choose other if the metadata is insufficient.",
-            &[
-                (
-                    "target",
-                    "The exact target service, file, component, or scope is missing.",
-                ),
-                (
-                    "behavior",
-                    "The expected behavior or acceptance result is missing.",
-                ),
-                (
-                    "constraint",
-                    "A required constraint or compatibility boundary is missing.",
-                ),
-                (
-                    "other",
-                    "No specific category is clear; use the generic clarification prompt.",
-                ),
-            ],
-        ),
-    ]
-}
-
-fn clarification_category(answers: &Answers, cfg: &CtxConfig) -> Option<String> {
-    let answer = answers.get(CLARIFICATION_CATEGORY_ID)?;
-    if !answer.decisive(cfg.proxy.min_confidence.max(0.7), cfg.proxy.min_margin) {
-        return None;
-    }
-    match answer.as_choice()? {
-        "target" | "behavior" | "constraint" => answer.as_choice().map(str::to_string),
-        _ => None,
-    }
-}
-
 /// Computes one [`ProxyDecision`] for `request`, in `repo`, under `cfg`.
 /// Never fails: every I/O-touching step inside is best-effort, and the
 /// deterministic baseline is always a valid answer on its own. Persists the
@@ -333,116 +265,18 @@ pub fn decide(
     let classification = decision::classify_request(request);
     let roster = decision::Roster::gather(cfg, repo);
     let baseline = decision::baseline(cfg, repo, request, &classification, &roster);
-    let safe_intake =
-        matches!(cfg.proxy.decider, ProxyDecider::Typesafe) && jev::available(&cfg.proxy.typesafe);
-    let safe_input = safe_intake.then(|| {
-        (
-            safe_intake_metadata(request, &baseline),
-            safe_intake_questions(),
-        )
-    });
     let model_input = matches!(cfg.proxy.decider, ProxyDecider::Helper)
         .then(|| protected_model_intake(cfg, state_dir, repo, request, &roster));
 
     let mut fallbacks = Vec::new();
     let mut winner = Decider::Deterministic;
-    let mut usage = None;
     let mut result = baseline.clone();
-    let mut ran_model = false;
 
-    if matches!(cfg.proxy.decider, ProxyDecider::Typesafe) && !safe_intake {
-        fallbacks.push(format!(
-            "typesafe: {}",
-            jev::JevError::NoCredential(cfg.proxy.typesafe.credential_env.clone())
-        ));
-    }
     if let Some(Err(error)) = &model_input {
         fallbacks.push(format!("sensitive-data masking: {error}"));
     }
 
-    let model_call_started = Instant::now();
-    let typesafe_result = safe_input.as_ref().map(|(input, questions)| {
-        jev::ask(
-            &cfg.proxy.typesafe,
-            state_dir,
-            cfg.jev.cache_ttl_secs,
-            input,
-            questions,
-        )
-    });
-    // Every live Jev request leaves a decision row, like the other Jev sites; a success's spend row is `persist`'s.
-    if let Some(call) = &typesafe_result {
-        let wall_ms = model_call_started
-            .elapsed()
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64;
-        let intake_state = state::StateDir::from_path(state_dir.to_path_buf());
-        let no_usage = decision::Usage {
-            input_tokens: 0,
-            output_tokens: 0,
-        };
-        match call {
-            Ok((answers, usage, cached)) => {
-                jev::record_decision_row(
-                    &intake_state,
-                    "intake",
-                    answers,
-                    usage,
-                    wall_ms,
-                    &[],
-                    *cached,
-                );
-            }
-            Err(jev::JevError::UnsafeState) => {}
-            // Like `advise_detailed`, a failed call leaves a decision row and a zero-usage spend row.
-            Err(error) => jev::record(
-                &intake_state,
-                cfg,
-                "intake",
-                &Answers::new(),
-                &no_usage,
-                wall_ms,
-                &[error.to_string()],
-                false,
-            ),
-        }
-    }
-    let cached = matches!(typesafe_result, Some(Ok((_, _, true))));
-    let typesafe_result =
-        typesafe_result.map(|call| call.map(|(answers, usage, _)| (answers, usage)));
-    if let Some(typesafe_result) = typesafe_result {
-        match typesafe_result {
-            Ok((answers, model_usage)) => {
-                result = decision::merge(
-                    cfg,
-                    &baseline,
-                    request,
-                    &answers,
-                    cfg.proxy.min_confidence,
-                    &roster,
-                );
-                if safe_intake
-                    && result.needs_clarification >= CLARIFY_THRESHOLD
-                    && result.needs_clarification_decisive
-                {
-                    result.clarification_category = clarification_category(&answers, cfg);
-                    // Coarse metadata cannot say what is missing, and the generic question went unanswered 9 of 9 times. (#452)
-                    if result.clarification_category.is_none() {
-                        result.needs_clarification_decisive = false;
-                        result.reasons.push(
-                            "needs_clarification: no informative category, not asking".to_string(),
-                        );
-                    }
-                }
-                winner = Decider::Typesafe;
-                usage = Some(model_usage);
-                ran_model = true;
-            }
-            Err(error) => fallbacks.push(format!("typesafe: {error}")),
-        }
-    }
-
-    if !ran_model && let Some(Ok((intake, questions))) = &model_input {
+    if let Some(Ok((intake, questions))) = &model_input {
         match try_helper(cfg, &intake.request, questions) {
             Ok(answers) => {
                 result = decision::merge(
@@ -466,7 +300,6 @@ pub fn decide(
     result.decider = winner;
     result.fallbacks = fallbacks;
     result.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-    result.usage = usage;
     result.created_at = state::now_secs();
     result.headless = headless;
     if headless {
@@ -477,7 +310,6 @@ pub fn decide(
         state_dir,
         &result,
         Some(&cfg.proxy.overrides).filter(|ov| !ov.is_empty()),
-        cached,
     );
     result
 }
@@ -548,14 +380,8 @@ pub fn announce_line(decision: &ProxyDecision) -> String {
 /// the whole answer, so there is no model to announce.
 pub fn asking_line(cfg: &CtxConfig) -> String {
     match cfg.proxy.decider {
-        ProxyDecider::Typesafe => {
-            format!(
-                "proxy: asking typesafe ({})\u{2026}",
-                cfg.proxy.typesafe.model
-            )
-        }
         ProxyDecider::Helper => "proxy: asking helper model\u{2026}".to_string(),
-        ProxyDecider::Deterministic => {
+        ProxyDecider::Typesafe | ProxyDecider::Deterministic => {
             "proxy: using the deterministic baseline\u{2026}".to_string()
         }
     }
@@ -660,16 +486,13 @@ struct ProxyDecisionWire<'a> {
 
 #[cfg(test)]
 pub(crate) fn persist(state_dir: &Path, d: &ProxyDecision) -> CtxResult<()> {
-    persist_with(state_dir, d, None, false)
+    persist_with(state_dir, d, None)
 }
 
-/// `cached`: the Jev answer came from the decision cache, so the spend row is marked like
-/// `jev::record`'s and spend counts never see it as a request (#452).
 fn persist_with(
     state_dir: &Path,
     d: &ProxyDecision,
     operator_override: Option<&decision::ProxyOverride>,
-    cached: bool,
 ) -> CtxResult<()> {
     state::create_private_dir_all(state_dir)?;
     let mut file = state::open_private_append(&state_dir.join(PROXY_DECISIONS_FILE))?;
@@ -684,7 +507,7 @@ fn persist_with(
     if let Some(usage) = &d.usage {
         let wrapped = state::StateDir::from_path(state_dir.to_path_buf());
         let (session, principal) = jev::session_and_principal();
-        let _ = log::append_delegation_cached(
+        let _ = log::append_delegation(
             &wrapped,
             &log::Delegation {
                 ts: d.created_at,
@@ -705,7 +528,6 @@ fn persist_with(
                 principal: &principal,
                 envelope_sha256: None,
             },
-            cached,
         );
     }
     Ok(())
@@ -941,292 +763,37 @@ pub(crate) mod tests {
         }
     }
 
-    /// #787: with the default `intake_savings = false`, a Typesafe decider still reaches Jev with the metadata-only intake.
+    /// The TypeSafe intake leg is retired: a typesafe decider with a credential sends nothing and
+    /// the deterministic baseline stands.
     #[test]
-    fn default_config_typesafe_intake_reaches_jev_with_metadata_only() {
+    fn a_typesafe_decider_makes_no_jev_request_and_the_baseline_stands() {
         let repo = crate::commands::ctx::testenv::repo();
         let state_tmp = tempfile::tempdir().expect("state");
         let mut cfg = CtxConfig::default();
-        assert!(!cfg.jev.intake_savings);
         cfg.proxy.decider = ProxyDecider::Typesafe;
-        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_INTAKE_DEFAULT".to_string();
+        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_INTAKE_RETIRED".to_string();
         cfg.jev.cache_ttl_secs = 0;
-        let body = r#"{"model":"jev-latest","answers":{"needs_clarification":{"type":"noul","noul":0.02},"clarification_category":{"type":"choice","choice":"other","probabilities":{"target":0.1,"behavior":0.1,"constraint":0.1,"other":0.7},"confidence":0.7}},"usage":{"input_tokens":5,"output_tokens":1}}"#;
         let (base_url, request) = crate::commands::ctx::provider::testhttp::one_shot_server(
             200,
-            body,
+            "{}",
             "application/json",
         );
         cfg.proxy.typesafe.base_url = base_url;
-        unsafe { std::env::set_var("JEV_TEST_KEY_INTAKE_DEFAULT", "test-key") };
+        unsafe { std::env::set_var("JEV_TEST_KEY_INTAKE_RETIRED", "test-key") };
         let decision = decide(
             &cfg,
             state_tmp.path(),
             repo.path(),
-            "change PRIVATE_CUSTOMER_SERVICE",
+            "change the service",
             false,
         );
-        unsafe { std::env::remove_var("JEV_TEST_KEY_INTAKE_DEFAULT") };
-        let sent = request
-            .recv_timeout(Duration::from_secs(2))
-            .expect("the default path reaches Jev");
-        assert!(!sent.contains("PRIVATE_CUSTOMER_SERVICE"), "{sent}");
-        assert_eq!(decision.decider, Decider::Typesafe);
+        unsafe { std::env::remove_var("JEV_TEST_KEY_INTAKE_RETIRED") };
         assert!(
-            !decision
-                .fallbacks
-                .iter()
-                .any(|reason| reason.contains("unsafe"))
+            request.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the retired intake leg must not call Jev"
         );
-    }
-
-    #[test]
-    fn safe_intake_request_passes_the_metadata_only_guard() {
-        let baseline = sample_decision();
-        let metadata = safe_intake_metadata("change src/private.rs", &baseline);
-        assert!(jev::safe_metadata_request(
-            &metadata,
-            &safe_intake_questions(),
-            "jev-latest"
-        ));
-    }
-
-    #[test]
-    fn intake_savings_batches_material_ambiguity_category_in_existing_call() {
-        let repo = crate::commands::ctx::testenv::repo();
-        let state_tmp = tempfile::tempdir().expect("state");
-        let mut cfg = CtxConfig::default();
-        cfg.jev.intake_savings = true;
-        cfg.proxy.decider = ProxyDecider::Typesafe;
-        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_INTAKE_CATEGORY".to_string();
-        cfg.jev.cache_ttl_secs = 0;
-        let body = r#"{"model":"jev-latest","answers":{"needs_clarification":{"type":"noul","noul":0.99},"clarification_category":{"type":"choice","choice":"target","probabilities":{"target":0.96,"behavior":0.02,"constraint":0.01,"other":0.01},"confidence":0.96}},"usage":{"input_tokens":23,"output_tokens":3}}"#;
-        let (base_url, server) = jev::tests::one_shot_server(200, body);
-        cfg.proxy.typesafe.base_url = base_url;
-        unsafe { std::env::set_var("JEV_TEST_KEY_INTAKE_CATEGORY", "test-key") };
-        let decision = decide(
-            &cfg,
-            state_tmp.path(),
-            repo.path(),
-            "change the service",
-            false,
-        );
-        unsafe { std::env::remove_var("JEV_TEST_KEY_INTAKE_CATEGORY") };
-        server.join().expect("one batched request");
-        assert_eq!(decision.clarification_category.as_deref(), Some("target"));
-        assert!(decision.needs_clarification_decisive);
-    }
-
-    /// A live intake call left only `proxy-decisions.jsonl` and a spend row, so `zirv ctx jev status`
-    /// and the dashboard never counted it; it must also leave one `intake` decision row.
-    #[test]
-    fn a_live_intake_call_writes_one_intake_decision_row_and_one_spend_row() {
-        let repo = crate::commands::ctx::testenv::repo();
-        let state_tmp = tempfile::tempdir().expect("state");
-        let mut cfg = CtxConfig::default();
-        cfg.jev.intake_savings = true;
-        cfg.proxy.decider = ProxyDecider::Typesafe;
-        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_INTAKE_ROW".to_string();
-        cfg.jev.cache_ttl_secs = 0;
-        let body = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests")
-                .join("fixtures")
-                .join("proxy")
-                .join("jev-response.json"),
-        )
-        .expect("fixture");
-        let (base_url, server) = jev::tests::one_shot_server(200, Box::leak(body.into_boxed_str()));
-        cfg.proxy.typesafe.base_url = base_url;
-        unsafe { std::env::set_var("JEV_TEST_KEY_INTAKE_ROW", "test-key") };
-        let decision = decide(
-            &cfg,
-            state_tmp.path(),
-            repo.path(),
-            "change the service",
-            false,
-        );
-        unsafe { std::env::remove_var("JEV_TEST_KEY_INTAKE_ROW") };
-        server.join().expect("one request");
-        assert_eq!(decision.decider, Decider::Typesafe);
-
-        let text = std::fs::read_to_string(state_tmp.path().join("jev-decisions.jsonl"))
-            .expect("jev-decisions.jsonl");
-        let rows: Vec<serde_json::Value> = text
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("row"))
-            .collect();
-        assert_eq!(rows.len(), 1, "{text}");
-        assert_eq!(rows[0]["site"], "intake");
-        assert_eq!(rows[0]["cached"], false);
-        let spend = log::read_delegations(&state::StateDir::from_path(state_tmp.path().into()), 10);
-        assert_eq!(spend.len(), 1, "exactly one spend row per live call");
-    }
-
-    /// #452: an intake answer served from the Jev cache made no request, so its zero-token spend
-    /// row is marked cached like every other site's, and `zirv ctx spend` does not count it.
-    #[test]
-    fn a_cached_intake_answer_writes_a_cached_spend_row() {
-        let repo = crate::commands::ctx::testenv::repo();
-        let state_tmp = tempfile::tempdir().expect("state");
-        let mut cfg = CtxConfig::default();
-        cfg.proxy.decider = ProxyDecider::Typesafe;
-        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_INTAKE_CACHED_452".to_string();
-        let body = r#"{"model":"jev-latest","answers":{"needs_clarification":{"type":"noul","noul":0.02}},"usage":{"input_tokens":23,"output_tokens":3}}"#;
-        let (base_url, server) = jev::tests::one_shot_server(200, body);
-        cfg.proxy.typesafe.base_url = base_url;
-        unsafe { std::env::set_var("JEV_TEST_KEY_INTAKE_CACHED_452", "test-key") };
-        for _ in 0..2 {
-            decide(
-                &cfg,
-                state_tmp.path(),
-                repo.path(),
-                "change the service",
-                false,
-            );
-        }
-        unsafe { std::env::remove_var("JEV_TEST_KEY_INTAKE_CACHED_452") };
-        server.join().expect("one live request");
-        let spend = log::read_delegations(&state::StateDir::from_path(state_tmp.path().into()), 10);
-        let cached: Vec<bool> = spend.iter().map(|row| row.cached).collect();
-        assert_eq!(cached, [false, true], "{spend:?}");
-    }
-
-    /// A failed intake call is still a live request: one fallback decision row and one zero-usage
-    /// spend row, as `advise_detailed` writes.
-    #[test]
-    fn a_failed_intake_call_writes_one_fallback_row_and_one_spend_row() {
-        let repo = crate::commands::ctx::testenv::repo();
-        let state_tmp = tempfile::tempdir().expect("state");
-        let mut cfg = CtxConfig::default();
-        cfg.jev.intake_savings = true;
-        cfg.proxy.decider = ProxyDecider::Typesafe;
-        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_INTAKE_FAIL_ROW".to_string();
-        cfg.jev.cache_ttl_secs = 0;
-        let (base_url, server) = jev::tests::one_shot_server(503, "unavailable");
-        cfg.proxy.typesafe.base_url = base_url;
-        unsafe { std::env::set_var("JEV_TEST_KEY_INTAKE_FAIL_ROW", "test-key") };
-        decide(
-            &cfg,
-            state_tmp.path(),
-            repo.path(),
-            "change the service",
-            false,
-        );
-        unsafe { std::env::remove_var("JEV_TEST_KEY_INTAKE_FAIL_ROW") };
-        server.join().expect("one request");
-
-        let text = std::fs::read_to_string(state_tmp.path().join("jev-decisions.jsonl"))
-            .expect("jev-decisions.jsonl");
-        assert_eq!(text.lines().count(), 1, "{text}");
-        assert!(text.contains("503"), "the row carries the fallback: {text}");
-        let spend = log::read_delegations(&state::StateDir::from_path(state_tmp.path().into()), 10);
-        assert_eq!(spend.len(), 1, "exactly one spend row per live call");
-    }
-
-    #[test]
-    fn intake_savings_http_error_keeps_the_deterministic_decision() {
-        let repo = crate::commands::ctx::testenv::repo();
-        let state_tmp = tempfile::tempdir().expect("state");
-        let mut cfg = CtxConfig::default();
-        cfg.jev.intake_savings = true;
-        cfg.proxy.decider = ProxyDecider::Typesafe;
-        cfg.proxy.typesafe.credential_env = "JEV_TEST_KEY_INTAKE_ERROR".to_string();
-        cfg.jev.cache_ttl_secs = 0;
-        let (base_url, server) = jev::tests::one_shot_server(503, "unavailable");
-        cfg.proxy.typesafe.base_url = base_url;
-        unsafe { std::env::set_var("JEV_TEST_KEY_INTAKE_ERROR", "test-key") };
-        let decision = decide(
-            &cfg,
-            state_tmp.path(),
-            repo.path(),
-            "change the service",
-            false,
-        );
-        unsafe { std::env::remove_var("JEV_TEST_KEY_INTAKE_ERROR") };
-        server.join().expect("one request");
         assert_eq!(decision.decider, Decider::Deterministic);
-        assert!(decision.clarification_category.is_none());
-        assert_eq!(decision.needs_clarification, 0.0);
-        assert!(
-            decision
-                .fallbacks
-                .iter()
-                .any(|reason| reason.contains("503"))
-        );
-    }
-
-    #[test]
-    fn missing_or_uncertain_category_keeps_generic_clarification() {
-        let cfg = CtxConfig::default();
-        assert!(clarification_category(&Answers::new(), &cfg).is_none());
-        let mut answers = Answers::new();
-        answers.insert(
-            CLARIFICATION_CATEGORY_ID.to_string(),
-            decision::Answer {
-                value: decision::AnswerValue::Choice("target".to_string()),
-                confidence: 0.2,
-                probabilities: BTreeMap::from([
-                    ("target".to_string(), 0.51),
-                    ("behavior".to_string(), 0.49),
-                ]),
-            },
-        );
-        assert!(clarification_category(&answers, &cfg).is_none());
-        let serialized = serde_json::to_value(sample_decision()).expect("decision JSON");
-        assert!(serialized.get("clarification_category").is_none());
-    }
-
-    #[test]
-    fn intake_savings_projects_only_coarse_request_metadata() {
-        let mut baseline = sample_decision();
-        baseline.intent = crate::commands::workflow::classify::Intent::Feature;
-        let request = "change PRIVATE_CUSTOMER_SERVICE in src/private.rs without downtime";
-        let metadata = safe_intake_metadata(request, &baseline).to_string();
-        assert!(!metadata.contains("PRIVATE_CUSTOMER_SERVICE"));
-        assert!(!metadata.contains("src/private.rs"));
-        assert!(!metadata.contains("without downtime"));
-        assert!(metadata.contains("_zirv_metadata_only"));
-        assert_eq!(safe_intake_questions().len(), 2);
-    }
-
-    /// One `decide()` against a fake Jev that answers `body`, cache off.
-    fn decide_against_fake_jev(body: &'static str, request: &str, key_env: &str) -> ProxyDecision {
-        let repo = crate::commands::ctx::testenv::repo();
-        let state_tmp = tempfile::tempdir().expect("state");
-        let mut cfg = CtxConfig::default();
-        cfg.proxy.decider = ProxyDecider::Typesafe;
-        cfg.proxy.typesafe.credential_env = key_env.to_string();
-        cfg.jev.cache_ttl_secs = 0;
-        let (base_url, server) = jev::tests::one_shot_server(200, body);
-        cfg.proxy.typesafe.base_url = base_url;
-        unsafe { std::env::set_var(key_env, "test-key") };
-        let decision = decide(&cfg, state_tmp.path(), repo.path(), request, false);
-        unsafe { std::env::remove_var(key_env) };
-        server.join().expect("one request");
-        decision
-    }
-
-    /// #452 J1: a decisive needs_clarification with a sub-threshold category asks nothing, since
-    /// the question would be the generic one; an informative category still asks.
-    #[test]
-    fn clarification_is_asked_only_with_an_informative_category() {
-        let generic = r#"{"model":"jev-latest","answers":{"needs_clarification":{"type":"noul","noul":0.99},"clarification_category":{"type":"choice","choice":"target","probabilities":{"target":0.6,"behavior":0.2,"constraint":0.1,"other":0.1},"confidence":0.6}},"usage":{"input_tokens":9,"output_tokens":1}}"#;
-        let silent =
-            decide_against_fake_jev(generic, "change the service", "JEV_TEST_KEY_GENERIC_452");
-        assert!(!silent.needs_clarification_decisive, "{:?}", silent.reasons);
-        assert!(silent.clarification_category.is_none());
-        assert!(!prompt_layer(&silent, None).contains("clarify:"));
-
-        let informative = r#"{"model":"jev-latest","answers":{"needs_clarification":{"type":"noul","noul":0.99},"clarification_category":{"type":"choice","choice":"target","probabilities":{"target":0.96,"behavior":0.02,"constraint":0.01,"other":0.01},"confidence":0.96}},"usage":{"input_tokens":9,"output_tokens":1}}"#;
-        let asked = decide_against_fake_jev(
-            informative,
-            "change the service",
-            "JEV_TEST_KEY_INFORMATIVE_452",
-        );
-        assert!(asked.needs_clarification_decisive);
-        assert_eq!(asked.clarification_category.as_deref(), Some("target"));
-        assert!(prompt_layer(&asked, None).contains(INTERACTIVE_CLARIFY_LINE));
+        assert!(decision.fallbacks.is_empty(), "{:?}", decision.fallbacks);
     }
 
     #[test]
@@ -1580,13 +1147,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn asking_line_names_typesafe_and_its_model() {
+    fn asking_line_for_the_retired_typesafe_decider_names_the_baseline() {
         let mut cfg = CtxConfig::default();
         cfg.proxy.decider = ProxyDecider::Typesafe;
-        cfg.proxy.typesafe.model = "jev-latest".to_string();
         assert_eq!(
             asking_line(&cfg),
-            "proxy: asking typesafe (jev-latest)\u{2026}"
+            "proxy: using the deterministic baseline\u{2026}"
         );
     }
 
@@ -1781,17 +1347,8 @@ pub(crate) mod tests {
         );
         assert_eq!(decision.decider, Decider::Deterministic);
         assert!(
-            decision
-                .fallbacks
-                .iter()
-                .any(|line| line.contains("credential env")),
-            "{:?}",
-            decision.fallbacks
-        );
-        assert_eq!(
-            decision.fallbacks.len(),
-            1,
-            "no credential means the baseline only, never a helper attempt: {:?}",
+            decision.fallbacks.is_empty(),
+            "the typesafe decider is the baseline only, with no credential note and no helper attempt: {:?}",
             decision.fallbacks
         );
         if let Some(value) = had {
@@ -2279,214 +1836,6 @@ pub(crate) mod tests {
             decision.validation.independent_review,
             "{:?}",
             decision.validation
-        );
-    }
-
-    #[derive(Debug, serde::Deserialize)]
-    struct JevBatteryExpect {
-        execution: String,
-        complexity: String,
-        workflow: String,
-        seat_tier: String,
-        // Jev's `intent` answer is advisory only -- this battery asserts
-        // execution/complexity/workflow/seat_tier, never intent -- but the
-        // field stays on the fixture (and this type) for a human reading
-        // `jev-battery.json` to see what Jev actually said.
-        #[allow(dead_code)]
-        intent: String,
-    }
-
-    #[derive(Debug, serde::Deserialize)]
-    struct JevBatteryCase {
-        id: String,
-        request: String,
-        expect: JevBatteryExpect,
-    }
-
-    /// One case's `(execution, complexity, workflow, seat_tier)` tuple, the
-    /// same four fields the fixture records rulings for.
-    fn battery_fields(decision: &ProxyDecision) -> (String, String, String, String) {
-        (
-            lower_debug(decision.execution),
-            lower_debug(decision.complexity),
-            decision
-                .workflow
-                .clone()
-                .unwrap_or_else(|| "none".to_string()),
-            decision.seat_tier.label().to_string(),
-        )
-    }
-
-    /// Replays the committed `tests/fixtures/proxy/jev-battery.json` against
-    /// the REAL TypeSafe Jev API TWICE per case -- issue #537's own recorded
-    /// rulings, re-verified against the pinned `jev-1.13.0` model and the
-    /// `min_margin` gate: four live double-run invocations on 2026-09-18
-    /// agreed on 22 of 24 cases every time, after re-recording four rulings
-    /// that were STABLY different from the old fixture (never flipping, just
-    /// consistently a new answer): `plugin-system`/`tui-redesign` workflow to
-    /// `none` (their own workflow answer's margin no longer clears the
-    /// floor, so both fall to the baseline's own `none`); `security-
-    /// credential` complexity to `bounded` and `perf-investigation` down a
-    /// full tier to `bounded` (both a stable, decisive, DIFFERENT answer from
-    /// the pinned model, not a margin-gate artifact -- `merge`'s own
-    /// monotonic floor only ever raises a decisive model answer over the
-    /// baseline, so recording the higher, stable value here is always
-    /// consistent with it). The remaining two, `bump-timeout` and `bug-
-    /// backtrace`, genuinely straddle the margin floor: across those four
-    /// runs each produced its recorded ruling at least once but also an
-    /// instability or a mismatch at least once, in no consistent direction --
-    /// real residual model noise `min_margin`'s current default does not
-    /// fully suppress for these two request shapes, left as their
-    /// originally-recorded ruling rather than loosened to tolerate either
-    /// outcome.
-    ///
-    /// Frontier seat gate (wrapper-overhead benchmark, 2026-09-22): `seat_
-    /// tier` no longer follows `execution`/`complexity` alone -- see
-    /// `decision::SeatTier::from_execution_complexity_risk`. A live re-run
-    /// against this fixture confirmed every recorded `orchestrated` case's
-    /// `seat_tier` is unchanged under the new rule: the four `architectural`
-    /// cases (`plugin-system`, `sqlite-migration`, `tui-redesign`, `new-
-    /// adapter`) earn `frontier` unconditionally, and the one `substantial`
-    /// case (`dependency-upgrade`) also stays `frontier` because Jev's own
-    /// risk answer for it is `high` (the request touches provider-client
-    /// credentials), not because complexity alone would clear the gate.
-    ///
-    /// Jev determinism fix (2026-09-18 replay): with `build_intake` no
-    /// longer measuring the repository at all (see `decision::
-    /// IntakeRepository`'s own doc comment), the request body is now fixed
-    /// by construction for a given `case.request`, so calling twice replays
-    /// the IDENTICAL request -- any difference between the two runs is Jev's
-    /// own answer-to-answer instability, not a body that drifted underneath
-    /// it. A flip between the two runs is reported as an INSTABILITY,
-    /// distinct from a MISMATCH against the recorded ruling (checked against
-    /// the first run only): the two failure modes have different causes and
-    /// different fixes (a mismatch means the fixture's own recorded ruling
-    /// is stale; an instability means `[proxy] min_margin` may need
-    /// raising, or the question wording sharpening).
-    ///
-    /// Calls the real TypeSafe Jev API and asserts on its live answers, so it
-    /// is nondeterministic by design and `#[ignore]`d, per this repo's own
-    /// convention for a live provider contract (see
-    /// `provider::anthropic::tests::live_anthropic_messages_contract`).
-    /// Run it with a key: `TYPESAFE_API_KEY=... cargo nextest run
-    /// --run-ignored only jev_live_battery`. Costs roughly 50 calls (two per
-    /// case) at about 6k input tokens each (TypeSafe's own published
-    /// $0.042/MTok input rate -- about two cents total). `state_dir` points
-    /// at a temp dir, never the real `<state>/proxy-decisions.jsonl`, so a
-    /// real run's own persisted decisions and spend rows are untouched -- it
-    /// persists exactly like any other `decide()` call, just into a
-    /// throwaway directory.
-    #[test]
-    #[ignore = "live TypeSafe Jev battery; set TYPESAFE_API_KEY"]
-    fn jev_live_battery_matches_recorded_rulings() {
-        let key = std::env::var("TYPESAFE_API_KEY").unwrap_or_default();
-        assert!(
-            !key.trim().is_empty(),
-            "TYPESAFE_API_KEY must be set to run this live battery -- it is #[ignore]d by \
-             default, so reaching here without it means it was run explicitly \
-             (--run-ignored/--ignored) with no key exported"
-        );
-
-        let text = std::fs::read_to_string(fixture("proxy/jev-battery.json"))
-            .expect("jev-battery fixture");
-        let cases: Vec<JevBatteryCase> =
-            serde_json::from_str(&text).expect("parse jev-battery fixture");
-        assert!(!cases.is_empty(), "jev-battery fixture must not be empty");
-
-        let mut cfg = CtxConfig::default();
-        cfg.proxy.enabled = true;
-        cfg.proxy.decider = ProxyDecider::Typesafe;
-        // The whole point of the double call below is two INDEPENDENT live
-        // answers to the identical body -- `jev::ask`'s own decision cache
-        // would otherwise replay the first call's answer for the second,
-        // making a real instability undetectable.
-        cfg.jev.cache_ttl_secs = 0;
-
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let state_dir = tempfile::tempdir().expect("tempdir");
-
-        let mut instabilities = Vec::new();
-        let mut mismatches = Vec::new();
-        for case in &cases {
-            let first = decide(&cfg, state_dir.path(), repo, &case.request, false);
-            let second = decide(&cfg, state_dir.path(), repo, &case.request, false);
-
-            if first.decider != Decider::Typesafe {
-                mismatches.push(format!(
-                    "{}: decider fell back to {:?} on the first run ({:?})",
-                    case.id, first.decider, first.fallbacks
-                ));
-                continue;
-            }
-            if second.decider != Decider::Typesafe {
-                mismatches.push(format!(
-                    "{}: decider fell back to {:?} on the second run ({:?})",
-                    case.id, second.decider, second.fallbacks
-                ));
-                continue;
-            }
-
-            let (first_execution, first_complexity, first_workflow, first_seat_tier) =
-                battery_fields(&first);
-            let (second_execution, second_complexity, second_workflow, second_seat_tier) =
-                battery_fields(&second);
-
-            for (field, before, after) in [
-                ("execution", &first_execution, &second_execution),
-                ("complexity", &first_complexity, &second_complexity),
-                ("workflow", &first_workflow, &second_workflow),
-                ("seat_tier", &first_seat_tier, &second_seat_tier),
-            ] {
-                if before != after {
-                    instabilities.push(format!(
-                        "{}: {field} flipped between two identical calls: {before} then {after}",
-                        case.id
-                    ));
-                }
-            }
-
-            if first_execution != case.expect.execution {
-                mismatches.push(format!(
-                    "{}: execution expected {} got {first_execution}",
-                    case.id, case.expect.execution
-                ));
-            }
-            if first_complexity != case.expect.complexity {
-                mismatches.push(format!(
-                    "{}: complexity expected {} got {first_complexity}",
-                    case.id, case.expect.complexity
-                ));
-            }
-            if first_workflow != case.expect.workflow {
-                mismatches.push(format!(
-                    "{}: workflow expected {} got {first_workflow}",
-                    case.id, case.expect.workflow
-                ));
-            }
-            if first_seat_tier != case.expect.seat_tier {
-                mismatches.push(format!(
-                    "{}: seat_tier expected {} got {first_seat_tier}",
-                    case.id, case.expect.seat_tier
-                ));
-            }
-        }
-
-        // Reported together, in one assertion, so a single run surfaces
-        // both failure modes at once -- each line is already labeled
-        // "instability" or carries its own "expected .. got .." shape, so
-        // the two causes stay distinguishable in the combined message.
-        assert!(
-            instabilities.is_empty() && mismatches.is_empty(),
-            "{} instability(ies) and {} mismatch(es) out of {} cases:\n{}",
-            instabilities.len(),
-            mismatches.len(),
-            cases.len(),
-            instabilities
-                .iter()
-                .map(|line| format!("instability: {line}"))
-                .chain(mismatches.iter().cloned())
-                .collect::<Vec<_>>()
-                .join("\n")
         );
     }
 }
