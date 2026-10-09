@@ -1913,10 +1913,7 @@ impl AgentAdapter for CodexAdapter {
                             .into_iter()
                             .flatten()
                             .filter_map(|part| part.get("text").and_then(Value::as_str))
-                            .filter(|text| {
-                                let text = text.trim_start();
-                                !text.starts_with('<') && !text.starts_with("# AGENTS.md")
-                            })
+                            .filter(|text| !super::is_injected_user_text(text))
                             .collect::<Vec<_>>()
                             .join("\n");
                         if !request.trim().is_empty() {
@@ -2493,6 +2490,26 @@ mod tests {
         assert_eq!(
             ctx.user_messages,
             vec!["implement the frontend\nacross two files".to_string()]
+        );
+    }
+
+    /// Only known injected context is skipped: a request that opens with markup is still a request.
+    #[test]
+    fn structural_context_keeps_a_request_that_starts_with_markup() {
+        let user = |text: &str| {
+            serde_json::json!({"type": "response_item", "payload": {"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": text}]}})
+            .to_string()
+        };
+        let jsonl = [
+            user("<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>"),
+            user("<Button> is misaligned in the header"),
+        ]
+        .join("\n");
+        let ctx = CodexAdapter::new(None).structural_context(&jsonl, 5);
+        assert_eq!(
+            ctx.user_messages,
+            vec!["<Button> is misaligned in the header"]
         );
     }
 
