@@ -1492,9 +1492,15 @@ pub(crate) fn record_effect(
         return;
     }
     let (session, principal) = session_and_principal();
+    // Only the approve_allow path lowers; its effect rows keep site "approve".
+    let gate = if effect.action == "lowered" {
+        "approve_allow"
+    } else {
+        jev_counters::gate_for_site(effect.site)
+    };
     jev_counters::count(
         state,
-        jev_counters::gate_for_site(effect.site),
+        gate,
         effect_changed_behaviour(effect),
         jev_counters::Stage::Acted,
         None,
@@ -2961,8 +2967,10 @@ pub(crate) mod tests {
             );
 
             record_effect(&cfg, &state, true, &JevEffect::new("approve", "escalated"));
+            record_effect(&cfg, &state, true, &JevEffect::new("approve", "lowered"));
             let counts = jev_counters::rollup(&state, state::now_secs());
             assert_eq!(counts["approve"].acted, 1);
+            assert_eq!(counts["approve_allow"].acted, 1);
         });
     }
 
