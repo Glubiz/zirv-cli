@@ -753,6 +753,25 @@ pub struct Pane {
     /// orchestrator pane and for a restored pane, neither of which is
     /// anybody's delegation. See [`DelegationFacts`].
     delegation: Option<DelegationFacts>,
+    /// Compact-verdict state: wrap's own cooldown and degrade switch, per pane.
+    auto_compact: AutoCompact,
+}
+
+/// A compaction this pane typed and is still waiting to see in the transcript.
+struct CompactVerify {
+    watcher: supervise::Watcher,
+    deadline: Instant,
+    adapter: Box<dyn super::super::adapters::AgentAdapter>,
+    transcript: PathBuf,
+}
+
+/// Reuses wrap's [`wrap::InjectionState`] (verdict, cooldown by signal count,
+/// one-way `degraded` after a failed or unverified compaction) for a pane.
+#[derive(Default)]
+struct AutoCompact {
+    rot: wrap::InjectionState,
+    transcript: Option<PathBuf>,
+    verifying: Option<CompactVerify>,
 }
 
 /// The pane driver owns either a wrapped child or a native session (#490).
@@ -1046,6 +1065,7 @@ impl Pane {
             delivery_sender: None,
             last_injection_at: Instant::now(),
             launch_mode: super::super::adapters::LaunchMode::Interactive,
+            auto_compact: AutoCompact::default(),
             writer_permit: None,
             cwd,
             owns_cwd: false,
@@ -1326,6 +1346,7 @@ impl Pane {
             delivery_sender: None,
             last_injection_at: Instant::now(),
             launch_mode,
+            auto_compact: AutoCompact::default(),
             writer_permit: None,
             cwd: cwd.to_path_buf(),
             owns_cwd: false,
@@ -1676,15 +1697,18 @@ impl Pane {
     /// Drain queued turn signals and observe child exit on the same pane tick.
     pub fn on_turn_signal(&mut self) {
         self.poll_exit();
-        let signalled = self.pty().is_some_and(|pty| {
-            let mut seen = false;
-            if let Some(server) = pty.server.as_ref() {
-                while server.try_recv().is_some() {
-                    seen = true;
-                }
+        let signals: Vec<_> = self
+            .pty()
+            .and_then(|pty| pty.server.as_ref())
+            .map(|server| std::iter::from_fn(|| server.try_recv()).collect())
+            .unwrap_or_default();
+        let signalled = !signals.is_empty();
+        for signal in &signals {
+            self.auto_compact.rot.on_turn(signal);
+            if let Some(path) = signal.transcript_path.as_deref().filter(|p| !p.is_empty()) {
+                self.auto_compact.transcript = Some(PathBuf::from(path));
             }
-            seen
-        });
+        }
         {
             if signalled {
                 self.last_signal_at = Some(Instant::now());
@@ -2026,13 +2050,22 @@ impl Pane {
             self.delivery_sender = None;
             return Ok(());
         }
+        self.type_deferred_line(&visible_injection_line(
+            &scrub_controls(label),
+            &scrub_controls(body),
+        ))
+    }
+
+    /// Type `line` without a carriage return and defer its submit until the echo settles.
+    fn type_deferred_line(&mut self, line: &str) -> CtxResult<()> {
         {
             let mut writer = self
                 .writer()?
                 .lock()
                 .map_err(|_| "dashboard pane: writer lock poisoned")?;
             let sink: &mut dyn Write = &mut **writer;
-            write_injection_phase1(sink, label, body)?;
+            sink.write_all(line.as_bytes())?;
+            sink.flush()?;
         }
         let now = Instant::now();
         self.last_local_input_at = Some(now);
@@ -2042,6 +2075,113 @@ impl Pane {
         self.submit_confirmation = None;
         self.delivery_sender = None;
         Ok(())
+    }
+
+    fn log_compaction(&self, action: &str, detail: &str) {
+        let _ = super::super::log::append(
+            &self.state_dir,
+            &super::super::log::Decision {
+                ts: super::super::state::now_secs(),
+                session: &self.session_id,
+                verb: "dash",
+                verdict: "compact",
+                score: self.auto_compact.rot.score,
+                action,
+                detail,
+                observed_at: None,
+            },
+        );
+    }
+
+    /// Act on a Compact verdict the way wrap does: type the adapter's compact
+    /// command only inside wrap's injection window and idle rule, arm wrap's
+    /// cooldown, and degrade to suggestion-only after one failed or
+    /// unverified compaction. Never blocks; a failure never touches the pane.
+    pub(crate) fn auto_compact(&mut self, cfg: &super::super::config::CtxConfig) {
+        if self.pty().is_none() {
+            return;
+        }
+        if let Some(verify) = self.auto_compact.verifying.as_mut() {
+            let seen = matches!(
+                verify.watcher.read_appended(),
+                Ok(Some(appended)) if verify
+                    .adapter
+                    .parse_events(&appended.lines)
+                    .iter()
+                    .any(|event| matches!(event, super::super::event::NormalizedEvent::Compaction))
+            );
+            if !seen && Instant::now() < verify.deadline {
+                return;
+            }
+            let detail = verify.transcript.display().to_string();
+            self.auto_compact.verifying = None;
+            if seen {
+                self.log_compaction("inject", &detail);
+                return;
+            }
+            self.auto_compact.rot.degraded = true;
+            self.log_compaction("inject-unverified", &detail);
+            self.log_compaction("degrade", "compaction not verified");
+            return;
+        }
+        if let Some(at) = self.last_output_at {
+            self.auto_compact.rot.last_output = at;
+        }
+        self.auto_compact.rot.user_typed_since_turn = self.user_typed_since_turn;
+        let debounce = Duration::from_millis(cfg.wrap.debounce_ms);
+        if wrap::action_for(&self.auto_compact.rot, Instant::now(), debounce)
+            != wrap::Action::Compact
+            || !self.injectable()
+        {
+            return;
+        }
+        let Ok(adapter) = super::super::adapters::select(Some(self.agent()), &[], cfg) else {
+            return;
+        };
+        // No interactive compact command: the dashboard only recommends.
+        let Some(command) = adapter.compact_command() else {
+            return;
+        };
+        let transcript = self.auto_compact.transcript.clone();
+        let focus = super::super::handoff::compaction_focus_for_transcript(
+            cfg,
+            &self.state_dir,
+            adapter.as_ref(),
+            transcript.as_deref(),
+            cfg.handoff.tail_items,
+            supervise::COMPACT_FOCUS,
+        );
+        // Prime past any compaction already in the transcript before typing.
+        let watcher = transcript.as_ref().map(|path| {
+            let mut watcher = supervise::Watcher::new(path.clone());
+            let _ = watcher.read_appended();
+            watcher
+        });
+        let typed =
+            self.type_deferred_line(&scrub_controls(&supervise::compact_prompt(command, &focus)));
+        // Arm the cooldown first so a failure cannot retry on every tick.
+        self.auto_compact.rot.cooldown_at_signal = Some(self.auto_compact.rot.signals_seen);
+        let failure = match (typed, watcher) {
+            (Err(_), _) => Some("compact injection failed"),
+            (Ok(()), None) => Some("no transcript reported, compaction unverifiable"),
+            (Ok(()), Some(watcher)) => {
+                self.auto_compact.verifying = transcript.map(|transcript| CompactVerify {
+                    watcher,
+                    deadline: Instant::now()
+                        + INJECTION_SUBMIT_DELAY
+                        + Duration::from_millis(cfg.wrap.inject_timeout_ms),
+                    adapter,
+                    transcript,
+                });
+                None
+            }
+        };
+        let Some(reason) = failure else {
+            return;
+        };
+        self.auto_compact.rot.degraded = true;
+        self.log_compaction("inject-unverified", reason);
+        self.log_compaction("degrade", reason);
     }
 
     /// Whether this pane has a deferred injection submission
@@ -2877,6 +3017,7 @@ impl Pane {
         self.last_local_input_at = None;
         self.injected_awaiting_turn = false;
         self.user_typed_since_turn = false;
+        self.auto_compact = AutoCompact::default();
         self.exit_code = None;
         self.launched_at = launched_at;
         self.exited_after = None;
@@ -7153,5 +7294,152 @@ pub(crate) mod tests {
         // Both halves are idempotent, exactly as they are for a wrapped pane.
         pane.finish_shutdown().expect("idempotent");
         pane.shutdown("").expect("idempotent");
+    }
+
+    #[cfg(unix)]
+    struct CompactRig {
+        _home: crate::commands::ctx::testenv::HomeGuard,
+        tmp: tempfile::TempDir,
+        state: StateDir,
+        session: String,
+        cfg: super::super::super::config::CtxConfig,
+        pane: Pane,
+    }
+
+    /// A claude-shaped pane whose child copies typed lines into `typed.txt`.
+    #[cfg(unix)]
+    fn compact_rig(script: &str) -> CompactRig {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = crate::commands::ctx::testenv::HomeGuard::set(tmp.path());
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let session = "88888888-2222-4333-8444-555555555555".to_string();
+        let mut spec = test_spec(&session);
+        spec.agent_name = "claude".to_string();
+        spec.argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            script.replace("TYPED", &tmp.path().join("typed.txt").display().to_string()),
+        ];
+        let pane = Pane::spawn(
+            spec,
+            &state,
+            tmp.path(),
+            tmp.path(),
+            (100, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+        let mut cfg = super::super::super::config::CtxConfig::default();
+        cfg.wrap.debounce_ms = 100;
+        cfg.wrap.inject_timeout_ms = 400;
+        CompactRig {
+            _home: home,
+            tmp,
+            state,
+            session,
+            cfg,
+            pane,
+        }
+    }
+
+    #[cfg(unix)]
+    impl CompactRig {
+        fn verdict(&self, turn: u64, verdict: crate::commands::ctx::rot::Verdict) {
+            let signal = crate::commands::ctx::signal::TurnSignal {
+                session_id: self.session.clone(),
+                turn,
+                score: 90,
+                verdict,
+                transcript_path: Some(self.tmp.path().join("t.jsonl").display().to_string()),
+            };
+            crate::commands::ctx::signal::send(&self.state.socket_for(&self.session), &signal)
+                .expect("send");
+        }
+
+        /// The dashboard's own per-pane tick, for `millis`.
+        fn tick_for(&mut self, millis: u64) {
+            let end = Instant::now() + Duration::from_millis(millis);
+            while Instant::now() < end {
+                self.pane.on_turn_signal();
+                self.pane.auto_compact(&self.cfg);
+                self.pane.drain();
+                if self.pane.pending_submit_due(Instant::now()) {
+                    let _ = self.pane.submit_pending();
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn typed(&self) -> String {
+            std::fs::read_to_string(self.tmp.path().join("typed.txt")).unwrap_or_default()
+        }
+
+        fn log(&self) -> String {
+            std::fs::read_to_string(self.state.root().join("logs/decisions.jsonl"))
+                .unwrap_or_default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_idle_pane_types_the_compact_command_once_and_not_again_inside_the_budget() {
+        use crate::commands::ctx::rot::Verdict;
+        let mut rig = compact_rig("echo ready; cat > TYPED");
+        rig.verdict(1, Verdict::Compact);
+        rig.tick_for(2500);
+        assert_eq!(
+            rig.typed().matches("/compact").count(),
+            1,
+            "{:?}",
+            rig.typed()
+        );
+
+        // A newer Compact verdict while the first is unverified types nothing,
+        // and once it fails verification the pane only suggests.
+        rig.verdict(2, Verdict::Compact);
+        rig.tick_for(1500);
+        rig.verdict(3, Verdict::Compact);
+        rig.tick_for(2000);
+        assert_eq!(
+            rig.typed().matches("/compact").count(),
+            1,
+            "{:?}",
+            rig.typed()
+        );
+        let log = rig.log();
+        assert_eq!(
+            log.matches("\"action\":\"inject-unverified\"").count(),
+            1,
+            "{log}"
+        );
+        assert_eq!(log.matches("\"action\":\"degrade\"").count(), 1, "{log}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_busy_pane_types_nothing_on_a_compact_verdict() {
+        use crate::commands::ctx::rot::Verdict;
+        let mut rig = compact_rig("while true; do echo working; sleep 0.02; done");
+        rig.verdict(1, Verdict::Compact);
+        rig.tick_for(2500);
+        assert!(
+            rig.pane.last_local_input_at.is_none(),
+            "typed into a busy pane"
+        );
+        assert!(!rig.log().contains("\"verdict\":\"compact\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restart_verdict_types_nothing() {
+        use crate::commands::ctx::rot::Verdict;
+        let mut rig = compact_rig("echo ready; cat > TYPED");
+        rig.verdict(1, Verdict::Restart);
+        rig.tick_for(2500);
+        assert_eq!(rig.pane.state(), PaneState::Idle);
+        assert!(rig.typed().is_empty(), "{:?}", rig.typed());
+        assert!(rig.pane.last_local_input_at.is_none());
     }
 }
