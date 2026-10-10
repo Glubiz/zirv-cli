@@ -430,11 +430,7 @@ fn dispatch_tier_advise(
         "frontier" => (crate::commands::ctx::catalogue::Tier::Deep, "frontier"),
         _ => return None,
     };
-    let vendor_slug = crate::commands::ctx::catalogue::vendor_of(seat)?;
-    let vendor = crate::commands::ctx::catalogue::vendor(vendor_slug)?;
-    let ladder = crate::commands::ctx::models::ladder_for(cfg, vendor);
-    let alias = crate::commands::ctx::catalogue::tier_model_in(vendor, tier, &ladder)?;
-    let alias = crate::commands::ctx::catalogue::intern(&alias);
+    let alias = dispatch_model(cfg, seat, tier)?;
     let mut effect = crate::commands::ctx::jev::JevEffect::new("dispatch", "tier_selected");
     effect.reason = Some(tier_label);
     effect.outcome = Some(alias);
@@ -448,6 +444,24 @@ fn dispatch_tier_advise(
         ),
         cfg,
     ))
+}
+
+/// The model a dispatch at `tier` from `seat`'s vendor names. Claude Code's
+/// Agent tool accepts only a short alias, never a full model id.
+fn dispatch_model(
+    cfg: &CtxConfig,
+    seat: &str,
+    tier: crate::commands::ctx::catalogue::Tier,
+) -> Option<&'static str> {
+    let vendor_slug = crate::commands::ctx::catalogue::vendor_of(seat)?;
+    let vendor = crate::commands::ctx::catalogue::vendor(vendor_slug)?;
+    let ladder = if vendor_slug == "anthropic" {
+        Vec::new()
+    } else {
+        crate::commands::ctx::models::ladder_for(cfg, vendor)
+    };
+    let alias = crate::commands::ctx::catalogue::tier_model_in(vendor, tier, &ladder)?;
+    Some(crate::commands::ctx::catalogue::intern(&alias))
 }
 
 /// Resolve config and state with the write guard's path rules so tier advice
@@ -964,6 +978,24 @@ capable a model does it actually need?",
                 "{tool} dispatches subagents"
             );
         }
+    }
+
+    #[test]
+    fn a_claude_dispatch_names_the_short_alias_even_when_a_full_id_is_discovered() {
+        crate::commands::ctx::models::set_test_discovered(vec![
+            crate::commands::ctx::catalogue::DiscoveredModel::new(
+                "anthropic",
+                "claude-sonnet-5-5",
+                true,
+            ),
+        ]);
+        let model = dispatch_model(
+            &CtxConfig::default(),
+            "claude-opus-5-5",
+            crate::commands::ctx::catalogue::Tier::Standard,
+        );
+        crate::commands::ctx::models::set_test_discovered(Vec::new());
+        assert_eq!(model, Some("sonnet"));
     }
 
     #[test]
