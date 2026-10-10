@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use super::super::catalogue;
 use super::super::config::CtxConfig;
 use super::super::event::TranscriptUsage;
+use super::super::exec;
 use super::super::log::{DelegationRow, TaskClass};
 use super::super::price::{self, PriceTable};
 use super::super::state::StateDir;
@@ -309,11 +310,13 @@ fn max_at(slot: &mut Option<u64>, at: u64) {
 }
 
 /// The existing benchmark composite: correctness, or the mean of correctness and judge/10. A
-/// failed run that produced output scores 0. A failed run with no output never ran the task
-/// (quota, rate limit, launch failure), and a run with nothing graded: neither has a quality.
+/// failed run that produced output, or that hung until the supervisor's timeout or stall exit,
+/// scores 0. A failed run with no output that ended any other way never ran the task (quota,
+/// rate limit, launch failure), and a run with nothing graded: neither has a quality.
 fn quality(row: &Row) -> Option<f64> {
     if row.status == Status::Failed {
-        return (row.output_tokens > 0).then_some(0.0);
+        let hung = matches!(row.exit_code, Some(exec::EXIT_TIMEOUT | exec::EXIT_STALLED));
+        return (row.output_tokens > 0 || hung).then_some(0.0);
     }
     let correctness = row.correctness?;
     Some(match row.judge_score {
@@ -711,6 +714,32 @@ mod tests {
         let stats = &evidence.cells[0].synthetic;
         assert_eq!(stats.n, 1);
         assert_eq!(stats.mean, Some(1.0));
+    }
+
+    #[test]
+    fn a_zero_output_timeout_scores_zero_but_a_quick_zero_output_failure_is_excluded() {
+        let failed = |exit_code: i32| {
+            let mut failed = row("claude", "m", CellComplexity::Any, 1.0);
+            failed.status = Status::Failed;
+            failed.correctness = Some(0.0);
+            failed.output_tokens = 0;
+            failed.exit_code = Some(exit_code);
+            failed
+        };
+        let ok = row("claude", "m", CellComplexity::Any, 1.0);
+        let table = price::built_in_table();
+        let timed_out = compute(
+            &[failed(exec::EXIT_TIMEOUT), ok.clone()],
+            &[],
+            &[],
+            &table,
+            NOW,
+        );
+        let stats = &timed_out.cells[0].synthetic;
+        assert_eq!((stats.n, stats.mean), (2, Some(0.5)));
+        let quick = compute(&[failed(1), ok], &[], &[], &table, NOW);
+        let stats = &quick.cells[0].synthetic;
+        assert_eq!((stats.n, stats.mean), (1, Some(1.0)));
     }
 
     #[test]

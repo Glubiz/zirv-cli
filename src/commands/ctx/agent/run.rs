@@ -291,13 +291,26 @@ fn run_goal_bootstrap(
     Ok(usage)
 }
 
+/// `agent_bin` reaches only the adapter it names; any other candidate keeps its own program.
+fn fallback_candidate(
+    name: &str,
+    ctor: fn(Option<&str>) -> Box<dyn AgentAdapter>,
+    bin: Option<&str>,
+) -> Box<dyn AgentAdapter> {
+    let foreign = adapters::agent_bin_names_a_different_adapter(bin, name).is_some();
+    ctor(if foreign { None } else { bin })
+}
+
 /// `auto` with no evidence pick: the default harness, unless that is this seat's own harness
-/// (which a seat may not delegate to) and another enabled, live harness exists.
+/// (which a seat may not delegate to) and another enabled, live, not usage-refused harness
+/// exists. Candidates are built the way `resolve_default` builds them: `agent_bin` reaches only
+/// the adapter it names, and presence is not consulted while it is set.
 fn auto_fallback(
     args: &mut AgentArgs,
     cfg: &CtxConfig,
     env: EnvLookup<'_>,
     present: &dyn Fn(&str, &str) -> adapters::Liveness,
+    pace_refused: &dyn Fn(&str) -> bool,
 ) -> CtxResult<()> {
     args.name = adapters::resolve_default_with_presence(cfg, present)?
         .0
@@ -312,12 +325,14 @@ fn auto_fallback(
         .iter()
         .filter(|(name, _)| !name.eq_ignore_ascii_case(&own) && cfg.agents.is_enabled(name))
         .find_map(|(name, ctor)| {
-            let adapter = ctor(bin);
+            let adapter = fallback_candidate(name, *ctor, bin);
             let live = adapter.ready().is_ok()
-                && !matches!(
-                    present(name, adapter.program()),
-                    adapters::Liveness::Absent(_)
-                );
+                && (bin.is_some()
+                    || !matches!(
+                        present(name, adapter.program()),
+                        adapters::Liveness::Absent(_)
+                    ))
+                && !pace_refused(name);
             live.then_some(*name)
         });
     match other {
@@ -358,7 +373,9 @@ fn apply_worker_routing(
     let Some(pick) = pick else {
         if auto {
             // No evidence yet: `auto` is the harness a plain run would use.
-            auto_fallback(args, cfg, env, &adapters::liveness_probe)?;
+            auto_fallback(args, cfg, env, &adapters::liveness_probe, &|harness| {
+                routing::pace_refuses(cfg, state, harness)
+            })?;
         }
         return Ok(false);
     };
@@ -1957,6 +1974,7 @@ mod tests {
             &cfg,
             &|k| env.get(k).cloned(),
             &adapters::everything_installed(),
+            &|_| false,
         )
         .expect("another harness is live");
         assert_eq!(args.name, "codex");
@@ -1967,9 +1985,74 @@ mod tests {
             &cfg,
             &|k| env.get(k).cloned(),
             &adapters::only_installed(&["claude"]),
+            &|_| false,
         )
         .expect_err("no other harness is installed");
         assert!(err.to_string().contains("own harness"), "{err}");
+    }
+
+    #[test]
+    fn auto_fallback_skips_a_usage_refused_harness() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let mut args = args_for(routing::AUTO, "go");
+        auto_fallback(
+            &mut args,
+            &CtxConfig::default(),
+            &|k| env.get(k).cloned(),
+            &adapters::everything_installed(),
+            &|harness| harness == "codex",
+        )
+        .expect("another harness is live");
+        assert_ne!(args.name, "codex");
+        assert_ne!(args.name, "claude");
+
+        let mut args = args_for(routing::AUTO, "go");
+        let err = auto_fallback(
+            &mut args,
+            &CtxConfig::default(),
+            &|k| env.get(k).cloned(),
+            &adapters::everything_installed(),
+            &|harness| harness != "claude",
+        )
+        .expect_err("every other harness is usage-refused");
+        assert!(err.to_string().contains("own harness"), "{err}");
+    }
+
+    #[test]
+    fn auto_fallback_does_not_launch_another_adapters_agent_bin() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let bin = Some("/opt/claude/claude");
+        let build = |name: &str| {
+            let (_, ctor) = adapters::ADAPTERS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .expect("adapter");
+            fallback_candidate(name, *ctor, bin)
+        };
+        assert_eq!(build("claude").program(), "/opt/claude/claude");
+        assert_ne!(build("codex").program(), "/opt/claude/claude");
+
+        // With agent_bin set, presence is not consulted, as in `resolve_default`.
+        let cfg = CtxConfig {
+            agent_bin: bin.map(str::to_string),
+            ..CtxConfig::default()
+        };
+        let mut args = args_for(routing::AUTO, "go");
+        auto_fallback(
+            &mut args,
+            &cfg,
+            &|k| env.get(k).cloned(),
+            &adapters::only_installed(&["claude"]),
+            &|_| false,
+        )
+        .expect("codex is built with its own program");
+        assert_eq!(args.name, "codex");
     }
 
     /// Issue #358 (T9): usage headroom never blocks a spawn -- renamed from

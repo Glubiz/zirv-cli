@@ -250,7 +250,7 @@ pub(crate) fn machine_presence(_name: &str, _program: &str) -> Liveness {
 }
 
 #[cfg(not(test))]
-fn pace_refuses(cfg: &CtxConfig, state: &StateDir, harness: &str) -> bool {
+pub(crate) fn pace_refuses(cfg: &CtxConfig, state: &StateDir, harness: &str) -> bool {
     let now = super::state::now_secs();
     let provider = adapters::provider_for_agent_name(Some(harness));
     let (collector, estimator) = super::pace::current_windows(state, &cfg.pace, now, provider);
@@ -261,7 +261,7 @@ fn pace_refuses(cfg: &CtxConfig, state: &StateDir, harness: &str) -> bool {
 }
 
 #[cfg(test)]
-fn pace_refuses(_cfg: &CtxConfig, _state: &StateDir, _harness: &str) -> bool {
+pub(crate) fn pace_refuses(_cfg: &CtxConfig, _state: &StateDir, _harness: &str) -> bool {
     false
 }
 
@@ -273,7 +273,7 @@ fn cell_model_excluded(
     held: &BTreeSet<String>,
 ) -> bool {
     let key = catalogue::normalize_id(model).to_lowercase();
-    if avoid.contains(&key) || held.contains(&key) {
+    if avoid.contains(&key) || avoid.contains(&model.to_lowercase()) || held.contains(&key) {
         return true;
     }
     let Some(vendor) = vendor else {
@@ -282,6 +282,10 @@ fn cell_model_excluded(
     let Some(family) = catalogue::model_family(vendor.slug, model) else {
         return false;
     };
+    // A Claude family's static alias (`opus`) in `avoid` avoids every model of that family.
+    if vendor.slug == "anthropic" && avoid.contains(family) {
+        return true;
+    }
     cfg.models
         .pin
         .get(&format!("{}.{family}", vendor.slug))
@@ -793,6 +797,22 @@ mod tests {
             .into_iter()
             .map(|c| c.model)
             .collect()
+    }
+
+    #[test]
+    fn a_claude_family_alias_in_avoid_excludes_its_evidence_cells() {
+        let ev = evidence(vec![
+            worker("claude", "claude-opus-4-1", 0.9, Some(1)),
+            worker("claude", "claude-sonnet-4-1", 0.9, Some(1)),
+        ]);
+        let mut cfg = CtxConfig::default();
+        cfg.models.avoid = vec!["opus".to_string()];
+        let names = names_for(&cfg, &ev);
+        assert!(!names.contains(&"claude-opus-4-1".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"claude-sonnet-4-1".to_string()),
+            "{names:?}"
+        );
     }
 
     #[test]

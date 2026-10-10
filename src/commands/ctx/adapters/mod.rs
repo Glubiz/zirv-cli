@@ -1217,7 +1217,10 @@ pub fn native_artifact_presentation_for_agent_name(
 /// one that is not `selected`; `None` when `bin` is unset, names no
 /// registered adapter at all (a stub/wrapper path, the common test and
 /// wrapper-script shape), or names `selected` itself.
-fn agent_bin_names_a_different_adapter(bin: Option<&str>, selected: &str) -> Option<&'static str> {
+pub(crate) fn agent_bin_names_a_different_adapter(
+    bin: Option<&str>,
+    selected: &str,
+) -> Option<&'static str> {
     let bin = bin?;
     let program = bin.split_whitespace().next()?;
     let stem = Path::new(program).file_stem()?.to_str()?;
