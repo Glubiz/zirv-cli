@@ -296,7 +296,10 @@ fn gather(
             harness: (*name).to_string(),
             metered: adapter.endpoint_vendor().is_some(),
             headroom: headroom_of(cfg, state, now, name),
-            new_family: promotion::new_family_probation(promotions, vendor),
+            new_family: promotion::new_family_probation(promotions, vendor)
+                .into_iter()
+                .chain(promotion::unverified_candidates(promotions, vendor, now))
+                .collect(),
             probation: promotion::probation_candidates(promotions, vendor),
             rejected,
             ladder,
@@ -460,7 +463,19 @@ fn record_availability(
     run_id: &str,
     now: u64,
 ) {
-    let candidates: BTreeSet<String> = promotions.new_families.keys().cloned().collect();
+    let vendor_of = |id: &String| {
+        promotions
+            .new_families
+            .get(id)
+            .map(|c| c.vendor.clone())
+            .or_else(|| promotions.unverified.get(id).map(|u| u.vendor.clone()))
+    };
+    let candidates: BTreeSet<String> = promotions
+        .new_families
+        .keys()
+        .chain(promotions.unverified.keys())
+        .cloned()
+        .collect();
     if candidates.is_empty() {
         return;
     }
@@ -475,7 +490,7 @@ fn record_availability(
     let ran: Vec<(String, String)> = outcomes
         .iter()
         .filter(|(_, ran)| *ran)
-        .filter_map(|(id, _)| Some((promotions.new_families.get(id)?.vendor.clone(), id.clone())))
+        .filter_map(|(id, _)| Some((vendor_of(id)?, id.clone())))
         .collect();
     if !ran.is_empty() {
         let _ = models::mark_probe_available(state, &ran, now);
@@ -753,6 +768,29 @@ mod tests {
         claude.ladder = ids(&["l-thin"]);
         let (targets, _) = select_targets(&routing(24), &[claude], &Evidence::default(), NOW);
         assert_eq!(models_of(&targets), vec!["claude-bel-1", "p-new", "l-thin"]);
+    }
+
+    #[test]
+    fn an_unverified_newer_version_is_a_probe_target_and_a_backed_off_one_is_not() {
+        let mut promotions = Promotions::default();
+        for (id, until) in [
+            ("claude-mythos-6", None),
+            ("claude-mythos-7", Some(NOW + 60)),
+        ] {
+            promotions.unverified.insert(
+                id.to_string(),
+                promotion::UnverifiedState {
+                    vendor: "anthropic".into(),
+                    first_seen: NOW,
+                    unavailable_until: until,
+                },
+            );
+        }
+        let mut claude = input("claude");
+        claude.new_family = promotion::unverified_candidates(&promotions, "anthropic", NOW);
+        claude.ladder = ids(&["l-thin"]);
+        let (targets, _) = select_targets(&routing(24), &[claude], &Evidence::default(), NOW);
+        assert_eq!(models_of(&targets), vec!["claude-mythos-6", "l-thin"]);
     }
 
     #[test]

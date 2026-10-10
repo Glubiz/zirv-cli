@@ -175,12 +175,14 @@ pub fn run(args: &ModelsArgs, w: &mut dyn Write) -> CtxResult<i32> {
     }
     let (registry, prices) = load_listing(&cfg, &state, args.command.is_none());
     let rows = list_rows(&cfg, &registry, &prices);
+    let unseen = models_dev_only_count(&registry, &rows);
     let card = scorecard::build(&state, &prices.table, state::now_secs());
     let warnings = avoid_warnings(&cfg, &registry);
     let promotions = promotion::load(&state).unwrap_or_default();
     if args.json {
         let report = serde_json::json!({
             "models": rows,
+            "models_dev_only": unseen,
             "scorecard": card,
             "promotions": promotions,
             "avoid": {
@@ -219,6 +221,12 @@ pub fn run(args: &ModelsArgs, w: &mut dyn Write) -> CtxResult<i32> {
                 row.retirement_at
                     .map(format_epoch_date)
                     .unwrap_or_else(|| "-".into()),
+            )?;
+        }
+        if unseen > 0 {
+            writeln!(
+                w,
+                "+{unseen} known from models.dev, not seen on this account"
             )?;
         }
         for warning in &warnings {
@@ -337,8 +345,14 @@ impl ModelRow {
 }
 
 fn list_rows(cfg: &CtxConfig, registry: &Registry, prices: &EffectivePrices) -> Vec<ModelRow> {
+    let held = held_for(&cfg.routing);
+    let unseen = models_dev_only_ids(registry);
     let mut ids: BTreeMap<(String, String), Option<&RegistryModel>> = BTreeMap::new();
     for model in registry.models.values() {
+        // Ids only models.dev lists are summarized by `models_dev_only_count`, not listed.
+        if unseen.contains(&model.id) && !held.contains(&model.id) {
+            continue;
+        }
         ids.insert((model.vendor.clone(), model.id.clone()), Some(model));
     }
     for vendor in catalogue::vendors() {
@@ -351,7 +365,6 @@ fn list_rows(cfg: &CtxConfig, registry: &Registry, prices: &EffectivePrices) -> 
                 .or_insert(None);
         }
     }
-    let held = held_for(&cfg.routing);
     let discovered = without_held(&discovered_models(registry), &held);
     let pins = effective_pins(cfg);
     let ladders: BTreeMap<String, Vec<catalogue::ResolvedRung>> = catalogue::vendors()
@@ -558,6 +571,31 @@ fn import_models_dev(registry: &mut Registry, listed: &[ListedModel], now: u64) 
             },
         );
     }
+}
+
+/// How many models.dev-only registry ids [`list_rows`] left out of `rows`.
+fn models_dev_only_count(registry: &Registry, rows: &[ModelRow]) -> usize {
+    let listed: BTreeSet<(&str, &str)> = rows
+        .iter()
+        .map(|row| (row.vendor.as_str(), row.id.as_str()))
+        .collect();
+    let unseen = models_dev_only_ids(registry);
+    registry
+        .models
+        .values()
+        .filter(|m| unseen.contains(&m.id) && !listed.contains(&(m.vendor.as_str(), m.id.as_str())))
+        .count()
+}
+
+/// Ids the registry knows only from models.dev: never seen or proven on this account.
+pub(crate) fn models_dev_only_ids(registry: &Registry) -> BTreeSet<String> {
+    registry
+        .models
+        .values()
+        .filter(|m| !m.available && m.sources.iter().all(|s| s == MODELS_DEV_SOURCE))
+        .filter(|m| !m.sources.is_empty())
+        .map(|m| m.id.clone())
+        .collect()
 }
 
 /// Mark ids a probe run proved runnable as available on this account.
@@ -1829,6 +1867,39 @@ mod tests {
         let bel = &registry.models["anthropic:claude-bel-1"];
         assert!(bel.available && bel.released_at.is_some());
         assert_eq!(bel.sources, ["claude-transcript", MODELS_DEV_SOURCE]);
+    }
+
+    #[test]
+    fn the_listing_summarizes_models_dev_only_ids_instead_of_listing_them() {
+        let mut registry = Registry::default();
+        let mut add = |id: &str, available: bool, sources: &[&str]| {
+            registry.models.insert(
+                format!("anthropic:{id}"),
+                RegistryModel {
+                    vendor: "anthropic".into(),
+                    id: id.into(),
+                    available,
+                    sources: sources.iter().map(|s| (*s).to_string()).collect(),
+                    ..RegistryModel::default()
+                },
+            );
+        };
+        add("claude-bel-1", false, &[MODELS_DEV_SOURCE]);
+        add("claude-bel-2", false, &[MODELS_DEV_SOURCE]);
+        add(
+            "claude-bel-3",
+            true,
+            &["claude-transcript", MODELS_DEV_SOURCE],
+        );
+        let cfg = CtxConfig::default();
+        let prices = effective_prices_from(&PriceCache::default(), None);
+        set_test_held(&["claude-bel-2"]);
+        let rows = list_rows(&cfg, &registry, &prices);
+        set_test_held(&[]);
+        let listed: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert!(!listed.contains(&"claude-bel-1"));
+        assert!(listed.contains(&"claude-bel-2") && listed.contains(&"claude-bel-3"));
+        assert_eq!(models_dev_only_count(&registry, &rows), 1);
     }
 
     #[test]

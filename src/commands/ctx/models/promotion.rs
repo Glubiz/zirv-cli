@@ -87,6 +87,8 @@ pub struct Promotions {
     /// first run, which is what makes that run a bootstrap.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_family_baseline: Option<BTreeSet<String>>,
+    /// Known-family versions newer than the incumbent that only models.dev lists, by id.
+    pub unverified: BTreeMap<String, UnverifiedState>,
 }
 
 /// What new-family tracking needs beyond the discovered models.
@@ -96,6 +98,19 @@ pub struct NewFamilyInput<'a> {
     /// False while the existence source has not been read yet, so the bootstrap waits for it
     /// instead of baselining only the local models.
     pub ready: bool,
+    /// Normalized ids whose only registry source is models.dev (never seen on this account).
+    pub models_dev_only: &'a BTreeSet<String>,
+}
+
+/// A version of a known family that exists only on models.dev and is newer than the family's
+/// incumbent: probed to learn whether this account can run it. Not a candidate yet, since it
+/// is not available; once a probe proves it runs it enters the ordinary family gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnverifiedState {
+    pub vendor: String,
+    pub first_seen: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_until: Option<u64>,
 }
 
 /// The harness whose evidence compares a vendor's models.
@@ -151,6 +166,7 @@ pub fn update(
     let input = NewFamilyInput {
         released: &BTreeMap::new(),
         ready: true,
+        models_dev_only: &BTreeSet::new(),
     };
     update_with(prev, discovered, evidence, cfg, now, &input)
 }
@@ -210,13 +226,88 @@ pub fn update_with(
         };
         families.insert(key, state);
     }
+    let unverified = update_unverified(prev, discovered, &families, gate, input, now);
     Promotions {
         version: PROMOTIONS_VERSION,
         updated_at: now,
         families,
         new_families,
         new_family_baseline,
+        unverified,
     }
+}
+
+/// Known-family ids only models.dev lists, newer than their family's incumbent (else its
+/// newest available id), released within the 90-day window. Bootstrap needs nothing special:
+/// only versions above the incumbent qualify, and a family with nothing available has none.
+fn update_unverified(
+    prev: &Promotions,
+    discovered: &[DiscoveredModel],
+    families: &BTreeMap<String, FamilyState>,
+    gate: bool,
+    input: &NewFamilyInput<'_>,
+    now: u64,
+) -> BTreeMap<String, UnverifiedState> {
+    if !gate {
+        return BTreeMap::new();
+    }
+    if !input.ready {
+        return prev.unverified.clone();
+    }
+    let available = available_by_family(discovered);
+    let mut out = BTreeMap::new();
+    for model in discovered.iter().filter(|model| !model.available) {
+        let id = catalogue::normalize_id(&model.id).to_lowercase();
+        if harness_of(&model.vendor).is_none() || !input.models_dev_only.contains(&id) {
+            continue;
+        }
+        let Some((family, version)) = catalogue::family_and_version(&model.vendor, &id) else {
+            continue;
+        };
+        let key = format!("{}.{family}", model.vendor);
+        let incumbent = families
+            .get(&key)
+            .and_then(|state| version_of(&model.vendor, &state.incumbent))
+            .or_else(|| available.get(&key)?.first().map(|(version, _)| *version));
+        if incumbent.is_none_or(|incumbent| version <= incumbent) {
+            continue;
+        }
+        if input
+            .released
+            .get(&id)
+            .is_some_and(|released| now.saturating_sub(*released) > MAX_RELEASE_AGE_SECS)
+        {
+            continue;
+        }
+        let mut state = prev
+            .unverified
+            .get(&id)
+            .cloned()
+            .unwrap_or(UnverifiedState {
+                vendor: model.vendor.clone(),
+                first_seen: now,
+                unavailable_until: None,
+            });
+        if state.unavailable_until.is_some_and(|until| until <= now) {
+            state.unavailable_until = None;
+        }
+        out.insert(id, state);
+    }
+    out
+}
+
+/// Unverified versions of `vendor` due a probe (not backed off), newest first.
+pub fn unverified_candidates(promotions: &Promotions, vendor: &str, now: u64) -> Vec<String> {
+    let mut out: Vec<(catalogue::ModelVersion, String)> = promotions
+        .unverified
+        .iter()
+        .filter(|(_, state)| {
+            state.vendor == vendor && state.unavailable_until.is_none_or(|until| until <= now)
+        })
+        .filter_map(|(id, _)| version_of(vendor, id).map(|version| (version, id.clone())))
+        .collect();
+    out.sort_by(|a, b| b.cmp(a));
+    out.into_iter().map(|(_, id)| id).collect()
 }
 
 /// The unknown-family models in `discovered` that belong to a gated vendor, keyed by
@@ -323,6 +414,12 @@ pub fn record_probe_outcomes(
     let mut next = prev.clone();
     for (id, ran) in outcomes {
         let key = catalogue::normalize_id(id).to_lowercase();
+        if let Some(unverified) = next.unverified.get_mut(&key) {
+            // A version that ran is registered as available and leaves the map on the next
+            // update, entering the ordinary family gate; one that did not is backed off.
+            unverified.unavailable_until = (!ran).then_some(now + UNAVAILABLE_BACKOFF_SECS);
+            continue;
+        }
         let Some(candidate) = next.new_families.get_mut(&key) else {
             continue;
         };
@@ -350,7 +447,7 @@ pub(crate) fn save_probe_outcomes(
 ) -> CtxResult<()> {
     let prev = load(state).unwrap_or_default();
     let next = record_probe_outcomes(&prev, outcomes, now);
-    if next.new_families != prev.new_families {
+    if next.new_families != prev.new_families || next.unverified != prev.unverified {
         write_json(&state.root().join(PROMOTIONS_FILE), &next)?;
     }
     Ok(())
@@ -518,6 +615,7 @@ pub fn held_ids(promotions: &Promotions) -> BTreeSet<String> {
                 .filter(|(_, candidate)| candidate.status != NewFamilyStatus::Eligible)
                 .map(|(id, _)| id.clone()),
         )
+        .chain(promotions.unverified.keys().cloned())
         .collect()
 }
 
@@ -561,8 +659,10 @@ pub(crate) fn refresh_with(
         .values()
         .filter_map(|model| Some((model.id.clone(), model.released_at?)))
         .collect();
+    let models_dev_only = super::models_dev_only_ids(registry);
     let input = NewFamilyInput {
         released: &released,
+        models_dev_only: &models_dev_only,
         // The first bootstrap waits for the existence source, so the whole catalogue is baseline.
         ready: !cfg.models.price_fetch
             || registry
@@ -574,6 +674,7 @@ pub(crate) fn refresh_with(
     if next.families != prev.families
         || next.new_families != prev.new_families
         || next.new_family_baseline != prev.new_family_baseline
+        || next.unverified != prev.unverified
     {
         write_json(&state.root().join(PROMOTIONS_FILE), &next)?;
     }
@@ -600,7 +701,10 @@ pub(crate) fn render(
             "\nPROMOTIONS\tnew models are adopted at once ([routing] hold_new_models = false)"
         );
     }
-    if promotions.families.is_empty() && promotions.new_families.is_empty() {
+    if promotions.families.is_empty()
+        && promotions.new_families.is_empty()
+        && promotions.unverified.is_empty()
+    {
         return writeln!(w, "\nPROMOTIONS\tno model families tracked yet");
     }
     writeln!(
@@ -629,6 +733,16 @@ pub(crate) fn render(
                     .map_or_else(|| "-".to_string(), super::format_epoch_date),
             )?;
         }
+    }
+    for (id, state) in &promotions.unverified {
+        writeln!(
+            w,
+            "unverified\t{id}\tprobe pending\t{}\t{}",
+            super::format_epoch_date(state.first_seen),
+            state
+                .unavailable_until
+                .map_or_else(|| "-".to_string(), super::format_epoch_date),
+        )?;
     }
     if promotions.families.is_empty() {
         return Ok(());
@@ -953,6 +1067,7 @@ mod tests {
         let input = NewFamilyInput {
             released,
             ready: true,
+            models_dev_only: &BTreeSet::new(),
         };
         update_with(prev, &found(ids), evidence, &cfg(), at, &input)
     }
@@ -1004,6 +1119,7 @@ mod tests {
         let input = NewFamilyInput {
             released: &none,
             ready: false,
+            models_dev_only: &BTreeSet::new(),
         };
         let waiting = update_with(
             &Promotions::default(),
@@ -1137,6 +1253,77 @@ mod tests {
         assert_eq!(back.new_families[BEL].unavailable_until, None);
         let ran = record_probe_outcomes(&down, &[(BEL.to_string(), true)], NOW + 20);
         assert_eq!(ran.new_families[BEL].status, NewFamilyStatus::Probation);
+    }
+
+    const MYTHOS5: &str = "claude-mythos-5";
+    const MYTHOS6: &str = "claude-mythos-6";
+
+    /// `MYTHOS5` is available; `listed` are models.dev-only unavailable ids.
+    fn step_unverified(prev: &Promotions, listed: &[&str], at: u64) -> Promotions {
+        let mut discovered = found(&[MYTHOS5]);
+        discovered.extend(
+            listed
+                .iter()
+                .map(|id| DiscoveredModel::new("anthropic", *id, false)),
+        );
+        let only: BTreeSet<String> = listed.iter().map(|id| (*id).to_string()).collect();
+        let input = NewFamilyInput {
+            released: &BTreeMap::new(),
+            ready: true,
+            models_dev_only: &only,
+        };
+        update_with(prev, &discovered, &Evidence::default(), &cfg(), at, &input)
+    }
+
+    #[test]
+    fn a_newer_models_dev_only_version_is_unverified_and_an_older_one_is_not() {
+        let next = step_unverified(&Promotions::default(), &[MYTHOS6, "claude-mythos-4"], NOW);
+        assert_eq!(next.unverified.keys().collect::<Vec<_>>(), [MYTHOS6]);
+        assert_eq!(unverified_candidates(&next, "anthropic", NOW), [MYTHOS6]);
+        assert!(held_ids(&next).contains(MYTHOS6));
+        // A family with nothing available has no incumbent, so nothing floods in.
+        let input = NewFamilyInput {
+            released: &BTreeMap::new(),
+            ready: true,
+            models_dev_only: &BTreeSet::from([MYTHOS6.to_string()]),
+        };
+        let none = update_with(
+            &Promotions::default(),
+            &[DiscoveredModel::new("anthropic", MYTHOS6, false)],
+            &Evidence::default(),
+            &cfg(),
+            NOW,
+            &input,
+        );
+        assert!(none.unverified.is_empty());
+    }
+
+    #[test]
+    fn a_probed_unverified_version_enters_the_family_gate_and_a_failed_one_backs_off() {
+        let listed = step_unverified(&Promotions::default(), &[MYTHOS6], NOW);
+        let down = record_probe_outcomes(&listed, &[(MYTHOS6.to_string(), false)], NOW + 5);
+        assert_eq!(
+            down.unverified[MYTHOS6].unavailable_until,
+            Some(NOW + 5 + 7 * DAY)
+        );
+        assert!(unverified_candidates(&down, "anthropic", NOW + 6).is_empty());
+        let later = step_unverified(&down, &[MYTHOS6], NOW + 5 + 7 * DAY);
+        assert_eq!(
+            unverified_candidates(&later, "anthropic", NOW + 5 + 7 * DAY),
+            [MYTHOS6]
+        );
+
+        // The probe ran it: the registry marks it available, so the next update sees an
+        // ordinary newer version and holds it on probation.
+        let next = update(
+            &later,
+            &found(&[MYTHOS5, MYTHOS6]),
+            &Evidence::default(),
+            &cfg(),
+            NOW + 9 * DAY,
+        );
+        assert!(next.unverified.is_empty());
+        assert_eq!(probation_candidates(&next, "anthropic"), [MYTHOS6]);
     }
 
     #[test]
