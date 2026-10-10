@@ -326,7 +326,8 @@ fn auto_fallback(
         .filter(|(name, _)| !name.eq_ignore_ascii_case(&own) && cfg.agents.is_enabled(name))
         .find_map(|(name, ctor)| {
             let adapter = fallback_candidate(name, *ctor, bin);
-            let uses_bin = bin.is_some_and(|b| adapter.program() == b);
+            let uses_bin =
+                bin.is_some() && adapters::agent_bin_names_a_different_adapter(bin, name).is_none();
             let live = adapter.ready().is_ok()
                 && (uses_bin
                     || !matches!(
@@ -2076,6 +2077,28 @@ mod tests {
         )
         .expect_err("codex is absent and agent_bin does not reach it");
         assert!(err.to_string().contains("own harness"), "{err}");
+    }
+
+    #[test]
+    fn auto_fallback_skips_presence_for_the_candidate_an_agent_bin_with_arguments_names() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let cfg = CtxConfig {
+            agent_bin: Some("/opt/codex/codex --profile work".to_string()),
+            ..CtxConfig::default()
+        };
+        let mut args = args_for(routing::AUTO, "go");
+        auto_fallback(
+            &mut args,
+            &cfg,
+            &|k| env.get(k).cloned(),
+            &adapters::only_installed(&["claude"]),
+            &|_| false,
+        )
+        .expect("agent_bin reaches codex, so codex needs no PATH presence");
+        assert_eq!(args.name, "codex");
     }
 
     /// Issue #358 (T9): usage headroom never blocks a spawn -- renamed from
