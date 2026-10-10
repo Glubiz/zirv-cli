@@ -3465,7 +3465,7 @@ No qualifying candidate means no pick, and the caller keeps its existing logic. 
 | `zirv agent auto "<prompt>"` | always (see [`zirv chat` and `zirv agent`](#zirv-chat-and-zirv-agent)) | a model in the flags |
 | `zirv agent <harness> ...` | the model inside that harness, from the classified prompt | a model in the flags, `[worker]` model for that harness |
 | Workflow seats | no task `model` and no `[model_tiers]` entry; tier `fast` is complexity `trivial`, `standard` is `bounded`, `deep` is `substantial`; picks within the seat's own harness | task `model`, `[model_tiers.<harness>]` |
-| Reviewer | `review.<harness>` unset; picks reviewer evidence within the harness, never stronger than the rung below the seat | `review.<harness>` |
+| Reviewer | `review.<harness>` unset; picks reviewer evidence within the harness, never stronger than the rung below the seat. The roster's code-review line marks it `(routed)` | `review.<harness>` |
 
 The orchestrator's harness roster gains one line when at least one route has evidence: `- routing: worker trivial -> h/m, bounded -> h/m, substantial -> h/m; reviewer -> h/m -- zirv agent auto "<prompt>" picks per task`. It is computed once per process, from the cached evidence and without usage pacing, so it does not change within a session.
 
