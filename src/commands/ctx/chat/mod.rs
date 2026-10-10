@@ -186,14 +186,16 @@ fn orchestrator_initial_prompt(
 pub(crate) fn resolve_adapter(
     cfg: &CtxConfig,
     requested: Option<&str>,
+    extra: &[String],
 ) -> CtxResult<(Box<dyn AgentAdapter>, HarnessRule)> {
-    resolve_adapter_with_presence(cfg, requested, &adapters::liveness_probe)
+    resolve_adapter_with_presence(cfg, requested, extra, &adapters::liveness_probe)
 }
 
 /// Inject presence for every resolution arm so tests never depend on the developer's installed PATH tools (#690).
 pub(crate) fn resolve_adapter_with_presence(
     cfg: &CtxConfig,
     requested: Option<&str>,
+    extra: &[String],
     present: &dyn Fn(&str, &str) -> adapters::Liveness,
 ) -> CtxResult<(Box<dyn AgentAdapter>, HarnessRule)> {
     // Empty chat argv means the adapter builds its own launch.
@@ -207,7 +209,10 @@ pub(crate) fn resolve_adapter_with_presence(
             HarnessRule::Configured,
         )),
         None => {
-            if let Some((adapter, rule)) = routed_seat(cfg, present) {
+            // A model pinned in passthrough extras is an explicit choice; routing could pick another vendor.
+            if !super::agent::flags_pin_model(extra)
+                && let Some((adapter, rule)) = routed_seat(cfg, present)
+            {
                 return Ok((adapter, rule));
             }
             adapters::resolve_default_with_presence(cfg, present).map(|(adapter, origin)| {
@@ -789,7 +794,7 @@ pub fn run_with<W: Write, E: Write>(
         }
     }
 
-    let (adapter, rule) = match resolve_adapter(&cfg, requested_agent.as_deref()) {
+    let (adapter, rule) = match resolve_adapter(&cfg, requested_agent.as_deref(), &args.extra) {
         Ok(found) => found,
         Err(err) => {
             // Print refusals once on stderr and return exit 1 to avoid top-level duplicate errors.
@@ -1175,7 +1180,11 @@ fn dash_orchestrator_pane_with_task(
 }
 
 /// Add model flags as trailing extras so they cannot land inside Windows cmd.exe /c launcher prefixes.
-fn extra_with_model(cfg: &CtxConfig, adapter: &dyn AgentAdapter, extra: &[String]) -> Vec<String> {
+pub(crate) fn extra_with_model(
+    cfg: &CtxConfig,
+    adapter: &dyn AgentAdapter,
+    extra: &[String],
+) -> Vec<String> {
     let Some(model) = cfg.chat.model.as_deref() else {
         return extra.to_vec();
     };
@@ -2527,7 +2536,7 @@ mod tests {
         let cfg = CtxConfig::default();
 
         let (adapter, rule) =
-            resolve_adapter_with_presence(&cfg, None, &adapters::only_installed(&["codex"]))
+            resolve_adapter_with_presence(&cfg, None, &[], &adapters::only_installed(&["codex"]))
                 .expect("codex is installed, so there is an answer");
         assert_eq!(adapter.name(), "codex");
         assert_eq!(
@@ -2538,7 +2547,7 @@ mod tests {
         );
 
         let (adapter, rule) =
-            resolve_adapter_with_presence(&cfg, None, &adapters::everything_installed())
+            resolve_adapter_with_presence(&cfg, None, &[], &adapters::everything_installed())
                 .expect("a default exists");
         assert_eq!(adapter.name(), "claude");
         assert_eq!(
@@ -2552,6 +2561,7 @@ mod tests {
         let (adapter, rule) = resolve_adapter_with_presence(
             &cfg,
             Some("claude"),
+            &[],
             &adapters::only_installed(&["codex"]),
         )
         .expect("an explicit --agent is never second-guessed");
@@ -2589,6 +2599,7 @@ mod tests {
         let (adapter, rule) = resolve_adapter_with_presence(
             &CtxConfig::default(),
             None,
+            &[],
             &adapters::everything_installed(),
         )
         .expect("a seat");
@@ -2600,12 +2611,24 @@ mod tests {
     }
 
     #[test]
+    fn a_model_pinned_in_passthrough_extras_bypasses_the_routed_seat() {
+        let _evidence = orchestrator_evidence();
+        let present = adapters::everything_installed();
+        let extra = vec!["--model".to_string(), "claude-x".to_string()];
+        let (adapter, rule) =
+            resolve_adapter_with_presence(&CtxConfig::default(), None, &extra, &present)
+                .expect("default seat");
+        assert_eq!(adapter.name(), "claude");
+        assert!(!matches!(rule, HarnessRule::Routed { .. }), "{rule:?}");
+    }
+
+    #[test]
     fn an_explicit_choice_bypasses_the_routed_seat() {
         let _evidence = orchestrator_evidence();
         let present = adapters::everything_installed();
 
         let (adapter, rule) =
-            resolve_adapter_with_presence(&CtxConfig::default(), Some("claude"), &present)
+            resolve_adapter_with_presence(&CtxConfig::default(), Some("claude"), &[], &present)
                 .expect("--agent");
         assert_eq!((adapter.name(), rule), ("claude", HarnessRule::Explicit));
 
@@ -2613,12 +2636,14 @@ mod tests {
             agent: Some("claude".to_string()),
             ..CtxConfig::default()
         };
-        let (adapter, rule) = resolve_adapter_with_presence(&cfg, None, &present).expect("agent");
+        let (adapter, rule) =
+            resolve_adapter_with_presence(&cfg, None, &[], &present).expect("agent");
         assert_eq!((adapter.name(), rule), ("claude", HarnessRule::Configured));
 
         let mut cfg = CtxConfig::default();
         cfg.chat.model = Some("my-model".to_string());
-        let (_, rule) = resolve_adapter_with_presence(&cfg, None, &present).expect("chat.model");
+        let (_, rule) =
+            resolve_adapter_with_presence(&cfg, None, &[], &present).expect("chat.model");
         assert_eq!(rule, HarnessRule::FirstEnabledReady);
     }
 

@@ -66,7 +66,11 @@ fn tier_default(agent: &str, tier: &str, cfg: &CtxConfig) -> Option<String> {
 /// `ZIRV_CTX_HANDOVER_<AGENT>_<TIER>` by `CtxConfig::load`'s ordinary
 /// env-over-merged-layers precedence (see `ENV_MAP` in `config.rs`), so this
 /// function needs no env lookup of its own.
-fn handover_config_tier<'a>(cfg: &'a CtxConfig, agent: &str, tier: &str) -> Option<&'a str> {
+pub(crate) fn handover_config_tier<'a>(
+    cfg: &'a CtxConfig,
+    agent: &str,
+    tier: &str,
+) -> Option<&'a str> {
     let agent_cfg = match agent {
         "claude" => &cfg.handover.claude,
         "codex" => &cfg.handover.codex,

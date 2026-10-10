@@ -291,6 +291,44 @@ fn run_goal_bootstrap(
     Ok(usage)
 }
 
+/// `auto` with no evidence pick: the default harness, unless that is this seat's own harness
+/// (which a seat may not delegate to) and another enabled, live harness exists.
+fn auto_fallback(
+    args: &mut AgentArgs,
+    cfg: &CtxConfig,
+    env: EnvLookup<'_>,
+    present: &dyn Fn(&str, &str) -> adapters::Liveness,
+) -> CtxResult<()> {
+    args.name = adapters::resolve_default_with_presence(cfg, present)?
+        .0
+        .name()
+        .to_string();
+    let Some(message) = same_harness_refusal(args, env) else {
+        return Ok(());
+    };
+    let own = args.name.clone();
+    let bin = cfg.agent_bin.as_deref();
+    let other = adapters::ADAPTERS
+        .iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(&own) && cfg.agents.is_enabled(name))
+        .find_map(|(name, ctor)| {
+            let adapter = ctor(bin);
+            let live = adapter.ready().is_ok()
+                && !matches!(
+                    present(name, adapter.program()),
+                    adapters::Liveness::Absent(_)
+                );
+            live.then_some(*name)
+        });
+    match other {
+        Some(name) => {
+            args.name = name.to_string();
+            Ok(())
+        }
+        None => Err(message.into()),
+    }
+}
+
 /// Resolve `zirv agent auto` to a harness and give an unpinned delegation the model evidence
 /// picks, announcing the choice. Returns whether a model was added to `args.flags`.
 fn apply_worker_routing(
@@ -298,6 +336,7 @@ fn apply_worker_routing(
     cfg: &CtxConfig,
     state: &StateDir,
     env: EnvLookup<'_>,
+    canary: &mut Option<super::super::attribution::CandidateGuard>,
 ) -> CtxResult<bool> {
     let auto = args.name == routing::AUTO;
     let own_seat = (env(adapters::SEAT_ROLE_ENV).as_deref() == Some("orchestrator") && !args.force)
@@ -319,10 +358,7 @@ fn apply_worker_routing(
     let Some(pick) = pick else {
         if auto {
             // No evidence yet: `auto` is the harness a plain run would use.
-            args.name = adapters::resolve_default(cfg)?.0.name().to_string();
-            if let Some(message) = same_harness_refusal(args, env) {
-                return Err(message.into());
-            }
+            auto_fallback(args, cfg, env, &adapters::liveness_probe)?;
         }
         return Ok(false);
     };
@@ -339,7 +375,7 @@ fn apply_worker_routing(
         routed = true;
     }
     if pick.canary {
-        super::super::attribution::set_process_candidate("canary");
+        *canary = super::super::attribution::scope_candidate("canary");
     }
     if !args.quiet {
         eprintln!(
@@ -391,7 +427,10 @@ pub fn run_with<W: Write>(
     // Resolve workspace names and skills before allocation so invalid references cannot leave temporary trees.
     let cfg = CtxConfig::load_for_launch(repo, env)?;
     // Evidence may choose the harness (`auto`) or the model, only where nothing was pinned.
-    let routed_model = !native && apply_worker_routing(args, &cfg, &state, env)?;
+    // The canary stamp lives only as long as this run.
+    let mut _canary_scope = None;
+    let routed_model =
+        !native && apply_worker_routing(args, &cfg, &state, env, &mut _canary_scope)?;
     let manifest_skills = if let Some(id) = args.manifest_agent.as_deref() {
         let home = env("HOME")
             .or_else(|| env("USERPROFILE"))
@@ -1904,6 +1943,34 @@ mod tests {
     use std::path::PathBuf;
 
     use super::super::tests::*;
+
+    #[test]
+    fn auto_without_evidence_avoids_the_seats_own_harness_when_another_is_live() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let cfg = CtxConfig::default();
+        let mut args = args_for(routing::AUTO, "go");
+        auto_fallback(
+            &mut args,
+            &cfg,
+            &|k| env.get(k).cloned(),
+            &adapters::everything_installed(),
+        )
+        .expect("another harness is live");
+        assert_eq!(args.name, "codex");
+
+        let mut args = args_for(routing::AUTO, "go");
+        let err = auto_fallback(
+            &mut args,
+            &cfg,
+            &|k| env.get(k).cloned(),
+            &adapters::only_installed(&["claude"]),
+        )
+        .expect_err("no other harness is installed");
+        assert!(err.to_string().contains("own harness"), "{err}");
+    }
 
     /// Issue #358 (T9): usage headroom never blocks a spawn -- renamed from
     /// `only_a_refusal_is_overridable_and_only_by_force`, which used to pin

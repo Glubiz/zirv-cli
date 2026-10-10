@@ -1314,13 +1314,23 @@ fn finalize_derived_fields(decision: &mut ProxyDecision, cfg: &CtxConfig) {
     decision.seat_role = SeatRole::from_execution(decision.execution);
     decision.orchestrator.model =
         model_for_tier(cfg, &decision.orchestrator.harness, decision.seat_tier);
-    if let Some(pick) = routing::route_seat(
-        cfg,
-        Some(decision.complexity),
-        decision.risk,
-        Some(&decision.orchestrator.harness),
-        &routing::machine_presence,
-    ) {
+    // An operator-configured `[handover.<harness>]` tier model is an explicit choice evidence never re-routes.
+    let tier_configured = !matches!(decision.seat_tier, SeatTier::Frontier)
+        && handover::handover_config_tier(
+            cfg,
+            &decision.orchestrator.harness,
+            decision.seat_tier.label(),
+        )
+        .is_some_and(|model| !model.trim().is_empty());
+    if !tier_configured
+        && let Some(pick) = routing::route_seat(
+            cfg,
+            Some(decision.complexity),
+            decision.risk,
+            Some(&decision.orchestrator.harness),
+            &routing::machine_presence,
+        )
+    {
         decision.reasons.push(format!(
             "seat: model '{}' routed by evidence ({})",
             pick.model, pick.reason
@@ -3258,6 +3268,27 @@ mod tests {
             decision.orchestrator.model, "claude-seat",
             "an explicit harness still routes its model by evidence"
         );
+    }
+
+    #[test]
+    fn baseline_keeps_a_configured_handover_tier_model_over_the_routed_seat() {
+        let _evidence = seat_evidence();
+        let request = "fix a typo in the readme";
+        let mut cfg = CtxConfig {
+            agent: Some("claude".to_string()),
+            ..CtxConfig::default()
+        };
+        cfg.handover.claude.cheap = Some("my-tier".to_string());
+        cfg.handover.claude.standard = Some("my-tier".to_string());
+        cfg.handover.claude.deep = Some("my-tier".to_string());
+        let decision = baseline(
+            &cfg,
+            Path::new("."),
+            request,
+            &classify_request(request),
+            &empty_roster(),
+        );
+        assert_eq!(decision.orchestrator.model, "my-tier");
     }
 
     /// A REGISTERED pack id named adjacent to "workflow" wins outright,

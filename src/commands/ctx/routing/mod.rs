@@ -265,6 +265,29 @@ fn pace_refuses(_cfg: &CtxConfig, _state: &StateDir, _harness: &str) -> bool {
     false
 }
 
+fn cell_model_excluded(
+    cfg: &CtxConfig,
+    vendor: Option<&catalogue::Vendor>,
+    model: &str,
+    avoid: &BTreeSet<String>,
+    held: &BTreeSet<String>,
+) -> bool {
+    let key = catalogue::normalize_id(model).to_lowercase();
+    if avoid.contains(&key) || held.contains(&key) {
+        return true;
+    }
+    let Some(vendor) = vendor else {
+        return false;
+    };
+    let Some(family) = catalogue::model_family(vendor.slug, model) else {
+        return false;
+    };
+    cfg.models
+        .pin
+        .get(&format!("{}.{family}", vendor.slug))
+        .is_some_and(|pinned| catalogue::normalize_id(pinned).to_lowercase() != key)
+}
+
 fn candidates_for(
     cfg: &CtxConfig,
     evidence: &Evidence,
@@ -285,11 +308,15 @@ fn candidates_for(
             }
         }
     }
-    for cell in evidence
-        .cells
-        .iter()
-        .filter(|cell| cell.harness == harness && cell.role == role)
-    {
+    // Evidence may name older, non-ladder models, but never one the operator avoided, the
+    // promotion gate holds, or a family pin points away from.
+    let avoid = models::avoid_for(cfg);
+    let held = models::held_for(&cfg.routing);
+    for cell in evidence.cells.iter().filter(|cell| {
+        cell.harness == harness
+            && cell.role == role
+            && !cell_model_excluded(cfg, vendor, &cell.model, &avoid, &held)
+    }) {
         if seen.insert(cell.model.clone()) {
             names.push(cell.model.clone());
         }
@@ -759,6 +786,56 @@ mod tests {
 
     fn pick_model(evidence: &Evidence, candidates: &[Candidate], q: &RouteQuery) -> Option<String> {
         choose(evidence, candidates, q, TOL).map(|pick| pick.model)
+    }
+
+    fn names_for(cfg: &CtxConfig, ev: &Evidence) -> Vec<String> {
+        candidates_for(cfg, ev, "claude", RouteRole::Worker)
+            .into_iter()
+            .map(|c| c.model)
+            .collect()
+    }
+
+    #[test]
+    fn evidence_models_that_are_avoided_held_or_pin_conflicting_are_not_candidates() {
+        let ev = evidence(vec![
+            worker("claude", "claude-opus-3-1", 0.9, Some(1)),
+            worker("claude", "claude-opus-3-2", 0.9, Some(1)),
+            worker("claude", "claude-sonnet-3-1", 0.9, Some(1)),
+            worker("claude", "claude-sonnet-3-2", 0.9, Some(1)),
+            worker("claude", "old-unlisted", 0.9, Some(1)),
+        ]);
+        let cfg = CtxConfig::default();
+        let names = names_for(&cfg, &ev);
+        assert!(names.contains(&"old-unlisted".to_string()), "{names:?}");
+        assert!(names.contains(&"claude-opus-3-1".to_string()), "{names:?}");
+
+        let mut avoiding = CtxConfig::default();
+        avoiding.models.avoid = vec!["claude-opus-3-1".to_string()];
+        assert!(!names_for(&avoiding, &ev).contains(&"claude-opus-3-1".to_string()));
+
+        let mut holding = CtxConfig::default();
+        holding.routing.enabled = true;
+        holding.routing.hold_new_models = true;
+        models::set_test_held(&["claude-opus-3-2"]);
+        let names = names_for(&holding, &ev);
+        models::set_test_held(&[]);
+        assert!(!names.contains(&"claude-opus-3-2".to_string()), "{names:?}");
+        assert!(names.contains(&"old-unlisted".to_string()));
+
+        let mut pinned = CtxConfig::default();
+        pinned
+            .models
+            .pin
+            .insert("anthropic.sonnet".into(), "claude-sonnet-3-1".into());
+        let names = names_for(&pinned, &ev);
+        assert!(
+            names.contains(&"claude-sonnet-3-1".to_string()),
+            "{names:?}"
+        );
+        assert!(
+            !names.contains(&"claude-sonnet-3-2".to_string()),
+            "{names:?}"
+        );
     }
 
     #[test]

@@ -858,7 +858,7 @@ pub fn validate_flags(flags: &[String]) -> CtxResult<()> {
 }
 
 /// Recognize all model pins, including Codex -m/attached forms, so explicit operator choices are never overwritten.
-fn flags_pin_model(flags: &[String]) -> bool {
+pub(crate) fn flags_pin_model(flags: &[String]) -> bool {
     flags
         .iter()
         .any(|f| adapters::classify_model_flag(f).is_some() || f.trim_start().starts_with("model="))

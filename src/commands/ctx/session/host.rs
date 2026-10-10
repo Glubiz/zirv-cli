@@ -1086,6 +1086,22 @@ impl super::super::dash::Injector for SessionInjector<'_> {
 pub const DEFAULT_ROWS: u16 = 24;
 pub const DEFAULT_COLS: u16 = 80;
 
+/// Only a routed seat's model must be added to the argv here; the pane builder never applies
+/// `chat.model`, and an operator-set `chat.model` keeps its existing behaviour.
+fn launch_extra(
+    cfg: &mut super::super::config::CtxConfig,
+    adapter: &dyn adapters::AgentAdapter,
+    rule: super::super::chrome::HarnessRule,
+    extra: &[String],
+) -> Vec<String> {
+    if let super::super::chrome::HarnessRule::Routed { model, .. } = rule {
+        cfg.chat.model = Some(model);
+        super::super::chat::extra_with_model(cfg, adapter, extra)
+    } else {
+        extra.to_vec()
+    }
+}
+
 /// Turns a protocol [`SessionSpec`] into a launch this runtime is willing to
 /// make.
 ///
@@ -1125,15 +1141,14 @@ pub fn launch_spec(spec: &SessionSpec, session_id: &str, state: &StateDir) -> Ct
         &repo,
         &super::super::config::env_from_process(),
     )?;
-    let (adapter, rule) = super::super::chat::resolve_adapter(&cfg, spec.agent.as_deref())?;
-    if let super::super::chrome::HarnessRule::Routed { model, .. } = rule {
-        cfg.chat.model = Some(model);
-    }
+    let (adapter, rule) =
+        super::super::chat::resolve_adapter(&cfg, spec.agent.as_deref(), &spec.extra_args)?;
+    let extra = launch_extra(&mut cfg, adapter.as_ref(), rule, &spec.extra_args);
     let prompt = spec.prompt.trim();
     let launch = super::super::chat::build_launch(
         adapter.as_ref(),
         (!prompt.is_empty()).then_some(prompt),
-        &spec.extra_args,
+        &extra,
     );
     // Issue #537: the persistent runtime's own launch path has no protocol
     // field yet for the harness proxy's bounded layer (`SessionSpec` carries
@@ -1549,6 +1564,27 @@ mod tests {
         );
     }
 
+    /// A routed seat's model must reach the argv: the pane builder never applies `chat.model`.
+    #[test]
+    fn a_routed_seats_model_is_added_to_the_hosts_launch_extras() {
+        use crate::commands::ctx::chrome::HarnessRule;
+        use crate::commands::ctx::config::CtxConfig;
+        let adapter = adapters::select(Some("claude"), &[], &CtxConfig::default()).expect("claude");
+        let tail = vec!["--continue".to_string()];
+
+        let mut cfg = CtxConfig::default();
+        let routed = HarnessRule::Routed {
+            model: "claude-seat".to_string(),
+            reason: "evidence".to_string(),
+        };
+        let extra = launch_extra(&mut cfg, adapter.as_ref(), routed, &tail);
+        assert_eq!(extra.last().map(String::as_str), Some("--continue"));
+        assert!(extra.iter().any(|arg| arg == "claude-seat"), "{extra:?}");
+
+        let mut cfg = CtxConfig::default();
+        let extra = launch_extra(&mut cfg, adapter.as_ref(), HarnessRule::Explicit, &tail);
+        assert_eq!(extra, tail, "only a routed seat gains a model");
+    }
     /// A stopped session lets go of its terminal, and the table of ended
     /// sessions is bounded. Before this, every `zirv session stop` (and so
     /// every chat restart) on a long-lived runtime left a live pty master, its

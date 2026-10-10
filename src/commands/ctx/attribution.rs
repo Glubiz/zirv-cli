@@ -43,20 +43,36 @@ fn is_valid_id(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
 }
 
-/// A candidate id this process claimed for itself (the routing canary), used when the env
-/// names none. One delegation runs per process, so this never crosses runs.
-static PROCESS_CANDIDATE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+thread_local! {
+    static RUN_CANDIDATE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
 
-pub(crate) fn set_process_candidate(candidate: &str) {
-    if is_valid_id(candidate)
-        && let Ok(mut slot) = PROCESS_CANDIDATE.lock()
-    {
-        *slot = Some(candidate.to_string());
+/// Holds a candidate id (the routing canary) for the one run that claimed it, used when the
+/// env names none. In-process callers run several delegations per process, so the claim is
+/// thread-local and ends when this guard drops.
+#[must_use = "the candidate lasts only while the guard is alive"]
+pub(crate) struct CandidateGuard {
+    previous: Option<String>,
+}
+
+impl Drop for CandidateGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        RUN_CANDIDATE.with(|slot| *slot.borrow_mut() = previous);
     }
 }
 
+pub(crate) fn scope_candidate(candidate: &str) -> Option<CandidateGuard> {
+    if !is_valid_id(candidate) {
+        return None;
+    }
+    let previous = RUN_CANDIDATE.with(|slot| slot.replace(Some(candidate.to_string())));
+    Some(CandidateGuard { previous })
+}
+
 fn process_candidate() -> Option<String> {
-    PROCESS_CANDIDATE.lock().ok()?.clone()
+    RUN_CANDIDATE.with(|slot| slot.borrow().clone())
 }
 
 /// Campaign/candidate/trial/logical-task ids for the autoresearch runner
@@ -893,6 +909,15 @@ pub fn run_spend(args: &SpendArgs, writer: &mut impl Write) -> CtxResult<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_canary_candidate_does_not_outlive_its_run() {
+        {
+            let _run = scope_candidate("canary");
+            assert_eq!(process_candidate().as_deref(), Some("canary"));
+        }
+        assert_eq!(process_candidate(), None, "the next run must be unstamped");
+    }
 
     fn table() -> PriceTable {
         let mut models = BTreeMap::new();
