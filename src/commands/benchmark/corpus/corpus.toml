@@ -146,3 +146,146 @@ pattern = 'tinyshop/util\.py'
 [[task.grader]]
 type = "answer_regex"
 pattern = 'round_money'
+
+[[task]]
+id = "w-find-test"
+role = "worker"
+complexity = "trivial"
+prompt = """
+In the tinyshop repository in your working directory, which command does README.md say runs the test suite? Do not edit any files. Reply with your final answer as the exact command.
+"""
+
+[[task.grader]]
+type = "answer_regex"
+pattern = 'unittest\s+discover'
+
+[[task.grader]]
+type = "answer_regex"
+pattern = '-s\s+tests'
+
+[[task]]
+id = "w-atomic-reserve"
+role = "worker"
+complexity = "substantial"
+prompt = """
+In the tinyshop repository in your working directory, add a method Inventory.reserve_many(requests) to tinyshop/inventory.py. requests is a dict mapping sku to quantity. The reservation is all or nothing: if any sku has fewer units in stock than requested (an unknown sku has none), raise InsufficientStock and leave every stock level unchanged. If any quantity is not positive, raise ValueError and leave every stock level unchanged. Otherwise reserve every requested quantity. Reuse the existing reserve behaviour rather than duplicating its rules, and add one line for reserve_many to the Usage list in README.md. Do not change any other behaviour. Do not fix any other problem you notice.
+"""
+
+[[task.grader]]
+type = "python"
+code = """import sys; sys.path.insert(0, '.')
+from tinyshop.inventory import Inventory, InsufficientStock
+inv = Inventory()
+inv.restock('a', 5)
+inv.restock('b', 2)
+inv.reserve_many({'a': 3, 'b': 2})
+assert inv.levels['a'] == 2 and inv.levels['b'] == 0
+try:
+    inv.reserve_many({'a': 1, 'b': 1})
+except InsufficientStock:
+    pass
+else:
+    raise AssertionError('short stock should raise InsufficientStock')
+assert inv.levels['a'] == 2 and inv.levels['b'] == 0
+try:
+    inv.reserve_many({'a': 1, 'zzz': 1})
+except InsufficientStock:
+    pass
+else:
+    raise AssertionError('an unknown sku should raise InsufficientStock')
+assert inv.levels['a'] == 2
+for bad in ({'a': 0}, {'a': 1, 'b': -1}):
+    try:
+        inv.reserve_many(bad)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('a non-positive quantity should raise ValueError')
+assert inv.levels['a'] == 2
+"""
+
+[[task.grader]]
+type = "file_regex"
+path = "README.md"
+pattern = 'reserve_many'
+
+[[task]]
+id = "w-rounding"
+role = "worker"
+complexity = "substantial"
+prompt = """
+In the tinyshop repository in your working directory, round_money in tinyshop/util.py is documented to round to whole cents with halves away from zero, but it truncates, and the failing test in tests/test_pricing.py shows the symptom. Fix it so that it rounds on the decimal value as written (for example 2.675 becomes 2.68 and 1.005 becomes 1.01, not the nearest binary float), halves go away from zero for negative amounts too, and it still returns a float. Keep its name and signature. Do not change any other function. Do not fix any other problem you notice.
+"""
+
+[[task.grader]]
+type = "python"
+code = """import sys; sys.path.insert(0, '.')
+from tinyshop.util import round_money
+from tinyshop.pricing import order_total
+assert round_money(0.125) == 0.13
+assert round_money(2.675) == 2.68
+assert round_money(1.005) == 1.01
+assert round_money(-0.125) == -0.13
+assert round_money(-2.675) == -2.68
+assert round_money(0.124) == 0.12
+assert round_money(10) == 10.0
+assert isinstance(round_money(3), float)
+assert order_total([(0.125, 1)]) == 0.13
+"""
+
+[[task.grader]]
+type = "file_regex"
+path = "tinyshop/pricing.py"
+pattern = 'price - percent'
+absent = false
+
+[[task]]
+id = "o-review-pricing"
+role = "orchestrator"
+complexity = "bounded"
+route_role = "reviewer"
+prompt = """
+Review tinyshop/pricing.py in your working directory as if it were a pull request. One function computes a wrong result for percentage discounts. Name that function and explain the defect in one or two sentences. Do not edit any files.
+"""
+
+[[task.grader]]
+type = "answer_regex"
+pattern = '\bapply_discount\b'
+
+[[task.grader]]
+type = "file_regex"
+path = "tinyshop/pricing.py"
+pattern = 'price - percent'
+absent = false
+
+[[task]]
+id = "o-locate"
+role = "orchestrator"
+complexity = "bounded"
+prompt = """
+Which functions in the tinyshop package in your working directory call round_money directly? Do not edit any files. Reply with only the function names, comma-separated.
+"""
+
+[[task.grader]]
+type = "answer_regex"
+pattern = '\bcalc_subtotal\b'
+
+[[task.grader]]
+type = "answer_regex"
+pattern = '\bapply_discount\b'
+
+[[task]]
+id = "o-plan-alerts"
+role = "orchestrator"
+complexity = "substantial"
+prompt = """
+Plan only. Do not edit any files. The tinyshop library must notify callers when a SKU's stock first drops to or below the low-stock threshold after a reservation, once per crossing and without changing the behaviour of reserve for existing callers. Read the repository in your working directory and reply with only a JSON object of the form {"files": [...], "steps": [...], "risks": [...]}, where the lists name the files you would change, the ordered implementation steps, and the risks. Do not add any text outside the JSON object.
+"""
+
+[[task.grader]]
+type = "answer_json"
+required = ["files", "steps", "risks"]
+
+[[task.grader]]
+type = "answer_regex"
+pattern = 'tinyshop/inventory\.py'

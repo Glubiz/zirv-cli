@@ -532,7 +532,7 @@ mod tests {
     #[test]
     fn the_embedded_corpus_is_consistent() {
         let corpus = embedded().expect("embedded corpus parses");
-        assert_eq!(corpus.tasks.len(), 7);
+        assert_eq!(corpus.tasks.len(), 13);
         let mut roles = BTreeSet::new();
         for task in &corpus.tasks {
             roles.insert(task.role);
@@ -567,6 +567,28 @@ mod tests {
         assert_eq!(role_of("w-read"), Some(RouteRole::Worker));
         assert_eq!(role_of("o-plan"), Some(RouteRole::Orchestrator));
         assert_eq!(role_of("o-review"), Some(RouteRole::Reviewer));
+    }
+
+    #[test]
+    fn every_class_the_router_uses_has_at_least_two_tasks() {
+        let corpus = embedded().expect("embedded corpus parses");
+        let count = |role: RouteRole, complexity: CellComplexity| {
+            corpus
+                .tasks
+                .iter()
+                .filter(|task| task.routing_role() == role && task.complexity == complexity)
+                .count()
+        };
+        for (role, complexity) in [
+            (RouteRole::Worker, CellComplexity::Trivial),
+            (RouteRole::Worker, CellComplexity::Bounded),
+            (RouteRole::Worker, CellComplexity::Substantial),
+            (RouteRole::Reviewer, CellComplexity::Bounded),
+            (RouteRole::Orchestrator, CellComplexity::Bounded),
+            (RouteRole::Orchestrator, CellComplexity::Substantial),
+        ] {
+            assert!(count(role, complexity) >= 2, "{role:?} {complexity:?}");
+        }
     }
 
     #[test]
