@@ -3,11 +3,15 @@
 //! Every candidate runs solo against a small embedded corpus; the stack is
 //! composed afterwards from per-role scores (see `report`).
 
+mod auto;
 mod corpus;
 mod discover;
 mod report;
 mod run;
 
+pub(crate) use auto::{
+    render_probe_status, spawn_probe_if_due_detached, spawn_probe_if_due_from_env,
+};
 #[cfg(test)]
 pub(crate) use corpus::Role;
 pub(crate) use run::{Row, Status};
@@ -70,6 +74,21 @@ enum Command {
         /// Emit one JSON document.
         #[arg(long)]
         json: bool,
+    },
+    /// Probe stale or new models with the deterministic corpus, within the routing budget. Never prompts.
+    Auto {
+        /// Ignore the probe interval (the lock still applies).
+        #[arg(long)]
+        force: bool,
+        /// Print the targets and spend nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit one JSON document.
+        #[arg(long)]
+        json: bool,
+        /// Print nothing; used by the automatic background probe.
+        #[arg(long)]
+        quiet: bool,
     },
     /// Re-render a stored run; the newest when no id is given.
     Report {
@@ -171,6 +190,24 @@ fn execute(
             emit(stdout, json, &plan, &run::render_plan(&plan))?;
             Ok(0)
         }
+        Command::Auto {
+            force,
+            dry_run,
+            json,
+            quiet,
+        } => auto::run(
+            &cfg,
+            env,
+            &auto::Opts {
+                force,
+                dry_run,
+                json,
+                quiet,
+            },
+            python_present,
+            present,
+            None,
+        ),
         Command::Report { run_id, json } => {
             let root = benchmark_root(env)?;
             let dir = run::find_run(&root, run_id.as_deref())?;
@@ -226,11 +263,26 @@ fn run_benchmark(
     plan: &run::Plan,
     timeout_secs: u64,
 ) -> Result<report::Report, String> {
-    // SAFETY: nothing else is running yet; the CLI is single-threaded until the first launch.
-    // Child zirv hooks read their own process env, so the knobs must be set there too.
-    unsafe {
-        for (key, value) in run::CHILD_KNOBS {
-            std::env::set_var(key, value);
+    run_benchmark_with(cfg, env, plan, timeout_secs, false, None).map(|(report, _)| report)
+}
+
+/// An injected launcher replaces the real harness launch, and then the child knobs are not
+/// exported either; the second value is the measured spend (agents and judge) in micro-USD.
+fn run_benchmark_with(
+    cfg: &CtxConfig,
+    env: EnvLookup<'_>,
+    plan: &run::Plan,
+    timeout_secs: u64,
+    quiet: bool,
+    injected: Option<&mut Launcher<'_>>,
+) -> Result<(report::Report, u64), String> {
+    if injected.is_none() {
+        // SAFETY: nothing else is running yet; the CLI is single-threaded until the first launch.
+        // Child zirv hooks read their own process env, so the knobs must be set there too.
+        unsafe {
+            for (key, value) in run::CHILD_KNOBS {
+                std::env::set_var(key, value);
+            }
         }
     }
     let started = chrono::Utc::now();
@@ -256,19 +308,35 @@ fn run_benchmark(
         table: &table,
         timeout_secs,
     };
-    let mut launch = |spec: &run::LaunchSpec| launcher.launch(spec);
+    let mut exec_launch = |spec: &run::LaunchSpec| launcher.launch(spec);
+    let launch: &mut Launcher<'_> = match injected {
+        Some(injected) => injected,
+        None => &mut exec_launch,
+    };
     let rows = run::Runner {
         dir: &dir,
         work: &work,
         python_present: plan.python3,
         git_present: adapters::program_is_present("git"),
-        launch: &mut launch,
-        progress: &mut |line| eprintln!("{line}"),
+        launch,
+        progress: &mut |line| {
+            if !quiet {
+                eprintln!("{line}");
+            }
+        },
     }
     .execute(plan);
     let _ = std::fs::remove_dir_all(&work_root);
-    Ok(report::build(meta, &rows?))
+    let rows = rows?;
+    let spend = rows.iter().fold(0u64, |sum, row| {
+        sum.saturating_add(row.cost_micros.unwrap_or(0))
+            .saturating_add(row.judge_cost_micros.unwrap_or(0))
+    });
+    Ok((report::build(meta, &rows), spend))
 }
+
+/// How one harness run is launched: the real supervised exec path, or a test double.
+type Launcher<'a> = dyn FnMut(&run::LaunchSpec) -> Result<run::Launch, String> + 'a;
 
 /// A filter that names something that cannot run is the caller's mistake, like a bad flag.
 fn usage_error(error: String) -> i32 {

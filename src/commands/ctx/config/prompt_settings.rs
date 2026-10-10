@@ -392,7 +392,6 @@ impl RoutingConfig {
     }
 
     /// The probe interval in seconds, never below the 24 h floor.
-    #[allow(dead_code)] // read by the probe scheduler, which lands after the evidence store
     pub fn probe_interval_secs(&self) -> u64 {
         self.probe_interval_hours.max(24).saturating_mul(3600)
     }

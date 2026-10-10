@@ -298,7 +298,6 @@ pub fn held_ids(promotions: &Promotions) -> BTreeSet<String> {
 }
 
 /// Candidates on probation for `vendor`, newest version first.
-#[allow(dead_code)] // read by the canary and the probe scheduler, which land after the gate
 pub fn probation_candidates(promotions: &Promotions, vendor: &str) -> Vec<String> {
     let prefix = format!("{vendor}.");
     let mut out: Vec<(catalogue::ModelVersion, String)> = promotions

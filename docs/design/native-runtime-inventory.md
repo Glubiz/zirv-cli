@@ -58,6 +58,7 @@ criterion).
 | `artifact render` | shared |  |
 | `artifact show` | shared |  |
 | `benchmark` | shared |  |
+| `benchmark auto` | shared | unattended routing probe; launches installed harnesses through the same `ctx exec` path as `benchmark run`; owns no model-calling call site of its own |
 | `benchmark plan` | shared | read-only; makes no model call |
 | `benchmark report` | shared | re-renders a stored run; makes no model call |
 | `benchmark run` | shared | launches installed harnesses solo through `ctx exec`; owns no model-calling call site of its own |
@@ -261,6 +262,7 @@ installed binary during self-update; never spawns it).
 | `ctx supervisor` consult spawn | `src/commands/ctx/supervisor.rs` | `spawn_consult` | shared | issue #835: detached self-recursion into `zirv ctx supervisor consult`, which runs ONE read-only `agent::run_with` delegation (the N10 dispatch above) and records a ruling; off by default |
 | `ctx supervisor ask` consult spawn | `src/commands/ctx/supervisor.rs` | `spawn_ask_consult` | shared | issue #835: the same consult child, waited on with a timeout, for a design-choice ruling; off by default |
 | `ctx models` background refresh | `src/commands/ctx/models/mod.rs` | `spawn_refresh_if_due_detached` | shared | issues #837/#838: detached self-recursion into `zirv ctx models refresh --quiet`, which reads local caches and public price lists; never calls a model |
+| `benchmark auto` background probe | `src/commands/benchmark/auto.rs` | `spawn_detached` | shared | detached self-recursion into `zirv benchmark auto --quiet`, at most daily and within `[routing]` headroom and spend limits; the child launches harnesses through the `benchmark run` path (`ctx exec`), this spawn itself calls no model |
 | `ctx ask` helper-model call | `src/commands/ctx/ask.rs` | `run_model` | N15 (#484) |  |
 | `ctx optimize` judgment call | `src/commands/ctx/surface_collect.rs` | `run_with` | N15 (#484) |  |
 | Harness proxy TypeSafe Jev intake | `src/commands/ctx/proxy/mod.rs` | `decide` | shared | direct `ureq` HTTP POST to TypeSafe's own `/systemone` endpoint; no harness CLI or `ProviderAdapter` involved, so it is already runtime-independent and needs no native-runtime migration step |
