@@ -66,12 +66,18 @@ fn read_secs(state: &StateDir, name: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Whether an automatic probe should start now: probing is on, the (24 h floored) interval
-/// since the last run has passed, and no attempt was made in the last hour. File reads only.
-pub(crate) fn probe_due(routing: &RoutingConfig, state: &StateDir, now: u64) -> bool {
+/// The probe's own gate: probing is on and the (24 h floored) interval since the last run has
+/// passed. The spawned child checks only this, since the spawner stamps the attempt first.
+fn interval_due(routing: &RoutingConfig, state: &StateDir, now: u64) -> bool {
     routing.enabled
         && routing.probe
         && now.saturating_sub(read_secs(state, LAST_RUN_FILE)) >= routing.probe_interval_secs()
+}
+
+/// Whether the spawner should start a probe now: [`interval_due`] and no attempt in the last
+/// hour. File reads only.
+pub(crate) fn probe_due(routing: &RoutingConfig, state: &StateDir, now: u64) -> bool {
+    interval_due(routing, state, now)
         && now.saturating_sub(read_secs(state, ATTEMPT_FILE)) >= ATTEMPT_BACKOFF_SECS
 }
 
@@ -326,7 +332,7 @@ pub(crate) fn run(
             Err(_) => return Ok(0),
         }
     };
-    if !opts.dry_run && !opts.force && !probe_due(&cfg.routing, &state, now) {
+    if !opts.dry_run && !opts.force && !interval_due(&cfg.routing, &state, now) {
         return Ok(0);
     }
 
@@ -907,6 +913,21 @@ mod tests {
         assert_eq!(code, Ok(0));
         assert_eq!(calls.get(), 0);
         assert!(fixture.log().is_empty());
+    }
+
+    #[test]
+    fn the_child_proceeds_past_the_gate_after_the_spawner_stamps_an_attempt() {
+        let fixture = Fixture::new().with_probation_candidate();
+        let now = state::now_secs();
+        stamp(&fixture.state, ATTEMPT_FILE, now);
+        let calls = Counter::new(0);
+        let mut launch = |_: &run::LaunchSpec| {
+            calls.set(calls.get() + 1);
+            Ok(fake_launch())
+        };
+        let code = fixture.run(&opts(false, false), &["claude"], Some(&mut launch));
+        assert_eq!(code, Ok(0));
+        assert!(calls.get() > 0, "a fresh attempt stamp must not gate run");
     }
 
     #[test]

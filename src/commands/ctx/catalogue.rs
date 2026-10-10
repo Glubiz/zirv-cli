@@ -1151,14 +1151,20 @@ pub fn resolved_ladder_avoiding(
             continue;
         }
         let current = family_and_version(vendor.slug, &rung.id).map(|(_, version)| version);
-        let mut same_family: Vec<(ModelVersion, String)> = discovered
+        let known: Vec<&DiscoveredModel> = discovered
             .iter()
             .filter(|candidate| candidate.vendor == vendor.slug && candidate.available)
-            .chain(std::iter::once(&DiscoveredModel::new(
-                vendor.slug,
-                vendor.rungs[idx].id,
-                true,
-            )))
+            .collect();
+        // When discovery knows this vendor, a static id newer than the rung may be a held id or
+        // one the account has never seen, so only an older static id (a downgrade) may join.
+        let static_rung = DiscoveredModel::new(vendor.slug, vendor.rungs[idx].id, true);
+        let static_usable = known.is_empty()
+            || family_and_version(vendor.slug, &static_rung.id)
+                .is_some_and(|(_, version)| Some(version) < current);
+        let mut same_family: Vec<(ModelVersion, String)> = known
+            .iter()
+            .copied()
+            .chain(static_usable.then_some(&static_rung))
             .filter_map(|candidate| {
                 let (family, version) = family_and_version(vendor.slug, &candidate.id)?;
                 (family == rung.family).then(|| (version, candidate.id.clone()))

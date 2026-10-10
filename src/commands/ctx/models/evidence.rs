@@ -309,10 +309,11 @@ fn max_at(slot: &mut Option<u64>, at: u64) {
 }
 
 /// The existing benchmark composite: correctness, or the mean of correctness and judge/10. A
-/// failed run scores 0; a run with nothing graded has no quality.
+/// failed run that produced output scores 0. A failed run with no output never ran the task
+/// (quota, rate limit, launch failure), and a run with nothing graded: neither has a quality.
 fn quality(row: &Row) -> Option<f64> {
     if row.status == Status::Failed {
-        return Some(0.0);
+        return (row.output_tokens > 0).then_some(0.0);
     }
     let correctness = row.correctness?;
     Some(match row.judge_score {
@@ -683,6 +684,7 @@ mod tests {
         let mut failed = row("claude", "m", CellComplexity::Any, 1.0);
         failed.status = Status::Failed;
         failed.correctness = None;
+        failed.output_tokens = 40;
         let mut skipped = row("claude", "m", CellComplexity::Any, 1.0);
         skipped.status = Status::Skipped;
         let ok = row("claude", "m", CellComplexity::Any, 1.0);
@@ -696,6 +698,19 @@ mod tests {
         let stats = &evidence.cells[0].synthetic;
         assert_eq!(stats.n, 2);
         assert_eq!(stats.mean, Some(0.5));
+    }
+
+    #[test]
+    fn a_failed_row_with_no_output_is_an_infrastructure_failure_with_no_quality() {
+        let mut infra = row("claude", "m", CellComplexity::Any, 1.0);
+        infra.status = Status::Failed;
+        infra.correctness = Some(0.0);
+        infra.output_tokens = 0;
+        let ok = row("claude", "m", CellComplexity::Any, 1.0);
+        let evidence = compute(&[infra, ok], &[], &[], &price::built_in_table(), NOW);
+        let stats = &evidence.cells[0].synthetic;
+        assert_eq!(stats.n, 1);
+        assert_eq!(stats.mean, Some(1.0));
     }
 
     #[test]

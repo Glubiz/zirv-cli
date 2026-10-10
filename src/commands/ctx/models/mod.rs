@@ -469,21 +469,30 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> CtxResult<()> {
 }
 
 fn refresh(cfg: &CtxConfig, state: &StateDir, now: u64) -> CtxResult<()> {
-    if cfg.models.discovery {
+    let registry = cfg.models.discovery.then(|| {
         let mut registry = discover_local(load_registry(state), now);
         registry.updated_at = now;
-        write_json(&state.root().join(REGISTRY_FILE), &registry)?;
-    }
+        registry
+    });
     if cfg.models.price_fetch {
         refresh_price_cache(state, now)?;
     }
     scorecard::refresh(state, &effective_prices(cfg, state).table, now)?;
-    if cfg.routing.enabled {
+    // The gate sees the new registry and holds new models before registry.json exposes them
+    // to long-lived processes. The registry is written even when the gate fails.
+    let gated = if cfg.routing.enabled {
         // Evidence first: the promotion gate decides on it.
-        evidence::refresh(state, cfg, now)?;
-        promotion::refresh(state, cfg, now)?;
+        evidence::refresh(state, cfg, now).and_then(|_| match &registry {
+            Some(registry) => promotion::refresh_with(state, cfg, registry, now).map(|_| ()),
+            None => promotion::refresh(state, cfg, now).map(|_| ()),
+        })
+    } else {
+        Ok(())
+    };
+    if let Some(registry) = &registry {
+        write_json(&state.root().join(REGISTRY_FILE), registry)?;
     }
-    Ok(())
+    gated
 }
 
 fn discover_local(mut registry: Registry, now: u64) -> Registry {
@@ -981,7 +990,7 @@ fn fetch_json(
 }
 
 pub(crate) fn retirement_warnings(cfg: &CtxConfig, registry: &Registry, now: u64) -> Vec<String> {
-    let discovered = discovered_models(registry);
+    let discovered = without_held(&discovered_models(registry), &held_for(&cfg.routing));
     let pins = effective_pins(cfg);
     let mut selected = BTreeSet::new();
     for vendor in ["anthropic", "openai"] {
@@ -1760,6 +1769,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_held_model_is_not_selected_for_retirement_warnings() {
+        let mut held = model("anthropic", "claude-opus-5-5");
+        held.retirement_at = Some(10 + 86_400);
+        let registry = registry_of(vec![model("anthropic", "claude-opus-5"), held]);
+        let cfg = CtxConfig::default();
+        set_test_held(&[]);
+        assert_eq!(retirement_warnings(&cfg, &registry, 10).len(), 1);
+        set_test_held(&["claude-opus-5-5"]);
+        assert!(retirement_warnings(&cfg, &registry, 10).is_empty());
+        set_test_held(&[]);
+    }
+
     fn due_state() -> (tempfile::TempDir, StateDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::resolve(&|_| Some(tmp.path().display().to_string())).expect("state");
@@ -1906,8 +1928,9 @@ mod tests {
             &BTreeMap::new(),
             &avoid_ids(&["gpt-5.5-sol".to_string()]),
         );
-        // A newer version of the family (the compiled one) is preferred over anything else.
-        assert_eq!(ladder[1].id, "gpt-5.6-sol");
+        // The compiled newer id is not chained once discovery knows the vendor: it may be
+        // held or never seen on this account.
+        assert_ne!(ladder[1].id, "gpt-5.6-sol");
     }
 
     #[test]
@@ -2245,6 +2268,25 @@ mod tests {
         assert_eq!(codex_deep(&cfg_avoiding(&["gpt-6.1-sol"])), "gpt-5.6-sol");
         set_test_held(&[]);
         assert_eq!(codex_deep(&cfg_avoiding(&["gpt-6.1-sol"])), "gpt-6.2-sol");
+    }
+
+    #[test]
+    fn avoid_never_falls_back_to_a_static_id_when_discovery_knows_the_vendor() {
+        let anthropic = catalogue::vendor("anthropic").expect("anthropic");
+        let idx = anthropic
+            .rungs
+            .iter()
+            .position(|rung| rung.alias == "opus")
+            .expect("opus rung");
+        let static_deep = anthropic.rungs[idx].id;
+        let discovered = [DiscoveredModel::new("anthropic", "claude-opus-4-1", true)];
+        let (ladder, _) = catalogue::resolved_ladder_avoiding(
+            anthropic,
+            &discovered,
+            &BTreeMap::new(),
+            &avoid_ids(&["claude-opus-4-1".to_string()]),
+        );
+        assert_ne!(ladder[idx].id, static_deep, "{ladder:?}");
     }
 
     #[test]

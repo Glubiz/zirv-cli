@@ -315,11 +315,22 @@ pub fn probation_candidates(promotions: &Promotions, vendor: &str) -> Vec<String
 /// Advance the stored gate with the current registry and evidence. A no-op while
 /// `[models] discovery` is off, since nothing is then discovered to gate.
 pub(crate) fn refresh(state: &StateDir, cfg: &CtxConfig, now: u64) -> CtxResult<Promotions> {
+    refresh_with(state, cfg, &load_registry(state), now)
+}
+
+/// [`refresh`] against a registry not yet on disk, so the gate can hold a new model before
+/// `registry.json` exposes it.
+pub(crate) fn refresh_with(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    registry: &super::Registry,
+    now: u64,
+) -> CtxResult<Promotions> {
     let prev = load(state).unwrap_or_default();
     if !cfg.models.discovery {
         return Ok(prev);
     }
-    let discovered = super::discovered_models(&load_registry(state));
+    let discovered = super::discovered_models(registry);
     let evidence = evidence::load(state).unwrap_or_default();
     let next = update(&prev, &discovered, &evidence, &cfg.routing, now);
     if next.families != prev.families {
