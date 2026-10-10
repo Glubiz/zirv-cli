@@ -253,10 +253,10 @@ fn write_builtins<W: Write>(
                 desc: &["Install the latest or a specified zirv release"],
             },
             Row {
-                name: "benchmark plan|run|report",
+                name: "benchmark plan|run|auto|report",
                 desc: &[
                     "Measure which harness and model stack is best here (run spends quota;",
-                    "needs --yes)",
+                    "needs --yes; auto is the unattended probe within the [routing] budget)",
                 ],
             },
             Row {

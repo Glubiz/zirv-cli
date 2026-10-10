@@ -173,9 +173,10 @@ In a pipe or with redirected output (non-TTY), `zirv tour` prints all sections p
 zirv benchmark plan   [--harness <name>]... [--family <name>]... [--model <harness:model>]... [--task <id>]... [--judge <harness:model>] [--no-judge] [--json]
 zirv benchmark run    [same filters] [--reps <n>] [--max-usd <usd>] [--timeout-secs <s>] --yes [--json]
 zirv benchmark report [<run-id>] [--json]
+zirv benchmark auto   [--force] [--dry-run] [--json] [--quiet]
 ```
 
-A bare `zirv benchmark` prints help. Every flag:
+`auto` is the unattended probe that feeds [Model routing](#model-routing); see [Automatic probes](#automatic-probes-zirv-benchmark-auto). A bare `zirv benchmark` prints help. Every flag:
 
 - `--harness <name>`: restrict to this harness. Repeatable.
 - `--family <name>`: restrict the discovered models to these model families (the `FAMILY` column of `zirv ctx models`). Repeatable. Default: every family.
@@ -233,6 +234,29 @@ Child runs disable zirv's supervisor, memory harvest, usage pacing and cross-har
 #### Agents
 
 `run` spends real quota, so a built-in safety rule always makes it ask, in interactive and headless launches alike and whatever `[safety] default` says; the rule matches every spelling the hook parses (case, extra spaces, quoting, compounds, `$(...)`, `env`, `zirv.exe`, path-qualified `zirv`). `plan` and `report` are read-only and stay allowed. The graders run corpus Python with a cleared environment (`HOME` set to the workdir) in their own process group, killed whole on timeout. `report <run-id>` accepts only generated run ids.
+
+#### Automatic probes (`zirv benchmark auto`)
+
+`zirv benchmark auto` runs a small, cheap benchmark with no operator present, to keep the evidence behind [Model routing](#model-routing) fresh. It never prompts and exits 0 when there is nothing to do, the lock is busy or the probe is not due.
+
+**When it runs.** Every `zirv ctx` verb except `hook`, `statusline` and `mcp` (the `zirv chat` and `zirv agent` aliases included) checks, from file reads only, whether a probe is due, and if so starts `zirv benchmark auto --quiet` detached with null stdio (so does bare `zirv`, `zirv ctx chat` and `zirv ctx status`, beside the model refresher). A probe is due when `[routing] enabled` and `probe` are on, at least `probe_interval_hours` (never less than 24) have passed since the last run, and (for the automatic start only) no start was attempted in the last hour. The attempt stamp is written before the spawn, so a probe that fails to start backs off for an hour too; the started probe itself re-checks only the interval. `--force` skips the interval, not the lock.
+
+**Targets.** Per installed, enabled harness, up to 4 models, in this order:
+
+1. models on probation (see [Model routing](#model-routing));
+2. rejected candidates not probed in the last 7 days;
+3. the incumbent, the resolved ladder and eligible new-family models, when a model's synthetic evidence is older than 7 days or has fewer than 5 rows (an eligible new-family model whose samples age out of the evidence window is otherwise dropped by the router).
+
+A harness is skipped, with the reason recorded, when it carries an `[endpoint.<harness>]` override (metered; unless `probe_metered = true`), when its usage limit is reached, when its headroom in the binding usage window is below `probe_min_headroom_pct`, or when its headroom is unknown and pacing is disabled. With no target nothing is stamped and the run does not count.
+
+**The run.** `auto` takes `<state>/probe.lock`, writes `<state>/probe-last-run` before the first agent launches (so a crash mid-run still backs the next probe off), then runs the embedded corpus with deterministic graders only (no judge), one rep, the usual per-run timeout, and a spend cap of `probe_max_usd` (default `$2`; runs past it are skipped with reason `spend cap`). It then, holding the model refresher's lock (waiting up to 60 seconds; on timeout the bookkeeping is skipped and the outcome says so), records which new candidates ran, refreshes `evidence.json` and `promotions.json`, and appends `{ts, run_id, targets, skipped, spend_micros, outcome}` to `<state>/logs/probe.jsonl`. Rows land in the ordinary `benchmark/<run-id>/` store, so `zirv benchmark report <run-id>` reads them.
+
+- `--force`: ignore the probe interval. A busy lock still exits 0.
+- `--dry-run`: print the targets and skip reasons and spend nothing; it takes no lock and ignores the interval.
+- `--json`: print one JSON document (the log record plus `dry_run` and `agent_runs`).
+- `--quiet`: print nothing.
+
+Like `run`, `auto` spends real quota, so the shipped safety posture makes an agent ask before running it by hand (`Bash(zirv benchmark auto*)`); the detached background start is zirv's own process and is not an agent tool call.
 
 ### `ZIRV.md` instruction files
 
@@ -310,6 +334,16 @@ having a separate one, not a bug in the alias routing itself.
   whenever a dashboard is live on this machine, and runs inline in this
   terminal (announced in one line) when none is. Pass `-` as the prompt to
   read it from stdin instead.
+- **`zirv agent auto "<prompt>"`** — `auto` is a reserved agent name that
+  lets evidence pick the harness as well as the model: the prompt is
+  classified (task class, complexity, risk), and the delegation goes to the
+  best-evidenced model for a worker (a reviewer when the task is a review)
+  across the enabled, live harnesses, excluding the calling seat's own
+  harness. It announces the choice on stderr (`zirv ctx agent: routed to
+  <harness> on <model> (<reason>)`) unless `--quiet`. With no usable
+  evidence it falls back to the harness a plain run would use, or, when that
+  is the calling seat's own harness, the first other enabled, ready one. A model passed
+  in the flags is never overridden. See [Model routing](#model-routing).
 
 #### Delegation receipt (`--json`)
 
@@ -1546,8 +1580,16 @@ protocol and harness: [docs/benchmarks/wrapped-vs-vanilla.md](docs/benchmarks/wr
 - **Model benchmark** — `benchmark` (`plan`, `run`, `report`) detects the
   installed harnesses and models, runs an embedded role-tagged task corpus
   against each candidate, and measures wall time, API-equivalent USD and
-  quality, then recommends an orchestrator and a worker. See [Benchmarking
-  agents and models](#benchmarking-agents-and-models-zirv-benchmark).
+  quality, then recommends an orchestrator and a worker. `auto`
+  (`zirv benchmark auto`) is the unattended, budget-capped probe that keeps
+  routing evidence fresh. See [Benchmarking agents and
+  models](#benchmarking-agents-and-models-zirv-benchmark).
+- **Model routing** — new model versions are held on probation until
+  probe and recorded-work evidence shows they are not worse, and an
+  unpinned seat, worker or reviewer gets the cheapest model within
+  tolerance of the best; `zirv agent auto "<prompt>"` (`auto` is a reserved
+  agent name) picks the harness too. `[routing]` is operator-only. See
+  [Model routing](#model-routing).
 - **Bug and feature reports** — `report` (`bug`/`feature`) files a Zirv
   issue on GitHub, optionally attaching a redacted `snapshot`.
 - **Workflow artifacts** — `artifact` registers and inspects workflow
@@ -3308,7 +3350,16 @@ Full event support is tracked in
 Codex's `~/.codex/models_cache.json` and model ids already present in Claude
 transcripts. It never reads Codex authentication data. Known families follow
 their newest available observed version; an unknown family is listed but is
-never placed on the ladder. Run-time tier and rung resolution (handover and
+never placed on the ladder (it is instead tracked as a
+[new-family candidate](#promotion-probation-and-demotion), probed, and
+routed on merit once it has evidence). Besides local evidence, the models.dev
+fetch that already supplies prices also records every `anthropic` and `openai`
+id it lists, with its release date when given, as known to exist but
+unverified for this account (`available = false`, source `models.dev`): the
+ladder never dispatches such an id, and an id another source marks available is
+never downgraded. `zirv ctx models` does not list these ids; it prints
+`+N known from models.dev, not seen on this account` instead (candidates and
+unverified versions below are still listed). With `price_fetch` off nothing is fetched or imported. Run-time tier and rung resolution (handover and
 proxy tiers, review-below, dispatch tiering, pricing equivalence) follows the
 discovered ladder; Claude dispatch still passes aliases. `[models].pin` and
 explicit model configuration hold a family on the operator's selected id, and an
@@ -3368,6 +3419,105 @@ fail: `exec` falls back to polling the transcript, and `wrap` runs as pure
 passthrough with the inner terminal pinned at 80x24. Everything else,
 including `score`, `handoff` and `status`, works on all three platforms.
 
+### Model routing
+
+zirv chooses models from evidence it collects on this machine, not from a fixed ladder. Two mechanisms share one evidence store:
+
+- **Promotion gate.** A new version of a model family (for example a new Opus or a new Codex model) is held on probation instead of being adopted the moment the account can see it. Dispatch keeps resolving the current incumbent until evidence shows the candidate is at least as good. A cheaper-but-worse new model therefore never becomes the default silently.
+- **Router.** Where you made no explicit choice, the harness and model for a seat, worker or reviewer are picked per role and complexity from the same evidence.
+
+Both are on by default and operator-only (see [`[routing]` keys](#routing-keys)). With thin evidence nothing changes: every seam falls back to the behaviour described in [Model discovery and pricing](#model-discovery-and-pricing).
+
+#### Evidence
+
+`<state>/evidence.json` holds one cell per (harness, model, role, complexity). Role is `orchestrator`, `worker` or `reviewer`; complexity is `trivial`, `bounded`, `substantial`, `architectural`, or `any` (every row also feeds its `any` rollup). Rows older than 30 days are ignored. A cell has two sides:
+
+- **Synthetic**: quality of [automatic probe](#automatic-probes-zirv-benchmark-auto) and manual `zirv benchmark run` rows (the benchmark composite, a failed run scoring 0, a skipped one or a failed one that produced no output, such as a usage-limit refusal, excluded), with its mean, a 95% interval, mean cost and median wall time. Under 5 rows the cell is inconclusive.
+- **Real**: your own recorded work, classified as in the [scorecard](#model-discovery-and-pricing) (infrastructure failures excluded): `zirv agent` delegations (reviewer when the task class is review, otherwise worker) and workflow outcomes (orchestrator; success is a completed run whose verification did not fail). It carries a Wilson success interval, and under 20 samples reads as inconclusive.
+
+The evidence is recomputed by the model refresher (`zirv ctx models refresh`, or the detached refresh, which also fires when `evidence.json` is over 24 hours old and routing is on) and at the end of every probe. It makes no model call.
+
+Two models are compared in this order, the first decisive rule winning, so **real work overrules probes when it is significant**:
+
+1. With 20 or more real outcomes on both sides: a candidate whose interval lies wholly below the incumbent's is `inferior`; wholly above is `better`.
+2. With 5 or more synthetic rows on both sides: a mean more than `tolerance` above is `better`; within `tolerance` below is `non-inferior`; otherwise `inferior`.
+3. Otherwise `insufficient`.
+
+#### Promotion, probation and demotion
+
+State lives in `<state>/promotions.json`, per `vendor.family` (Anthropic and OpenAI families, compared on the `claude` and `codex` evidence, pooled across roles at complexity `any`).
+
+- **First sight**: the newest available id becomes the incumbent. Upgrading changes nothing.
+- **Probation**: a later-seen id with a version above the incumbent's is held. It is removed from the dispatch ladder (it is listed under PROMOTIONS in `zirv ctx models`), and the probe tests it first.
+- **Promotion**: the highest-version candidate whose verdict is `better` or `non-inferior` becomes the incumbent; the old one is kept as `previous`.
+- **Rejection**: an `inferior` candidate is marked `rejected` and stays held. It keeps being re-evaluated as new probes arrive, so a model that later proves good enough is still promoted.
+- **Demotion**: if a promoted incumbent later compares `inferior` to its `previous`, the previous one is restored and the demoted id becomes `rejected`.
+- **Incumbent gone**: if the account stops offering the incumbent, the best qualifying probation candidate (else the newest available id) replaces it, with the reason recorded.
+- **Bypasses**: `[models] pin` and every other explicit model setting hold a family on the chosen id regardless of the gate. `hold_new_models = false` or `enabled = false` restores plain "newest available id" resolution.
+
+**New families.** A vendor's next model need not belong to a family zirv already names. An id that parses as `claude-<family>-<major>[-<minor>]` or `gpt-<major>[.<minor>]-<family>` (family letters only, after the usual date and prefix normalization) but whose family is not on the ladder (for example a future `claude-bel-1` or `gpt-6-bel`) is a new-family candidate. It has no incumbent and no rung, so there is nothing to compare it with; the router judges it on merit once it has evidence. State is the `new_families` map in `promotions.json`:
+
+- **Bootstrap**: the first run, every unknown-family id already known (including the models.dev list) is baseline, not a candidate, so the existing catalogue does not flood in. While `price_fetch` is on, the bootstrap waits until models.dev has been read. With `price_fetch` off the bootstrap baselines only local ids; the first time the models.dev list later appears in the registry, all of its unknown-family ids are baselined too, so only ids that arrive after that are candidates. A models.dev release date more than 90 days before the id was first seen also makes it baseline.
+- **Probation**: a newcomer is held off dispatch and probed first on its vendor's harness (before ordinary probation candidates, under the same four-per-harness and spend caps).
+- **Eligible**: once a cell holds at least 5 synthetic rows for it, it leaves the held set and the router may pick it like any other model (same minimum-evidence rule, real-world veto, tolerance and cost tie-break). There is no rejection step.
+- **Unavailable**: if every probe row for it failed without producing output, it never ran on this account. It is marked `unavailable` for 7 days (`unavailable_until`), then returns to probation. A candidate with any row that ran is recorded in the registry as available (source `probe`).
+
+**Unverified versions.** A new version of a known family can also exist only on models.dev (for example `claude-mythos-6` before Claude Code has used it). An id that only models.dev lists, newer than its family's incumbent (else the newest available id) and within the same 90-day release rule, is an unverified version, recorded in the `unverified` map of `promotions.json` and held. A family with nothing available has no incumbent, so nothing is recorded for it. The probe tests it first on its vendor's harness, like a new-family candidate. If any row ran, the registry marks it available (source `probe`) and the next refresh treats it as an ordinary newer version, so it enters the probation and promotion gate above with the probe rows already counting as evidence. If every row failed without output it is backed off for 7 days.
+
+A new-family Claude id is dispatched by its full id through the `--model` seams only; the Agent tool's short aliases are unchanged.
+
+Claude is dispatched by its full model id once one has been seen on the account (a pin, or a transcript or discovery hit); only while nothing concrete is known does dispatch pass the short alias (`opus`, `sonnet`, `haiku`). That way zirv never dispatches a static id it has not seen work. The Agent tool's own model parameter accepts only a short alias, so the pre-tool rewrite for native subagents keeps the short alias.
+
+#### Routing
+
+A router pick is the cheapest model whose quality is within `tolerance` of the best, among candidates with at least 5 synthetic rows in the cell for the role and complexity (the `any` rollup when the exact cell is missing):
+
+1. Candidates come from every enabled harness whose binary is live (or unknown) and not refused by usage pacing, using each vendor's resolved ladder (probation models excluded) plus any model with a cell for that harness.
+2. Strength floors: a task at `high` risk or above needs a rung of strength 3 or more, and an orchestrator seat needs 2 or more. A model of unknown strength is allowed.
+3. A candidate whose real success interval lies wholly below the best peer's (20 or more outcomes each) is dropped, however well it probed.
+4. Among those within `tolerance` of the best mean, the lowest mean cost wins (unknown cost ranks last); ties follow `[fallback] order`, then registry order.
+
+No qualifying candidate means no pick, and the caller keeps its existing logic. A pick applies only where there is no explicit choice:
+
+| Seam | Routed when | Never re-routed (explicit) |
+|---|---|---|
+| Chat seat (`zirv`, `zirv chat`) | no `--agent` and no `agent =`; no `chat.model`. Bare chat has no task text, so it uses orchestrator evidence at complexity `any`. The launch announcement prints `routed by evidence: <reason>` | `--agent`, `agent`, `chat.model`, a model in the passthrough args (`zirv chat -- --model X`) |
+| Proxy seat | no `agent =`; the harness follows the classified complexity and risk of the request | `agent`, `chat.model`, a `[handover.<harness>]` model for the seat's tier |
+| `zirv agent auto "<prompt>"` | always (see [`zirv chat` and `zirv agent`](#zirv-chat-and-zirv-agent)) | a model in the flags |
+| `zirv agent <harness> ...` | the model inside that harness, from the classified prompt | a model in the flags, `[worker]` model for that harness |
+| Workflow seats | no task `model` and no `[model_tiers]` entry; tier `fast` is complexity `trivial`, `standard` is `bounded`, `deep` is `substantial`; picks within the seat's own harness | task `model`, `[model_tiers.<harness>]` |
+| Reviewer | `review.<harness>` unset; picks reviewer evidence within the harness, never stronger than the rung below the seat. The roster's code-review line marks it `(routed)` | `review.<harness>` |
+
+The orchestrator's harness roster gains one line when at least one route has evidence: `- routing: worker trivial -> h/m, bounded -> h/m, substantial -> h/m; reviewer -> h/m -- zirv agent auto "<prompt>" picks per task`. It is computed once per process, from the cached evidence and without usage pacing, so it does not change within a session.
+
+**Canary.** For a `zirv agent` worker delegation at medium risk or below with no model pinned, a deterministic share of delegations, `sha256(session id + prompt) % 100 < canary_pct` (default 5%), goes to the newest probation candidate of that harness's vendor, if one exists, to gather real outcomes for it. The delegation row carries `attribution.candidate = "canary"`. It never applies to a pinned model or a configured `[worker]` model, and `canary_pct = 0` turns it off.
+
+#### Seeing it
+
+`zirv ctx models` appends three sections to its listing:
+
+- **PROMOTIONS**: each family's incumbent, previous model, and held candidates with status (`probation` or `rejected`) and last verdict; new-family candidates with status (`probation`, `eligible` or `unavailable`), first-seen date and unavailable-until date.
+- **ROUTES**: for each role and complexity, the pick and its reason (`<role>/<complexity> evidence: n=<rows>, quality <q>, cost <usd>`), or "no route yet" while evidence is thin.
+- **PROBES**: last run, next due, the last skip reasons, and the last run's spend.
+
+State files, all under the zirv state directory: `evidence.json`, `promotions.json`, `probe-last-run`, `probe-attempt`, `probe.lock`, `logs/probe.jsonl`, and the probe rows in `benchmark/<run-id>/results.jsonl`.
+
+#### `[routing]` keys
+
+Operator-only: set in `~/.zirv/ctx.toml` or as `ZIRV_CTX_ROUTING_<KEY>` (for example `ZIRV_CTX_ROUTING_CANARY_PCT=0`). A repository's `.zirv/ctx.toml` that sets any `routing.*` key is a hard error. Out-of-range values are config errors.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Master switch for the promotion gate, the router and canaries. Off gives exactly the behaviour before routing existed |
+| `hold_new_models` | `true` | Hold a new family version on probation. `false` adopts it at once |
+| `probe` | `true` | Run [automatic probes](#automatic-probes-zirv-benchmark-auto) |
+| `probe_interval_hours` | `24` | Hours between probe runs; values under 24 are treated as 24 |
+| `probe_max_usd` | `2.0` | Spend cap per probe run, greater than 0 and at most 100 |
+| `probe_min_headroom_pct` | `50.0` | Probe a harness only with at least this much headroom in its binding usage window (0 to 100) |
+| `probe_metered` | `false` | `false` never probes a harness with an `[endpoint.<harness>]` override |
+| `tolerance` | `0.05` | Non-inferiority margin on the 0 to 1 quality scale (0 to 0.5): how far below the best a model may be and still win on cost or be promoted |
+| `canary_pct` | `5` | Percentage of low-risk worker delegations sent to a probation candidate (0 to 50) |
+
 ### Verbs
 
 | Command | What it does |
@@ -3380,7 +3530,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx resume` | Starts a clean session with the latest handoff injected |
 | `zirv ctx hook <stop\|prompt\|pre-compact\|pretool\|notify\|session-start\|install>` | Agent hook entrypoints; `install <agent>` wires zirv's own guard/compaction hooks into a non-claude agent's native hooks file (copilot, droid, gemini) |
 | `zirv ctx status [--json] [--agents]` | Shows supervised sessions, the resolved chat agent, unread mail, recent decisions, handoffs, and (issue #358) a cross-harness capacity/pool section; `--json` emits the pool view plus the orchestrator seat as structured JSON; `--agents` (issue #490) emits the native dashboard's own agent/task overview, usage-and-health provenance strip and a `limitations` list, built from the identical reducers the TUI renders through, plus (issue #723) a `delegation_conditions` map of delegation id to its typed condition list, alongside (never replacing) each agent's coarse phase |
-| `zirv ctx models [refresh] [--json]` | Lists account-discovered models, ladder placement, availability, effective price provenance, retirements and the per-model scorecard (avoid-list warnings included); `refresh` reads local Codex/Claude evidence and conditionally fetches public price catalogues |
+| `zirv ctx models [refresh] [--json]` | Lists account-discovered models, ladder placement, availability, effective price provenance, retirements and the per-model scorecard (avoid-list warnings included), then the PROMOTIONS, ROUTES and PROBES sections of [Model routing](#model-routing); `refresh` reads local Codex/Claude evidence and conditionally fetches public price catalogues |
 | `zirv ctx mcp serve [--stdio] [--repo <path>] [--session <id>]` | Serves seven read-only MCP tools for one repository/worktree; optionally binds inbox reads to a registered session. See [MCP bridge](#mcp-bridge) |
 | `zirv ctx mcp doctor [--repo <path>] [--session <id>] [--timeout-seconds <1..60>]` | Launches this executable as a stdio server, checks tool discovery and a snapshot call, and prints JSON; default deadline 10 seconds |
 | `zirv ctx usage` | Shows usage-window state, or `usage tee` to collect it from the statusline |
@@ -4817,6 +4967,17 @@ pin = { "anthropic.opus" = "claude-opus-5-5" } # optional family pins
 avoid = []                    # model ids never resolved from a tier or rung; an explicit pin wins
 auto_avoid = false            # also avoid models significantly worse than a same-tier peer (needs 20+ samples)
 
+[routing]                     # operator-only; see "Model routing"; ZIRV_CTX_ROUTING_<KEY>
+enabled = true                # promotion gate, router and canaries; false restores the pre-routing behaviour
+hold_new_models = true        # hold a new family version on probation until evidence says it is not worse
+probe = true                  # automatic synthetic probes (`zirv benchmark auto`)
+probe_interval_hours = 24     # clamped to at least 24
+probe_max_usd = 2.0           # spend cap per probe run, (0, 100]
+probe_min_headroom_pct = 50.0 # probe a harness only with this much usage headroom
+probe_metered = false         # false: never probe a harness with an [endpoint.<h>] override
+tolerance = 0.05              # non-inferiority margin, [0, 0.5]
+canary_pct = 5                # share of low-risk worker delegations sent to a probation model, [0, 50]
+
 [price]
 stale_after_days = 90
 # table_path = "~/.zirv/prices.toml" # per-model operator overrides
@@ -5262,6 +5423,7 @@ keep only your own.
 | `[sandbox] scrub_worker_secrets` | operator home or environment only | on by default; a delegated worker (`zirv agent`, `zirv ctx exec`/`loop`) launches without secret-shaped environment variables, never a repository's call to turn off; its hook-side `[jev]` gates reach Jev through the supervisor's relay (`exec`, dashboard Worker panes), and a `loop` cycle with a gate on keeps `credential_env` |
 | `[headless]` cost levers | operator home or environment only | a headless (`-p`) Claude Code launch only -- prompt-cache TTL, per-complexity effort (defaults to `low`) and a lean/`--disallowedTools` tool surface (lean on by default) -- with every key unset the launch differs from before this table existed only by `CLAUDE_CODE_EFFORT_LEVEL=low`, `CLAUDE_CODE_PROMPT_CACHE_TTL=5m` and the lean settings layer and unused-tool (`Workflow`, `ScheduleWakeup`, `ShareOnboardingGuide`, `ListAgents`, `ReportFindings`, `Agent` for worker/single) deny; an interactive `wrap`/`chat`/dash session is never narrowed by it |
 | `[models]` discovery, price refresh, pins, `avoid` and `auto_avoid` | operator home or environment only | discovery/refresh default on, `avoid` empty and `auto_avoid` off; the scorecard only reads zirv's own logs; reads account-local caches/transcripts, while network access occurs only in `zirv ctx models refresh`, run explicitly or as the detached background refresh started by `status` and dashboard startup; repositories cannot select or conceal the operator's models or prices |
+| `[routing]` promotion gate, probes, router, canary | operator home or environment only | on by default; the whole table is repo-forbidden, so a repository's `.zirv/ctx.toml` setting any `routing.*` key is a hard error and a checkout can neither disable the gate, steer a seat to a model, raise the probe spend cap nor turn on metered probing; evidence is read from zirv's own logs and benchmark rows, a pick applies only where the operator made no explicit choice, and probes spend quota only under the daily interval, the per-run `probe_max_usd` cap and the per-harness headroom floor |
 | `[policy] network_allowlist` | operator (home layer, or the same operator-owned repo layer's own narrowing) | a repository checkout may only remove hosts from the operator's own list, never name one beyond it — naming an ungranted host is a hard error; on Claude Code, a non-empty list replaces the wholesale `WebFetch`/`WebSearch` allow in the launch argv with one `WebFetch(domain:<host>)`/`WebSearch(domain:<host>)` allow rule per host (reported `degraded`, never `enforced`) — it scopes those two brokered tools only, and does nothing to `Bash` network calls (`curl`, `wget`, a raw socket, or any other network-capable program); an operator-only `[sandbox] extra_allow` entry naming bare `WebFetch` or `WebSearch` is appended afterwards and re-widens it |
 | Autoresearch campaign manifest (`zirv workflow research plan\|run`) and every file it references (corpus, fixture, evaluator, candidate patch) | operator input, like a script | a `[[candidates]]` env overlay may only use a key that is in BOTH the manifest's own `[candidate_space] allow_env` AND a compiled-in allowlist (non-safety Jev gates/floors, `ZIRV_CTX_PROXY_MIN_CONFIDENCE`/`MIN_MARGIN`, the handover ladder, `[headless]` effort, `[score]` token ratios); anything permission/sandbox/safety/credential/base_url-shaped, and the fixed Jev safety gates (approve/approve_allow/inject_screen/stop_verify/missing_tests/review/gates/admin_dispatch), are always refused regardless of what the manifest declares; repo-owned `.zirv/` files cannot widen either list, and a `requires_receipts` entry outside the compiled prefixes is refused at `plan` time |
 
@@ -5490,6 +5652,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `models.avoid` | `ZIRV_CTX_MODELS_AVOID` (model ids, comma-separated) |
 | `models.auto_avoid` | `ZIRV_CTX_MODELS_AUTO_AVOID` |
 | `models` | `ZIRV_CTX_MODELS_*` (the table-node match also blocks any other `models.*` key) |
+| `routing` | `ZIRV_CTX_ROUTING_*` (the whole table: promotion gate, probes, router and canary are operator-only) |
 | `search.max_output_bytes` | `ZIRV_CTX_SEARCH_MAX_OUTPUT_BYTES` |
 | `output.compact` | `ZIRV_CTX_OUTPUT_COMPACT` |
 | `output.compact_min_bytes` | `ZIRV_CTX_OUTPUT_COMPACT_MIN_BYTES` |

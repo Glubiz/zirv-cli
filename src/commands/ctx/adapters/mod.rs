@@ -375,10 +375,16 @@ pub trait AgentAdapter: std::fmt::Debug {
         // never a guess of zirv's own. Neither branch ever narrows or widens
         // `manifest.model_tier` itself -- the tier resolved is always the one
         // the manifest already declared.
-        let resolved_model = task
+        let explicit_model = task
             .model
             .as_deref()
             .or_else(|| resolve_tiered_model(&cfg, self.name(), manifest.model_tier));
+        // Only with no pin and no tier entry may evidence choose the model inside this harness.
+        let routed_model = match explicit_model {
+            Some(_) => None,
+            None => super::routing::route_tier(&cfg, self.name(), manifest.model_tier),
+        };
+        let resolved_model = explicit_model.or(routed_model.as_deref());
         if let Some(model) = resolved_model {
             extra.extend(self.model_args(model));
         }
@@ -1211,7 +1217,10 @@ pub fn native_artifact_presentation_for_agent_name(
 /// one that is not `selected`; `None` when `bin` is unset, names no
 /// registered adapter at all (a stub/wrapper path, the common test and
 /// wrapper-script shape), or names `selected` itself.
-fn agent_bin_names_a_different_adapter(bin: Option<&str>, selected: &str) -> Option<&'static str> {
+pub(crate) fn agent_bin_names_a_different_adapter(
+    bin: Option<&str>,
+    selected: &str,
+) -> Option<&'static str> {
     let bin = bin?;
     let program = bin.split_whitespace().next()?;
     let stem = Path::new(program).file_stem()?.to_str()?;

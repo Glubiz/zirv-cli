@@ -1032,7 +1032,7 @@ pub struct ResolvedRung {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct ModelVersion {
+pub(crate) struct ModelVersion {
     major: u32,
     minor: u32,
 }
@@ -1040,7 +1040,10 @@ struct ModelVersion {
 const ANTHROPIC_FAMILIES: &[&str] = &["fable", "mythos", "opus", "sonnet", "haiku"];
 const OPENAI_FAMILIES: &[&str] = &["sol", "astra", "terra", "luna"];
 
-fn family_and_version(vendor_slug: &str, model: &str) -> Option<(&'static str, ModelVersion)> {
+pub(crate) fn family_and_version(
+    vendor_slug: &str,
+    model: &str,
+) -> Option<(&'static str, ModelVersion)> {
     let normalized = normalize_id(model).to_lowercase();
     match vendor_slug {
         "anthropic" => {
@@ -1077,6 +1080,54 @@ fn family_and_version(vendor_slug: &str, model: &str) -> Option<(&'static str, M
     }
 }
 
+/// Parses any family, known or not: anthropic `claude-<family>-<major>[-<minor>]` and openai
+/// `gpt-<major>[.<minor>]-<family>`, the family being ASCII letters only. Run after
+/// [`normalize_id`], so a dated snapshot parses as its base id; anything else is rejected.
+pub(crate) fn generic_family_and_version(
+    vendor_slug: &str,
+    model: &str,
+) -> Option<(String, ModelVersion)> {
+    let normalized = normalize_id(model).to_lowercase();
+    let letters = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_lowercase());
+    match vendor_slug {
+        "anthropic" => {
+            let rest = normalized.strip_prefix("claude-")?;
+            let mut parts = rest.split('-');
+            let family = parts.next().filter(|f| letters(f))?;
+            let major = parts.next()?.parse().ok()?;
+            let minor = parts.next().map(str::parse).transpose().ok()?.unwrap_or(0);
+            if parts.next().is_some() {
+                return None;
+            }
+            Some((family.to_string(), ModelVersion { major, minor }))
+        }
+        "openai" => {
+            let rest = normalized.strip_prefix("gpt-")?;
+            let (version, family) = rest.split_once('-')?;
+            if !letters(family) {
+                return None;
+            }
+            let mut parts = version.split('.');
+            let major = parts.next()?.parse().ok()?;
+            let minor = parts.next().map(str::parse).transpose().ok()?.unwrap_or(0);
+            if parts.next().is_some() {
+                return None;
+            }
+            Some((family.to_string(), ModelVersion { major, minor }))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `family` is one of the ladder's hard-coded families for the vendor.
+pub(crate) fn is_known_family(vendor_slug: &str, family: &str) -> bool {
+    match vendor_slug {
+        "anthropic" => ANTHROPIC_FAMILIES.contains(&family),
+        "openai" => OPENAI_FAMILIES.contains(&family),
+        _ => false,
+    }
+}
+
 /// The known ladder family for a normalised model id. Unknown families are
 /// deliberately not inferred: discovery may list them, but it cannot rank
 /// them or alter an existing tier without an explicit catalogue family.
@@ -1105,14 +1156,22 @@ pub struct AvoidNote {
     pub kept_because: Option<&'static str>,
 }
 
-fn rung_is_avoided(rung: &ResolvedRung, avoid: &BTreeSet<String>) -> bool {
+/// `base_alias` is the static rung's alias: a Claude rung dispatched by a concrete id still
+/// answers to its short name (`opus`) in an operator's avoid list.
+fn rung_is_avoided(
+    vendor: &Vendor,
+    rung: &ResolvedRung,
+    base_alias: &str,
+    avoid: &BTreeSet<String>,
+) -> bool {
     avoid.contains(&normalize_id(&rung.id).to_lowercase())
         || avoid.contains(&rung.alias.to_lowercase())
+        || (vendor.slug == "anthropic" && avoid.contains(base_alias))
 }
 
 /// [`resolved_ladder`] with `avoid` (lowercased model ids or aliases) applied. An avoided,
 /// unpinned rung is replaced by, in order: a newer non-avoided version of its family; an older
-/// one (not on Claude, whose alias stays the dispatched name); another non-avoided rung of the
+/// one (not on Claude, whose static id may not exist on the account); another non-avoided rung of the
 /// same tier. Never a different tier. When nothing qualifies the rung is kept. An explicit pin
 /// is never replaced. An empty `avoid` returns exactly [`resolved_ladder`]'s ladder.
 pub fn resolved_ladder_avoiding(
@@ -1128,7 +1187,7 @@ pub fn resolved_ladder_avoiding(
     let mut out = ladder.clone();
     let mut notes = Vec::new();
     for (idx, rung) in ladder.iter().enumerate() {
-        if !rung_is_avoided(rung, avoid) {
+        if !rung_is_avoided(vendor, rung, vendor.rungs[idx].alias, avoid) {
             continue;
         }
         if rung.pinned {
@@ -1140,14 +1199,20 @@ pub fn resolved_ladder_avoiding(
             continue;
         }
         let current = family_and_version(vendor.slug, &rung.id).map(|(_, version)| version);
-        let mut same_family: Vec<(ModelVersion, String)> = discovered
+        let known: Vec<&DiscoveredModel> = discovered
             .iter()
             .filter(|candidate| candidate.vendor == vendor.slug && candidate.available)
-            .chain(std::iter::once(&DiscoveredModel::new(
-                vendor.slug,
-                vendor.rungs[idx].id,
-                true,
-            )))
+            .collect();
+        // When discovery knows this vendor, a static id newer than the rung may be a held id or
+        // one the account has never seen, so only an older static id (a downgrade) may join.
+        let static_rung = DiscoveredModel::new(vendor.slug, vendor.rungs[idx].id, true);
+        let static_usable = known.is_empty()
+            || family_and_version(vendor.slug, &static_rung.id)
+                .is_some_and(|(_, version)| Some(version) < current);
+        let mut same_family: Vec<(ModelVersion, String)> = known
+            .iter()
+            .copied()
+            .chain(static_usable.then_some(&static_rung))
             .filter_map(|candidate| {
                 let (family, version) = family_and_version(vendor.slug, &candidate.id)?;
                 (family == rung.family).then(|| (version, candidate.id.clone()))
@@ -1171,13 +1236,13 @@ pub fn resolved_ladder_avoiding(
             .flatten();
         let peer = rung.tier.and_then(|tier| {
             ladder.iter().enumerate().find(|(other, candidate)| {
-                *other != idx && candidate.tier == Some(tier) && !rung_is_avoided(candidate, avoid)
+                *other != idx
+                    && candidate.tier == Some(tier)
+                    && !rung_is_avoided(vendor, candidate, vendor.rungs[*other].alias, avoid)
             })
         });
         if let Some(id) = newer.or(older) {
-            if vendor.slug != "anthropic" {
-                out[idx].alias = id.clone();
-            }
+            out[idx].alias = id.clone();
             out[idx].id = id.clone();
             notes.push(AvoidNote {
                 avoided: rung.id.clone(),
@@ -1227,12 +1292,16 @@ fn base_ladder(
                 })
                 .max_by_key(|(version, _)| *version)
                 .map(|(_, id)| id);
+            let concrete = pinned.is_some() || newest.is_some();
             let id = pinned
                 .map(String::as_str)
                 .or(newest)
                 .unwrap_or(base.id)
                 .to_string();
-            let alias = if vendor.slug == "anthropic" {
+            // A concrete id (pinned or seen on this account) is dispatched as is; the static
+            // alias stays only while nothing concrete is known, so zirv never dispatches a
+            // static id it has not seen work.
+            let alias = if vendor.slug == "anthropic" && !concrete {
                 base.alias.to_string()
             } else {
                 id.clone()
@@ -1624,6 +1693,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn generic_parse_accepts_any_letters_family_and_rejects_junk() {
+        let parse = |vendor: &str, id: &str| {
+            generic_family_and_version(vendor, id).map(|(family, v)| (family, v.major, v.minor))
+        };
+        let some = |family: &str, major, minor| Some((family.to_string(), major, minor));
+        assert_eq!(parse("anthropic", "claude-bel-1"), some("bel", 1, 0));
+        assert_eq!(parse("anthropic", "claude-bel-1-2"), some("bel", 1, 2));
+        assert_eq!(
+            parse("anthropic", "claude-bel-1-2-20260101"),
+            some("bel", 1, 2)
+        );
+        assert_eq!(parse("openai", "gpt-6-bel"), some("bel", 6, 0));
+        assert_eq!(parse("openai", "gpt-6.1-bel"), some("bel", 6, 1));
+        assert!(!is_known_family("openai", "bel") && is_known_family("openai", "sol"));
+        for junk in [
+            "claude-bel",
+            "claude-3-opus",
+            "claude-b3l-1",
+            "claude-bel-1-2-3",
+            "claude-bel-1-latest",
+            "gpt-4o",
+            "gpt-6-bel-2",
+            "gpt-6.1.2-bel",
+            "gpt-x-bel",
+            "gpt-6-b3l",
+        ] {
+            let vendor = if junk.starts_with("gpt") {
+                "openai"
+            } else {
+                "anthropic"
+            };
+            assert_eq!(parse(vendor, junk), None, "{junk}");
+        }
+        assert_eq!(parse("google", "gemini-3-pro"), None);
     }
 
     #[test]

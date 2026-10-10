@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use super::adapters::{self, AGENT_ENV, DefaultOrigin};
 use super::chain;
+use super::chrome::HarnessRule;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::event::input_hash;
 use super::group;
@@ -867,6 +868,17 @@ fn describe_chat_with_presence(
     colour: bool,
     present: &dyn Fn(&str, &str) -> adapters::Liveness,
 ) -> String {
+    if cfg.agent.is_none()
+        && let Some((adapter, HarnessRule::Routed { model, reason })) =
+            super::chat::routed_seat(cfg, present)
+    {
+        return format!(
+            "{} {} ({})",
+            label(colour, "chat:"),
+            style::paint(adapter.name(), Tone::Accent, colour),
+            style::paint(&format!("routed to {model}: {reason}"), Tone::Muted, colour)
+        );
+    }
     match adapters::resolve_default_with_presence(cfg, present) {
         Ok((adapter, origin)) => {
             let rule = match origin {
@@ -2775,6 +2787,7 @@ pub fn run<W: Write>(args: &StatusArgs, w: &mut W) -> CtxResult<i32> {
     // Only the CLI run starts the refresher; `run_with` also serves the prompt hook.
     if let (Ok(state), Ok(cfg)) = (StateDir::resolve(&env), CtxConfig::load(&repo, &env)) {
         super::models::spawn_refresh_if_due_detached(&cfg, &state);
+        crate::commands::benchmark::spawn_probe_if_due_detached(&cfg, &state);
     }
     Ok(code)
 }
@@ -4180,6 +4193,29 @@ mod tests {
             describe_chat_with_presence(&configured_cfg, false, &adapters::everything_installed()),
             "chat: claude (configured)"
         );
+    }
+
+    /// A seat evidence routes is said on the `chat:` line, with the model and the reason.
+    #[test]
+    fn status_names_the_routed_chat_seat_and_its_evidence() {
+        use crate::commands::ctx::models::evidence::RouteRole;
+        use crate::commands::ctx::routing::TestEvidence;
+        use crate::commands::ctx::routing::fixtures::{cell, evidence};
+        let _evidence = TestEvidence::set(evidence(vec![cell(
+            "codex",
+            "codex-seat",
+            RouteRole::Orchestrator,
+            5,
+            0.9,
+            Some(100),
+        )]));
+        let line = describe_chat_with_presence(
+            &CtxConfig::default(),
+            false,
+            &adapters::everything_installed(),
+        );
+        assert!(line.contains("chat: codex"), "got {line}");
+        assert!(line.contains("routed to codex-seat"), "got {line}");
     }
 
     /// The other half of the same line, and the reason the seam exists:

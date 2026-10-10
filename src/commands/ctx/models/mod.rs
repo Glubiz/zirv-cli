@@ -4,6 +4,8 @@
 //! Codex-owned cache and Claude transcripts, persists observations, and
 //! injects the resulting rows into their pure lookup helpers.
 
+pub(crate) mod evidence;
+pub(crate) mod promotion;
 pub(crate) mod scorecard;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,7 +20,7 @@ use serde_json::Value;
 
 use super::CtxResult;
 use super::catalogue::{self, DiscoveredModel, Tier};
-use super::config::{CtxConfig, ModelsConfig, env_from_process};
+use super::config::{CtxConfig, ModelsConfig, RoutingConfig, env_from_process};
 use super::price::{self, ModelPrice, PriceTable};
 use super::state::{self, StateDir};
 
@@ -85,6 +87,22 @@ pub struct RegistryModel {
     pub retirement_at: Option<u64>,
     pub upgrade: Option<String>,
     pub sources: Vec<String>,
+    /// models.dev's release date (unix seconds), when it gave one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<u64>,
+}
+
+/// The registry source for ids models.dev lists: known to exist, not verified for this account.
+pub(crate) const MODELS_DEV_SOURCE: &str = "models.dev";
+/// The registry source for ids a probe run proved runnable on this account.
+pub(crate) const PROBE_SOURCE: &str = "probe";
+
+/// One model models.dev lists for a provider we route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ListedModel {
+    vendor: String,
+    id: String,
+    released_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -93,6 +111,7 @@ struct PriceCache {
     fetched_at: u64,
     models_dev_etag: Option<String>,
     litellm_etag: Option<String>,
+    models_dev_ids: Vec<ListedModel>,
     models_dev: BTreeMap<String, ModelPrice>,
     litellm: BTreeMap<String, ModelPrice>,
 }
@@ -156,12 +175,16 @@ pub fn run(args: &ModelsArgs, w: &mut dyn Write) -> CtxResult<i32> {
     }
     let (registry, prices) = load_listing(&cfg, &state, args.command.is_none());
     let rows = list_rows(&cfg, &registry, &prices);
+    let unseen = models_dev_only_count(&registry, &rows);
     let card = scorecard::build(&state, &prices.table, state::now_secs());
     let warnings = avoid_warnings(&cfg, &registry);
+    let promotions = promotion::load(&state).unwrap_or_default();
     if args.json {
         let report = serde_json::json!({
             "models": rows,
+            "models_dev_only": unseen,
             "scorecard": card,
+            "promotions": promotions,
             "avoid": {
                 "manual": cfg.models.avoid,
                 "auto_enabled": cfg.models.auto_avoid,
@@ -200,10 +223,22 @@ pub fn run(args: &ModelsArgs, w: &mut dyn Write) -> CtxResult<i32> {
                     .unwrap_or_else(|| "-".into()),
             )?;
         }
+        if unseen > 0 {
+            writeln!(
+                w,
+                "+{unseen} known from models.dev, not seen on this account"
+            )?;
+        }
         for warning in &warnings {
             writeln!(w, "warning: {warning}")?;
         }
         scorecard::render(&card, w)?;
+        promotion::render(&promotions, &cfg.routing, w)?;
+        write!(w, "{}", super::routing::render_routes(&cfg, &state))?;
+        w.write_all(
+            crate::commands::benchmark::render_probe_status(&state, &cfg, state::now_secs())
+                .as_bytes(),
+        )?;
     }
     Ok(0)
 }
@@ -263,6 +298,10 @@ pub(crate) fn candidates<'a>(
 /// Rows with `availability` of `available` are models this machine has actually seen or been offered.
 pub(crate) const AVAILABLE: &str = "available";
 
+/// Rows with `availability` of `candidate` are new models held off dispatch until probe
+/// evidence promotes them; they are not selectable as an ordinary available model.
+pub(crate) const CANDIDATE: &str = "candidate";
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct ModelRow {
     pub(crate) vendor: String,
@@ -306,8 +345,14 @@ impl ModelRow {
 }
 
 fn list_rows(cfg: &CtxConfig, registry: &Registry, prices: &EffectivePrices) -> Vec<ModelRow> {
+    let held = held_for(&cfg.routing);
+    let unseen = models_dev_only_ids(registry);
     let mut ids: BTreeMap<(String, String), Option<&RegistryModel>> = BTreeMap::new();
     for model in registry.models.values() {
+        // Ids only models.dev lists are summarized by `models_dev_only_count`, not listed.
+        if unseen.contains(&model.id) && !held.contains(&model.id) {
+            continue;
+        }
         ids.insert((model.vendor.clone(), model.id.clone()), Some(model));
     }
     for vendor in catalogue::vendors() {
@@ -320,7 +365,7 @@ fn list_rows(cfg: &CtxConfig, registry: &Registry, prices: &EffectivePrices) -> 
                 .or_insert(None);
         }
     }
-    let discovered = discovered_models(registry);
+    let discovered = without_held(&discovered_models(registry), &held);
     let pins = effective_pins(cfg);
     let ladders: BTreeMap<String, Vec<catalogue::ResolvedRung>> = catalogue::vendors()
         .iter()
@@ -346,12 +391,15 @@ fn list_rows(cfg: &CtxConfig, registry: &Registry, prices: &EffectivePrices) -> 
                 id,
                 rung: rung.map(|r| r.alias.clone()),
                 tier: rung.and_then(|r| r.tier).map(tier_name).map(str::to_string),
-                availability: model
-                    .map_or(
+                availability: if held.contains(&normalized) {
+                    CANDIDATE
+                } else {
+                    model.map_or(
                         "snapshot",
                         |m| if m.available { AVAILABLE } else { "hidden" },
                     )
-                    .to_string(),
+                }
+                .to_string(),
                 input_micros_per_million: price.map(|p| p.input_micros),
                 output_micros_per_million: price.map(|p| p.output_micros),
                 price_source: provenance.map(|p| p.source.clone()),
@@ -451,15 +499,33 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> CtxResult<()> {
 }
 
 fn refresh(cfg: &CtxConfig, state: &StateDir, now: u64) -> CtxResult<()> {
-    if cfg.models.discovery {
+    let mut registry = cfg.models.discovery.then(|| {
         let mut registry = discover_local(load_registry(state), now);
         registry.updated_at = now;
-        write_json(&state.root().join(REGISTRY_FILE), &registry)?;
-    }
+        registry
+    });
     if cfg.models.price_fetch {
         refresh_price_cache(state, now)?;
+        if let Some(registry) = &mut registry {
+            import_models_dev(registry, &load_price_cache(state).models_dev_ids, now);
+        }
     }
-    scorecard::refresh(state, &effective_prices(cfg, state).table, now)
+    scorecard::refresh(state, &effective_prices(cfg, state).table, now)?;
+    // The gate sees the new registry and holds new models before registry.json exposes them
+    // to long-lived processes. The registry is written even when the gate fails.
+    let gated = if cfg.routing.enabled {
+        // Evidence first: the promotion gate decides on it.
+        evidence::refresh(state, cfg, now).and_then(|_| match &registry {
+            Some(registry) => promotion::refresh_with(state, cfg, registry, now).map(|_| ()),
+            None => promotion::refresh(state, cfg, now).map(|_| ()),
+        })
+    } else {
+        Ok(())
+    };
+    if let Some(registry) = &registry {
+        write_json(&state.root().join(REGISTRY_FILE), registry)?;
+    }
+    gated
 }
 
 fn discover_local(mut registry: Registry, now: u64) -> Registry {
@@ -472,6 +538,114 @@ fn discover_local(mut registry: Registry, now: u64) -> Registry {
         merge_observations(&mut registry, scan_claude_transcripts(&root));
     }
     registry
+}
+
+/// Record the ids models.dev lists as existing but unverified (`available = false`, so the
+/// ladder never dispatches them). A model another source already knows keeps its availability;
+/// it only gains the source and the release date.
+fn import_models_dev(registry: &mut Registry, listed: &[ListedModel], now: u64) {
+    for model in listed {
+        let id = catalogue::normalize_id(&model.id).to_lowercase();
+        let key = format!("{}:{id}", model.vendor);
+        if let Some(existing) = registry.models.get_mut(&key) {
+            if !existing.sources.iter().any(|s| s == MODELS_DEV_SOURCE) {
+                existing.sources.push(MODELS_DEV_SOURCE.to_string());
+            }
+            existing.released_at = existing.released_at.or(model.released_at);
+            continue;
+        }
+        let family = catalogue::model_family(&model.vendor, &id);
+        registry.models.insert(
+            key,
+            RegistryModel {
+                vendor: model.vendor.clone(),
+                family: family.map(str::to_string),
+                version: model_version(&model.vendor, &id),
+                id,
+                available: false,
+                first_seen: now,
+                last_seen: now,
+                sources: vec![MODELS_DEV_SOURCE.to_string()],
+                released_at: model.released_at,
+                ..RegistryModel::default()
+            },
+        );
+    }
+}
+
+/// How many models.dev-only registry ids [`list_rows`] left out of `rows`.
+fn models_dev_only_count(registry: &Registry, rows: &[ModelRow]) -> usize {
+    let listed: BTreeSet<(&str, &str)> = rows
+        .iter()
+        .map(|row| (row.vendor.as_str(), row.id.as_str()))
+        .collect();
+    let unseen = models_dev_only_ids(registry);
+    registry
+        .models
+        .values()
+        .filter(|m| unseen.contains(&m.id) && !listed.contains(&(m.vendor.as_str(), m.id.as_str())))
+        .count()
+}
+
+/// Ids the registry knows only from models.dev: never seen or proven on this account.
+pub(crate) fn models_dev_only_ids(registry: &Registry) -> BTreeSet<String> {
+    registry
+        .models
+        .values()
+        .filter(|m| !m.available && m.sources.iter().all(|s| s == MODELS_DEV_SOURCE))
+        .filter(|m| !m.sources.is_empty())
+        .map(|m| m.id.clone())
+        .collect()
+}
+
+/// Run `f` holding the refresher's lock, so a read-modify-write of registry.json,
+/// promotions.json or evidence.json cannot interleave with `models refresh`, which holds it from
+/// load to write. Retries until `wait` has passed; false when the lock stayed busy.
+pub(crate) fn with_refresh_lock(
+    state: &StateDir,
+    wait: std::time::Duration,
+    f: impl FnOnce(),
+) -> bool {
+    let _ = std::fs::create_dir_all(state.root());
+    let path = state.root().join(REFRESH_LOCK_FILE);
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if let Ok(_lock) = state::try_acquire_lock(&path) {
+            f();
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// Mark ids a probe run proved runnable as available on this account.
+pub(crate) fn mark_probe_available(
+    state: &StateDir,
+    ids: &[(String, String)],
+    now: u64,
+) -> CtxResult<()> {
+    let mut registry = load_registry(state);
+    for (vendor, id) in ids {
+        let id = catalogue::normalize_id(id).to_lowercase();
+        let model = registry
+            .models
+            .entry(format!("{vendor}:{id}"))
+            .or_insert_with(|| RegistryModel {
+                vendor: vendor.clone(),
+                id,
+                first_seen: now,
+                ..RegistryModel::default()
+            });
+        model.available = true;
+        model.last_seen = model.last_seen.max(now);
+        if !model.sources.iter().any(|s| s == PROBE_SOURCE) {
+            model.sources.push(PROBE_SOURCE.to_string());
+        }
+    }
+    write_json(&state.root().join(REGISTRY_FILE), &registry)
 }
 
 fn apply_codex_cache(registry: &mut Registry, text: &str, now: u64) {
@@ -641,6 +815,7 @@ fn merge_observations(registry: &mut Registry, observations: Vec<RegistryModel>)
             }
             observed.first_seen = existing.first_seen.min(observed.first_seen);
             observed.last_seen = existing.last_seen.max(observed.last_seen);
+            observed.released_at = observed.released_at.or(existing.released_at);
             *existing = observed;
         } else {
             registry.models.insert(key, observed);
@@ -746,6 +921,36 @@ fn parse_models_dev(text: &str) -> BTreeMap<String, ModelPrice> {
         }
     }
     prices
+}
+
+/// Every model id models.dev lists under the `anthropic` and `openai` providers, priced or
+/// not, with its release date when it gives one.
+fn parse_models_dev_ids(text: &str) -> Vec<ListedModel> {
+    let Ok(root) = serde_json::from_str::<Value>(text) else {
+        return Vec::new();
+    };
+    let mut listed = Vec::new();
+    for provider in ["anthropic", "openai"] {
+        let Some(models) = root
+            .get(provider)
+            .and_then(|p| p.get("models"))
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        for (id, model) in models {
+            let released_at = model
+                .get("release_date")
+                .and_then(Value::as_str)
+                .and_then(|date| super::window::parse_rfc3339_utc(&format!("{date}T00:00:00Z")));
+            listed.push(ListedModel {
+                vendor: provider.to_string(),
+                id: id.clone(),
+                released_at,
+            });
+        }
+    }
+    listed
 }
 
 fn parse_litellm(text: &str) -> BTreeMap<String, ModelPrice> {
@@ -888,14 +1093,20 @@ fn refresh_price_cache(state: &StateDir, now: u64) -> CtxResult<()> {
         .build()
         .into();
     let mut reached_source = false;
+    // A cache from before the id list existed has no ids, so it must be refetched in full.
+    let etag = cache
+        .models_dev_etag
+        .as_deref()
+        .filter(|_| !cache.models_dev_ids.is_empty());
     if let Ok((models_dev, models_dev_etag, models_dev_changed)) =
-        fetch_json(&agent, MODELS_DEV_URL, cache.models_dev_etag.as_deref())
+        fetch_json(&agent, MODELS_DEV_URL, etag)
     {
         reached_source = true;
         if models_dev_changed {
             let parsed = parse_models_dev(&models_dev);
             if !parsed.is_empty() {
                 cache.models_dev = parsed;
+                cache.models_dev_ids = parse_models_dev_ids(&models_dev);
                 cache.models_dev_etag = models_dev_etag;
             }
         }
@@ -957,7 +1168,7 @@ fn fetch_json(
 }
 
 pub(crate) fn retirement_warnings(cfg: &CtxConfig, registry: &Registry, now: u64) -> Vec<String> {
-    let discovered = discovered_models(registry);
+    let discovered = without_held(&discovered_models(registry), &held_for(&cfg.routing));
     let pins = effective_pins(cfg);
     let mut selected = BTreeSet::new();
     for vendor in ["anthropic", "openai"] {
@@ -1074,16 +1285,35 @@ fn with_discovered<R>(f: impl FnOnce(&[DiscoveredModel]) -> R) -> R {
     TEST_DISCOVERED.with(|cell| f(&cell.borrow()))
 }
 
+/// `discovered` without the models the promotion gate holds off dispatch.
+fn without_held(models: &[DiscoveredModel], held: &BTreeSet<String>) -> Vec<DiscoveredModel> {
+    models
+        .iter()
+        .filter(|m| !held.contains(&catalogue::normalize_id(&m.id).to_lowercase()))
+        .cloned()
+        .collect()
+}
+
 /// Empty (the static ladder applies unchanged) unless discovery has a model for this vendor or
-/// `avoid` must be applied to the static ladder.
+/// `avoid` must be applied to the static ladder. Models in `held` are invisible to the ladder,
+/// so the newest remaining id of a family is its promoted incumbent; an explicit pin still wins.
 fn ladder_with(
     vendor: &catalogue::Vendor,
     discovery: bool,
     pins: impl FnOnce() -> BTreeMap<String, String>,
     avoid: &BTreeSet<String>,
+    held: &BTreeSet<String>,
 ) -> Vec<catalogue::ResolvedRung> {
     with_discovered(|discovered| {
-        let discovered = if discovery { discovered } else { &[] };
+        let visible;
+        let discovered = if !discovery {
+            &[]
+        } else if held.is_empty() {
+            discovered
+        } else {
+            visible = without_held(discovered, held);
+            &visible[..]
+        };
         if avoid.is_empty()
             && !discovered
                 .iter()
@@ -1125,12 +1355,63 @@ fn cached_auto_avoid() -> BTreeSet<String> {
     .clone()
 }
 
+/// The operator's `[routing]` table for callers without a config, read once per process
+/// (repos cannot set `routing.*`).
+#[cfg(not(test))]
+fn process_routing() -> RoutingConfig {
+    static ROUTING: std::sync::OnceLock<RoutingConfig> = std::sync::OnceLock::new();
+    ROUTING
+        .get_or_init(|| RoutingConfig::load_operator_only(&env_from_process()).unwrap_or_default())
+        .clone()
+}
+
+/// The ids the promotion gate holds off dispatch, from the refresher's `promotions.json`,
+/// read once per process.
+#[cfg(not(test))]
+fn cached_held() -> BTreeSet<String> {
+    static HELD: std::sync::OnceLock<BTreeSet<String>> = std::sync::OnceLock::new();
+    HELD.get_or_init(|| {
+        StateDir::resolve(&env_from_process())
+            .ok()
+            .and_then(|state| promotion::load(&state))
+            .map(|promotions| promotion::held_ids(&promotions))
+            .unwrap_or_default()
+    })
+    .clone()
+}
+
 #[cfg(test)]
 thread_local! {
     static TEST_MODELS: std::cell::RefCell<ModelsConfig> =
         std::cell::RefCell::new(ModelsConfig::default());
     static TEST_AUTO_AVOID: std::cell::RefCell<BTreeSet<String>> =
         const { std::cell::RefCell::new(BTreeSet::new()) };
+    static TEST_HELD: std::cell::RefCell<BTreeSet<String>> =
+        const { std::cell::RefCell::new(BTreeSet::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_held(ids: &[&str]) {
+    TEST_HELD.with(|cell| *cell.borrow_mut() = ids.iter().map(|id| (*id).to_string()).collect());
+}
+
+#[cfg(test)]
+fn process_routing() -> RoutingConfig {
+    RoutingConfig::default()
+}
+
+#[cfg(test)]
+fn cached_held() -> BTreeSet<String> {
+    TEST_HELD.with(|cell| cell.borrow().clone())
+}
+
+/// The ids the promotion gate holds under `routing`: none while routing or the hold is off.
+pub(crate) fn held_for(routing: &RoutingConfig) -> BTreeSet<String> {
+    if routing.enabled && routing.hold_new_models {
+        cached_held()
+    } else {
+        BTreeSet::new()
+    }
 }
 
 #[cfg(test)]
@@ -1213,6 +1494,7 @@ pub(crate) fn runtime_ladder(vendor: &catalogue::Vendor) -> Vec<catalogue::Resol
         models.discovery,
         || models.pin.clone(),
         &avoid_from(&models),
+        &held_for(&process_routing()),
     )
 }
 
@@ -1227,10 +1509,12 @@ pub(crate) fn ladder_for(
         cfg.models.discovery,
         || effective_pins(cfg),
         &avoid_for(cfg),
+        &held_for(&cfg.routing),
     )
 }
 
-/// [`ladder_for`] without avoid: for recognising which tier an already-running model is on.
+/// [`ladder_for`] without avoid or the promotion gate: for recognising which tier an
+/// already-running model is on, which must work for a model the gate holds.
 pub(crate) fn identity_ladder_for(
     cfg: &CtxConfig,
     vendor: &catalogue::Vendor,
@@ -1239,6 +1523,7 @@ pub(crate) fn identity_ladder_for(
         vendor,
         cfg.models.discovery,
         || effective_pins(cfg),
+        &BTreeSet::new(),
         &BTreeSet::new(),
     )
 }
@@ -1250,7 +1535,7 @@ fn avoid_warnings(cfg: &CtxConfig, registry: &Registry) -> Vec<String> {
         return Vec::new();
     }
     let discovered = if cfg.models.discovery {
-        discovered_models(registry)
+        without_held(&discovered_models(registry), &held_for(&cfg.routing))
     } else {
         Vec::new()
     };
@@ -1283,7 +1568,10 @@ fn refresh_due(cfg: &CtxConfig, state: &StateDir, now: u64) -> bool {
     let scorecard_stale = cfg.models.auto_avoid
         && now.saturating_sub(scorecard::load(state).map_or(0, |card| card.generated_at))
             > REGISTRY_MAX_AGE_SECS;
-    if !registry_stale && !prices_stale && !scorecard_stale {
+    let evidence_stale = cfg.routing.enabled
+        && now.saturating_sub(evidence::load(state).map_or(0, |e| e.generated_at))
+            > REGISTRY_MAX_AGE_SECS;
+    if !registry_stale && !prices_stale && !scorecard_stale && !evidence_stale {
         return false;
     }
     let last_attempt = std::fs::read_to_string(state.root().join(REFRESH_ATTEMPT_FILE))
@@ -1560,6 +1848,84 @@ mod tests {
     }
 
     #[test]
+    fn models_dev_ids_import_as_unavailable_and_never_downgrade_an_available_id() {
+        let listed = parse_models_dev_ids(
+            r#"{"anthropic":{"models":{"claude-bel-1":{"release_date":"2026-10-01"},"claude-opus-5":{}}},
+                "openai":{"models":{"gpt-6-bel":{"cost":{"input":1,"output":2}}}},
+                "google":{"models":{"gemini-3":{}}}}"#,
+        );
+        assert_eq!(listed.len(), 3);
+        let mut registry = Registry::default();
+        let seen = RegistryModel {
+            vendor: "anthropic".into(),
+            id: "claude-opus-5".into(),
+            available: true,
+            first_seen: 5,
+            last_seen: 5,
+            sources: vec!["claude-transcript".into()],
+            ..RegistryModel::default()
+        };
+        registry
+            .models
+            .insert("anthropic:claude-opus-5".into(), seen);
+        import_models_dev(&mut registry, &listed, 100);
+
+        let bel = &registry.models["anthropic:claude-bel-1"];
+        assert!(!bel.available);
+        assert_eq!(bel.sources, [MODELS_DEV_SOURCE]);
+        assert_eq!(
+            bel.released_at,
+            super::super::window::parse_rfc3339_utc("2026-10-01T00:00:00Z")
+        );
+        assert!(!registry.models["openai:gpt-6-bel"].available);
+        assert!(!registry.models.contains_key("google:gemini-3"));
+        let opus = &registry.models["anthropic:claude-opus-5"];
+        assert!(opus.available);
+        assert_eq!(opus.sources, ["claude-transcript", MODELS_DEV_SOURCE]);
+        // A later local observation upgrades the unverified id and keeps its release date.
+        merge_observations(
+            &mut registry,
+            parse_claude_transcript(r#"{"message":{"model":"claude-bel-1"}}"#, 200),
+        );
+        let bel = &registry.models["anthropic:claude-bel-1"];
+        assert!(bel.available && bel.released_at.is_some());
+        assert_eq!(bel.sources, ["claude-transcript", MODELS_DEV_SOURCE]);
+    }
+
+    #[test]
+    fn the_listing_summarizes_models_dev_only_ids_instead_of_listing_them() {
+        let mut registry = Registry::default();
+        let mut add = |id: &str, available: bool, sources: &[&str]| {
+            registry.models.insert(
+                format!("anthropic:{id}"),
+                RegistryModel {
+                    vendor: "anthropic".into(),
+                    id: id.into(),
+                    available,
+                    sources: sources.iter().map(|s| (*s).to_string()).collect(),
+                    ..RegistryModel::default()
+                },
+            );
+        };
+        add("claude-bel-1", false, &[MODELS_DEV_SOURCE]);
+        add("claude-bel-2", false, &[MODELS_DEV_SOURCE]);
+        add(
+            "claude-bel-3",
+            true,
+            &["claude-transcript", MODELS_DEV_SOURCE],
+        );
+        let cfg = CtxConfig::default();
+        let prices = effective_prices_from(&PriceCache::default(), None);
+        set_test_held(&["claude-bel-2"]);
+        let rows = list_rows(&cfg, &registry, &prices);
+        set_test_held(&[]);
+        let listed: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert!(!listed.contains(&"claude-bel-1"));
+        assert!(listed.contains(&"claude-bel-2") && listed.contains(&"claude-bel-3"));
+        assert_eq!(models_dev_only_count(&registry, &rows), 1);
+    }
+
+    #[test]
     fn models_dev_and_litellm_fixtures_parse_per_million_prices() {
         let models_dev = parse_models_dev(
             r#"{"anthropic":{"models":{"claude-opus-5-5":{"cost":{"input":4,"output":20,"cache_read":0.2,"cache_write":5}}}}}"#,
@@ -1659,6 +2025,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_held_model_is_not_selected_for_retirement_warnings() {
+        let mut held = model("anthropic", "claude-opus-5-5");
+        held.retirement_at = Some(10 + 86_400);
+        let registry = registry_of(vec![model("anthropic", "claude-opus-5"), held]);
+        let cfg = CtxConfig::default();
+        set_test_held(&[]);
+        assert_eq!(retirement_warnings(&cfg, &registry, 10).len(), 1);
+        set_test_held(&["claude-opus-5-5"]);
+        assert!(retirement_warnings(&cfg, &registry, 10).is_empty());
+        set_test_held(&[]);
+    }
+
     fn due_state() -> (tempfile::TempDir, StateDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::resolve(&|_| Some(tmp.path().display().to_string())).expect("state");
@@ -1680,6 +2059,7 @@ mod tests {
         let mut cfg = CtxConfig::default();
         cfg.models.discovery = false;
         cfg.models.price_fetch = false;
+        cfg.routing.enabled = false;
         let now = 10 * 86_400;
         assert_eq!(count_spawns(&cfg, &state, now), 0, "auto_avoid off");
         cfg.models.auto_avoid = true;
@@ -1727,6 +2107,14 @@ mod tests {
             },
         )
         .expect("prices");
+        write_json(
+            &state.root().join(evidence::EVIDENCE_FILE),
+            &evidence::Evidence {
+                generated_at: now - 3_600,
+                ..evidence::Evidence::default()
+            },
+        )
+        .expect("evidence");
         assert_eq!(count_spawns(&cfg, &state, now), 0);
     }
 
@@ -1739,11 +2127,26 @@ mod tests {
     }
 
     #[test]
+    fn the_probe_bookkeeping_waits_for_the_refresh_lock_and_gives_up_when_it_stays_held() {
+        let (_tmp, state) = due_state();
+        let zero = std::time::Duration::ZERO;
+        assert!(with_refresh_lock(&state, zero, || {}));
+        let _held = state::try_acquire_lock(&state.root().join(REFRESH_LOCK_FILE)).expect("lock");
+        let ran = std::cell::Cell::new(false);
+        let locked = with_refresh_lock(&state, std::time::Duration::from_millis(300), || {
+            ran.set(true);
+        });
+        assert!(!locked);
+        assert!(!ran.get());
+    }
+
+    #[test]
     fn disabled_discovery_and_price_fetch_never_spawn() {
         let (_tmp, state) = due_state();
         let mut cfg = CtxConfig::default();
         cfg.models.discovery = false;
         cfg.models.price_fetch = false;
+        cfg.routing.enabled = false;
         assert_eq!(count_spawns(&cfg, &state, 10 * 86_400), 0);
     }
 
@@ -1795,8 +2198,9 @@ mod tests {
             &BTreeMap::new(),
             &avoid_ids(&["gpt-5.5-sol".to_string()]),
         );
-        // A newer version of the family (the compiled one) is preferred over anything else.
-        assert_eq!(ladder[1].id, "gpt-5.6-sol");
+        // The compiled newer id is not chained once discovery knows the vendor: it may be
+        // held or never seen on this account.
+        assert_ne!(ladder[1].id, "gpt-5.6-sol");
     }
 
     #[test]
@@ -1985,12 +2389,12 @@ mod tests {
     }
 
     #[test]
-    fn claude_keeps_its_alias_when_the_observed_id_is_avoided() {
+    fn claude_dispatches_the_observed_id_even_when_it_is_the_last_usable_one() {
         observed_ids("anthropic", &["claude-opus-5-5"]);
         let cfg = cfg_avoiding(&["claude-opus-5-5"]);
         assert_eq!(
             crate::commands::ctx::handover::resolve_model("claude", "deep", &cfg).expect("deep"),
-            "opus"
+            "claude-opus-5-5"
         );
         let registry = Registry {
             models: BTreeMap::from([(
@@ -2072,5 +2476,208 @@ mod tests {
             avoid_for_state(&cfg, &state),
             BTreeSet::from(["gpt-5.6-sol".to_string(), "gpt-5.6-terra".to_string()])
         );
+    }
+
+    fn opus_id(ladder: &[catalogue::ResolvedRung]) -> String {
+        ladder
+            .iter()
+            .find(|rung| rung.family == "opus")
+            .map(|rung| rung.id.clone())
+            .expect("opus rung")
+    }
+
+    fn held_setup() -> &'static catalogue::Vendor {
+        observed_ids("anthropic", &["claude-opus-5", "claude-opus-5-5"]);
+        set_test_held(&["claude-opus-5-5"]);
+        catalogue::vendor("anthropic").expect("anthropic")
+    }
+
+    #[test]
+    fn dispatch_ladders_skip_a_held_id_but_the_identity_ladder_still_knows_it() {
+        let anthropic = held_setup();
+        let cfg = CtxConfig::default();
+        assert_eq!(opus_id(&ladder_for(&cfg, anthropic)), "claude-opus-5");
+        assert_eq!(opus_id(&runtime_ladder(anthropic)), "claude-opus-5");
+        assert_eq!(
+            opus_id(&identity_ladder_for(&cfg, anthropic)),
+            "claude-opus-5-5"
+        );
+        set_test_held(&[]);
+    }
+
+    #[test]
+    fn turning_the_hold_or_routing_off_restores_todays_newest_id() {
+        let anthropic = held_setup();
+        let mut cfg = CtxConfig::default();
+        cfg.routing.hold_new_models = false;
+        assert_eq!(opus_id(&ladder_for(&cfg, anthropic)), "claude-opus-5-5");
+        let mut cfg = CtxConfig::default();
+        cfg.routing.enabled = false;
+        assert_eq!(opus_id(&ladder_for(&cfg, anthropic)), "claude-opus-5-5");
+        set_test_held(&[]);
+    }
+
+    #[test]
+    fn an_explicit_pin_bypasses_the_gate() {
+        let anthropic = held_setup();
+        let mut cfg = CtxConfig::default();
+        cfg.models
+            .pin
+            .insert("anthropic.opus".into(), "claude-opus-5-5".into());
+        let ladder = ladder_for(&cfg, anthropic);
+        assert_eq!(opus_id(&ladder), "claude-opus-5-5");
+        assert!(ladder.iter().any(|rung| rung.pinned));
+        set_test_held(&[]);
+    }
+
+    #[test]
+    fn avoid_never_replaces_a_rung_with_a_held_id() {
+        observed_ids("openai", &["gpt-6.1-sol", "gpt-6.2-sol"]);
+        set_test_held(&["gpt-6.2-sol"]);
+        assert_eq!(codex_deep(&CtxConfig::default()), "gpt-6.1-sol");
+        assert_eq!(codex_deep(&cfg_avoiding(&["gpt-6.1-sol"])), "gpt-5.6-sol");
+        set_test_held(&[]);
+        assert_eq!(codex_deep(&cfg_avoiding(&["gpt-6.1-sol"])), "gpt-6.2-sol");
+    }
+
+    #[test]
+    fn avoid_never_falls_back_to_a_static_id_when_discovery_knows_the_vendor() {
+        let anthropic = catalogue::vendor("anthropic").expect("anthropic");
+        let idx = anthropic
+            .rungs
+            .iter()
+            .position(|rung| rung.alias == "opus")
+            .expect("opus rung");
+        let static_deep = anthropic.rungs[idx].id;
+        let discovered = [DiscoveredModel::new("anthropic", "claude-opus-4-1", true)];
+        let (ladder, _) = catalogue::resolved_ladder_avoiding(
+            anthropic,
+            &discovered,
+            &BTreeMap::new(),
+            &avoid_ids(&["claude-opus-4-1".to_string()]),
+        );
+        assert_ne!(ladder[idx].id, static_deep, "{ladder:?}");
+    }
+
+    #[test]
+    fn the_listing_marks_held_ids_as_candidates_without_a_rung() {
+        let registry = registry_of(vec![
+            model("anthropic", "claude-opus-5"),
+            model("anthropic", "claude-opus-5-5"),
+        ]);
+        set_test_discovered(discovered_models(&registry));
+        set_test_held(&["claude-opus-5-5"]);
+        let rows = list_rows(
+            &CtxConfig::default(),
+            &registry,
+            &effective_prices_from(&PriceCache::default(), None),
+        );
+        let row = |id: &str| rows.iter().find(|row| row.id == id).expect("row");
+        assert_eq!(row("claude-opus-5-5").availability, CANDIDATE);
+        assert_eq!(row("claude-opus-5-5").rung, None);
+        assert_eq!(row("claude-opus-5").availability, AVAILABLE);
+        assert_eq!(row("claude-opus-5").rung.as_deref(), Some("claude-opus-5"));
+        set_test_held(&[]);
+    }
+
+    #[test]
+    fn a_discovered_claude_id_dispatches_in_full_and_static_only_stays_the_alias() {
+        use crate::commands::ctx::handover::{resolve_model, tier_for_model};
+        let cfg = CtxConfig::default();
+        set_test_discovered(Vec::new());
+        assert_eq!(resolve_model("claude", "deep", &cfg).expect("deep"), "opus");
+        observed_ids("anthropic", &["claude-opus-5-5"]);
+        assert_eq!(
+            resolve_model("claude", "deep", &cfg).expect("deep"),
+            "claude-opus-5-5"
+        );
+        assert_eq!(
+            resolve_model("claude", "standard", &cfg).expect("standard"),
+            "sonnet",
+            "nothing concrete is known for sonnet"
+        );
+        // The short name and the dated id still land on the same tier.
+        assert_eq!(tier_for_model("claude", "opus", &cfg), Some("deep"));
+        assert_eq!(
+            tier_for_model("claude", "claude-opus-5-5", &cfg),
+            Some("deep")
+        );
+        // A pin is concrete too.
+        let mut pinned = CtxConfig::default();
+        pinned
+            .models
+            .pin
+            .insert("anthropic.sonnet".into(), "claude-sonnet-5".into());
+        assert_eq!(
+            resolve_model("claude", "standard", &pinned).expect("standard"),
+            "claude-sonnet-5"
+        );
+    }
+
+    #[test]
+    fn the_review_model_below_a_discovered_seat_is_a_full_id_on_the_right_rung() {
+        observed_ids("anthropic", &["claude-opus-5-5", "claude-sonnet-5"]);
+        let anthropic = catalogue::vendor("anthropic").expect("anthropic");
+        let below = catalogue::rung_below(anthropic, Some("fable"));
+        assert_eq!(below, "claude-opus-5-5");
+        let rung = catalogue::rung_of(anthropic, below).expect("rung");
+        assert_eq!(rung.alias, "opus");
+    }
+
+    #[test]
+    fn an_operator_avoiding_a_claude_alias_still_matches_a_dated_rung() {
+        observed_ids("anthropic", &["claude-opus-5-5"]);
+        let warnings = avoid_warnings(
+            &cfg_avoiding(&["opus"]),
+            &registry_of(vec![model("anthropic", "claude-opus-5-5")]),
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("last usable model")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn stale_evidence_triggers_a_refresh_only_while_routing_is_enabled() {
+        let (_tmp, state) = due_state();
+        let mut cfg = CtxConfig::default();
+        cfg.models.discovery = false;
+        cfg.models.price_fetch = false;
+        let now = 10 * 86_400;
+        assert_eq!(count_spawns(&cfg, &state, now), 1, "no evidence yet");
+        write_json(
+            &state.root().join(evidence::EVIDENCE_FILE),
+            &evidence::Evidence {
+                generated_at: now,
+                ..evidence::Evidence::default()
+            },
+        )
+        .expect("evidence");
+        assert_eq!(count_spawns(&cfg, &state, now + 3_600), 0, "fresh");
+        assert_eq!(
+            count_spawns(&cfg, &state, now + 86_400 + 3_600),
+            1,
+            "a day old"
+        );
+        cfg.routing.enabled = false;
+        assert_eq!(
+            count_spawns(&cfg, &state, now + 3 * 86_400),
+            0,
+            "routing off"
+        );
+    }
+
+    #[test]
+    fn the_refresher_writes_evidence_only_while_routing_is_enabled() {
+        let (_tmp, state) = due_state();
+        let mut cfg = CtxConfig::default();
+        cfg.models.discovery = false;
+        cfg.models.price_fetch = false;
+        cfg.routing.enabled = false;
+        refresh(&cfg, &state, 100).expect("refresh");
+        assert!(evidence::load(&state).is_none());
+        cfg.routing.enabled = true;
+        refresh(&cfg, &state, 200).expect("refresh");
+        assert_eq!(evidence::load(&state).map(|e| e.generated_at), Some(200));
     }
 }

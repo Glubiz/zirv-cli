@@ -394,6 +394,9 @@ const MUTATING: &[&str] = &[
     // Spends real model quota: dispatches every candidate through the exec
     // path and writes `<state>/benchmark/<run-id>/` (run.json, results.jsonl).
     "zirv benchmark run",
+    // Spends real model quota like `run`, but unattended and bounded by `[routing]`;
+    // writes the same benchmark store plus `<state>/probe-*` stamps, evidence and promotions.
+    "zirv benchmark auto",
 ];
 
 fn classify(path: &str) -> Option<bool> {

@@ -3,12 +3,21 @@
 //! Every candidate runs solo against a small embedded corpus; the stack is
 //! composed afterwards from per-role scores (see `report`).
 
+mod auto;
 mod corpus;
 mod discover;
 mod report;
 mod run;
 
+pub(crate) use auto::{
+    render_probe_status, spawn_probe_if_due_detached, spawn_probe_if_due_from_env,
+};
+#[cfg(test)]
+pub(crate) use corpus::Role;
+pub(crate) use run::{Row, Status};
+
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 
@@ -65,6 +74,21 @@ enum Command {
         /// Emit one JSON document.
         #[arg(long)]
         json: bool,
+    },
+    /// Probe stale or new models with the deterministic corpus, within the routing budget. Never prompts.
+    Auto {
+        /// Ignore the probe interval (the lock still applies).
+        #[arg(long)]
+        force: bool,
+        /// Print the targets and spend nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit one JSON document.
+        #[arg(long)]
+        json: bool,
+        /// Print nothing; used by the automatic background probe.
+        #[arg(long)]
+        quiet: bool,
     },
     /// Re-render a stored run; the newest when no id is given.
     Report {
@@ -166,6 +190,24 @@ fn execute(
             emit(stdout, json, &plan, &run::render_plan(&plan))?;
             Ok(0)
         }
+        Command::Auto {
+            force,
+            dry_run,
+            json,
+            quiet,
+        } => auto::run(
+            &cfg,
+            env,
+            &auto::Opts {
+                force,
+                dry_run,
+                json,
+                quiet,
+            },
+            python_present,
+            present,
+            None,
+        ),
         Command::Report { run_id, json } => {
             let root = benchmark_root(env)?;
             let dir = run::find_run(&root, run_id.as_deref())?;
@@ -221,11 +263,26 @@ fn run_benchmark(
     plan: &run::Plan,
     timeout_secs: u64,
 ) -> Result<report::Report, String> {
-    // SAFETY: nothing else is running yet; the CLI is single-threaded until the first launch.
-    // Child zirv hooks read their own process env, so the knobs must be set there too.
-    unsafe {
-        for (key, value) in run::CHILD_KNOBS {
-            std::env::set_var(key, value);
+    run_benchmark_with(cfg, env, plan, timeout_secs, false, None).map(|(report, _)| report)
+}
+
+/// An injected launcher replaces the real harness launch, and then the child knobs are not
+/// exported either; the second value is the measured spend (agents and judge) in micro-USD.
+fn run_benchmark_with(
+    cfg: &CtxConfig,
+    env: EnvLookup<'_>,
+    plan: &run::Plan,
+    timeout_secs: u64,
+    quiet: bool,
+    injected: Option<&mut Launcher<'_>>,
+) -> Result<(report::Report, u64), String> {
+    if injected.is_none() {
+        // SAFETY: nothing else is running yet; the CLI is single-threaded until the first launch.
+        // Child zirv hooks read their own process env, so the knobs must be set there too.
+        unsafe {
+            for (key, value) in run::CHILD_KNOBS {
+                std::env::set_var(key, value);
+            }
         }
     }
     let started = chrono::Utc::now();
@@ -251,19 +308,35 @@ fn run_benchmark(
         table: &table,
         timeout_secs,
     };
-    let mut launch = |spec: &run::LaunchSpec| launcher.launch(spec);
+    let mut exec_launch = |spec: &run::LaunchSpec| launcher.launch(spec);
+    let launch: &mut Launcher<'_> = match injected {
+        Some(injected) => injected,
+        None => &mut exec_launch,
+    };
     let rows = run::Runner {
         dir: &dir,
         work: &work,
         python_present: plan.python3,
         git_present: adapters::program_is_present("git"),
-        launch: &mut launch,
-        progress: &mut |line| eprintln!("{line}"),
+        launch,
+        progress: &mut |line| {
+            if !quiet {
+                eprintln!("{line}");
+            }
+        },
     }
     .execute(plan);
     let _ = std::fs::remove_dir_all(&work_root);
-    Ok(report::build(meta, &rows?))
+    let rows = rows?;
+    let spend = rows.iter().fold(0u64, |sum, row| {
+        sum.saturating_add(row.cost_micros.unwrap_or(0))
+            .saturating_add(row.judge_cost_micros.unwrap_or(0))
+    });
+    Ok((report::build(meta, &rows), spend))
 }
+
+/// How one harness run is launched: the real supervised exec path, or a test double.
+type Launcher<'a> = dyn FnMut(&run::LaunchSpec) -> Result<run::Launch, String> + 'a;
 
 /// A filter that names something that cannot run is the caller's mistake, like a bad flag.
 fn usage_error(error: String) -> i32 {
@@ -280,6 +353,41 @@ fn model_listing(cfg: &CtxConfig, env: EnvLookup<'_>) -> Result<models::Listing,
 fn benchmark_root(env: EnvLookup<'_>) -> Result<std::path::PathBuf, String> {
     let state = StateDir::resolve(env).map_err(|e| e.to_string())?;
     Ok(state.root().join("benchmark"))
+}
+
+/// Every stored row of every run under `root` (`<state>/benchmark`) that started at or after
+/// `since` (unix seconds), each stamped with its run's start time. Unreadable runs and torn
+/// lines are skipped, exactly as `load_store` tolerates them.
+pub(crate) fn read_rows_since(root: &Path, since: u64) -> Vec<Row> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.join("run.json").is_file())
+        .collect();
+    dirs.sort();
+    let mut out = Vec::new();
+    for dir in dirs {
+        let Ok((meta, rows)) = run::load_store(&dir) else {
+            continue;
+        };
+        let Some(started) = chrono::DateTime::parse_from_rfc3339(&meta.started_at)
+            .ok()
+            .and_then(|at| u64::try_from(at.timestamp()).ok())
+        else {
+            continue;
+        };
+        if started < since {
+            continue;
+        }
+        out.extend(rows.into_iter().map(|mut row| {
+            row.ts = started;
+            row
+        }));
+    }
+    out
 }
 
 fn emit(

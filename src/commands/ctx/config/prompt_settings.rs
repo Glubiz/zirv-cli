@@ -344,6 +344,59 @@ impl ModelsConfig {
     }
 }
 
+/// Operator-only evidence-driven model routing: the new-model promotion gate, automatic probes
+/// and the router. `enabled = false` restores the pre-routing behaviour exactly.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RoutingConfig {
+    /// Master switch for the promotion gate, the router and canaries.
+    pub enabled: bool,
+    /// Hold a new family version on probation until evidence says it is not worse; false adopts it at once.
+    pub hold_new_models: bool,
+    /// Run automatic synthetic probes.
+    pub probe: bool,
+    /// Hours between probe runs; clamped to at least 24 wherever it is used.
+    pub probe_interval_hours: u64,
+    /// Spend cap per probe run in USD, in (0, 100].
+    pub probe_max_usd: f64,
+    /// A harness is probed only with at least this much headroom in its binding usage window.
+    pub probe_min_headroom_pct: f64,
+    /// Probe harnesses that carry an `[endpoint.<h>]` override (metered spend).
+    pub probe_metered: bool,
+    /// Non-inferiority margin on the 0-1 quality scale, in [0, 0.5].
+    pub tolerance: f64,
+    /// Share of low-risk worker delegations sent to a probation candidate, at most 50.
+    pub canary_pct: u8,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hold_new_models: true,
+            probe: true,
+            probe_interval_hours: 24,
+            probe_max_usd: 2.0,
+            probe_min_headroom_pct: 50.0,
+            probe_metered: false,
+            tolerance: 0.05,
+            canary_pct: 5,
+        }
+    }
+}
+
+impl RoutingConfig {
+    /// Operator file plus `ZIRV_CTX_ROUTING_*` only; `routing.*` is repo-forbidden, so this is the whole truth.
+    pub(crate) fn load_operator_only(env: EnvLookup<'_>) -> CtxResult<Self> {
+        load_operator_section(env, "routing")
+    }
+
+    /// The probe interval in seconds, never below the 24 h floor.
+    pub fn probe_interval_secs(&self) -> u64 {
+        self.probe_interval_hours.max(24).saturating_mul(3600)
+    }
+}
+
 /// Ignorable compaction advice requires both reclaim and context thresholds (#312).
 /// Repos may only raise them to quiet advice; these do not control rot supervision.
 #[derive(Debug, Clone, PartialEq, Deserialize)]

@@ -101,6 +101,7 @@ pub mod reuse;
 pub mod rollover;
 pub mod rot;
 pub mod route;
+pub(crate) mod routing;
 pub mod run_loop;
 pub mod runtime;
 pub mod safety;
@@ -850,6 +851,13 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Exec(_) | CtxVerb::Loop(_) | CtxVerb::Agent(_)
     ) {
         priority::apply_process(priority::posture_for(prompt::PromptRole::Worker));
+    }
+
+    if !matches!(
+        &cli.verb,
+        CtxVerb::Hook(_) | CtxVerb::Statusline(_) | CtxVerb::Mcp(_)
+    ) {
+        crate::commands::benchmark::spawn_probe_if_due_from_env();
     }
 
     let mut out = std::io::stdout();

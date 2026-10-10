@@ -27,7 +27,7 @@ const AUTO_AVOID_LOG_FILE: &str = "model-auto-avoid.jsonl";
 pub const MIN_SAMPLES: usize = 20;
 const WILSON_Z: f64 = 1.96;
 /// Delegation rows by these agents are classifier calls, not tasks.
-const NON_TASK_AGENTS: &[&str] = &["typesafe", "helper"];
+pub(crate) const NON_TASK_AGENTS: &[&str] = &["typesafe", "helper"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
@@ -83,7 +83,7 @@ pub struct Rate {
 }
 
 impl Rate {
-    fn new(k: usize, n: usize) -> Self {
+    pub(crate) fn new(k: usize, n: usize) -> Self {
         if n < MIN_SAMPLES {
             return Self {
                 n,

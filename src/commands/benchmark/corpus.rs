@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
+use crate::commands::ctx::models::evidence::{CellComplexity, RouteRole};
 use crate::commands::ctx::result_schema::extract_json_candidate;
 use crate::commands::ctx::supervise;
 
@@ -65,6 +66,14 @@ impl Role {
             Role::Worker => "worker",
         }
     }
+
+    /// The routing role an untagged task of this role is evidence for.
+    pub fn route_role(self) -> RouteRole {
+        match self {
+            Role::Orchestrator => RouteRole::Orchestrator,
+            Role::Worker => RouteRole::Worker,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -92,11 +101,23 @@ pub enum Grader {
 pub struct Task {
     pub id: String,
     pub role: Role,
+    /// How hard the task is; required so every probe lands in a routing cell.
+    pub complexity: CellComplexity,
+    /// The routing role this task is evidence for when it differs from `role`.
+    #[serde(default)]
+    pub route_role: Option<RouteRole>,
     #[serde(default = "default_judge")]
     pub judge: bool,
     pub prompt: String,
     #[serde(default, rename = "grader")]
     pub graders: Vec<Grader>,
+}
+
+impl Task {
+    /// The routing role this task is evidence for: its explicit `route_role`, else its `role`.
+    pub fn routing_role(&self) -> RouteRole {
+        self.route_role.unwrap_or_else(|| self.role.route_role())
+    }
 }
 
 fn default_judge() -> bool {
@@ -286,7 +307,7 @@ mod tests {
 
     fn task(graders: &str) -> Task {
         let text = format!(
-            "schema = 1\n[[task]]\nid = \"t\"\nrole = \"worker\"\nprompt = \"p\"\n{graders}"
+            "schema = 1\n[[task]]\nid = \"t\"\nrole = \"worker\"\ncomplexity = \"bounded\"\nprompt = \"p\"\n{graders}"
         );
         parse(&text).expect("parses").tasks.remove(0)
     }
@@ -499,19 +520,19 @@ mod tests {
 
     #[test]
     fn parse_rejects_duplicate_ids_graderless_tasks_and_bad_schema() {
-        let dup = "schema = 1\n[[task]]\nid = \"a\"\nrole = \"worker\"\nprompt = \"p\"\n[[task.grader]]\ntype = \"answer_regex\"\npattern = 'x'\n[[task]]\nid = \"a\"\nrole = \"worker\"\nprompt = \"p\"\n[[task.grader]]\ntype = \"answer_regex\"\npattern = 'x'\n";
+        let dup = "schema = 1\n[[task]]\nid = \"a\"\nrole = \"worker\"\ncomplexity = \"bounded\"\nprompt = \"p\"\n[[task.grader]]\ntype = \"answer_regex\"\npattern = 'x'\n[[task]]\nid = \"a\"\nrole = \"worker\"\ncomplexity = \"bounded\"\nprompt = \"p\"\n[[task.grader]]\ntype = \"answer_regex\"\npattern = 'x'\n";
         assert!(parse(dup).unwrap_err().contains("duplicate"));
-        let bare = "schema = 1\n[[task]]\nid = \"a\"\nrole = \"worker\"\nprompt = \"p\"\n";
+        let bare = "schema = 1\n[[task]]\nid = \"a\"\nrole = \"worker\"\ncomplexity = \"bounded\"\nprompt = \"p\"\n";
         assert!(parse(bare).unwrap_err().contains("no grader"));
         assert!(parse("schema = 2\n").unwrap_err().contains("schema"));
-        let bad = "schema = 1\n[[task]]\nid = \"a\"\nrole = \"worker\"\nprompt = \"p\"\n[[task.grader]]\ntype = \"answer_regex\"\npattern = '('\n";
+        let bad = "schema = 1\n[[task]]\nid = \"a\"\nrole = \"worker\"\ncomplexity = \"bounded\"\nprompt = \"p\"\n[[task.grader]]\ntype = \"answer_regex\"\npattern = '('\n";
         assert!(parse(bad).is_err());
     }
 
     #[test]
     fn the_embedded_corpus_is_consistent() {
         let corpus = embedded().expect("embedded corpus parses");
-        assert_eq!(corpus.tasks.len(), 7);
+        assert_eq!(corpus.tasks.len(), 13);
         let mut roles = BTreeSet::new();
         for task in &corpus.tasks {
             roles.insert(task.role);
@@ -524,6 +545,49 @@ mod tests {
                     assert!(files.contains(path.as_str()), "{}: {path}", task.id);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_task_without_a_complexity_is_rejected() {
+        let text = "schema = 1\n[[task]]\nid = \"a\"\nrole = \"worker\"\nprompt = \"p\"\n[[task.grader]]\ntype = \"answer_regex\"\npattern = 'x'\n";
+        assert!(parse(text).unwrap_err().contains("complexity"));
+    }
+
+    #[test]
+    fn a_task_routes_as_its_role_unless_it_names_a_route_role() {
+        let corpus = embedded().expect("embedded corpus parses");
+        let role_of = |id: &str| {
+            corpus
+                .tasks
+                .iter()
+                .find(|task| task.id == id)
+                .map(Task::routing_role)
+        };
+        assert_eq!(role_of("w-read"), Some(RouteRole::Worker));
+        assert_eq!(role_of("o-plan"), Some(RouteRole::Orchestrator));
+        assert_eq!(role_of("o-review"), Some(RouteRole::Reviewer));
+    }
+
+    #[test]
+    fn every_class_the_router_uses_has_at_least_two_tasks() {
+        let corpus = embedded().expect("embedded corpus parses");
+        let count = |role: RouteRole, complexity: CellComplexity| {
+            corpus
+                .tasks
+                .iter()
+                .filter(|task| task.routing_role() == role && task.complexity == complexity)
+                .count()
+        };
+        for (role, complexity) in [
+            (RouteRole::Worker, CellComplexity::Trivial),
+            (RouteRole::Worker, CellComplexity::Bounded),
+            (RouteRole::Worker, CellComplexity::Substantial),
+            (RouteRole::Reviewer, CellComplexity::Bounded),
+            (RouteRole::Orchestrator, CellComplexity::Bounded),
+            (RouteRole::Orchestrator, CellComplexity::Substantial),
+        ] {
+            assert!(count(role, complexity) >= 2, "{role:?} {complexity:?}");
         }
     }
 

@@ -20,6 +20,7 @@ use super::super::pace;
 use super::super::permit::{self, WorkerMode};
 use super::super::policy;
 use super::super::result_schema::{self, Schema};
+use super::super::routing;
 use super::super::state::StateDir;
 use super::super::worktree;
 use super::dashboard::*;
@@ -290,6 +291,125 @@ fn run_goal_bootstrap(
     Ok(usage)
 }
 
+/// `agent_bin` reaches only the adapter it names; any other candidate keeps its own program.
+fn fallback_candidate(
+    name: &str,
+    ctor: fn(Option<&str>) -> Box<dyn AgentAdapter>,
+    bin: Option<&str>,
+) -> Box<dyn AgentAdapter> {
+    let foreign = adapters::agent_bin_names_a_different_adapter(bin, name).is_some();
+    ctor(if foreign { None } else { bin })
+}
+
+/// `auto` with no evidence pick: the default harness, unless that is this seat's own harness
+/// (which a seat may not delegate to) and another enabled, live, not usage-refused harness
+/// exists. Candidates are built the way `resolve_default` builds them: `agent_bin` reaches only
+/// the adapter it names, and presence is skipped only for that adapter.
+fn auto_fallback(
+    args: &mut AgentArgs,
+    cfg: &CtxConfig,
+    env: EnvLookup<'_>,
+    present: &dyn Fn(&str, &str) -> adapters::Liveness,
+    pace_refused: &dyn Fn(&str) -> bool,
+) -> CtxResult<()> {
+    args.name = adapters::resolve_default_with_presence(cfg, present)?
+        .0
+        .name()
+        .to_string();
+    let Some(message) = same_harness_refusal(args, env) else {
+        return Ok(());
+    };
+    let own = args.name.clone();
+    let bin = cfg.agent_bin.as_deref();
+    let other = adapters::ADAPTERS
+        .iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(&own) && cfg.agents.is_enabled(name))
+        .find_map(|(name, ctor)| {
+            let adapter = fallback_candidate(name, *ctor, bin);
+            let uses_bin =
+                bin.is_some() && adapters::agent_bin_names_a_different_adapter(bin, name).is_none();
+            let live = adapter.ready().is_ok()
+                && (uses_bin
+                    || !matches!(
+                        present(name, adapter.program()),
+                        adapters::Liveness::Absent(_)
+                    ))
+                && !pace_refused(name);
+            live.then_some(*name)
+        });
+    match other {
+        Some(name) => {
+            args.name = name.to_string();
+            Ok(())
+        }
+        None => Err(message.into()),
+    }
+}
+
+/// Resolve `zirv agent auto` to a harness and give an unpinned delegation the model evidence
+/// picks, announcing the choice. Returns whether a model was added to `args.flags`.
+fn apply_worker_routing(
+    args: &mut AgentArgs,
+    cfg: &CtxConfig,
+    state: &StateDir,
+    env: EnvLookup<'_>,
+    canary: &mut Option<super::super::attribution::CandidateGuard>,
+) -> CtxResult<bool> {
+    let auto = args.name == routing::AUTO;
+    let own_seat = (env(adapters::SEAT_ROLE_ENV).as_deref() == Some("orchestrator") && !args.force)
+        .then(|| env(adapters::AGENT_ENV))
+        .flatten();
+    let session = super::super::mail::session_identity(env).unwrap_or_default();
+    let pick = routing::route_worker(
+        cfg,
+        state,
+        &routing::WorkerRequest {
+            name: &args.name,
+            prompt: &args.prompt,
+            review: args.task_class == Some(super::super::log::TaskClass::Review),
+            model_pinned: flags_pin_model(&args.flags),
+            session: &session,
+            exclude: own_seat.as_deref(),
+        },
+    );
+    let Some(pick) = pick else {
+        if auto {
+            // No evidence yet: `auto` is the harness a plain run would use.
+            auto_fallback(args, cfg, env, &adapters::liveness_probe, &|harness| {
+                routing::pace_refuses(cfg, state, harness)
+            })?;
+        }
+        return Ok(false);
+    };
+    args.name = pick.harness.clone();
+    if auto && let Some(message) = same_harness_refusal(args, env) {
+        return Err(message.into());
+    }
+    let mut routed = false;
+    if let Some(model) = &pick.model {
+        let adapter = adapters::select(Some(&args.name), &[], cfg)?;
+        let mut flags = adapter.model_args(model);
+        flags.append(&mut args.flags);
+        args.flags = flags;
+        routed = true;
+    }
+    if pick.canary {
+        *canary = super::super::attribution::scope_candidate("canary");
+    }
+    if !args.quiet {
+        eprintln!(
+            "zirv ctx agent: routed to {}{} ({})",
+            pick.harness,
+            pick.model
+                .as_deref()
+                .map(|model| format!(" on {model}"))
+                .unwrap_or_default(),
+            pick.reason
+        );
+    }
+    Ok(routed)
+}
+
 pub fn run_with<W: Write>(
     args: &AgentArgs,
     w: &mut W,
@@ -325,6 +445,11 @@ pub fn run_with<W: Write>(
     super::super::seat::fence(&state)?;
     // Resolve workspace names and skills before allocation so invalid references cannot leave temporary trees.
     let cfg = CtxConfig::load_for_launch(repo, env)?;
+    // Evidence may choose the harness (`auto`) or the model, only where nothing was pinned.
+    // The canary stamp lives only as long as this run.
+    let mut _canary_scope = None;
+    let routed_model =
+        !native && apply_worker_routing(args, &cfg, &state, env, &mut _canary_scope)?;
     let manifest_skills = if let Some(id) = args.manifest_agent.as_deref() {
         let home = env("HOME")
             .or_else(|| env("USERPROFILE"))
@@ -567,7 +692,8 @@ pub fn run_with<W: Write>(
         },
         &mut refresh_flags,
     );
-    let source_model_explicit = flags_pin_model(&args.flags);
+    // A routed model is a default, not a pin: a reroute may still use the target's own policy.
+    let source_model_explicit = flags_pin_model(&args.flags) && !routed_model;
     let bounds = super::super::fallback::TaskBounds {
         tokens: args.budget_tokens,
         tool_calls: args.max_tool_calls,
@@ -1836,6 +1962,144 @@ mod tests {
     use std::path::PathBuf;
 
     use super::super::tests::*;
+
+    #[test]
+    fn auto_without_evidence_avoids_the_seats_own_harness_when_another_is_live() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let cfg = CtxConfig::default();
+        let mut args = args_for(routing::AUTO, "go");
+        auto_fallback(
+            &mut args,
+            &cfg,
+            &|k| env.get(k).cloned(),
+            &adapters::everything_installed(),
+            &|_| false,
+        )
+        .expect("another harness is live");
+        assert_eq!(args.name, "codex");
+
+        let mut args = args_for(routing::AUTO, "go");
+        let err = auto_fallback(
+            &mut args,
+            &cfg,
+            &|k| env.get(k).cloned(),
+            &adapters::only_installed(&["claude"]),
+            &|_| false,
+        )
+        .expect_err("no other harness is installed");
+        assert!(err.to_string().contains("own harness"), "{err}");
+    }
+
+    #[test]
+    fn auto_fallback_skips_a_usage_refused_harness() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let mut args = args_for(routing::AUTO, "go");
+        auto_fallback(
+            &mut args,
+            &CtxConfig::default(),
+            &|k| env.get(k).cloned(),
+            &adapters::everything_installed(),
+            &|harness| harness == "codex",
+        )
+        .expect("another harness is live");
+        assert_ne!(args.name, "codex");
+        assert_ne!(args.name, "claude");
+
+        let mut args = args_for(routing::AUTO, "go");
+        let err = auto_fallback(
+            &mut args,
+            &CtxConfig::default(),
+            &|k| env.get(k).cloned(),
+            &adapters::everything_installed(),
+            &|harness| harness != "claude",
+        )
+        .expect_err("every other harness is usage-refused");
+        assert!(err.to_string().contains("own harness"), "{err}");
+    }
+
+    #[test]
+    fn auto_fallback_does_not_launch_another_adapters_agent_bin() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let bin = Some("/opt/claude/claude");
+        let build = |name: &str| {
+            let (_, ctor) = adapters::ADAPTERS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .expect("adapter");
+            fallback_candidate(name, *ctor, bin)
+        };
+        assert_eq!(build("claude").program(), "/opt/claude/claude");
+        assert_ne!(build("codex").program(), "/opt/claude/claude");
+
+        // A foreign candidate keeps its own program, so it must be present to be chosen.
+        let cfg = CtxConfig {
+            agent_bin: bin.map(str::to_string),
+            ..CtxConfig::default()
+        };
+        let mut args = args_for(routing::AUTO, "go");
+        auto_fallback(
+            &mut args,
+            &cfg,
+            &|k| env.get(k).cloned(),
+            &adapters::everything_installed(),
+            &|_| false,
+        )
+        .expect("codex is built with its own program and is installed");
+        assert_eq!(args.name, "codex");
+    }
+
+    #[test]
+    fn auto_fallback_with_agent_bin_still_requires_a_foreign_candidate_present() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let cfg = CtxConfig {
+            agent_bin: Some("/opt/claude/claude".to_string()),
+            ..CtxConfig::default()
+        };
+        let mut args = args_for(routing::AUTO, "go");
+        let err = auto_fallback(
+            &mut args,
+            &cfg,
+            &|k| env.get(k).cloned(),
+            &adapters::only_installed(&["claude"]),
+            &|_| false,
+        )
+        .expect_err("codex is absent and agent_bin does not reach it");
+        assert!(err.to_string().contains("own harness"), "{err}");
+    }
+
+    #[test]
+    fn auto_fallback_skips_presence_for_the_candidate_an_agent_bin_with_arguments_names() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let cfg = CtxConfig {
+            agent_bin: Some("/opt/codex/codex --profile work".to_string()),
+            ..CtxConfig::default()
+        };
+        let mut args = args_for(routing::AUTO, "go");
+        auto_fallback(
+            &mut args,
+            &cfg,
+            &|k| env.get(k).cloned(),
+            &adapters::only_installed(&["claude"]),
+            &|_| false,
+        )
+        .expect("agent_bin reaches codex, so codex needs no PATH presence");
+        assert_eq!(args.name, "codex");
+    }
 
     /// Issue #358 (T9): usage headroom never blocks a spawn -- renamed from
     /// `only_a_refusal_is_overridable_and_only_by_force`, which used to pin

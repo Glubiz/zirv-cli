@@ -56,6 +56,8 @@ pub fn provider_for_usage_readout(cfg: &CtxConfig) -> &'static str {
 pub(crate) struct ReviewModelChoice {
     pub(crate) model: String,
     pub(crate) configured: bool,
+    /// Evidence, not the below-the-seat default, picked the model.
+    pub(crate) routed: bool,
 }
 
 /// The reviewer launch uses this resolved model, matching the roster guidance.
@@ -73,6 +75,14 @@ pub(crate) fn resolve_review_model(
         return ReviewModelChoice {
             model: model.to_string(),
             configured: true,
+            routed: false,
+        };
+    }
+    if let Some(model) = super::super::routing::route_reviewer(cfg, name) {
+        return ReviewModelChoice {
+            model,
+            configured: false,
+            routed: true,
         };
     }
     ReviewModelChoice {
@@ -80,6 +90,7 @@ pub(crate) fn resolve_review_model(
             .review_model_below(cfg.chat.model.as_deref())
             .to_string(),
         configured: false,
+        routed: false,
     }
 }
 
@@ -357,6 +368,90 @@ mod tests {
                 "{name}: an explicit AgentTask::model pin must win over a mapped tier, got {argv:?}"
             );
         }
+    }
+
+    fn routed_evidence() -> crate::commands::ctx::routing::TestEvidence {
+        use crate::commands::ctx::models::evidence::RouteRole;
+        use crate::commands::ctx::routing::fixtures::{cell, evidence};
+        crate::commands::ctx::routing::TestEvidence::set(evidence(vec![
+            cell(
+                "claude",
+                "routed-worker",
+                RouteRole::Worker,
+                5,
+                0.9,
+                Some(100),
+            ),
+            cell(
+                "claude",
+                "routed-reviewer",
+                RouteRole::Reviewer,
+                5,
+                0.9,
+                Some(100),
+            ),
+        ]))
+    }
+
+    /// Evidence picks a workflow seat's model only when the task, the tier map and the
+    /// operator all left it open.
+    #[test]
+    fn dispatch_agent_routes_the_model_only_when_nothing_pins_one() {
+        use crate::commands::workflow::agents::{AgentTask, ModelTier};
+
+        let _evidence = routed_evidence();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let adapter =
+            select(Some("claude"), &[], &super::super::tests::permissive_cfg()).expect("claude");
+        let manifest = tiered_probe_manifest(ModelTier::Standard);
+        let task = |model: Option<&str>| AgentTask {
+            prompt: "do the thing".to_string(),
+            repo: repo.path().to_path_buf(),
+            model: model.map(str::to_string),
+        };
+        let model_of = |task: &AgentTask| {
+            argv_model(&flatten_command(
+                adapter.dispatch_agent(&manifest, task).expect("dispatch"),
+            ))
+            .map(str::to_string)
+        };
+
+        assert_eq!(model_of(&task(None)).as_deref(), Some("routed-worker"));
+        assert_eq!(
+            model_of(&task(Some("pinned-model"))).as_deref(),
+            Some("pinned-model"),
+            "an explicit task model is never rerouted"
+        );
+
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[model_tiers.claude]\nstandard = \"mapped-model\"\n",
+        )
+        .expect("write home ctx.toml");
+        assert_eq!(
+            model_of(&task(None)).as_deref(),
+            Some("mapped-model"),
+            "a [model_tiers] entry is never rerouted"
+        );
+    }
+
+    #[test]
+    fn the_review_model_is_routed_unless_review_is_configured() {
+        let _evidence = routed_evidence();
+        let mut cfg = super::super::tests::permissive_cfg();
+        let adapter = select(Some("claude"), &[], &cfg).expect("claude");
+
+        let choice = resolve_review_model(&cfg, "claude", adapter.as_ref());
+        assert_eq!(choice.model, "routed-reviewer");
+        assert!(choice.routed && !choice.configured);
+
+        cfg.review.claude = Some("operator-review".to_string());
+        let choice = resolve_review_model(&cfg, "claude", adapter.as_ref());
+        assert_eq!(choice.model, "operator-review");
+        assert!(choice.configured && !choice.routed);
     }
 
     /// Track C (#383): a stand-in for an upcoming multi-provider adapter

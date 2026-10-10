@@ -43,6 +43,38 @@ fn is_valid_id(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
 }
 
+thread_local! {
+    static RUN_CANDIDATE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Holds a candidate id (the routing canary) for the one run that claimed it, used when the
+/// env names none. In-process callers run several delegations per process, so the claim is
+/// thread-local and ends when this guard drops.
+#[must_use = "the candidate lasts only while the guard is alive"]
+pub(crate) struct CandidateGuard {
+    previous: Option<String>,
+}
+
+impl Drop for CandidateGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        RUN_CANDIDATE.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+pub(crate) fn scope_candidate(candidate: &str) -> Option<CandidateGuard> {
+    if !is_valid_id(candidate) {
+        return None;
+    }
+    let previous = RUN_CANDIDATE.with(|slot| slot.replace(Some(candidate.to_string())));
+    Some(CandidateGuard { previous })
+}
+
+fn process_candidate() -> Option<String> {
+    RUN_CANDIDATE.with(|slot| slot.borrow().clone())
+}
+
 /// Campaign/candidate/trial/logical-task ids for the autoresearch runner
 /// (#802), read from `ZIRV_ATTR_CAMPAIGN|CANDIDATE|TRIAL|TASK`. Serializes
 /// only the fields that are set (`is_empty` -> nothing at all), so an
@@ -71,7 +103,11 @@ impl Attribution {
     /// does not match [`is_valid_id`]. Best-effort by construction: there is
     /// no failure mode other than "this field is unset".
     pub fn from_env() -> Self {
-        Self::from_lookup(|key| std::env::var(key).ok())
+        let mut attribution = Self::from_lookup(|key| std::env::var(key).ok());
+        if attribution.candidate.is_none() {
+            attribution.candidate = process_candidate();
+        }
+        attribution
     }
 
     pub(crate) fn from_lookup(env: impl Fn(&str) -> Option<String>) -> Self {
@@ -873,6 +909,15 @@ pub fn run_spend(args: &SpendArgs, writer: &mut impl Write) -> CtxResult<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_canary_candidate_does_not_outlive_its_run() {
+        {
+            let _run = scope_candidate("canary");
+            assert_eq!(process_candidate().as_deref(), Some("canary"));
+        }
+        assert_eq!(process_candidate(), None, "the next run must be unstamped");
+    }
 
     fn table() -> PriceTable {
         let mut models = BTreeMap::new();
