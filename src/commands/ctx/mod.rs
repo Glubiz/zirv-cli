@@ -101,6 +101,7 @@ pub mod reuse;
 pub mod rollover;
 pub mod rot;
 pub mod route;
+pub(crate) mod routing;
 pub mod run_loop;
 pub mod runtime;
 pub mod safety;

@@ -209,6 +209,7 @@ pub fn run(args: &ModelsArgs, w: &mut dyn Write) -> CtxResult<i32> {
         }
         scorecard::render(&card, w)?;
         promotion::render(&promotions, &cfg.routing, w)?;
+        write!(w, "{}", super::routing::render_routes(&cfg, &state))?;
         w.write_all(
             crate::commands::benchmark::render_probe_status(&state, &cfg, state::now_secs())
                 .as_bytes(),

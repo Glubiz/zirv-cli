@@ -43,6 +43,22 @@ fn is_valid_id(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
 }
 
+/// A candidate id this process claimed for itself (the routing canary), used when the env
+/// names none. One delegation runs per process, so this never crosses runs.
+static PROCESS_CANDIDATE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub(crate) fn set_process_candidate(candidate: &str) {
+    if is_valid_id(candidate)
+        && let Ok(mut slot) = PROCESS_CANDIDATE.lock()
+    {
+        *slot = Some(candidate.to_string());
+    }
+}
+
+fn process_candidate() -> Option<String> {
+    PROCESS_CANDIDATE.lock().ok()?.clone()
+}
+
 /// Campaign/candidate/trial/logical-task ids for the autoresearch runner
 /// (#802), read from `ZIRV_ATTR_CAMPAIGN|CANDIDATE|TRIAL|TASK`. Serializes
 /// only the fields that are set (`is_empty` -> nothing at all), so an
@@ -71,7 +87,11 @@ impl Attribution {
     /// does not match [`is_valid_id`]. Best-effort by construction: there is
     /// no failure mode other than "this field is unset".
     pub fn from_env() -> Self {
-        Self::from_lookup(|key| std::env::var(key).ok())
+        let mut attribution = Self::from_lookup(|key| std::env::var(key).ok());
+        if attribution.candidate.is_none() {
+            attribution.candidate = process_candidate();
+        }
+        attribution
     }
 
     pub(crate) fn from_lookup(env: impl Fn(&str) -> Option<String>) -> Self {

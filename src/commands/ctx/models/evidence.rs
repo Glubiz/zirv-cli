@@ -115,7 +115,6 @@ pub struct Evidence {
 impl Evidence {
     /// The cell for exactly this key, else the complexity-`any` rollup of the same
     /// (harness, model, role).
-    #[allow(dead_code)] // read by the router, which lands after the evidence store
     pub fn cell(
         &self,
         harness: &str,
