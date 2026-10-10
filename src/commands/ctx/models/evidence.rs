@@ -309,14 +309,28 @@ fn max_at(slot: &mut Option<u64>, at: u64) {
     *slot = Some(slot.map_or(at, |old| old.max(at)));
 }
 
+/// Whether a row shows the model actually ran the task. A failed row counts only when it
+/// produced output or hung until the supervisor's timeout or stall exit; a failure without
+/// either (quota, rate limit, launch failure) never ran. The one definition shared by
+/// [`quality`] and the probe's availability outcome.
+pub(crate) fn row_ran(row: &Row) -> bool {
+    match row.status {
+        Status::Failed => {
+            row.output_tokens > 0
+                || matches!(row.exit_code, Some(exec::EXIT_TIMEOUT | exec::EXIT_STALLED))
+        }
+        Status::Ok => true,
+        Status::Skipped => false,
+    }
+}
+
 /// The existing benchmark composite: correctness, or the mean of correctness and judge/10. A
 /// failed run that produced output, or that hung until the supervisor's timeout or stall exit,
 /// scores 0. A failed run with no output that ended any other way never ran the task (quota,
 /// rate limit, launch failure), and a run with nothing graded: neither has a quality.
 fn quality(row: &Row) -> Option<f64> {
     if row.status == Status::Failed {
-        let hung = matches!(row.exit_code, Some(exec::EXIT_TIMEOUT | exec::EXIT_STALLED));
-        return (row.output_tokens > 0 || hung).then_some(0.0);
+        return row_ran(row).then_some(0.0);
     }
     let correctness = row.correctness?;
     Some(match row.judge_score {
@@ -740,6 +754,23 @@ mod tests {
         let quick = compute(&[failed(1), ok], &[], &[], &table, NOW);
         let stats = &quick.cells[0].synthetic;
         assert_eq!((stats.n, stats.mean), (1, Some(1.0)));
+    }
+
+    #[test]
+    fn a_failed_row_ran_exactly_when_evidence_scores_it() {
+        for (output_tokens, exit_code) in [
+            (0, Some(1)),
+            (0, None),
+            (7, Some(1)),
+            (0, Some(exec::EXIT_TIMEOUT)),
+            (0, Some(exec::EXIT_STALLED)),
+        ] {
+            let mut failed = row("claude", "m", CellComplexity::Any, 1.0);
+            failed.status = Status::Failed;
+            failed.output_tokens = output_tokens;
+            failed.exit_code = exit_code;
+            assert_eq!(row_ran(&failed), quality(&failed).is_some(), "{failed:?}");
+        }
     }
 
     #[test]

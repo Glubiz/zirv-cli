@@ -304,7 +304,7 @@ fn fallback_candidate(
 /// `auto` with no evidence pick: the default harness, unless that is this seat's own harness
 /// (which a seat may not delegate to) and another enabled, live, not usage-refused harness
 /// exists. Candidates are built the way `resolve_default` builds them: `agent_bin` reaches only
-/// the adapter it names, and presence is not consulted while it is set.
+/// the adapter it names, and presence is skipped only for that adapter.
 fn auto_fallback(
     args: &mut AgentArgs,
     cfg: &CtxConfig,
@@ -326,8 +326,9 @@ fn auto_fallback(
         .filter(|(name, _)| !name.eq_ignore_ascii_case(&own) && cfg.agents.is_enabled(name))
         .find_map(|(name, ctor)| {
             let adapter = fallback_candidate(name, *ctor, bin);
+            let uses_bin = bin.is_some_and(|b| adapter.program() == b);
             let live = adapter.ready().is_ok()
-                && (bin.is_some()
+                && (uses_bin
                     || !matches!(
                         present(name, adapter.program()),
                         adapters::Liveness::Absent(_)
@@ -2038,7 +2039,7 @@ mod tests {
         assert_eq!(build("claude").program(), "/opt/claude/claude");
         assert_ne!(build("codex").program(), "/opt/claude/claude");
 
-        // With agent_bin set, presence is not consulted, as in `resolve_default`.
+        // A foreign candidate keeps its own program, so it must be present to be chosen.
         let cfg = CtxConfig {
             agent_bin: bin.map(str::to_string),
             ..CtxConfig::default()
@@ -2048,11 +2049,33 @@ mod tests {
             &mut args,
             &cfg,
             &|k| env.get(k).cloned(),
+            &adapters::everything_installed(),
+            &|_| false,
+        )
+        .expect("codex is built with its own program and is installed");
+        assert_eq!(args.name, "codex");
+    }
+
+    #[test]
+    fn auto_fallback_with_agent_bin_still_requires_a_foreign_candidate_present() {
+        let env = env_map(&[
+            (adapters::SEAT_ROLE_ENV, "orchestrator"),
+            (adapters::AGENT_ENV, "claude"),
+        ]);
+        let cfg = CtxConfig {
+            agent_bin: Some("/opt/claude/claude".to_string()),
+            ..CtxConfig::default()
+        };
+        let mut args = args_for(routing::AUTO, "go");
+        let err = auto_fallback(
+            &mut args,
+            &cfg,
+            &|k| env.get(k).cloned(),
             &adapters::only_installed(&["claude"]),
             &|_| false,
         )
-        .expect("codex is built with its own program");
-        assert_eq!(args.name, "codex");
+        .expect_err("codex is absent and agent_bin does not reach it");
+        assert!(err.to_string().contains("own harness"), "{err}");
     }
 
     /// Issue #358 (T9): usage headroom never blocks a spawn -- renamed from

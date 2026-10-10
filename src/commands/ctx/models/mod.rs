@@ -598,6 +598,28 @@ pub(crate) fn models_dev_only_ids(registry: &Registry) -> BTreeSet<String> {
         .collect()
 }
 
+/// Run `f` holding the refresher's lock, so a read-modify-write of registry.json,
+/// promotions.json or evidence.json cannot interleave with `models refresh`, which holds it from
+/// load to write. Retries until `wait` has passed; `None` when the lock stayed busy.
+pub(crate) fn with_refresh_lock<T>(
+    state: &StateDir,
+    wait: std::time::Duration,
+    f: impl FnOnce() -> T,
+) -> Option<T> {
+    let _ = std::fs::create_dir_all(state.root());
+    let path = state.root().join(REFRESH_LOCK_FILE);
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if let Ok(_lock) = state::try_acquire_lock(&path) {
+            return Some(f());
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
 /// Mark ids a probe run proved runnable as available on this account.
 pub(crate) fn mark_probe_available(
     state: &StateDir,
@@ -2101,6 +2123,20 @@ mod tests {
         let cfg = CtxConfig::default();
         let _held = state::try_acquire_lock(&state.root().join(REFRESH_LOCK_FILE)).expect("lock");
         assert_eq!(count_spawns(&cfg, &state, 10 * 86_400), 0);
+    }
+
+    #[test]
+    fn the_probe_bookkeeping_waits_for_the_refresh_lock_and_gives_up_when_it_stays_held() {
+        let (_tmp, state) = due_state();
+        let zero = std::time::Duration::ZERO;
+        assert_eq!(with_refresh_lock(&state, zero, || 7), Some(7));
+        let _held = state::try_acquire_lock(&state.root().join(REFRESH_LOCK_FILE)).expect("lock");
+        let ran = std::cell::Cell::new(false);
+        let skipped = with_refresh_lock(&state, std::time::Duration::from_millis(300), || {
+            ran.set(true);
+        });
+        assert_eq!(skipped, None);
+        assert!(!ran.get());
     }
 
     #[test]

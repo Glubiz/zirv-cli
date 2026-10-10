@@ -87,6 +87,10 @@ pub struct Promotions {
     /// first run, which is what makes that run a bootstrap.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_family_baseline: Option<BTreeSet<String>>,
+    /// Whether the models.dev catalogue has been baselined: set at the bootstrap when it was
+    /// already in the registry, else the first time it appears (a bootstrap with
+    /// `price_fetch = false` baselines only local ids).
+    pub models_dev_baselined: bool,
     /// Known-family versions newer than the incumbent that only models.dev lists, by id.
     pub unverified: BTreeMap<String, UnverifiedState>,
 }
@@ -98,6 +102,8 @@ struct NewFamilyInput<'a> {
     /// False while the existence source has not been read yet, so the bootstrap waits for it
     /// instead of baselining only the local models.
     pub ready: bool,
+    /// Whether the registry holds any models.dev-sourced model.
+    pub models_dev: bool,
     /// Normalized ids whose only registry source is models.dev (never seen on this account).
     pub models_dev_only: &'a BTreeSet<String>,
 }
@@ -173,7 +179,7 @@ fn update_with(
     input: &NewFamilyInput<'_>,
 ) -> Promotions {
     let gate = cfg.enabled && cfg.hold_new_models;
-    let (new_families, new_family_baseline) =
+    let (new_families, new_family_baseline, models_dev_baselined) =
         update_new_families(prev, discovered, evidence, gate, input, now);
     let mut families = prev.families.clone();
     for (key, available) in available_by_family(discovered) {
@@ -225,6 +231,7 @@ fn update_with(
         families,
         new_families,
         new_family_baseline,
+        models_dev_baselined,
         unverified,
     }
 }
@@ -333,18 +340,44 @@ fn update_new_families(
     gate: bool,
     input: &NewFamilyInput<'_>,
     now: u64,
-) -> (BTreeMap<String, NewFamilyState>, Option<BTreeSet<String>>) {
+) -> (
+    BTreeMap<String, NewFamilyState>,
+    Option<BTreeSet<String>>,
+    bool,
+) {
     if !gate {
-        return (BTreeMap::new(), prev.new_family_baseline.clone());
+        return (
+            BTreeMap::new(),
+            prev.new_family_baseline.clone(),
+            prev.models_dev_baselined,
+        );
     }
     if !input.ready {
-        return (prev.new_families.clone(), prev.new_family_baseline.clone());
+        return (
+            prev.new_families.clone(),
+            prev.new_family_baseline.clone(),
+            prev.models_dev_baselined,
+        );
     }
     let seen = unknown_family_models(discovered);
     let Some(mut baseline) = prev.new_family_baseline.clone() else {
         // Bootstrap: everything known now is the existing catalogue, not a newcomer.
-        return (BTreeMap::new(), Some(seen.keys().cloned().collect()));
+        return (
+            BTreeMap::new(),
+            Some(seen.keys().cloned().collect()),
+            input.models_dev,
+        );
     };
+    let mut models_dev_baselined = prev.models_dev_baselined;
+    if !models_dev_baselined && input.models_dev {
+        // The bootstrap saw only local ids; the catalogue arriving now is existing, not new.
+        baseline.extend(
+            seen.keys()
+                .filter(|id| input.models_dev_only.contains(*id))
+                .cloned(),
+        );
+        models_dev_baselined = true;
+    }
     let mut candidates = prev.new_families.clone();
     candidates.retain(|id, _| seen.contains_key(id));
     for (id, (vendor, family, _)) in &seen {
@@ -384,7 +417,7 @@ fn update_new_families(
             candidate.status = NewFamilyStatus::Eligible;
         }
     }
-    (candidates, Some(baseline))
+    (candidates, Some(baseline), models_dev_baselined)
 }
 
 /// Apply one probe run's availability findings: `(model id, ran)`, where a model that never
@@ -446,6 +479,17 @@ pub fn new_family_probation(promotions: &Promotions, vendor: &str) -> Vec<String
         .collect();
     out.sort_by(|a, b| b.cmp(a));
     out.into_iter().map(|(_, id)| id).collect()
+}
+
+/// New-family candidates that earned enough synthetic samples, for `vendor`: re-probed when
+/// stale or thin so the router keeps seeing them.
+pub fn new_family_eligible(promotions: &Promotions, vendor: &str) -> Vec<String> {
+    promotions
+        .new_families
+        .iter()
+        .filter(|(_, c)| c.vendor == vendor && c.status == NewFamilyStatus::Eligible)
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 fn gate_family(
@@ -640,20 +684,22 @@ pub(crate) fn refresh_with(
         .filter_map(|model| Some((model.id.clone(), model.released_at?)))
         .collect();
     let models_dev_only = super::models_dev_only_ids(registry);
+    let models_dev = registry
+        .models
+        .values()
+        .any(|model| model.sources.iter().any(|s| s == super::MODELS_DEV_SOURCE));
     let input = NewFamilyInput {
         released: &released,
         models_dev_only: &models_dev_only,
+        models_dev,
         // The first bootstrap waits for the existence source, so the whole catalogue is baseline.
-        ready: !cfg.models.price_fetch
-            || registry
-                .models
-                .values()
-                .any(|model| model.sources.iter().any(|s| s == super::MODELS_DEV_SOURCE)),
+        ready: !cfg.models.price_fetch || models_dev,
     };
     let next = update_with(&prev, &discovered, &evidence, &cfg.routing, now, &input);
     if next.families != prev.families
         || next.new_families != prev.new_families
         || next.new_family_baseline != prev.new_family_baseline
+        || next.models_dev_baselined != prev.models_dev_baselined
         || next.unverified != prev.unverified
     {
         write_json(&state.root().join(PROMOTIONS_FILE), &next)?;
@@ -770,6 +816,7 @@ mod tests {
         let input = NewFamilyInput {
             released: &BTreeMap::new(),
             ready: true,
+            models_dev: false,
             models_dev_only: &BTreeSet::new(),
         };
         update_with(prev, discovered, evidence, cfg, now, &input)
@@ -1063,6 +1110,7 @@ mod tests {
         let input = NewFamilyInput {
             released,
             ready: true,
+            models_dev: false,
             models_dev_only: &BTreeSet::new(),
         };
         update_with(prev, &found(ids), evidence, &cfg(), at, &input)
@@ -1115,6 +1163,7 @@ mod tests {
         let input = NewFamilyInput {
             released: &none,
             ready: false,
+            models_dev: false,
             models_dev_only: &BTreeSet::new(),
         };
         let waiting = update_with(
@@ -1127,6 +1176,47 @@ mod tests {
         );
         assert_eq!(waiting.new_family_baseline, None);
         assert!(waiting.new_families.is_empty());
+    }
+
+    #[test]
+    fn enabling_models_dev_after_a_local_bootstrap_baselines_its_catalogue() {
+        let none = BTreeMap::new();
+        let boot = step_new(
+            &Promotions::default(),
+            &[OLD],
+            &none,
+            &Evidence::default(),
+            NOW,
+        );
+        assert!(!boot.models_dev_baselined);
+        let catalogue_ids = ["claude-bel-1", "claude-bel-2", "claude-bel-3"];
+        let only: BTreeSet<String> = catalogue_ids.iter().map(|id| (*id).to_string()).collect();
+        let step_dev = |prev: &Promotions, extra: &[&str], at: u64| {
+            let mut discovered = found(&[OLD]);
+            discovered.extend(
+                catalogue_ids
+                    .iter()
+                    .chain(extra)
+                    .map(|id| DiscoveredModel::new("anthropic", *id, false)),
+            );
+            let mut only = only.clone();
+            only.extend(extra.iter().map(|id| (*id).to_string()));
+            let input = NewFamilyInput {
+                released: &BTreeMap::new(),
+                ready: true,
+                models_dev: true,
+                models_dev_only: &only,
+            };
+            update_with(prev, &discovered, &Evidence::default(), &cfg(), at, &input)
+        };
+        let enabled = step_dev(&boot, &[], NOW + 1);
+        assert!(enabled.new_families.is_empty());
+        assert!(enabled.models_dev_baselined);
+        let later = step_dev(&enabled, &["claude-bel-4"], NOW + 2);
+        assert_eq!(
+            held_ids(&later),
+            BTreeSet::from(["claude-bel-4".to_string()])
+        );
     }
 
     #[test]
@@ -1266,6 +1356,7 @@ mod tests {
         let input = NewFamilyInput {
             released: &BTreeMap::new(),
             ready: true,
+            models_dev: false,
             models_dev_only: &only,
         };
         update_with(prev, &discovered, &Evidence::default(), &cfg(), at, &input)
@@ -1281,6 +1372,7 @@ mod tests {
         let input = NewFamilyInput {
             released: &BTreeMap::new(),
             ready: true,
+            models_dev: false,
             models_dev_only: &BTreeSet::from([MYTHOS6.to_string()]),
         };
         let none = update_with(

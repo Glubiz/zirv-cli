@@ -30,6 +30,9 @@ const ATTEMPT_BACKOFF_SECS: u64 = 3600;
 /// A model whose synthetic evidence is older than this is probed again.
 const STALE_SECS: u64 = 7 * 24 * 3600;
 const MAX_PER_HARNESS: usize = 4;
+/// How long the detached probe waits for `models refresh` to release its lock before skipping
+/// the post-run bookkeeping.
+const BOOKKEEPING_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub(crate) struct Opts {
     pub force: bool,
@@ -161,7 +164,7 @@ struct HarnessInput {
     /// Probation candidates, newest first.
     probation: Vec<String>,
     rejected: Vec<String>,
-    /// Incumbents, then the resolved ladder.
+    /// Incumbents, the resolved ladder, then eligible new-family ids.
     ladder: Vec<String>,
 }
 
@@ -284,6 +287,9 @@ fn gather(
         let rungs = catalogue::vendor(vendor)
             .map(|vendor| models::ladder_for(cfg, vendor))
             .unwrap_or_default();
+        // Eligible new-family ids ride the ladder tier: their synthetic cells age out of the
+        // evidence window like any other, and the router drops a model that falls below
+        // MIN_SYNTH.
         let ladder = families()
             .map(|family| family.incumbent.clone())
             .chain(
@@ -291,6 +297,7 @@ fn gather(
                     .iter()
                     .map(|rung| catalogue::normalize_id(&rung.id).to_lowercase()),
             )
+            .chain(promotion::new_family_eligible(promotions, vendor))
             .collect();
         out.push(HarnessInput {
             harness: (*name).to_string(),
@@ -417,38 +424,43 @@ pub(crate) fn run(
         Err(error) => (None, 0, format!("run failed: {error}")),
     };
     let refreshed = state::now_secs();
-    if let Some(run_id) = &run_id {
-        record_availability(&state, env, &promotions, run_id, refreshed);
-    }
-    if let Err(error) = evidence::refresh(&state, cfg, refreshed) {
-        outcome = format!("{outcome}; evidence refresh failed: {error}");
-    } else if let Err(error) = promotion::refresh(&state, cfg, refreshed) {
-        outcome = format!("{outcome}; promotion refresh failed: {error}");
+    // Under the refresher's lock: these read-modify-write the files `models refresh` writes.
+    let bookkeeping = models::with_refresh_lock(&state, BOOKKEEPING_LOCK_WAIT, || {
+        if let Some(run_id) = &run_id {
+            record_availability(&state, env, &promotions, run_id, refreshed);
+        }
+        if let Err(error) = evidence::refresh(&state, cfg, refreshed) {
+            Some(format!("evidence refresh failed: {error}"))
+        } else if let Err(error) = promotion::refresh(&state, cfg, refreshed) {
+            Some(format!("promotion refresh failed: {error}"))
+        } else {
+            None
+        }
+    });
+    match bookkeeping {
+        Some(Some(failure)) => outcome = format!("{outcome}; {failure}"),
+        Some(None) => {}
+        None => {
+            outcome = format!(
+                "{outcome}; availability and evidence not recorded: models refresh held its lock"
+            );
+        }
     }
     let done = record(&outcome, run_id, spend);
     append_log(&state, &done);
     emit(opts, &done, plan.agent_runs)
 }
 
-/// Whether a row shows the model actually ran: it succeeded, or spent tokens or money.
-fn row_ran(row: &Row) -> bool {
-    row.status == Status::Ok
-        || row.input_tokens > 0
-        || row.output_tokens > 0
-        || row.cache_creation_input_tokens > 0
-        || row.cache_read_input_tokens > 0
-        || row.cost_micros.is_some_and(|cost| cost > 0)
-}
-
-/// For each of `candidates` (normalized ids) that has rows in `rows`: whether any row ran. A
-/// candidate whose rows all failed without output never ran on this account. Skipped rows say
+/// For each of `candidates` (normalized ids) that has rows in `rows`: whether any row ran, by
+/// the same definition evidence counts samples with ([`evidence::row_ran`]). A candidate whose
+/// rows all failed without output or a hang never ran on this account. Skipped rows say
 /// nothing. Sorted by id.
 fn probe_outcomes(rows: &[Row], candidates: &BTreeSet<String>) -> Vec<(String, bool)> {
     let mut seen: BTreeMap<String, bool> = BTreeMap::new();
     for row in rows.iter().filter(|row| row.status != Status::Skipped) {
         let id = catalogue::normalize_id(row.candidate_label()).to_lowercase();
         if candidates.contains(&id) {
-            *seen.entry(id).or_insert(false) |= row_ran(row);
+            *seen.entry(id).or_insert(false) |= evidence::row_ran(row);
         }
     }
     seen.into_iter().collect()
@@ -816,12 +828,18 @@ mod tests {
             row("claude-bel-3", Status::Failed, 40),
             row("claude-bel-4", Status::Skipped, 0),
             row("claude-opus-5", Status::Failed, 0),
+            {
+                let mut hung = row("claude-bel-5", Status::Failed, 0);
+                hung.exit_code = Some(crate::commands::ctx::exec::EXIT_TIMEOUT);
+                hung
+            },
         ];
         let candidates: BTreeSet<String> = [
             "claude-bel-1",
             "claude-bel-2",
             "claude-bel-3",
             "claude-bel-4",
+            "claude-bel-5",
         ]
         .iter()
         .map(|id| (*id).to_string())
@@ -832,8 +850,52 @@ mod tests {
                 ("claude-bel-1".to_string(), false),
                 ("claude-bel-2".to_string(), true),
                 ("claude-bel-3".to_string(), true),
+                ("claude-bel-5".to_string(), true),
             ]
         );
+    }
+
+    #[test]
+    fn eligible_new_family_ids_are_reprobed_when_stale_or_thin() {
+        let mut promotions = Promotions::default();
+        for (id, status) in [
+            ("claude-bel-1", promotion::NewFamilyStatus::Eligible),
+            ("claude-bel-2", promotion::NewFamilyStatus::Eligible),
+            ("claude-bel-3", promotion::NewFamilyStatus::Unavailable),
+        ] {
+            promotions.new_families.insert(
+                id.to_string(),
+                promotion::NewFamilyState {
+                    vendor: "anthropic".into(),
+                    family: "bel".into(),
+                    first_seen: 1,
+                    status,
+                    unavailable_until: None,
+                },
+            );
+        }
+        let fixture = Fixture::new();
+        let inputs = gather(
+            &fixture.cfg,
+            &fixture.state,
+            NOW,
+            &adapters::only_installed(&["claude"]),
+            &promotions,
+        );
+        let claude = inputs.iter().find(|i| i.harness == "claude").unwrap();
+        assert!(claude.ladder.iter().any(|m| m == "claude-bel-1"));
+        assert!(!claude.ladder.iter().any(|m| m == "claude-bel-3"));
+        let evidence = evidence_of(
+            "claude",
+            &[
+                ("claude-bel-1", 9, NOW - DAY),
+                ("claude-bel-2", 9, NOW - 8 * DAY),
+            ],
+        );
+        let mut only_bel = claude.clone();
+        only_bel.ladder.retain(|m| m.starts_with("claude-bel"));
+        let (targets, _) = select_targets(&routing(24), &[only_bel], &evidence, NOW);
+        assert_eq!(models_of(&targets), vec!["claude-bel-2"]);
     }
 
     #[test]
