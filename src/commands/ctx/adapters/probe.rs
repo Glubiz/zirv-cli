@@ -405,17 +405,48 @@ fn known_install_roots(adapter_name: &str) -> &'static [&'static str] {
     }
 }
 
+/// `PATH` directories that hold only a launcher offering to install
+/// `adapter_name`'s CLI, never the CLI itself, as lowercase `/`-separated
+/// path suffixes. VS Code's Copilot Chat extension puts its `copilotCli`
+/// directory (a `copilot.bat`/`copilot.ps1` bootstrapper) on the integrated
+/// terminal's `PATH` whether or not `@github/copilot` is installed; the probe
+/// skips it and judges the rest of `PATH`, as the bootstrapper's own
+/// `Find-RealCopilot` does. A fixed table for the same reason as
+/// [`known_install_roots`].
+fn known_bootstrapper_dirs(adapter_name: &str) -> &'static [&'static str] {
+    match adapter_name {
+        "copilot" => &["/github.copilot-chat/copilotcli"],
+        _ => &[],
+    }
+}
+
+fn is_bootstrapper_dir(adapter_name: &str, dir: &Path) -> bool {
+    let dir = dir
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let dir = dir.trim_end_matches('/');
+    known_bootstrapper_dirs(adapter_name)
+        .iter()
+        .any(|suffix| dir.ends_with(suffix))
+}
+
 /// Every directory the widened liveness probe checks for `adapter_name`'s
-/// `program`: `PATH`, then [`known_install_roots`]. Empty when `program`
-/// already names a directory (an absolute/relative path, or an `agent_bin`
-/// override) -- matching [`program_is_present`]'s own convention that such a
-/// program is checked only at that one exact path.
+/// `program`: `PATH` minus [`known_bootstrapper_dirs`], then
+/// [`known_install_roots`]. Empty when `program` already names a directory
+/// (an absolute/relative path, or an `agent_bin` override) -- matching
+/// [`program_is_present`]'s own convention that such a program is checked
+/// only at that one exact path.
 fn liveness_search_dirs(adapter_name: &str, program: &str) -> Vec<PathBuf> {
     if program.is_empty() || program.contains('/') || program.contains('\\') {
         return Vec::new();
     }
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).collect())
+        .map(|paths| {
+            std::env::split_paths(&paths)
+                .filter(|dir| !is_bootstrapper_dir(adapter_name, dir))
+                .collect()
+        })
         .unwrap_or_default();
     dirs.extend(
         known_install_roots(adapter_name)
@@ -425,15 +456,15 @@ fn liveness_search_dirs(adapter_name: &str, program: &str) -> Vec<PathBuf> {
     dirs
 }
 
-/// [`program_is_present`], widened with [`known_install_roots`]: reuses
+/// [`program_is_present`] over [`liveness_search_dirs`]: reuses
 /// `program_is_present`'s own PATHEXT-aware Windows resolution and plain
 /// Unix file check unchanged -- handing it a full candidate path exercises
 /// exactly the same code path an absolute `agent_bin` override already does
-/// -- so widening only ever adds candidate *directories*; it never changes
-/// how a program name or an explicit override is resolved.
+/// -- so the search only changes which candidate *directories* are walked;
+/// it never changes how a program name or an explicit override is resolved.
 fn program_is_present_widened(adapter_name: &str, program: &str) -> bool {
-    if program_is_present(program) {
-        return true;
+    if program.contains('/') || program.contains('\\') {
+        return program_is_present(program);
     }
     liveness_search_dirs(adapter_name, program)
         .iter()
@@ -840,6 +871,33 @@ mod tests {
             known_install_roots("claude").is_empty(),
             "claude has no known install root of its own, so this stub must not leak into it"
         );
+    }
+
+    /// VS Code's Copilot Chat bootstrapper directory on `PATH` is not an
+    /// install of the copilot CLI; a real `copilot` elsewhere on `PATH` is.
+    #[test]
+    fn liveness_probe_skips_the_vscode_copilot_bootstrapper_dir() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let shim = root
+            .path()
+            .join("Code/User/globalStorage/github.copilot-chat/copilotCli");
+        std::fs::create_dir_all(&shim).expect("mkdir");
+        std::fs::write(shim.join("copilot"), "").expect("write stub");
+        std::fs::write(shim.join("copilot.bat"), "").expect("write stub");
+        let real = root.path().join("npm");
+        std::fs::create_dir_all(&real).expect("mkdir");
+
+        let path = std::env::join_paths([&shim, &real]).expect("join PATH");
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "PATH",
+            Some(path.to_str().expect("utf8 path")),
+        )]);
+
+        let verdict = liveness_probe("copilot", "copilot");
+        assert!(matches!(verdict, Liveness::Absent(_)), "got {verdict:?}");
+
+        std::fs::write(real.join("copilot"), "").expect("write stub");
+        assert_eq!(liveness_probe("copilot", "copilot"), Liveness::Live);
     }
 
     /// A `PATH` entry that turns out to be a plain file, not a directory,

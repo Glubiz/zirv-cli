@@ -3394,6 +3394,11 @@ mod tests {
             harnesses.contains(&("claude".to_string(), true)),
             "claude is enabled and present, so it must still be listed as live: {harnesses:?}"
         );
+        #[cfg(windows)]
+        assert!(
+            !harnesses.iter().any(|(name, _)| name == "muse"),
+            "muse cannot run on Windows (#394), so a stub on PATH must not list it: {harnesses:?}"
+        );
     }
 
     // Issue #537 (T2a): the harness proxy's launch wiring.

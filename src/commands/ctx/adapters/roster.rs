@@ -59,7 +59,13 @@ pub(crate) fn adapter_liveness_with(
     apply_endpoint_override(&mut adapter, cfg);
     apply_chat_override(&mut adapter, cfg);
     apply_headless_override(&mut adapter, cfg);
-    adapter.ready().map_err(|err| err.to_string())?;
+    if let Err(err) = adapter.ready() {
+        // A harness that can never run on this platform is confirmed absent, not uncertain.
+        if adapter.platform_unsupported() {
+            return Ok((adapter, Liveness::Absent(err.to_string())));
+        }
+        return Err(err.to_string());
+    }
     let program = adapter.program().to_string();
     let resolved_bin = if names_other { None } else { bin };
     let verdict = match cache {
@@ -461,6 +467,24 @@ mod tests {
         );
     }
 
+    /// A harness that can never run on this platform is confirmed absent, so
+    /// the roster omits it instead of rendering "installed? not ready".
+    #[cfg(windows)]
+    #[test]
+    fn a_platform_unsupported_harness_is_absent_from_the_roster_on_windows() {
+        let cfg = super::super::tests::permissive_cfg();
+        let verdict = adapter_liveness(&cfg, "muse", None).map(|(_, verdict)| verdict);
+        assert!(
+            matches!(verdict, Ok(Liveness::Absent(_))),
+            "got {verdict:?}"
+        );
+        let lines = harness_prompt_lines(&cfg, "");
+        assert!(
+            !lines.iter().any(|l| l.starts_with("- muse:")),
+            "got {lines:?}"
+        );
+    }
+
     /// Symmetry check for the test immediately above: off Windows, muse's
     /// `ready()` succeeds (nothing on this codebase requires the binary to
     /// actually be installed -- see `resolve_program`'s non-Windows arm), so
@@ -498,10 +522,16 @@ mod tests {
         )]);
 
         let lines = harness_prompt_lines(&super::super::tests::permissive_cfg(), "");
-        // One line per adapter, plus one trailing "- code review: ..." line
-        // naming every enabled harness's resolved review model.
-        assert_eq!(lines.len(), ADAPTERS.len() + 1);
-        for (name, _) in ADAPTERS {
+        // One line per adapter this platform can run, plus one trailing
+        // "- code review: ..." line naming every enabled harness's resolved
+        // review model.
+        let supported: Vec<&str> = ADAPTERS
+            .iter()
+            .filter(|(_, ctor)| !ctor(None).platform_unsupported())
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(lines.len(), supported.len() + 1);
+        for name in supported {
             assert!(
                 lines.iter().any(|l| l.starts_with(&format!("- {name}:"))),
                 "missing a line for '{name}': {lines:?}"

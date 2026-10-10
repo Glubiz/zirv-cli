@@ -6239,6 +6239,11 @@ Only a confident absence removes a candidate: a probe that cannot decide
 keeps it, so nothing is ever lost to a guess -- and an `agent_bin` you
 configured yourself is never checked at all, since you have already named the
 program (it may not even be a path, as a wrapper command is not).
+VS Code's Copilot Chat `copilotCli` directory does not count as a copilot
+install. It only holds a bootstrapper that offers to install the CLI, so the
+probe skips it and checks the rest of `PATH`. A harness that cannot run on this
+platform, such as muse on Windows, is confidently absent. Neither one is listed
+in the `zirv` banner or the harness roster.
 
 When presence rather than
 registry order decided the answer, zirv says so: `zirv ctx chat` prints a
