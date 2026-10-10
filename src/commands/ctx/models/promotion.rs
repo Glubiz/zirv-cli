@@ -45,6 +45,34 @@ pub struct FamilyState {
     pub reason: Option<String>,
 }
 
+/// Where a model of a family the ladder does not know stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NewFamilyStatus {
+    /// Held off dispatch and probed until it has enough synthetic samples.
+    Probation,
+    /// Enough samples: no longer held, so the router may pick it on merit.
+    Eligible,
+    /// Every probe row failed without output; probed again once `unavailable_until` passes.
+    Unavailable,
+}
+
+/// A model of a brand-new family: a vendor-level candidate with no incumbent and no rung.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewFamilyState {
+    pub vendor: String,
+    pub family: String,
+    pub first_seen: u64,
+    pub status: NewFamilyStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_until: Option<u64>,
+}
+
+/// An unavailable candidate is probed again after this long.
+const UNAVAILABLE_BACKOFF_SECS: u64 = 7 * 24 * 3600;
+/// A models.dev release date older than this at first sight marks the model as old catalogue.
+const MAX_RELEASE_AGE_SECS: u64 = 90 * 24 * 3600;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Promotions {
@@ -52,6 +80,22 @@ pub struct Promotions {
     pub updated_at: u64,
     /// Keyed `vendor.family`, for example `anthropic.opus`.
     pub families: BTreeMap<String, FamilyState>,
+    /// Models of unknown families, keyed by normalized id.
+    pub new_families: BTreeMap<String, NewFamilyState>,
+    /// Unknown-family ids that are not candidates: those already known when new-family
+    /// tracking began, and those released long before they were first seen. `None` until the
+    /// first run, which is what makes that run a bootstrap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_family_baseline: Option<BTreeSet<String>>,
+}
+
+/// What new-family tracking needs beyond the discovered models.
+pub struct NewFamilyInput<'a> {
+    /// models.dev release dates (unix seconds) by normalized id.
+    pub released: &'a BTreeMap<String, u64>,
+    /// False while the existence source has not been read yet, so the bootstrap waits for it
+    /// instead of baselining only the local models.
+    pub ready: bool,
 }
 
 /// The harness whose evidence compares a vendor's models.
@@ -96,6 +140,7 @@ fn version_of(vendor: &str, id: &str) -> Option<catalogue::ModelVersion> {
 ///
 /// With `enabled` or `hold_new_models` off every family's incumbent is simply the newest
 /// available id and nothing is held, which is exactly today's resolution.
+#[cfg(test)]
 pub fn update(
     prev: &Promotions,
     discovered: &[DiscoveredModel],
@@ -103,7 +148,25 @@ pub fn update(
     cfg: &RoutingConfig,
     now: u64,
 ) -> Promotions {
+    let input = NewFamilyInput {
+        released: &BTreeMap::new(),
+        ready: true,
+    };
+    update_with(prev, discovered, evidence, cfg, now, &input)
+}
+
+/// [`update`] with the new-family inputs (release dates, existence source readiness).
+pub fn update_with(
+    prev: &Promotions,
+    discovered: &[DiscoveredModel],
+    evidence: &Evidence,
+    cfg: &RoutingConfig,
+    now: u64,
+    input: &NewFamilyInput<'_>,
+) -> Promotions {
     let gate = cfg.enabled && cfg.hold_new_models;
+    let (new_families, new_family_baseline) =
+        update_new_families(prev, discovered, evidence, gate, input, now);
     let mut families = prev.families.clone();
     for (key, available) in available_by_family(discovered) {
         let Some((vendor, _)) = key.split_once('.') else {
@@ -151,7 +214,161 @@ pub fn update(
         version: PROMOTIONS_VERSION,
         updated_at: now,
         families,
+        new_families,
+        new_family_baseline,
     }
+}
+
+/// The unknown-family models in `discovered` that belong to a gated vendor, keyed by
+/// normalized id, with whether any source marks them available.
+fn unknown_family_models(
+    discovered: &[DiscoveredModel],
+) -> BTreeMap<String, (String, String, bool)> {
+    let mut out: BTreeMap<String, (String, String, bool)> = BTreeMap::new();
+    for model in discovered {
+        if harness_of(&model.vendor).is_none() {
+            continue;
+        }
+        let Some((family, _)) = catalogue::generic_family_and_version(&model.vendor, &model.id)
+        else {
+            continue;
+        };
+        if catalogue::is_known_family(&model.vendor, &family) {
+            continue;
+        }
+        let id = catalogue::normalize_id(&model.id).to_lowercase();
+        let entry = out
+            .entry(id)
+            .or_insert_with(|| (model.vendor.clone(), family, false));
+        entry.2 |= model.available;
+    }
+    out
+}
+
+/// Advance the new-family candidates: bootstrap the baseline, admit newcomers, lift an expired
+/// backoff and mark candidates with enough synthetic samples eligible.
+fn update_new_families(
+    prev: &Promotions,
+    discovered: &[DiscoveredModel],
+    evidence: &Evidence,
+    gate: bool,
+    input: &NewFamilyInput<'_>,
+    now: u64,
+) -> (BTreeMap<String, NewFamilyState>, Option<BTreeSet<String>>) {
+    if !gate {
+        return (BTreeMap::new(), prev.new_family_baseline.clone());
+    }
+    if !input.ready {
+        return (prev.new_families.clone(), prev.new_family_baseline.clone());
+    }
+    let seen = unknown_family_models(discovered);
+    let Some(mut baseline) = prev.new_family_baseline.clone() else {
+        // Bootstrap: everything known now is the existing catalogue, not a newcomer.
+        return (BTreeMap::new(), Some(seen.keys().cloned().collect()));
+    };
+    let mut candidates = prev.new_families.clone();
+    candidates.retain(|id, _| seen.contains_key(id));
+    for (id, (vendor, family, _)) in &seen {
+        if candidates.contains_key(id) || baseline.contains(id) {
+            continue;
+        }
+        let old = input
+            .released
+            .get(id)
+            .is_some_and(|released| now.saturating_sub(*released) > MAX_RELEASE_AGE_SECS);
+        if old {
+            baseline.insert(id.clone());
+            continue;
+        }
+        candidates.insert(
+            id.clone(),
+            NewFamilyState {
+                vendor: vendor.clone(),
+                family: family.clone(),
+                first_seen: now,
+                status: NewFamilyStatus::Probation,
+                unavailable_until: None,
+            },
+        );
+    }
+    for (id, candidate) in &mut candidates {
+        if candidate.status == NewFamilyStatus::Unavailable
+            && candidate.unavailable_until.is_none_or(|until| until <= now)
+        {
+            candidate.status = NewFamilyStatus::Probation;
+            candidate.unavailable_until = None;
+        }
+        let sampled = harness_of(&candidate.vendor).is_some_and(|harness| {
+            evidence.cells.iter().any(|cell| {
+                cell.harness == harness
+                    && cell.model == *id
+                    && cell.synthetic.n >= evidence::MIN_SYNTH
+            })
+        });
+        if candidate.status == NewFamilyStatus::Probation && sampled {
+            candidate.status = NewFamilyStatus::Eligible;
+        }
+    }
+    (candidates, Some(baseline))
+}
+
+/// Apply one probe run's availability findings: `(model id, ran)`, where a model that never
+/// ran (every row failed without output) is unavailable for a week and one that did run is
+/// back on probation if it was unavailable. Eligible candidates are left alone.
+pub fn record_probe_outcomes(
+    prev: &Promotions,
+    outcomes: &[(String, bool)],
+    now: u64,
+) -> Promotions {
+    let mut next = prev.clone();
+    for (id, ran) in outcomes {
+        let key = catalogue::normalize_id(id).to_lowercase();
+        let Some(candidate) = next.new_families.get_mut(&key) else {
+            continue;
+        };
+        match (ran, candidate.status) {
+            (_, NewFamilyStatus::Eligible) => {}
+            (false, _) => {
+                candidate.status = NewFamilyStatus::Unavailable;
+                candidate.unavailable_until = Some(now + UNAVAILABLE_BACKOFF_SECS);
+            }
+            (true, _) => {
+                candidate.status = NewFamilyStatus::Probation;
+                candidate.unavailable_until = None;
+            }
+        }
+    }
+    next.updated_at = now;
+    next
+}
+
+/// Persist [`record_probe_outcomes`].
+pub(crate) fn save_probe_outcomes(
+    state: &StateDir,
+    outcomes: &[(String, bool)],
+    now: u64,
+) -> CtxResult<()> {
+    let prev = load(state).unwrap_or_default();
+    let next = record_probe_outcomes(&prev, outcomes, now);
+    if next.new_families != prev.new_families {
+        write_json(&state.root().join(PROMOTIONS_FILE), &next)?;
+    }
+    Ok(())
+}
+
+/// New-family candidates on probation (not unavailable, not eligible) for `vendor`, newest
+/// version first.
+pub fn new_family_probation(promotions: &Promotions, vendor: &str) -> Vec<String> {
+    let mut out: Vec<(catalogue::ModelVersion, String)> = promotions
+        .new_families
+        .iter()
+        .filter(|(_, c)| c.vendor == vendor && c.status == NewFamilyStatus::Probation)
+        .filter_map(|(id, _)| {
+            catalogue::generic_family_and_version(vendor, id).map(|(_, v)| (v, id.clone()))
+        })
+        .collect();
+    out.sort_by(|a, b| b.cmp(a));
+    out.into_iter().map(|(_, id)| id).collect()
 }
 
 fn gate_family(
@@ -294,6 +511,13 @@ pub fn held_ids(promotions: &Promotions) -> BTreeSet<String> {
         .families
         .values()
         .flat_map(|family| family.candidates.keys().cloned())
+        .chain(
+            promotions
+                .new_families
+                .iter()
+                .filter(|(_, candidate)| candidate.status != NewFamilyStatus::Eligible)
+                .map(|(id, _)| id.clone()),
+        )
         .collect()
 }
 
@@ -332,8 +556,25 @@ pub(crate) fn refresh_with(
     }
     let discovered = super::discovered_models(registry);
     let evidence = evidence::load(state).unwrap_or_default();
-    let next = update(&prev, &discovered, &evidence, &cfg.routing, now);
-    if next.families != prev.families {
+    let released: BTreeMap<String, u64> = registry
+        .models
+        .values()
+        .filter_map(|model| Some((model.id.clone(), model.released_at?)))
+        .collect();
+    let input = NewFamilyInput {
+        released: &released,
+        // The first bootstrap waits for the existence source, so the whole catalogue is baseline.
+        ready: !cfg.models.price_fetch
+            || registry
+                .models
+                .values()
+                .any(|model| model.sources.iter().any(|s| s == super::MODELS_DEV_SOURCE)),
+    };
+    let next = update_with(&prev, &discovered, &evidence, &cfg.routing, now, &input);
+    if next.families != prev.families
+        || next.new_families != prev.new_families
+        || next.new_family_baseline != prev.new_family_baseline
+    {
         write_json(&state.root().join(PROMOTIONS_FILE), &next)?;
     }
     Ok(next)
@@ -359,13 +600,39 @@ pub(crate) fn render(
             "\nPROMOTIONS\tnew models are adopted at once ([routing] hold_new_models = false)"
         );
     }
-    if promotions.families.is_empty() {
+    if promotions.families.is_empty() && promotions.new_families.is_empty() {
         return writeln!(w, "\nPROMOTIONS\tno model families tracked yet");
     }
     writeln!(
         w,
         "\nPROMOTIONS (a new model is held until probe evidence says it is not worse)"
     )?;
+    if !promotions.new_families.is_empty() {
+        writeln!(
+            w,
+            "NEW FAMILY\tMODEL\tSTATUS\tFIRST SEEN\tUNAVAILABLE UNTIL"
+        )?;
+        for (id, candidate) in &promotions.new_families {
+            writeln!(
+                w,
+                "{}.{}\t{id}\t{}\t{}\t{}",
+                candidate.vendor,
+                candidate.family,
+                match candidate.status {
+                    NewFamilyStatus::Probation => "probation",
+                    NewFamilyStatus::Eligible => "eligible",
+                    NewFamilyStatus::Unavailable => "unavailable",
+                },
+                super::format_epoch_date(candidate.first_seen),
+                candidate
+                    .unavailable_until
+                    .map_or_else(|| "-".to_string(), super::format_epoch_date),
+            )?;
+        }
+    }
+    if promotions.families.is_empty() {
+        return Ok(());
+    }
     writeln!(w, "FAMILY\tINCUMBENT\tPREVIOUS\tCANDIDATE\tSTATUS\tVERDICT")?;
     for (key, family) in &promotions.families {
         let previous = family.previous.as_deref().unwrap_or("-");
@@ -671,5 +938,212 @@ mod tests {
             NOW,
         );
         assert!(promotions.families.is_empty());
+    }
+
+    const BEL: &str = "claude-bel-1";
+    const DAY: u64 = 24 * 3600;
+
+    fn step_new(
+        prev: &Promotions,
+        ids: &[&str],
+        released: &BTreeMap<String, u64>,
+        evidence: &Evidence,
+        at: u64,
+    ) -> Promotions {
+        let input = NewFamilyInput {
+            released,
+            ready: true,
+        };
+        update_with(prev, &found(ids), evidence, &cfg(), at, &input)
+    }
+
+    fn bel_evidence(model: &str, n: usize) -> Evidence {
+        evidence(vec![cell(model, n, 0.9)])
+    }
+
+    #[test]
+    fn bootstrap_baselines_existing_ids_and_a_later_newcomer_is_a_candidate() {
+        let none = BTreeMap::new();
+        let boot = step_new(
+            &Promotions::default(),
+            &[OLD, BEL],
+            &none,
+            &Evidence::default(),
+            NOW,
+        );
+        assert!(boot.new_families.is_empty());
+        assert!(held_ids(&boot).is_empty());
+        let later = step_new(
+            &boot,
+            &[OLD, BEL, "claude-bel-2"],
+            &none,
+            &Evidence::default(),
+            NOW + 1,
+        );
+        assert_eq!(
+            held_ids(&later),
+            BTreeSet::from(["claude-bel-2".to_string()])
+        );
+        let candidate = &later.new_families["claude-bel-2"];
+        assert_eq!(
+            (
+                candidate.status,
+                candidate.first_seen,
+                candidate.family.as_str()
+            ),
+            (NewFamilyStatus::Probation, NOW + 1, "bel")
+        );
+        assert_eq!(new_family_probation(&later, "anthropic"), ["claude-bel-2"]);
+        // Known-family ids never become new-family candidates.
+        assert!(!later.new_families.contains_key(OLD));
+    }
+
+    #[test]
+    fn bootstrap_waits_for_the_existence_source() {
+        let none = BTreeMap::new();
+        let input = NewFamilyInput {
+            released: &none,
+            ready: false,
+        };
+        let waiting = update_with(
+            &Promotions::default(),
+            &found(&[BEL]),
+            &Evidence::default(),
+            &cfg(),
+            NOW,
+            &input,
+        );
+        assert_eq!(waiting.new_family_baseline, None);
+        assert!(waiting.new_families.is_empty());
+    }
+
+    #[test]
+    fn a_model_released_over_90_days_before_first_seen_is_not_a_candidate() {
+        let boot = step_new(
+            &Promotions::default(),
+            &[OLD],
+            &BTreeMap::new(),
+            &Evidence::default(),
+            NOW,
+        );
+        let at = 200 * DAY;
+        let released = BTreeMap::from([
+            ("claude-bel-1".to_string(), at - 91 * DAY),
+            ("claude-bel-2".to_string(), at - 89 * DAY),
+        ]);
+        let next = step_new(
+            &boot,
+            &[OLD, "claude-bel-1", "claude-bel-2"],
+            &released,
+            &Evidence::default(),
+            at,
+        );
+        assert_eq!(
+            held_ids(&next),
+            BTreeSet::from(["claude-bel-2".to_string()])
+        );
+        let again = step_new(
+            &next,
+            &[OLD, "claude-bel-1", "claude-bel-2"],
+            &released,
+            &Evidence::default(),
+            at + DAY,
+        );
+        assert_eq!(
+            held_ids(&again),
+            BTreeSet::from(["claude-bel-2".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_new_family_is_held_then_eligible_at_min_synth_and_the_router_can_pick_it() {
+        use crate::commands::ctx::routing::{Candidate, RouteQuery, choose};
+        use crate::commands::workflow::classify::RiskBand;
+        let none = BTreeMap::new();
+        let boot = step_new(
+            &Promotions::default(),
+            &[OLD],
+            &none,
+            &Evidence::default(),
+            NOW,
+        );
+        let held = step_new(&boot, &[OLD, BEL], &none, &bel_evidence(BEL, 4), NOW + 1);
+        assert_eq!(held.new_families[BEL].status, NewFamilyStatus::Probation);
+        assert!(held_ids(&held).contains(BEL));
+        let eligible = step_new(
+            &held,
+            &[OLD, BEL],
+            &none,
+            &bel_evidence(BEL, evidence::MIN_SYNTH),
+            NOW + 2,
+        );
+        assert_eq!(eligible.new_families[BEL].status, NewFamilyStatus::Eligible);
+        assert!(held_ids(&eligible).is_empty());
+        // Eligible is sticky and, with no incumbent, the router compares on merit alone.
+        let still = step_new(&eligible, &[OLD, BEL], &none, &Evidence::default(), NOW + 3);
+        assert_eq!(still.new_families[BEL].status, NewFamilyStatus::Eligible);
+        let candidates = [Candidate {
+            harness: "claude".into(),
+            model: BEL.into(),
+            strength: None,
+        }];
+        let query = RouteQuery {
+            role: RouteRole::Worker,
+            complexity: None,
+            risk: RiskBand::Low,
+        };
+        let pick = choose(
+            &bel_evidence(BEL, evidence::MIN_SYNTH),
+            &candidates,
+            &query,
+            0.05,
+        );
+        assert_eq!(pick.map(|p| p.model), Some(BEL.to_string()));
+    }
+
+    #[test]
+    fn no_output_probe_rows_mark_a_candidate_unavailable_for_seven_days() {
+        let none = BTreeMap::new();
+        let boot = step_new(
+            &Promotions::default(),
+            &[OLD],
+            &none,
+            &Evidence::default(),
+            NOW,
+        );
+        let held = step_new(&boot, &[OLD, BEL], &none, &Evidence::default(), NOW + 1);
+        let down = record_probe_outcomes(&held, &[(BEL.to_string(), false)], NOW + 10);
+        let candidate = &down.new_families[BEL];
+        assert_eq!(candidate.status, NewFamilyStatus::Unavailable);
+        assert_eq!(candidate.unavailable_until, Some(NOW + 10 + 7 * DAY));
+        assert!(new_family_probation(&down, "anthropic").is_empty());
+        assert!(held_ids(&down).contains(BEL));
+        let early = step_new(
+            &down,
+            &[OLD, BEL],
+            &none,
+            &Evidence::default(),
+            NOW + 7 * DAY,
+        );
+        assert_eq!(early.new_families[BEL].status, NewFamilyStatus::Unavailable);
+        let back = step_new(
+            &early,
+            &[OLD, BEL],
+            &none,
+            &Evidence::default(),
+            NOW + 10 + 7 * DAY,
+        );
+        assert_eq!(back.new_families[BEL].status, NewFamilyStatus::Probation);
+        assert_eq!(back.new_families[BEL].unavailable_until, None);
+        let ran = record_probe_outcomes(&down, &[(BEL.to_string(), true)], NOW + 20);
+        assert_eq!(ran.new_families[BEL].status, NewFamilyStatus::Probation);
+    }
+
+    #[test]
+    fn an_old_promotions_file_without_new_family_fields_still_loads() {
+        let old: Promotions = serde_json::from_str(r#"{"version":1,"updated_at":5,"families":{}}"#)
+            .expect("old file");
+        assert!(old.new_families.is_empty());
+        assert_eq!(old.new_family_baseline, None);
     }
 }

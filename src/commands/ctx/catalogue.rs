@@ -1080,6 +1080,54 @@ pub(crate) fn family_and_version(
     }
 }
 
+/// Parses any family, known or not: anthropic `claude-<family>-<major>[-<minor>]` and openai
+/// `gpt-<major>[.<minor>]-<family>`, the family being ASCII letters only. Run after
+/// [`normalize_id`], so a dated snapshot parses as its base id; anything else is rejected.
+pub(crate) fn generic_family_and_version(
+    vendor_slug: &str,
+    model: &str,
+) -> Option<(String, ModelVersion)> {
+    let normalized = normalize_id(model).to_lowercase();
+    let letters = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_lowercase());
+    match vendor_slug {
+        "anthropic" => {
+            let rest = normalized.strip_prefix("claude-")?;
+            let mut parts = rest.split('-');
+            let family = parts.next().filter(|f| letters(f))?;
+            let major = parts.next()?.parse().ok()?;
+            let minor = parts.next().map(str::parse).transpose().ok()?.unwrap_or(0);
+            if parts.next().is_some() {
+                return None;
+            }
+            Some((family.to_string(), ModelVersion { major, minor }))
+        }
+        "openai" => {
+            let rest = normalized.strip_prefix("gpt-")?;
+            let (version, family) = rest.split_once('-')?;
+            if !letters(family) {
+                return None;
+            }
+            let mut parts = version.split('.');
+            let major = parts.next()?.parse().ok()?;
+            let minor = parts.next().map(str::parse).transpose().ok()?.unwrap_or(0);
+            if parts.next().is_some() {
+                return None;
+            }
+            Some((family.to_string(), ModelVersion { major, minor }))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `family` is one of the ladder's hard-coded families for the vendor.
+pub(crate) fn is_known_family(vendor_slug: &str, family: &str) -> bool {
+    match vendor_slug {
+        "anthropic" => ANTHROPIC_FAMILIES.contains(&family),
+        "openai" => OPENAI_FAMILIES.contains(&family),
+        _ => false,
+    }
+}
+
 /// The known ladder family for a normalised model id. Unknown families are
 /// deliberately not inferred: discovery may list them, but it cannot rank
 /// them or alter an existing tier without an explicit catalogue family.
@@ -1645,6 +1693,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn generic_parse_accepts_any_letters_family_and_rejects_junk() {
+        let parse = |vendor: &str, id: &str| {
+            generic_family_and_version(vendor, id).map(|(family, v)| (family, v.major, v.minor))
+        };
+        let some = |family: &str, major, minor| Some((family.to_string(), major, minor));
+        assert_eq!(parse("anthropic", "claude-bel-1"), some("bel", 1, 0));
+        assert_eq!(parse("anthropic", "claude-bel-1-2"), some("bel", 1, 2));
+        assert_eq!(
+            parse("anthropic", "claude-bel-1-2-20260101"),
+            some("bel", 1, 2)
+        );
+        assert_eq!(parse("openai", "gpt-6-bel"), some("bel", 6, 0));
+        assert_eq!(parse("openai", "gpt-6.1-bel"), some("bel", 6, 1));
+        assert!(!is_known_family("openai", "bel") && is_known_family("openai", "sol"));
+        for junk in [
+            "claude-bel",
+            "claude-3-opus",
+            "claude-b3l-1",
+            "claude-bel-1-2-3",
+            "claude-bel-1-latest",
+            "gpt-4o",
+            "gpt-6-bel-2",
+            "gpt-6.1.2-bel",
+            "gpt-x-bel",
+            "gpt-6-b3l",
+        ] {
+            let vendor = if junk.starts_with("gpt") {
+                "openai"
+            } else {
+                "anthropic"
+            };
+            assert_eq!(parse(vendor, junk), None, "{junk}");
+        }
+        assert_eq!(parse("google", "gemini-3-pro"), None);
     }
 
     #[test]

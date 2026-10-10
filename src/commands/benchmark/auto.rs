@@ -4,10 +4,12 @@
 //! never prompts. Models probed are new or stale ones (see [`select_targets`]); the rows land
 //! in the ordinary benchmark store, and `evidence` and `promotion` are refreshed afterwards.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 
 use serde::{Deserialize, Serialize};
 
+use super::run::{Row, Status};
 use super::{Filters, Launcher, run};
 use crate::commands::ctx::adapters::{self, Liveness};
 use crate::commands::ctx::catalogue;
@@ -154,6 +156,8 @@ struct HarnessInput {
     harness: String,
     metered: bool,
     headroom: Headroom,
+    /// New-family candidates on probation (not unavailable), newest first.
+    new_family: Vec<String>,
     /// Probation candidates, newest first.
     probation: Vec<String>,
     rejected: Vec<String>,
@@ -208,8 +212,9 @@ fn select_targets(
         };
         let thin = |model: &str| synthetic(model).is_none_or(|s| s.n < MIN_SYNTH);
         let ordered = input
-            .probation
+            .new_family
             .iter()
+            .chain(input.probation.iter())
             .chain(input.rejected.iter().filter(|m| !probed_recently(m)))
             .chain(
                 input
@@ -291,6 +296,7 @@ fn gather(
             harness: (*name).to_string(),
             metered: adapter.endpoint_vendor().is_some(),
             headroom: headroom_of(cfg, state, now, name),
+            new_family: promotion::new_family_probation(promotions, vendor),
             probation: promotion::probation_candidates(promotions, vendor),
             rejected,
             ladder,
@@ -408,6 +414,9 @@ pub(crate) fn run(
         Err(error) => (None, 0, format!("run failed: {error}")),
     };
     let refreshed = state::now_secs();
+    if let Some(run_id) = &run_id {
+        record_availability(&state, env, &promotions, run_id, refreshed);
+    }
     if let Err(error) = evidence::refresh(&state, cfg, refreshed) {
         outcome = format!("{outcome}; evidence refresh failed: {error}");
     } else if let Err(error) = promotion::refresh(&state, cfg, refreshed) {
@@ -416,6 +425,61 @@ pub(crate) fn run(
     let done = record(&outcome, run_id, spend);
     append_log(&state, &done);
     emit(opts, &done, plan.agent_runs)
+}
+
+/// Whether a row shows the model actually ran: it succeeded, or spent tokens or money.
+fn row_ran(row: &Row) -> bool {
+    row.status == Status::Ok
+        || row.input_tokens > 0
+        || row.output_tokens > 0
+        || row.cache_creation_input_tokens > 0
+        || row.cache_read_input_tokens > 0
+        || row.cost_micros.is_some_and(|cost| cost > 0)
+}
+
+/// For each of `candidates` (normalized ids) that has rows in `rows`: whether any row ran. A
+/// candidate whose rows all failed without output never ran on this account. Skipped rows say
+/// nothing. Sorted by id.
+fn probe_outcomes(rows: &[Row], candidates: &BTreeSet<String>) -> Vec<(String, bool)> {
+    let mut seen: BTreeMap<String, bool> = BTreeMap::new();
+    for row in rows.iter().filter(|row| row.status != Status::Skipped) {
+        let id = catalogue::normalize_id(row.candidate_label()).to_lowercase();
+        if candidates.contains(&id) {
+            *seen.entry(id).or_insert(false) |= row_ran(row);
+        }
+    }
+    seen.into_iter().collect()
+}
+
+/// After a probe run: back off a new-family candidate that never ran, and record one that did
+/// as available on this account. Best effort, like the rest of the post-run bookkeeping.
+fn record_availability(
+    state: &StateDir,
+    env: EnvLookup<'_>,
+    promotions: &Promotions,
+    run_id: &str,
+    now: u64,
+) {
+    let candidates: BTreeSet<String> = promotions.new_families.keys().cloned().collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let Ok(root) = super::benchmark_root(env) else {
+        return;
+    };
+    let Ok((_, rows)) = super::run::load_store(&root.join(run_id)) else {
+        return;
+    };
+    let outcomes = probe_outcomes(&rows, &candidates);
+    let _ = promotion::save_probe_outcomes(state, &outcomes, now);
+    let ran: Vec<(String, String)> = outcomes
+        .iter()
+        .filter(|(_, ran)| *ran)
+        .filter_map(|(id, _)| Some((promotions.new_families.get(id)?.vendor.clone(), id.clone())))
+        .collect();
+    if !ran.is_empty() {
+        let _ = models::mark_probe_available(state, &ran, now);
+    }
 }
 
 fn emit(opts: &Opts, record: &ProbeRecord, agent_runs: usize) -> Result<i32, String> {
@@ -620,6 +684,7 @@ mod tests {
             harness: harness.to_string(),
             metered: false,
             headroom: Headroom::Known(100.0),
+            new_family: Vec::new(),
             probation: Vec::new(),
             rejected: Vec::new(),
             ladder: Vec::new(),
@@ -678,6 +743,59 @@ mod tests {
             vec!["p-new", "r-stale", "l-old", "l-thin"]
         );
         assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn a_new_family_candidate_is_probed_before_everything_else() {
+        let mut claude = input("claude");
+        claude.new_family = ids(&["claude-bel-1"]);
+        claude.probation = ids(&["p-new"]);
+        claude.ladder = ids(&["l-thin"]);
+        let (targets, _) = select_targets(&routing(24), &[claude], &Evidence::default(), NOW);
+        assert_eq!(models_of(&targets), vec!["claude-bel-1", "p-new", "l-thin"]);
+    }
+
+    #[test]
+    fn a_candidate_whose_rows_all_failed_without_output_never_ran() {
+        let row = |model: &str, status: Status, output_tokens: u64| {
+            let mut row = Row::new(
+                "claude",
+                model,
+                None,
+                "t",
+                super::super::corpus::Role::Worker,
+                1,
+                status,
+            );
+            row.output_tokens = output_tokens;
+            row
+        };
+        let rows = vec![
+            row("claude-bel-1", Status::Failed, 0),
+            row("claude-bel-1", Status::Failed, 0),
+            row("claude-bel-2", Status::Failed, 0),
+            row("claude-bel-2", Status::Ok, 0),
+            row("claude-bel-3", Status::Failed, 40),
+            row("claude-bel-4", Status::Skipped, 0),
+            row("claude-opus-5", Status::Failed, 0),
+        ];
+        let candidates: BTreeSet<String> = [
+            "claude-bel-1",
+            "claude-bel-2",
+            "claude-bel-3",
+            "claude-bel-4",
+        ]
+        .iter()
+        .map(|id| (*id).to_string())
+        .collect();
+        assert_eq!(
+            probe_outcomes(&rows, &candidates),
+            vec![
+                ("claude-bel-1".to_string(), false),
+                ("claude-bel-2".to_string(), true),
+                ("claude-bel-3".to_string(), true),
+            ]
+        );
     }
 
     #[test]

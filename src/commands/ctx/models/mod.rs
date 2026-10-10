@@ -87,6 +87,22 @@ pub struct RegistryModel {
     pub retirement_at: Option<u64>,
     pub upgrade: Option<String>,
     pub sources: Vec<String>,
+    /// models.dev's release date (unix seconds), when it gave one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<u64>,
+}
+
+/// The registry source for ids models.dev lists: known to exist, not verified for this account.
+pub(crate) const MODELS_DEV_SOURCE: &str = "models.dev";
+/// The registry source for ids a probe run proved runnable on this account.
+pub(crate) const PROBE_SOURCE: &str = "probe";
+
+/// One model models.dev lists for a provider we route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ListedModel {
+    vendor: String,
+    id: String,
+    released_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -95,6 +111,7 @@ struct PriceCache {
     fetched_at: u64,
     models_dev_etag: Option<String>,
     litellm_etag: Option<String>,
+    models_dev_ids: Vec<ListedModel>,
     models_dev: BTreeMap<String, ModelPrice>,
     litellm: BTreeMap<String, ModelPrice>,
 }
@@ -469,13 +486,16 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> CtxResult<()> {
 }
 
 fn refresh(cfg: &CtxConfig, state: &StateDir, now: u64) -> CtxResult<()> {
-    let registry = cfg.models.discovery.then(|| {
+    let mut registry = cfg.models.discovery.then(|| {
         let mut registry = discover_local(load_registry(state), now);
         registry.updated_at = now;
         registry
     });
     if cfg.models.price_fetch {
         refresh_price_cache(state, now)?;
+        if let Some(registry) = &mut registry {
+            import_models_dev(registry, &load_price_cache(state).models_dev_ids, now);
+        }
     }
     scorecard::refresh(state, &effective_prices(cfg, state).table, now)?;
     // The gate sees the new registry and holds new models before registry.json exposes them
@@ -505,6 +525,66 @@ fn discover_local(mut registry: Registry, now: u64) -> Registry {
         merge_observations(&mut registry, scan_claude_transcripts(&root));
     }
     registry
+}
+
+/// Record the ids models.dev lists as existing but unverified (`available = false`, so the
+/// ladder never dispatches them). A model another source already knows keeps its availability;
+/// it only gains the source and the release date.
+fn import_models_dev(registry: &mut Registry, listed: &[ListedModel], now: u64) {
+    for model in listed {
+        let id = catalogue::normalize_id(&model.id).to_lowercase();
+        let key = format!("{}:{id}", model.vendor);
+        if let Some(existing) = registry.models.get_mut(&key) {
+            if !existing.sources.iter().any(|s| s == MODELS_DEV_SOURCE) {
+                existing.sources.push(MODELS_DEV_SOURCE.to_string());
+            }
+            existing.released_at = existing.released_at.or(model.released_at);
+            continue;
+        }
+        let family = catalogue::model_family(&model.vendor, &id);
+        registry.models.insert(
+            key,
+            RegistryModel {
+                vendor: model.vendor.clone(),
+                family: family.map(str::to_string),
+                version: model_version(&model.vendor, &id),
+                id,
+                available: false,
+                first_seen: now,
+                last_seen: now,
+                sources: vec![MODELS_DEV_SOURCE.to_string()],
+                released_at: model.released_at,
+                ..RegistryModel::default()
+            },
+        );
+    }
+}
+
+/// Mark ids a probe run proved runnable as available on this account.
+pub(crate) fn mark_probe_available(
+    state: &StateDir,
+    ids: &[(String, String)],
+    now: u64,
+) -> CtxResult<()> {
+    let mut registry = load_registry(state);
+    for (vendor, id) in ids {
+        let id = catalogue::normalize_id(id).to_lowercase();
+        let model = registry
+            .models
+            .entry(format!("{vendor}:{id}"))
+            .or_insert_with(|| RegistryModel {
+                vendor: vendor.clone(),
+                id,
+                first_seen: now,
+                ..RegistryModel::default()
+            });
+        model.available = true;
+        model.last_seen = model.last_seen.max(now);
+        if !model.sources.iter().any(|s| s == PROBE_SOURCE) {
+            model.sources.push(PROBE_SOURCE.to_string());
+        }
+    }
+    write_json(&state.root().join(REGISTRY_FILE), &registry)
 }
 
 fn apply_codex_cache(registry: &mut Registry, text: &str, now: u64) {
@@ -674,6 +754,7 @@ fn merge_observations(registry: &mut Registry, observations: Vec<RegistryModel>)
             }
             observed.first_seen = existing.first_seen.min(observed.first_seen);
             observed.last_seen = existing.last_seen.max(observed.last_seen);
+            observed.released_at = observed.released_at.or(existing.released_at);
             *existing = observed;
         } else {
             registry.models.insert(key, observed);
@@ -779,6 +860,36 @@ fn parse_models_dev(text: &str) -> BTreeMap<String, ModelPrice> {
         }
     }
     prices
+}
+
+/// Every model id models.dev lists under the `anthropic` and `openai` providers, priced or
+/// not, with its release date when it gives one.
+fn parse_models_dev_ids(text: &str) -> Vec<ListedModel> {
+    let Ok(root) = serde_json::from_str::<Value>(text) else {
+        return Vec::new();
+    };
+    let mut listed = Vec::new();
+    for provider in ["anthropic", "openai"] {
+        let Some(models) = root
+            .get(provider)
+            .and_then(|p| p.get("models"))
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        for (id, model) in models {
+            let released_at = model
+                .get("release_date")
+                .and_then(Value::as_str)
+                .and_then(|date| super::window::parse_rfc3339_utc(&format!("{date}T00:00:00Z")));
+            listed.push(ListedModel {
+                vendor: provider.to_string(),
+                id: id.clone(),
+                released_at,
+            });
+        }
+    }
+    listed
 }
 
 fn parse_litellm(text: &str) -> BTreeMap<String, ModelPrice> {
@@ -921,14 +1032,20 @@ fn refresh_price_cache(state: &StateDir, now: u64) -> CtxResult<()> {
         .build()
         .into();
     let mut reached_source = false;
+    // A cache from before the id list existed has no ids, so it must be refetched in full.
+    let etag = cache
+        .models_dev_etag
+        .as_deref()
+        .filter(|_| !cache.models_dev_ids.is_empty());
     if let Ok((models_dev, models_dev_etag, models_dev_changed)) =
-        fetch_json(&agent, MODELS_DEV_URL, cache.models_dev_etag.as_deref())
+        fetch_json(&agent, MODELS_DEV_URL, etag)
     {
         reached_source = true;
         if models_dev_changed {
             let parsed = parse_models_dev(&models_dev);
             if !parsed.is_empty() {
                 cache.models_dev = parsed;
+                cache.models_dev_ids = parse_models_dev_ids(&models_dev);
                 cache.models_dev_etag = models_dev_etag;
             }
         }
@@ -1667,6 +1784,51 @@ mod tests {
     fn epoch_dates_render_as_iso_dates() {
         assert_eq!(format_epoch_date(0), "1970-01-01");
         assert_eq!(format_epoch_date(1_799_798_400), "2027-01-13");
+    }
+
+    #[test]
+    fn models_dev_ids_import_as_unavailable_and_never_downgrade_an_available_id() {
+        let listed = parse_models_dev_ids(
+            r#"{"anthropic":{"models":{"claude-bel-1":{"release_date":"2026-10-01"},"claude-opus-5":{}}},
+                "openai":{"models":{"gpt-6-bel":{"cost":{"input":1,"output":2}}}},
+                "google":{"models":{"gemini-3":{}}}}"#,
+        );
+        assert_eq!(listed.len(), 3);
+        let mut registry = Registry::default();
+        let seen = RegistryModel {
+            vendor: "anthropic".into(),
+            id: "claude-opus-5".into(),
+            available: true,
+            first_seen: 5,
+            last_seen: 5,
+            sources: vec!["claude-transcript".into()],
+            ..RegistryModel::default()
+        };
+        registry
+            .models
+            .insert("anthropic:claude-opus-5".into(), seen);
+        import_models_dev(&mut registry, &listed, 100);
+
+        let bel = &registry.models["anthropic:claude-bel-1"];
+        assert!(!bel.available);
+        assert_eq!(bel.sources, [MODELS_DEV_SOURCE]);
+        assert_eq!(
+            bel.released_at,
+            super::super::window::parse_rfc3339_utc("2026-10-01T00:00:00Z")
+        );
+        assert!(!registry.models["openai:gpt-6-bel"].available);
+        assert!(!registry.models.contains_key("google:gemini-3"));
+        let opus = &registry.models["anthropic:claude-opus-5"];
+        assert!(opus.available);
+        assert_eq!(opus.sources, ["claude-transcript", MODELS_DEV_SOURCE]);
+        // A later local observation upgrades the unverified id and keeps its release date.
+        merge_observations(
+            &mut registry,
+            parse_claude_transcript(r#"{"message":{"model":"claude-bel-1"}}"#, 200),
+        );
+        let bel = &registry.models["anthropic:claude-bel-1"];
+        assert!(bel.available && bel.released_at.is_some());
+        assert_eq!(bel.sources, ["claude-transcript", MODELS_DEV_SOURCE]);
     }
 
     #[test]
