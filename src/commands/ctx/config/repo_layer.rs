@@ -837,6 +837,51 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Bool,
     ),
     (
+        "ZIRV_CTX_ROUTING_ENABLED",
+        &["routing", "enabled"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_ROUTING_HOLD_NEW_MODELS",
+        &["routing", "hold_new_models"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_ROUTING_PROBE",
+        &["routing", "probe"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_ROUTING_PROBE_INTERVAL_HOURS",
+        &["routing", "probe_interval_hours"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_ROUTING_PROBE_MAX_USD",
+        &["routing", "probe_max_usd"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_ROUTING_PROBE_MIN_HEADROOM_PCT",
+        &["routing", "probe_min_headroom_pct"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_ROUTING_PROBE_METERED",
+        &["routing", "probe_metered"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_ROUTING_TOLERANCE",
+        &["routing", "tolerance"],
+        EnvKind::Float,
+    ),
+    (
+        "ZIRV_CTX_ROUTING_CANARY_PCT",
+        &["routing", "canary_pct"],
+        EnvKind::Int,
+    ),
+    (
         "ZIRV_CTX_COMPACT_ADVISORY_MIN_RECLAIM_TOKENS",
         &["compact_advisory", "min_reclaim_tokens"],
         EnvKind::Int,
@@ -1850,6 +1895,8 @@ pub(super) const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["price", "table_path"], "ZIRV_CTX_PRICE_TABLE_PATH"),
     // Discovery and fetched pricing choose operator accounts and network egress; repos cannot steer either or pin a spending model.
     (&["models"], "ZIRV_CTX_MODELS_*"),
+    // Routing steers which models run and spends probe quota; repos cannot enable, tune or veto it.
+    (&["routing"], "ZIRV_CTX_ROUTING_*"),
     // Repos cannot raise their history-search output cap (#315).
     (
         &["search", "max_output_bytes"],

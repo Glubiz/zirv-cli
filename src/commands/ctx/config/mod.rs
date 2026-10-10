@@ -74,6 +74,8 @@ pub struct CtxConfig {
     pub pace: PaceConfig,
     pub price: PriceConfig,
     pub models: ModelsConfig,
+    /// Operator-only evidence-driven routing; see [`RoutingConfig`].
+    pub routing: RoutingConfig,
     pub compact_advisory: CompactAdvisoryConfig,
     pub optimize: OptimizeConfig,
     pub verify_on_stop: VerifyOnStopConfig,
@@ -1632,6 +1634,33 @@ impl CtxConfig {
 
         for model in &cfg.models.avoid {
             validate_model_str("models.avoid", model)?;
+        }
+
+        let routing = &cfg.routing;
+        let routing_error = |message: String| add_config_error_prefix(message.into());
+        if !(routing.probe_max_usd > 0.0 && routing.probe_max_usd <= 100.0) {
+            return Err(routing_error(format!(
+                "routing.probe_max_usd must be greater than 0 and at most 100, got {}",
+                routing.probe_max_usd
+            )));
+        }
+        if !(0.0..=100.0).contains(&routing.probe_min_headroom_pct) {
+            return Err(routing_error(format!(
+                "routing.probe_min_headroom_pct must be between 0 and 100, got {}",
+                routing.probe_min_headroom_pct
+            )));
+        }
+        if !(0.0..=0.5).contains(&routing.tolerance) {
+            return Err(routing_error(format!(
+                "routing.tolerance must be between 0.0 and 0.5, got {}",
+                routing.tolerance
+            )));
+        }
+        if routing.canary_pct > 50 {
+            return Err(routing_error(format!(
+                "routing.canary_pct must be at most 50, got {}",
+                routing.canary_pct
+            )));
         }
 
         // Validate operator endpoints once so downstream launch code can trust catalogue membership (#395).
@@ -8040,6 +8069,120 @@ intake_discipline = true
             cfg.models.pin.get("openai.sol").map(String::as_str),
             Some("gpt-6.1-sol")
         );
+    }
+
+    #[test]
+    fn routing_defaults_are_on_with_conservative_probe_limits() {
+        let routing = RoutingConfig::default();
+        assert!(routing.enabled && routing.hold_new_models && routing.probe);
+        assert!(!routing.probe_metered);
+        assert_eq!(routing.probe_interval_hours, 24);
+        assert_eq!(routing.probe_max_usd, 2.0);
+        assert_eq!(routing.probe_min_headroom_pct, 50.0);
+        assert_eq!(routing.tolerance, 0.05);
+        assert_eq!(routing.canary_pct, 5);
+        assert_eq!(CtxConfig::default().routing, routing);
+    }
+
+    #[test]
+    fn a_probe_interval_below_a_day_is_clamped_to_a_day() {
+        let routing = RoutingConfig {
+            probe_interval_hours: 1,
+            ..RoutingConfig::default()
+        };
+        assert_eq!(routing.probe_interval_secs(), 24 * 3600);
+        let routing = RoutingConfig {
+            probe_interval_hours: 48,
+            ..RoutingConfig::default()
+        };
+        assert_eq!(routing.probe_interval_secs(), 48 * 3600);
+    }
+
+    #[test]
+    fn routing_environment_variables_map_onto_the_table() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let env = env_map(&[
+            ("ZIRV_CTX_ROUTING_ENABLED", "false"),
+            ("ZIRV_CTX_ROUTING_HOLD_NEW_MODELS", "false"),
+            ("ZIRV_CTX_ROUTING_PROBE", "false"),
+            ("ZIRV_CTX_ROUTING_PROBE_INTERVAL_HOURS", "72"),
+            ("ZIRV_CTX_ROUTING_PROBE_MAX_USD", "7.5"),
+            ("ZIRV_CTX_ROUTING_PROBE_MIN_HEADROOM_PCT", "60"),
+            ("ZIRV_CTX_ROUTING_PROBE_METERED", "true"),
+            ("ZIRV_CTX_ROUTING_TOLERANCE", "0.1"),
+            ("ZIRV_CTX_ROUTING_CANARY_PCT", "20"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|key| env.get(key).cloned()).expect("load env");
+        assert_eq!(
+            cfg.routing,
+            RoutingConfig {
+                enabled: false,
+                hold_new_models: false,
+                probe: false,
+                probe_interval_hours: 72,
+                probe_max_usd: 7.5,
+                probe_min_headroom_pct: 60.0,
+                probe_metered: true,
+                tolerance: 0.1,
+                canary_pct: 20,
+            }
+        );
+        let operator_only =
+            RoutingConfig::load_operator_only(&|key| env.get(key).cloned()).expect("operator");
+        assert_eq!(operator_only, cfg.routing);
+    }
+
+    #[test]
+    fn routing_values_outside_their_bounds_are_rejected() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        for (variable, value) in [
+            ("ZIRV_CTX_ROUTING_PROBE_MAX_USD", "0"),
+            ("ZIRV_CTX_ROUTING_PROBE_MAX_USD", "100.5"),
+            ("ZIRV_CTX_ROUTING_PROBE_MIN_HEADROOM_PCT", "101"),
+            ("ZIRV_CTX_ROUTING_TOLERANCE", "0.6"),
+            ("ZIRV_CTX_ROUTING_TOLERANCE", "-0.1"),
+            ("ZIRV_CTX_ROUTING_CANARY_PCT", "51"),
+        ] {
+            let env = env_map(&[(variable, value)]);
+            let err = CtxConfig::load(repo.path(), &|key| env.get(key).cloned())
+                .expect_err("out of bounds");
+            assert!(
+                err.to_string().contains("routing."),
+                "{variable}={value}: {err}"
+            );
+        }
+        for (variable, value) in [
+            ("ZIRV_CTX_ROUTING_PROBE_MAX_USD", "100"),
+            ("ZIRV_CTX_ROUTING_TOLERANCE", "0.5"),
+            ("ZIRV_CTX_ROUTING_TOLERANCE", "0"),
+            ("ZIRV_CTX_ROUTING_CANARY_PCT", "50"),
+            ("ZIRV_CTX_ROUTING_PROBE_MIN_HEADROOM_PCT", "0"),
+        ] {
+            let env = env_map(&[(variable, value)]);
+            CtxConfig::load(repo.path(), &|key| env.get(key).cloned())
+                .unwrap_or_else(|err| panic!("{variable}={value} must load: {err}"));
+        }
+    }
+
+    #[test]
+    fn routing_table_is_repo_forbidden() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        for repo_toml in [
+            "[routing]\nenabled = false\n",
+            "[routing]\ncanary_pct = 0\n",
+            "[routing]\nprobe_max_usd = 50.0\n",
+        ] {
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), repo_toml).expect("write repo");
+            let err = CtxConfig::load(repo.path(), &|_| None).expect_err("repo routing must fail");
+            assert!(is_repo_forbidden(err.as_ref()), "{err}");
+        }
     }
 
     /// The operator's own home layer is unaffected: `[model_tiers.<agent>]`

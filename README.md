@@ -5490,6 +5490,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `models.avoid` | `ZIRV_CTX_MODELS_AVOID` (model ids, comma-separated) |
 | `models.auto_avoid` | `ZIRV_CTX_MODELS_AUTO_AVOID` |
 | `models` | `ZIRV_CTX_MODELS_*` (the table-node match also blocks any other `models.*` key) |
+| `routing` | `ZIRV_CTX_ROUTING_*` (the whole table: promotion gate, probes, router and canary are operator-only) |
 | `search.max_output_bytes` | `ZIRV_CTX_SEARCH_MAX_OUTPUT_BYTES` |
 | `output.compact` | `ZIRV_CTX_OUTPUT_COMPACT` |
 | `output.compact_min_bytes` | `ZIRV_CTX_OUTPUT_COMPACT_MIN_BYTES` |
