@@ -852,6 +852,13 @@ pub fn dispatch(args: &[String]) -> i32 {
         priority::apply_process(priority::posture_for(prompt::PromptRole::Worker));
     }
 
+    if !matches!(
+        &cli.verb,
+        CtxVerb::Hook(_) | CtxVerb::Statusline(_) | CtxVerb::Mcp(_)
+    ) {
+        crate::commands::benchmark::spawn_probe_if_due_from_env();
+    }
+
     let mut out = std::io::stdout();
     let result = match &cli.verb {
         CtxVerb::Mcp(a) => mcp::run(a),

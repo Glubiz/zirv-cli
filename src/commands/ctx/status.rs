@@ -2775,6 +2775,7 @@ pub fn run<W: Write>(args: &StatusArgs, w: &mut W) -> CtxResult<i32> {
     // Only the CLI run starts the refresher; `run_with` also serves the prompt hook.
     if let (Ok(state), Ok(cfg)) = (StateDir::resolve(&env), CtxConfig::load(&repo, &env)) {
         super::models::spawn_refresh_if_due_detached(&cfg, &state);
+        crate::commands::benchmark::spawn_probe_if_due_detached(&cfg, &state);
     }
     Ok(code)
 }
