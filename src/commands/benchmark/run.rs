@@ -17,6 +17,7 @@ use crate::commands::ctx::config::{CtxConfig, EnvLookup};
 use crate::commands::ctx::event::{SessionId, SessionRef, TranscriptUsage};
 use crate::commands::ctx::exec::{self, ExecArgs};
 use crate::commands::ctx::models::Listing;
+use crate::commands::ctx::models::evidence::{CellComplexity, RouteRole};
 use crate::commands::ctx::price::{self, PriceTable};
 use crate::commands::ctx::sessions::SUPERVISION_ENV;
 use crate::commands::ctx::state;
@@ -56,6 +57,15 @@ pub struct Row {
     pub family: Option<String>,
     pub task: String,
     pub role: Role,
+    /// The task's complexity when the run was made; `any` in rows from before this field.
+    #[serde(default)]
+    pub complexity: CellComplexity,
+    /// The routing role the task is evidence for; `None` in old rows, which read as their `role`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_role: Option<RouteRole>,
+    /// Unix seconds the run started; 0 until [`read_rows_since`](super::read_rows_since) fills it from `run.json`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ts: u64,
     pub rep: u32,
     pub status: Status,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -93,7 +103,16 @@ pub struct Row {
     pub error: Option<String>,
 }
 
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 impl Row {
+    /// The routing role this row is evidence for: recorded, else derived from its `role`.
+    pub fn routing_role(&self) -> RouteRole {
+        self.route_role.unwrap_or_else(|| self.role.route_role())
+    }
+
     /// The planned candidate this run belongs to, falling back to `model` for old rows.
     pub fn candidate_label(&self) -> &str {
         if self.candidate.is_empty() {
@@ -120,6 +139,9 @@ impl Row {
             family: family.map(str::to_string),
             task: task.to_string(),
             role,
+            complexity: CellComplexity::Any,
+            route_role: None,
+            ts: 0,
             rep,
             status,
             skip_reason: None,
@@ -548,7 +570,7 @@ fn interleave_roles(tasks: &[Task]) -> Vec<&Task> {
 }
 
 fn base_row(candidate: &Candidate, task: &Task, rep: u32, status: Status) -> Row {
-    Row::new(
+    let mut row = Row::new(
         &candidate.harness,
         &candidate.model,
         candidate.family.as_deref(),
@@ -556,7 +578,10 @@ fn base_row(candidate: &Candidate, task: &Task, rep: u32, status: Status) -> Row
         task.role,
         rep,
         status,
-    )
+    );
+    row.complexity = task.complexity;
+    row.route_role = Some(task.routing_role());
+    row
 }
 
 fn failed_to_start(mut row: Row, error: String) -> Row {

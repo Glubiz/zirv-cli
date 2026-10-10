@@ -906,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn an_observed_claude_id_maps_to_its_tier_and_claude_keeps_aliases() {
+    fn an_observed_claude_id_maps_to_its_tier_and_is_dispatched_in_full() {
         let cfg = CtxConfig::default();
         assert_eq!(tier_for_model("claude", "claude-opus-5-5", &cfg), None);
         observed("anthropic", &["claude-opus-5-5"]);
@@ -914,7 +914,10 @@ mod tests {
             tier_for_model("claude", "claude-opus-5-5", &cfg),
             Some("deep")
         );
-        assert_eq!(resolve_model("claude", "deep", &cfg).unwrap(), "opus");
+        assert_eq!(
+            resolve_model("claude", "deep", &cfg).unwrap(),
+            "claude-opus-5-5"
+        );
     }
 
     #[test]

@@ -1032,7 +1032,7 @@ pub struct ResolvedRung {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct ModelVersion {
+pub(crate) struct ModelVersion {
     major: u32,
     minor: u32,
 }
@@ -1040,7 +1040,10 @@ struct ModelVersion {
 const ANTHROPIC_FAMILIES: &[&str] = &["fable", "mythos", "opus", "sonnet", "haiku"];
 const OPENAI_FAMILIES: &[&str] = &["sol", "astra", "terra", "luna"];
 
-fn family_and_version(vendor_slug: &str, model: &str) -> Option<(&'static str, ModelVersion)> {
+pub(crate) fn family_and_version(
+    vendor_slug: &str,
+    model: &str,
+) -> Option<(&'static str, ModelVersion)> {
     let normalized = normalize_id(model).to_lowercase();
     match vendor_slug {
         "anthropic" => {
@@ -1105,9 +1108,17 @@ pub struct AvoidNote {
     pub kept_because: Option<&'static str>,
 }
 
-fn rung_is_avoided(rung: &ResolvedRung, avoid: &BTreeSet<String>) -> bool {
+/// `base_alias` is the static rung's alias: a Claude rung dispatched by a concrete id still
+/// answers to its short name (`opus`) in an operator's avoid list.
+fn rung_is_avoided(
+    vendor: &Vendor,
+    rung: &ResolvedRung,
+    base_alias: &str,
+    avoid: &BTreeSet<String>,
+) -> bool {
     avoid.contains(&normalize_id(&rung.id).to_lowercase())
         || avoid.contains(&rung.alias.to_lowercase())
+        || (vendor.slug == "anthropic" && avoid.contains(base_alias))
 }
 
 /// [`resolved_ladder`] with `avoid` (lowercased model ids or aliases) applied. An avoided,
@@ -1128,7 +1139,7 @@ pub fn resolved_ladder_avoiding(
     let mut out = ladder.clone();
     let mut notes = Vec::new();
     for (idx, rung) in ladder.iter().enumerate() {
-        if !rung_is_avoided(rung, avoid) {
+        if !rung_is_avoided(vendor, rung, vendor.rungs[idx].alias, avoid) {
             continue;
         }
         if rung.pinned {
@@ -1171,13 +1182,13 @@ pub fn resolved_ladder_avoiding(
             .flatten();
         let peer = rung.tier.and_then(|tier| {
             ladder.iter().enumerate().find(|(other, candidate)| {
-                *other != idx && candidate.tier == Some(tier) && !rung_is_avoided(candidate, avoid)
+                *other != idx
+                    && candidate.tier == Some(tier)
+                    && !rung_is_avoided(vendor, candidate, vendor.rungs[*other].alias, avoid)
             })
         });
         if let Some(id) = newer.or(older) {
-            if vendor.slug != "anthropic" {
-                out[idx].alias = id.clone();
-            }
+            out[idx].alias = id.clone();
             out[idx].id = id.clone();
             notes.push(AvoidNote {
                 avoided: rung.id.clone(),
@@ -1227,12 +1238,16 @@ fn base_ladder(
                 })
                 .max_by_key(|(version, _)| *version)
                 .map(|(_, id)| id);
+            let concrete = pinned.is_some() || newest.is_some();
             let id = pinned
                 .map(String::as_str)
                 .or(newest)
                 .unwrap_or(base.id)
                 .to_string();
-            let alias = if vendor.slug == "anthropic" {
+            // A concrete id (pinned or seen on this account) is dispatched as is; the static
+            // alias stays only while nothing concrete is known, so zirv never dispatches a
+            // static id it has not seen work.
+            let alias = if vendor.slug == "anthropic" && !concrete {
                 base.alias.to_string()
             } else {
                 id.clone()

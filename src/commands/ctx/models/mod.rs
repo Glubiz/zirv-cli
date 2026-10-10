@@ -4,6 +4,8 @@
 //! Codex-owned cache and Claude transcripts, persists observations, and
 //! injects the resulting rows into their pure lookup helpers.
 
+pub(crate) mod evidence;
+pub(crate) mod promotion;
 pub(crate) mod scorecard;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,7 +20,7 @@ use serde_json::Value;
 
 use super::CtxResult;
 use super::catalogue::{self, DiscoveredModel, Tier};
-use super::config::{CtxConfig, ModelsConfig, env_from_process};
+use super::config::{CtxConfig, ModelsConfig, RoutingConfig, env_from_process};
 use super::price::{self, ModelPrice, PriceTable};
 use super::state::{self, StateDir};
 
@@ -158,10 +160,12 @@ pub fn run(args: &ModelsArgs, w: &mut dyn Write) -> CtxResult<i32> {
     let rows = list_rows(&cfg, &registry, &prices);
     let card = scorecard::build(&state, &prices.table, state::now_secs());
     let warnings = avoid_warnings(&cfg, &registry);
+    let promotions = promotion::load(&state).unwrap_or_default();
     if args.json {
         let report = serde_json::json!({
             "models": rows,
             "scorecard": card,
+            "promotions": promotions,
             "avoid": {
                 "manual": cfg.models.avoid,
                 "auto_enabled": cfg.models.auto_avoid,
@@ -204,6 +208,7 @@ pub fn run(args: &ModelsArgs, w: &mut dyn Write) -> CtxResult<i32> {
             writeln!(w, "warning: {warning}")?;
         }
         scorecard::render(&card, w)?;
+        promotion::render(&promotions, &cfg.routing, w)?;
     }
     Ok(0)
 }
@@ -263,6 +268,10 @@ pub(crate) fn candidates<'a>(
 /// Rows with `availability` of `available` are models this machine has actually seen or been offered.
 pub(crate) const AVAILABLE: &str = "available";
 
+/// Rows with `availability` of `candidate` are new models held off dispatch until probe
+/// evidence promotes them; they are not selectable as an ordinary available model.
+pub(crate) const CANDIDATE: &str = "candidate";
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct ModelRow {
     pub(crate) vendor: String,
@@ -320,7 +329,8 @@ fn list_rows(cfg: &CtxConfig, registry: &Registry, prices: &EffectivePrices) -> 
                 .or_insert(None);
         }
     }
-    let discovered = discovered_models(registry);
+    let held = held_for(&cfg.routing);
+    let discovered = without_held(&discovered_models(registry), &held);
     let pins = effective_pins(cfg);
     let ladders: BTreeMap<String, Vec<catalogue::ResolvedRung>> = catalogue::vendors()
         .iter()
@@ -346,12 +356,15 @@ fn list_rows(cfg: &CtxConfig, registry: &Registry, prices: &EffectivePrices) -> 
                 id,
                 rung: rung.map(|r| r.alias.clone()),
                 tier: rung.and_then(|r| r.tier).map(tier_name).map(str::to_string),
-                availability: model
-                    .map_or(
+                availability: if held.contains(&normalized) {
+                    CANDIDATE
+                } else {
+                    model.map_or(
                         "snapshot",
                         |m| if m.available { AVAILABLE } else { "hidden" },
                     )
-                    .to_string(),
+                }
+                .to_string(),
                 input_micros_per_million: price.map(|p| p.input_micros),
                 output_micros_per_million: price.map(|p| p.output_micros),
                 price_source: provenance.map(|p| p.source.clone()),
@@ -459,7 +472,13 @@ fn refresh(cfg: &CtxConfig, state: &StateDir, now: u64) -> CtxResult<()> {
     if cfg.models.price_fetch {
         refresh_price_cache(state, now)?;
     }
-    scorecard::refresh(state, &effective_prices(cfg, state).table, now)
+    scorecard::refresh(state, &effective_prices(cfg, state).table, now)?;
+    if cfg.routing.enabled {
+        // Evidence first: the promotion gate decides on it.
+        evidence::refresh(state, cfg, now)?;
+        promotion::refresh(state, cfg, now)?;
+    }
+    Ok(())
 }
 
 fn discover_local(mut registry: Registry, now: u64) -> Registry {
@@ -1074,16 +1093,35 @@ fn with_discovered<R>(f: impl FnOnce(&[DiscoveredModel]) -> R) -> R {
     TEST_DISCOVERED.with(|cell| f(&cell.borrow()))
 }
 
+/// `discovered` without the models the promotion gate holds off dispatch.
+fn without_held(models: &[DiscoveredModel], held: &BTreeSet<String>) -> Vec<DiscoveredModel> {
+    models
+        .iter()
+        .filter(|m| !held.contains(&catalogue::normalize_id(&m.id).to_lowercase()))
+        .cloned()
+        .collect()
+}
+
 /// Empty (the static ladder applies unchanged) unless discovery has a model for this vendor or
-/// `avoid` must be applied to the static ladder.
+/// `avoid` must be applied to the static ladder. Models in `held` are invisible to the ladder,
+/// so the newest remaining id of a family is its promoted incumbent; an explicit pin still wins.
 fn ladder_with(
     vendor: &catalogue::Vendor,
     discovery: bool,
     pins: impl FnOnce() -> BTreeMap<String, String>,
     avoid: &BTreeSet<String>,
+    held: &BTreeSet<String>,
 ) -> Vec<catalogue::ResolvedRung> {
     with_discovered(|discovered| {
-        let discovered = if discovery { discovered } else { &[] };
+        let visible;
+        let discovered = if !discovery {
+            &[]
+        } else if held.is_empty() {
+            discovered
+        } else {
+            visible = without_held(discovered, held);
+            &visible[..]
+        };
         if avoid.is_empty()
             && !discovered
                 .iter()
@@ -1125,12 +1163,63 @@ fn cached_auto_avoid() -> BTreeSet<String> {
     .clone()
 }
 
+/// The operator's `[routing]` table for callers without a config, read once per process
+/// (repos cannot set `routing.*`).
+#[cfg(not(test))]
+fn process_routing() -> RoutingConfig {
+    static ROUTING: std::sync::OnceLock<RoutingConfig> = std::sync::OnceLock::new();
+    ROUTING
+        .get_or_init(|| RoutingConfig::load_operator_only(&env_from_process()).unwrap_or_default())
+        .clone()
+}
+
+/// The ids the promotion gate holds off dispatch, from the refresher's `promotions.json`,
+/// read once per process.
+#[cfg(not(test))]
+fn cached_held() -> BTreeSet<String> {
+    static HELD: std::sync::OnceLock<BTreeSet<String>> = std::sync::OnceLock::new();
+    HELD.get_or_init(|| {
+        StateDir::resolve(&env_from_process())
+            .ok()
+            .and_then(|state| promotion::load(&state))
+            .map(|promotions| promotion::held_ids(&promotions))
+            .unwrap_or_default()
+    })
+    .clone()
+}
+
 #[cfg(test)]
 thread_local! {
     static TEST_MODELS: std::cell::RefCell<ModelsConfig> =
         std::cell::RefCell::new(ModelsConfig::default());
     static TEST_AUTO_AVOID: std::cell::RefCell<BTreeSet<String>> =
         const { std::cell::RefCell::new(BTreeSet::new()) };
+    static TEST_HELD: std::cell::RefCell<BTreeSet<String>> =
+        const { std::cell::RefCell::new(BTreeSet::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_held(ids: &[&str]) {
+    TEST_HELD.with(|cell| *cell.borrow_mut() = ids.iter().map(|id| (*id).to_string()).collect());
+}
+
+#[cfg(test)]
+fn process_routing() -> RoutingConfig {
+    RoutingConfig::default()
+}
+
+#[cfg(test)]
+fn cached_held() -> BTreeSet<String> {
+    TEST_HELD.with(|cell| cell.borrow().clone())
+}
+
+/// The ids the promotion gate holds under `routing`: none while routing or the hold is off.
+pub(crate) fn held_for(routing: &RoutingConfig) -> BTreeSet<String> {
+    if routing.enabled && routing.hold_new_models {
+        cached_held()
+    } else {
+        BTreeSet::new()
+    }
 }
 
 #[cfg(test)]
@@ -1213,6 +1302,7 @@ pub(crate) fn runtime_ladder(vendor: &catalogue::Vendor) -> Vec<catalogue::Resol
         models.discovery,
         || models.pin.clone(),
         &avoid_from(&models),
+        &held_for(&process_routing()),
     )
 }
 
@@ -1227,10 +1317,12 @@ pub(crate) fn ladder_for(
         cfg.models.discovery,
         || effective_pins(cfg),
         &avoid_for(cfg),
+        &held_for(&cfg.routing),
     )
 }
 
-/// [`ladder_for`] without avoid: for recognising which tier an already-running model is on.
+/// [`ladder_for`] without avoid or the promotion gate: for recognising which tier an
+/// already-running model is on, which must work for a model the gate holds.
 pub(crate) fn identity_ladder_for(
     cfg: &CtxConfig,
     vendor: &catalogue::Vendor,
@@ -1239,6 +1331,7 @@ pub(crate) fn identity_ladder_for(
         vendor,
         cfg.models.discovery,
         || effective_pins(cfg),
+        &BTreeSet::new(),
         &BTreeSet::new(),
     )
 }
@@ -1250,7 +1343,7 @@ fn avoid_warnings(cfg: &CtxConfig, registry: &Registry) -> Vec<String> {
         return Vec::new();
     }
     let discovered = if cfg.models.discovery {
-        discovered_models(registry)
+        without_held(&discovered_models(registry), &held_for(&cfg.routing))
     } else {
         Vec::new()
     };
@@ -1283,7 +1376,10 @@ fn refresh_due(cfg: &CtxConfig, state: &StateDir, now: u64) -> bool {
     let scorecard_stale = cfg.models.auto_avoid
         && now.saturating_sub(scorecard::load(state).map_or(0, |card| card.generated_at))
             > REGISTRY_MAX_AGE_SECS;
-    if !registry_stale && !prices_stale && !scorecard_stale {
+    let evidence_stale = cfg.routing.enabled
+        && now.saturating_sub(evidence::load(state).map_or(0, |e| e.generated_at))
+            > REGISTRY_MAX_AGE_SECS;
+    if !registry_stale && !prices_stale && !scorecard_stale && !evidence_stale {
         return false;
     }
     let last_attempt = std::fs::read_to_string(state.root().join(REFRESH_ATTEMPT_FILE))
@@ -1680,6 +1776,7 @@ mod tests {
         let mut cfg = CtxConfig::default();
         cfg.models.discovery = false;
         cfg.models.price_fetch = false;
+        cfg.routing.enabled = false;
         let now = 10 * 86_400;
         assert_eq!(count_spawns(&cfg, &state, now), 0, "auto_avoid off");
         cfg.models.auto_avoid = true;
@@ -1727,6 +1824,14 @@ mod tests {
             },
         )
         .expect("prices");
+        write_json(
+            &state.root().join(evidence::EVIDENCE_FILE),
+            &evidence::Evidence {
+                generated_at: now - 3_600,
+                ..evidence::Evidence::default()
+            },
+        )
+        .expect("evidence");
         assert_eq!(count_spawns(&cfg, &state, now), 0);
     }
 
@@ -1744,6 +1849,7 @@ mod tests {
         let mut cfg = CtxConfig::default();
         cfg.models.discovery = false;
         cfg.models.price_fetch = false;
+        cfg.routing.enabled = false;
         assert_eq!(count_spawns(&cfg, &state, 10 * 86_400), 0);
     }
 
@@ -1985,12 +2091,12 @@ mod tests {
     }
 
     #[test]
-    fn claude_keeps_its_alias_when_the_observed_id_is_avoided() {
+    fn claude_dispatches_the_observed_id_even_when_it_is_the_last_usable_one() {
         observed_ids("anthropic", &["claude-opus-5-5"]);
         let cfg = cfg_avoiding(&["claude-opus-5-5"]);
         assert_eq!(
             crate::commands::ctx::handover::resolve_model("claude", "deep", &cfg).expect("deep"),
-            "opus"
+            "claude-opus-5-5"
         );
         let registry = Registry {
             models: BTreeMap::from([(
@@ -2072,5 +2178,189 @@ mod tests {
             avoid_for_state(&cfg, &state),
             BTreeSet::from(["gpt-5.6-sol".to_string(), "gpt-5.6-terra".to_string()])
         );
+    }
+
+    fn opus_id(ladder: &[catalogue::ResolvedRung]) -> String {
+        ladder
+            .iter()
+            .find(|rung| rung.family == "opus")
+            .map(|rung| rung.id.clone())
+            .expect("opus rung")
+    }
+
+    fn held_setup() -> &'static catalogue::Vendor {
+        observed_ids("anthropic", &["claude-opus-5", "claude-opus-5-5"]);
+        set_test_held(&["claude-opus-5-5"]);
+        catalogue::vendor("anthropic").expect("anthropic")
+    }
+
+    #[test]
+    fn dispatch_ladders_skip_a_held_id_but_the_identity_ladder_still_knows_it() {
+        let anthropic = held_setup();
+        let cfg = CtxConfig::default();
+        assert_eq!(opus_id(&ladder_for(&cfg, anthropic)), "claude-opus-5");
+        assert_eq!(opus_id(&runtime_ladder(anthropic)), "claude-opus-5");
+        assert_eq!(
+            opus_id(&identity_ladder_for(&cfg, anthropic)),
+            "claude-opus-5-5"
+        );
+        set_test_held(&[]);
+    }
+
+    #[test]
+    fn turning_the_hold_or_routing_off_restores_todays_newest_id() {
+        let anthropic = held_setup();
+        let mut cfg = CtxConfig::default();
+        cfg.routing.hold_new_models = false;
+        assert_eq!(opus_id(&ladder_for(&cfg, anthropic)), "claude-opus-5-5");
+        let mut cfg = CtxConfig::default();
+        cfg.routing.enabled = false;
+        assert_eq!(opus_id(&ladder_for(&cfg, anthropic)), "claude-opus-5-5");
+        set_test_held(&[]);
+    }
+
+    #[test]
+    fn an_explicit_pin_bypasses_the_gate() {
+        let anthropic = held_setup();
+        let mut cfg = CtxConfig::default();
+        cfg.models
+            .pin
+            .insert("anthropic.opus".into(), "claude-opus-5-5".into());
+        let ladder = ladder_for(&cfg, anthropic);
+        assert_eq!(opus_id(&ladder), "claude-opus-5-5");
+        assert!(ladder.iter().any(|rung| rung.pinned));
+        set_test_held(&[]);
+    }
+
+    #[test]
+    fn avoid_never_replaces_a_rung_with_a_held_id() {
+        observed_ids("openai", &["gpt-6.1-sol", "gpt-6.2-sol"]);
+        set_test_held(&["gpt-6.2-sol"]);
+        assert_eq!(codex_deep(&CtxConfig::default()), "gpt-6.1-sol");
+        assert_eq!(codex_deep(&cfg_avoiding(&["gpt-6.1-sol"])), "gpt-5.6-sol");
+        set_test_held(&[]);
+        assert_eq!(codex_deep(&cfg_avoiding(&["gpt-6.1-sol"])), "gpt-6.2-sol");
+    }
+
+    #[test]
+    fn the_listing_marks_held_ids_as_candidates_without_a_rung() {
+        let registry = registry_of(vec![
+            model("anthropic", "claude-opus-5"),
+            model("anthropic", "claude-opus-5-5"),
+        ]);
+        set_test_discovered(discovered_models(&registry));
+        set_test_held(&["claude-opus-5-5"]);
+        let rows = list_rows(
+            &CtxConfig::default(),
+            &registry,
+            &effective_prices_from(&PriceCache::default(), None),
+        );
+        let row = |id: &str| rows.iter().find(|row| row.id == id).expect("row");
+        assert_eq!(row("claude-opus-5-5").availability, CANDIDATE);
+        assert_eq!(row("claude-opus-5-5").rung, None);
+        assert_eq!(row("claude-opus-5").availability, AVAILABLE);
+        assert_eq!(row("claude-opus-5").rung.as_deref(), Some("claude-opus-5"));
+        set_test_held(&[]);
+    }
+
+    #[test]
+    fn a_discovered_claude_id_dispatches_in_full_and_static_only_stays_the_alias() {
+        use crate::commands::ctx::handover::{resolve_model, tier_for_model};
+        let cfg = CtxConfig::default();
+        set_test_discovered(Vec::new());
+        assert_eq!(resolve_model("claude", "deep", &cfg).expect("deep"), "opus");
+        observed_ids("anthropic", &["claude-opus-5-5"]);
+        assert_eq!(
+            resolve_model("claude", "deep", &cfg).expect("deep"),
+            "claude-opus-5-5"
+        );
+        assert_eq!(
+            resolve_model("claude", "standard", &cfg).expect("standard"),
+            "sonnet",
+            "nothing concrete is known for sonnet"
+        );
+        // The short name and the dated id still land on the same tier.
+        assert_eq!(tier_for_model("claude", "opus", &cfg), Some("deep"));
+        assert_eq!(
+            tier_for_model("claude", "claude-opus-5-5", &cfg),
+            Some("deep")
+        );
+        // A pin is concrete too.
+        let mut pinned = CtxConfig::default();
+        pinned
+            .models
+            .pin
+            .insert("anthropic.sonnet".into(), "claude-sonnet-5".into());
+        assert_eq!(
+            resolve_model("claude", "standard", &pinned).expect("standard"),
+            "claude-sonnet-5"
+        );
+    }
+
+    #[test]
+    fn the_review_model_below_a_discovered_seat_is_a_full_id_on_the_right_rung() {
+        observed_ids("anthropic", &["claude-opus-5-5", "claude-sonnet-5"]);
+        let anthropic = catalogue::vendor("anthropic").expect("anthropic");
+        let below = catalogue::rung_below(anthropic, Some("fable"));
+        assert_eq!(below, "claude-opus-5-5");
+        let rung = catalogue::rung_of(anthropic, below).expect("rung");
+        assert_eq!(rung.alias, "opus");
+    }
+
+    #[test]
+    fn an_operator_avoiding_a_claude_alias_still_matches_a_dated_rung() {
+        observed_ids("anthropic", &["claude-opus-5-5"]);
+        let warnings = avoid_warnings(
+            &cfg_avoiding(&["opus"]),
+            &registry_of(vec![model("anthropic", "claude-opus-5-5")]),
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("last usable model")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn stale_evidence_triggers_a_refresh_only_while_routing_is_enabled() {
+        let (_tmp, state) = due_state();
+        let mut cfg = CtxConfig::default();
+        cfg.models.discovery = false;
+        cfg.models.price_fetch = false;
+        let now = 10 * 86_400;
+        assert_eq!(count_spawns(&cfg, &state, now), 1, "no evidence yet");
+        write_json(
+            &state.root().join(evidence::EVIDENCE_FILE),
+            &evidence::Evidence {
+                generated_at: now,
+                ..evidence::Evidence::default()
+            },
+        )
+        .expect("evidence");
+        assert_eq!(count_spawns(&cfg, &state, now + 3_600), 0, "fresh");
+        assert_eq!(
+            count_spawns(&cfg, &state, now + 86_400 + 3_600),
+            1,
+            "a day old"
+        );
+        cfg.routing.enabled = false;
+        assert_eq!(
+            count_spawns(&cfg, &state, now + 3 * 86_400),
+            0,
+            "routing off"
+        );
+    }
+
+    #[test]
+    fn the_refresher_writes_evidence_only_while_routing_is_enabled() {
+        let (_tmp, state) = due_state();
+        let mut cfg = CtxConfig::default();
+        cfg.models.discovery = false;
+        cfg.models.price_fetch = false;
+        cfg.routing.enabled = false;
+        refresh(&cfg, &state, 100).expect("refresh");
+        assert!(evidence::load(&state).is_none());
+        cfg.routing.enabled = true;
+        refresh(&cfg, &state, 200).expect("refresh");
+        assert_eq!(evidence::load(&state).map(|e| e.generated_at), Some(200));
     }
 }

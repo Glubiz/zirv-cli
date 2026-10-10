@@ -8,7 +8,12 @@ mod discover;
 mod report;
 mod run;
 
+#[cfg(test)]
+pub(crate) use corpus::Role;
+pub(crate) use run::{Row, Status};
+
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 
@@ -280,6 +285,41 @@ fn model_listing(cfg: &CtxConfig, env: EnvLookup<'_>) -> Result<models::Listing,
 fn benchmark_root(env: EnvLookup<'_>) -> Result<std::path::PathBuf, String> {
     let state = StateDir::resolve(env).map_err(|e| e.to_string())?;
     Ok(state.root().join("benchmark"))
+}
+
+/// Every stored row of every run under `root` (`<state>/benchmark`) that started at or after
+/// `since` (unix seconds), each stamped with its run's start time. Unreadable runs and torn
+/// lines are skipped, exactly as `load_store` tolerates them.
+pub(crate) fn read_rows_since(root: &Path, since: u64) -> Vec<Row> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.join("run.json").is_file())
+        .collect();
+    dirs.sort();
+    let mut out = Vec::new();
+    for dir in dirs {
+        let Ok((meta, rows)) = run::load_store(&dir) else {
+            continue;
+        };
+        let Some(started) = chrono::DateTime::parse_from_rfc3339(&meta.started_at)
+            .ok()
+            .and_then(|at| u64::try_from(at.timestamp()).ok())
+        else {
+            continue;
+        };
+        if started < since {
+            continue;
+        }
+        out.extend(rows.into_iter().map(|mut row| {
+            row.ts = started;
+            row
+        }));
+    }
+    out
 }
 
 fn emit(
