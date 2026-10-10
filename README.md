@@ -239,7 +239,7 @@ Child runs disable zirv's supervisor, memory harvest, usage pacing and cross-har
 
 `zirv benchmark auto` runs a small, cheap benchmark with no operator present, to keep the evidence behind [Model routing](#model-routing) fresh. It never prompts and exits 0 when there is nothing to do, the lock is busy or the probe is not due.
 
-**When it runs.** Every `zirv ctx` verb except `hook`, `statusline` and `mcp` (the `zirv chat` and `zirv agent` aliases included) checks, from file reads only, whether a probe is due, and if so starts `zirv benchmark auto --quiet` detached with null stdio (so does bare `zirv`, `zirv ctx chat` and `zirv ctx status`, beside the model refresher). A probe is due when `[routing] enabled` and `probe` are on, at least `probe_interval_hours` (never less than 24) have passed since the last run, and no start was attempted in the last hour. The attempt stamp is written before the spawn, so a probe that fails to start backs off for an hour too. `--force` skips the interval, not the lock.
+**When it runs.** Every `zirv ctx` verb except `hook`, `statusline` and `mcp` (the `zirv chat` and `zirv agent` aliases included) checks, from file reads only, whether a probe is due, and if so starts `zirv benchmark auto --quiet` detached with null stdio (so does bare `zirv`, `zirv ctx chat` and `zirv ctx status`, beside the model refresher). A probe is due when `[routing] enabled` and `probe` are on, at least `probe_interval_hours` (never less than 24) have passed since the last run, and (for the automatic start only) no start was attempted in the last hour. The attempt stamp is written before the spawn, so a probe that fails to start backs off for an hour too; the started probe itself re-checks only the interval. `--force` skips the interval, not the lock.
 
 **Targets.** Per installed, enabled harness, up to 4 models, in this order:
 
@@ -251,7 +251,7 @@ A harness is skipped, with the reason recorded, when it carries an `[endpoint.<h
 
 **The run.** `auto` takes `<state>/probe.lock`, writes `<state>/probe-last-run` before the first agent launches (so a crash mid-run still backs the next probe off), then runs the embedded corpus with deterministic graders only (no judge), one rep, the usual per-run timeout, and a spend cap of `probe_max_usd` (default `$2`; runs past it are skipped with reason `spend cap`). It then refreshes `evidence.json` and `promotions.json` and appends `{ts, run_id, targets, skipped, spend_micros, outcome}` to `<state>/logs/probe.jsonl`. Rows land in the ordinary `benchmark/<run-id>/` store, so `zirv benchmark report <run-id>` reads them.
 
-- `--force`: ignore the probe interval and the attempt backoff. A busy lock still exits 0.
+- `--force`: ignore the probe interval. A busy lock still exits 0.
 - `--dry-run`: print the targets and skip reasons and spend nothing; it takes no lock and ignores the interval.
 - `--json`: print one JSON document (the log record plus `dry_run` and `agent_runs`).
 - `--quiet`: print nothing.
@@ -341,7 +341,8 @@ having a separate one, not a bug in the alias routing itself.
   across the enabled, live harnesses, excluding the calling seat's own
   harness. It announces the choice on stderr (`zirv ctx agent: routed to
   <harness> on <model> (<reason>)`) unless `--quiet`. With no usable
-  evidence it falls back to the harness a plain run would use. A model passed
+  evidence it falls back to the harness a plain run would use, or, when that
+  is the calling seat's own harness, the first other enabled, ready one. A model passed
   in the flags is never overridden. See [Model routing](#model-routing).
 
 #### Delegation receipt (`--json`)
@@ -3422,7 +3423,7 @@ Both are on by default and operator-only (see [`[routing]` keys](#routing-keys))
 
 `<state>/evidence.json` holds one cell per (harness, model, role, complexity). Role is `orchestrator`, `worker` or `reviewer`; complexity is `trivial`, `bounded`, `substantial`, `architectural`, or `any` (every row also feeds its `any` rollup). Rows older than 30 days are ignored. A cell has two sides:
 
-- **Synthetic**: quality of [automatic probe](#automatic-probes-zirv-benchmark-auto) and manual `zirv benchmark run` rows (the benchmark composite, a failed run scoring 0, a skipped one excluded), with its mean, a 95% interval, mean cost and median wall time. Under 5 rows the cell is inconclusive.
+- **Synthetic**: quality of [automatic probe](#automatic-probes-zirv-benchmark-auto) and manual `zirv benchmark run` rows (the benchmark composite, a failed run scoring 0, a skipped one or a failed one that produced no output, such as a usage-limit refusal, excluded), with its mean, a 95% interval, mean cost and median wall time. Under 5 rows the cell is inconclusive.
 - **Real**: your own recorded work, classified as in the [scorecard](#model-discovery-and-pricing) (infrastructure failures excluded): `zirv agent` delegations (reviewer when the task class is review, otherwise worker) and workflow outcomes (orchestrator; success is a completed run whose verification did not fail). It carries a Wilson success interval, and under 20 samples reads as inconclusive.
 
 The evidence is recomputed by the model refresher (`zirv ctx models refresh`, or the detached refresh, which also fires when `evidence.json` is over 24 hours old and routing is on) and at the end of every probe. It makes no model call.
@@ -3460,8 +3461,8 @@ No qualifying candidate means no pick, and the caller keeps its existing logic. 
 
 | Seam | Routed when | Never re-routed (explicit) |
 |---|---|---|
-| Chat seat (`zirv`, `zirv chat`) | no `--agent` and no `agent =`; no `chat.model`. Bare chat has no task text, so it uses orchestrator evidence at complexity `any`. The launch announcement prints `routed by evidence: <reason>` | `--agent`, `agent`, `chat.model` |
-| Proxy seat | no `agent =`; the harness follows the classified complexity and risk of the request | `agent`, `chat.model` |
+| Chat seat (`zirv`, `zirv chat`) | no `--agent` and no `agent =`; no `chat.model`. Bare chat has no task text, so it uses orchestrator evidence at complexity `any`. The launch announcement prints `routed by evidence: <reason>` | `--agent`, `agent`, `chat.model`, a model in the passthrough args (`zirv chat -- --model X`) |
+| Proxy seat | no `agent =`; the harness follows the classified complexity and risk of the request | `agent`, `chat.model`, a `[handover.<harness>]` model for the seat's tier |
 | `zirv agent auto "<prompt>"` | always (see [`zirv chat` and `zirv agent`](#zirv-chat-and-zirv-agent)) | a model in the flags |
 | `zirv agent <harness> ...` | the model inside that harness, from the classified prompt | a model in the flags, `[worker]` model for that harness |
 | Workflow seats | no task `model` and no `[model_tiers]` entry; tier `fast` is complexity `trivial`, `standard` is `bounded`, `deep` is `substantial`; picks within the seat's own harness | task `model`, `[model_tiers.<harness>]` |
