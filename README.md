@@ -3350,7 +3350,14 @@ Full event support is tracked in
 Codex's `~/.codex/models_cache.json` and model ids already present in Claude
 transcripts. It never reads Codex authentication data. Known families follow
 their newest available observed version; an unknown family is listed but is
-never placed on the ladder. Run-time tier and rung resolution (handover and
+never placed on the ladder (it is instead tracked as a
+[new-family candidate](#promotion-probation-and-demotion), probed, and
+routed on merit once it has evidence). Besides local evidence, the models.dev
+fetch that already supplies prices also records every `anthropic` and `openai`
+id it lists, with its release date when given, as known to exist but
+unverified for this account (`available = false`, source `models.dev`): the
+ladder never dispatches such an id, and an id another source marks available is
+never downgraded. With `price_fetch` off nothing is fetched or imported. Run-time tier and rung resolution (handover and
 proxy tiers, review-below, dispatch tiering, pricing equivalence) follows the
 discovered ladder; Claude dispatch still passes aliases. `[models].pin` and
 explicit model configuration hold a family on the operator's selected id, and an
@@ -3446,6 +3453,15 @@ State lives in `<state>/promotions.json`, per `vendor.family` (Anthropic and Ope
 - **Incumbent gone**: if the account stops offering the incumbent, the best qualifying probation candidate (else the newest available id) replaces it, with the reason recorded.
 - **Bypasses**: `[models] pin` and every other explicit model setting hold a family on the chosen id regardless of the gate. `hold_new_models = false` or `enabled = false` restores plain "newest available id" resolution.
 
+**New families.** A vendor's next model need not belong to a family zirv already names. An id that parses as `claude-<family>-<major>[-<minor>]` or `gpt-<major>[.<minor>]-<family>` (family letters only, after the usual date and prefix normalization) but whose family is not on the ladder (for example a future `claude-bel-1` or `gpt-6-bel`) is a new-family candidate. It has no incumbent and no rung, so there is nothing to compare it with; the router judges it on merit once it has evidence. State is the `new_families` map in `promotions.json`:
+
+- **Bootstrap**: the first run, every unknown-family id already known (including the models.dev list) is baseline, not a candidate, so the existing catalogue does not flood in. While `price_fetch` is on, the bootstrap waits until models.dev has been read. A models.dev release date more than 90 days before the id was first seen also makes it baseline.
+- **Probation**: a newcomer is held off dispatch and probed first on its vendor's harness (before ordinary probation candidates, under the same four-per-harness and spend caps).
+- **Eligible**: once a cell holds at least 5 synthetic rows for it, it leaves the held set and the router may pick it like any other model (same minimum-evidence rule, real-world veto, tolerance and cost tie-break). There is no rejection step.
+- **Unavailable**: if every probe row for it failed without producing output, it never ran on this account. It is marked `unavailable` for 7 days (`unavailable_until`), then returns to probation. A candidate with any row that ran is recorded in the registry as available (source `probe`).
+
+A new-family Claude id is dispatched by its full id through the `--model` seams only; the Agent tool's short aliases are unchanged.
+
 Claude is dispatched by its full model id once one has been seen on the account (a pin, or a transcript or discovery hit); only while nothing concrete is known does dispatch pass the short alias (`opus`, `sonnet`, `haiku`). That way zirv never dispatches a static id it has not seen work. The Agent tool's own model parameter accepts only a short alias, so the pre-tool rewrite for native subagents keeps the short alias.
 
 #### Routing
@@ -3476,7 +3492,7 @@ The orchestrator's harness roster gains one line when at least one route has evi
 
 `zirv ctx models` appends three sections to its listing:
 
-- **PROMOTIONS**: each family's incumbent, previous model, and held candidates with status (`probation` or `rejected`) and last verdict.
+- **PROMOTIONS**: each family's incumbent, previous model, and held candidates with status (`probation` or `rejected`) and last verdict; new-family candidates with status (`probation`, `eligible` or `unavailable`), first-seen date and unavailable-until date.
 - **ROUTES**: for each role and complexity, the pick and its reason (`<role>/<complexity> evidence: n=<rows>, quality <q>, cost <usd>`), or "no route yet" while evidence is thin.
 - **PROBES**: last run, next due, the last skip reasons, and the last run's spend.
 
