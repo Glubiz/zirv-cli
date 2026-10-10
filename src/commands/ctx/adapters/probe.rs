@@ -432,7 +432,8 @@ fn is_bootstrapper_dir(adapter_name: &str, dir: &Path) -> bool {
 }
 
 /// Every directory the widened liveness probe checks for `adapter_name`'s
-/// `program`: `PATH` minus [`known_bootstrapper_dirs`], then
+/// `program`: `PATH` minus empty entries (the working directory, which a
+/// checkout controls) and [`known_bootstrapper_dirs`], then
 /// [`known_install_roots`]. Empty when `program` already names a directory
 /// (an absolute/relative path, or an `agent_bin` override) -- matching
 /// [`program_is_present`]'s own convention that such a program is checked
@@ -444,7 +445,9 @@ fn liveness_search_dirs(adapter_name: &str, program: &str) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|paths| {
             std::env::split_paths(&paths)
-                .filter(|dir| !is_bootstrapper_dir(adapter_name, dir))
+                .filter(|dir| {
+                    !dir.as_os_str().is_empty() && !is_bootstrapper_dir(adapter_name, dir)
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -887,7 +890,9 @@ mod tests {
         let real = root.path().join("npm");
         std::fs::create_dir_all(&real).expect("mkdir");
 
-        let path = std::env::join_paths([&shim, &real]).expect("join PATH");
+        // The empty entry must not re-open a whole-PATH search that finds the shim.
+        let path = std::env::join_paths([shim.as_path(), Path::new(""), real.as_path()])
+            .expect("join PATH");
         let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[(
             "PATH",
             Some(path.to_str().expect("utf8 path")),
