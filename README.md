@@ -3357,7 +3357,9 @@ fetch that already supplies prices also records every `anthropic` and `openai`
 id it lists, with its release date when given, as known to exist but
 unverified for this account (`available = false`, source `models.dev`): the
 ladder never dispatches such an id, and an id another source marks available is
-never downgraded. With `price_fetch` off nothing is fetched or imported. Run-time tier and rung resolution (handover and
+never downgraded. `zirv ctx models` does not list these ids; it prints
+`+N known from models.dev, not seen on this account` instead (candidates and
+unverified versions below are still listed). With `price_fetch` off nothing is fetched or imported. Run-time tier and rung resolution (handover and
 proxy tiers, review-below, dispatch tiering, pricing equivalence) follows the
 discovered ladder; Claude dispatch still passes aliases. `[models].pin` and
 explicit model configuration hold a family on the operator's selected id, and an
@@ -3459,6 +3461,8 @@ State lives in `<state>/promotions.json`, per `vendor.family` (Anthropic and Ope
 - **Probation**: a newcomer is held off dispatch and probed first on its vendor's harness (before ordinary probation candidates, under the same four-per-harness and spend caps).
 - **Eligible**: once a cell holds at least 5 synthetic rows for it, it leaves the held set and the router may pick it like any other model (same minimum-evidence rule, real-world veto, tolerance and cost tie-break). There is no rejection step.
 - **Unavailable**: if every probe row for it failed without producing output, it never ran on this account. It is marked `unavailable` for 7 days (`unavailable_until`), then returns to probation. A candidate with any row that ran is recorded in the registry as available (source `probe`).
+
+**Unverified versions.** A new version of a known family can also exist only on models.dev (for example `claude-mythos-6` before Claude Code has used it). An id that only models.dev lists, newer than its family's incumbent (else the newest available id) and within the same 90-day release rule, is an unverified version, recorded in the `unverified` map of `promotions.json` and held. A family with nothing available has no incumbent, so nothing is recorded for it. The probe tests it first on its vendor's harness, like a new-family candidate. If any row ran, the registry marks it available (source `probe`) and the next refresh treats it as an ordinary newer version, so it enters the probation and promotion gate above with the probe rows already counting as evidence. If every row failed without output it is backed off for 7 days.
 
 A new-family Claude id is dispatched by its full id through the `--model` seams only; the Agent tool's short aliases are unchanged.
 
