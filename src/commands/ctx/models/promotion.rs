@@ -92,7 +92,7 @@ pub struct Promotions {
 }
 
 /// What new-family tracking needs beyond the discovered models.
-pub struct NewFamilyInput<'a> {
+struct NewFamilyInput<'a> {
     /// models.dev release dates (unix seconds) by normalized id.
     pub released: &'a BTreeMap<String, u64>,
     /// False while the existence source has not been read yet, so the bootstrap waits for it
@@ -100,6 +100,15 @@ pub struct NewFamilyInput<'a> {
     pub ready: bool,
     /// Normalized ids whose only registry source is models.dev (never seen on this account).
     pub models_dev_only: &'a BTreeSet<String>,
+}
+
+impl NewFamilyInput<'_> {
+    /// Released more than 90 days before `now`: old catalogue, not a newcomer.
+    fn is_old(&self, id: &str, now: u64) -> bool {
+        self.released
+            .get(id)
+            .is_some_and(|released| now.saturating_sub(*released) > MAX_RELEASE_AGE_SECS)
+    }
 }
 
 /// A version of a known family that exists only on models.dev and is newer than the family's
@@ -155,24 +164,7 @@ fn version_of(vendor: &str, id: &str) -> Option<catalogue::ModelVersion> {
 ///
 /// With `enabled` or `hold_new_models` off every family's incumbent is simply the newest
 /// available id and nothing is held, which is exactly today's resolution.
-#[cfg(test)]
-pub fn update(
-    prev: &Promotions,
-    discovered: &[DiscoveredModel],
-    evidence: &Evidence,
-    cfg: &RoutingConfig,
-    now: u64,
-) -> Promotions {
-    let input = NewFamilyInput {
-        released: &BTreeMap::new(),
-        ready: true,
-        models_dev_only: &BTreeSet::new(),
-    };
-    update_with(prev, discovered, evidence, cfg, now, &input)
-}
-
-/// [`update`] with the new-family inputs (release dates, existence source readiness).
-pub fn update_with(
+fn update_with(
     prev: &Promotions,
     discovered: &[DiscoveredModel],
     evidence: &Evidence,
@@ -272,11 +264,7 @@ fn update_unverified(
         if incumbent.is_none_or(|incumbent| version <= incumbent) {
             continue;
         }
-        if input
-            .released
-            .get(&id)
-            .is_some_and(|released| now.saturating_sub(*released) > MAX_RELEASE_AGE_SECS)
-        {
+        if input.is_old(&id, now) {
             continue;
         }
         let mut state = prev
@@ -363,11 +351,7 @@ fn update_new_families(
         if candidates.contains_key(id) || baseline.contains(id) {
             continue;
         }
-        let old = input
-            .released
-            .get(id)
-            .is_some_and(|released| now.saturating_sub(*released) > MAX_RELEASE_AGE_SECS);
-        if old {
+        if input.is_old(id, now) {
             baseline.insert(id.clone());
             continue;
         }
@@ -406,11 +390,7 @@ fn update_new_families(
 /// Apply one probe run's availability findings: `(model id, ran)`, where a model that never
 /// ran (every row failed without output) is unavailable for a week and one that did run is
 /// back on probation if it was unavailable. Eligible candidates are left alone.
-pub fn record_probe_outcomes(
-    prev: &Promotions,
-    outcomes: &[(String, bool)],
-    now: u64,
-) -> Promotions {
+fn record_probe_outcomes(prev: &Promotions, outcomes: &[(String, bool)], now: u64) -> Promotions {
     let mut next = prev.clone();
     for (id, ran) in outcomes {
         let key = catalogue::normalize_id(id).to_lowercase();
@@ -778,6 +758,22 @@ pub(crate) fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`update_with`] with no new-family inputs.
+    fn update(
+        prev: &Promotions,
+        discovered: &[DiscoveredModel],
+        evidence: &Evidence,
+        cfg: &RoutingConfig,
+        now: u64,
+    ) -> Promotions {
+        let input = NewFamilyInput {
+            released: &BTreeMap::new(),
+            ready: true,
+            models_dev_only: &BTreeSet::new(),
+        };
+        update_with(prev, discovered, evidence, cfg, now, &input)
+    }
     use crate::commands::ctx::models::evidence::{
         Cell, CellComplexity, RealStats, RouteRole, SyntheticStats,
     };
