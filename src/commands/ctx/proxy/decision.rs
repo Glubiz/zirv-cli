@@ -23,6 +23,7 @@ use crate::commands::ctx::adapters;
 use crate::commands::ctx::catalogue::{self, Tier};
 use crate::commands::ctx::config::CtxConfig;
 use crate::commands::ctx::handover;
+use crate::commands::ctx::routing;
 // Re-export shared Jev shapes to preserve this module's public paths. (#537)
 pub use crate::commands::ctx::jev::{
     Answer, AnswerValue, Answers, Criteria, MAX_CHOICE_OPTIONS, Question, QuestionKind, Usage,
@@ -769,6 +770,23 @@ pub fn baseline(
     apply_security_risk_floor(&mut decision);
     apply_orchestration_request_complexity_floor(&mut decision, request);
     apply_explicit_workflow_request_floor(&mut decision, request, classification, roster);
+    // With no configured `agent`, evidence may pick the harness too; the model follows in
+    // `finalize_derived_fields`.
+    if cfg.agent.is_none()
+        && let Some(pick) = routing::route_seat(
+            cfg,
+            Some(decision.complexity),
+            decision.risk,
+            None,
+            &routing::machine_presence,
+        )
+    {
+        decision.reasons.push(format!(
+            "seat: harness '{}' routed by evidence ({})",
+            pick.harness, pick.reason
+        ));
+        decision.orchestrator.harness = pick.harness;
+    }
     finalize_derived_fields(&mut decision, cfg);
     decision
 }
@@ -1296,6 +1314,19 @@ fn finalize_derived_fields(decision: &mut ProxyDecision, cfg: &CtxConfig) {
     decision.seat_role = SeatRole::from_execution(decision.execution);
     decision.orchestrator.model =
         model_for_tier(cfg, &decision.orchestrator.harness, decision.seat_tier);
+    if let Some(pick) = routing::route_seat(
+        cfg,
+        Some(decision.complexity),
+        decision.risk,
+        Some(&decision.orchestrator.harness),
+        &routing::machine_presence,
+    ) {
+        decision.reasons.push(format!(
+            "seat: model '{}' routed by evidence ({})",
+            pick.model, pick.reason
+        ));
+        decision.orchestrator.model = pick.model;
+    }
 }
 
 /// Force unattended launches to one seat with no delegation; preserve the decision's other constraints. (#537)
@@ -3153,6 +3184,79 @@ mod tests {
         assert!(
             substantial_decision.workflow.is_some(),
             "a substantial task must still get an auto-proposed workflow"
+        );
+    }
+
+    fn seat_evidence() -> routing::TestEvidence {
+        use crate::commands::ctx::models::evidence::RouteRole;
+        use crate::commands::ctx::routing::fixtures::{cell, evidence};
+        routing::TestEvidence::set(evidence(vec![
+            cell(
+                "claude",
+                "claude-seat",
+                RouteRole::Orchestrator,
+                5,
+                0.90,
+                Some(900),
+            ),
+            cell(
+                "codex",
+                "codex-seat",
+                RouteRole::Orchestrator,
+                5,
+                0.89,
+                Some(100),
+            ),
+        ]))
+    }
+
+    /// With no `agent` and no `chat.model`, evidence picks both the proxy seat's harness and model.
+    #[test]
+    fn baseline_routes_the_seat_by_evidence_when_nothing_is_configured() {
+        let _evidence = seat_evidence();
+        let request = "fix a typo in the readme";
+        let decision = baseline(
+            &CtxConfig::default(),
+            Path::new("."),
+            request,
+            &classify_request(request),
+            &empty_roster(),
+        );
+        assert_eq!(decision.orchestrator.harness, "codex");
+        assert_eq!(decision.orchestrator.model, "codex-seat");
+    }
+
+    #[test]
+    fn baseline_keeps_a_configured_agent_and_chat_model_over_the_routed_seat() {
+        let _evidence = seat_evidence();
+        let request = "fix a typo in the readme";
+        let mut cfg = CtxConfig::default();
+        cfg.chat.model = Some("my-model".to_string());
+        let decision = baseline(
+            &cfg,
+            Path::new("."),
+            request,
+            &classify_request(request),
+            &empty_roster(),
+        );
+        assert_ne!(decision.orchestrator.model, "codex-seat");
+        assert_ne!(decision.orchestrator.model, "claude-seat");
+
+        let cfg = CtxConfig {
+            agent: Some("claude".to_string()),
+            ..CtxConfig::default()
+        };
+        let decision = baseline(
+            &cfg,
+            Path::new("."),
+            request,
+            &classify_request(request),
+            &empty_roster(),
+        );
+        assert_eq!(decision.orchestrator.harness, "claude");
+        assert_eq!(
+            decision.orchestrator.model, "claude-seat",
+            "an explicit harness still routes its model by evidence"
         );
     }
 

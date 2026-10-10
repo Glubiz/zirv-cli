@@ -1121,11 +1121,14 @@ pub fn launch_spec(spec: &SessionSpec, session_id: &str, state: &StateDir) -> Ct
         .into());
     }
     let repo = spec.cwd.clone();
-    let cfg = super::super::config::CtxConfig::load_for_launch(
+    let mut cfg = super::super::config::CtxConfig::load_for_launch(
         &repo,
         &super::super::config::env_from_process(),
     )?;
-    let (adapter, _rule) = super::super::chat::resolve_adapter(&cfg, spec.agent.as_deref())?;
+    let (adapter, rule) = super::super::chat::resolve_adapter(&cfg, spec.agent.as_deref())?;
+    if let super::super::chrome::HarnessRule::Routed { model, .. } = rule {
+        cfg.chat.model = Some(model);
+    }
     let prompt = spec.prompt.trim();
     let launch = super::super::chat::build_launch(
         adapter.as_ref(),

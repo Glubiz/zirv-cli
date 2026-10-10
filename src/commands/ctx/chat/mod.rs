@@ -206,17 +206,46 @@ pub(crate) fn resolve_adapter_with_presence(
             adapters::select_with_presence(Some(name), &[], cfg, true, present)?,
             HarnessRule::Configured,
         )),
-        None => adapters::resolve_default_with_presence(cfg, present).map(|(adapter, origin)| {
-            let rule = match origin {
-                DefaultOrigin::Configured => HarnessRule::Configured,
-                DefaultOrigin::FirstEnabledReady => HarnessRule::FirstEnabledReady,
-                DefaultOrigin::FirstInstalledReady { not_found } => {
-                    HarnessRule::FirstInstalledReady { not_found }
-                }
-            };
-            (adapter, rule)
-        }),
+        None => {
+            if let Some((adapter, rule)) = routed_seat(cfg, present) {
+                return Ok((adapter, rule));
+            }
+            adapters::resolve_default_with_presence(cfg, present).map(|(adapter, origin)| {
+                let rule = match origin {
+                    DefaultOrigin::Configured => HarnessRule::Configured,
+                    DefaultOrigin::FirstEnabledReady => HarnessRule::FirstEnabledReady,
+                    DefaultOrigin::FirstInstalledReady { not_found } => {
+                        HarnessRule::FirstInstalledReady { not_found }
+                    }
+                };
+                (adapter, rule)
+            })
+        }
     }
+}
+
+/// With no `--agent`, `agent` or `chat.model`, the seat evidence picks (`routing`); bare chat
+/// has no task text, so it routes on orchestrator evidence at any complexity.
+pub(crate) fn routed_seat(
+    cfg: &CtxConfig,
+    present: &dyn Fn(&str, &str) -> adapters::Liveness,
+) -> Option<(Box<dyn AgentAdapter>, HarnessRule)> {
+    let pick = super::routing::route_seat(
+        cfg,
+        None,
+        crate::commands::workflow::classify::RiskBand::Low,
+        None,
+        present,
+    )?;
+    let adapter =
+        adapters::select_with_presence(Some(&pick.harness), &[], cfg, true, present).ok()?;
+    Some((
+        adapter,
+        HarnessRule::Routed {
+            model: pick.model,
+            reason: pick.reason,
+        },
+    ))
 }
 
 /// Show disabled harnesses, omit only confirmed-absent enabled binaries, and retain uncertain/readiness-failed entries (#298).
@@ -773,6 +802,10 @@ pub fn run_with<W: Write, E: Write>(
             return Ok(1);
         }
     };
+    // A routed seat's model rides `chat.model` from here on, so extras, the banner and pacing agree.
+    if let HarnessRule::Routed { model, .. } = &rule {
+        cfg.chat.model = Some(model.clone());
+    }
     // Proxy request and resume handoff cannot compete for the initial prompt because resume always skips intake (#537).
     let initial_prompt = match &intake {
         ProxyIntakeOutcome::Decided { request, .. } => Some(request.clone()),
@@ -831,7 +864,7 @@ pub fn run_with<W: Write, E: Write>(
     if chrome.banner {
         let facts = BannerFacts {
             harness: adapter.name().to_string(),
-            rule,
+            rule: rule.clone(),
             session: session.as_str().to_string(),
             harnesses: harness_list(&cfg),
             resuming: resuming.then(|| "the last stored handoff for this repo".to_string()),
@@ -850,8 +883,11 @@ pub fn run_with<W: Write, E: Write>(
     let env = pin_env(&env, args.pin_harness);
 
     // Disclose after quiet resolution and before dispatch, independently of the banner.
-    announce_model_choice(stderr, &cfg, args.quiet);
-    announce_harness_choice(stderr, &cfg, args.quiet, adapter.name(), rule);
+    // A routed model is disclosed by the routing line, not as if the config had named it.
+    if !matches!(rule, HarnessRule::Routed { .. }) {
+        announce_model_choice(stderr, &cfg, args.quiet);
+    }
+    announce_harness_choice(stderr, &cfg, args.quiet, adapter.name(), &rule);
 
     // Try persistence before both local paths; experimental-runtime failures must fall back to a usable session (#352).
     if super::session::chat_route(
@@ -971,22 +1007,27 @@ fn announce_harness_choice<E: Write>(
     cfg: &CtxConfig,
     quiet: bool,
     chosen: &str,
-    rule: HarnessRule,
+    rule: &HarnessRule,
 ) {
-    let HarnessRule::FirstInstalledReady { not_found } = rule else {
-        return;
+    let event = match rule {
+        HarnessRule::FirstInstalledReady { not_found } => {
+            super::announce::Event::HarnessAutoSelected {
+                chosen: chosen.to_string(),
+                not_found: not_found.to_string(),
+            }
+        }
+        HarnessRule::Routed { model, reason } => super::announce::Event::HarnessRouted {
+            chosen: chosen.to_string(),
+            model: model.clone(),
+            reason: reason.clone(),
+        },
+        _ => return,
     };
     super::announce::Announcer::new(
         cfg.chrome.events && !quiet,
         console::colors_enabled_stderr(),
     )
-    .emit_to(
-        stderr,
-        &super::announce::Event::HarnessAutoSelected {
-            chosen: chosen.to_string(),
-            not_found: not_found.to_string(),
-        },
-    );
+    .emit_to(stderr, &event);
 }
 
 /// Match wrap's order: compile, merge explicit prompt, inject, then log (#44).
@@ -2516,6 +2557,69 @@ mod tests {
         .expect("an explicit --agent is never second-guessed");
         assert_eq!(adapter.name(), "claude");
         assert_eq!(rule, HarnessRule::Explicit);
+    }
+
+    fn orchestrator_evidence() -> super::super::routing::TestEvidence {
+        use super::super::routing::fixtures::{cell, evidence};
+        use crate::commands::ctx::models::evidence::RouteRole;
+        super::super::routing::TestEvidence::set(evidence(vec![
+            cell(
+                "claude",
+                "claude-seat",
+                RouteRole::Orchestrator,
+                5,
+                0.90,
+                Some(900),
+            ),
+            cell(
+                "codex",
+                "codex-seat",
+                RouteRole::Orchestrator,
+                5,
+                0.89,
+                Some(100),
+            ),
+        ]))
+    }
+
+    /// Bare chat has no task text, so the seat routes on orchestrator evidence at any complexity.
+    #[test]
+    fn a_bare_chat_seat_is_routed_by_orchestrator_evidence() {
+        let _evidence = orchestrator_evidence();
+        let (adapter, rule) = resolve_adapter_with_presence(
+            &CtxConfig::default(),
+            None,
+            &adapters::everything_installed(),
+        )
+        .expect("a seat");
+        assert_eq!(adapter.name(), "codex");
+        assert!(
+            matches!(&rule, HarnessRule::Routed { model, .. } if model == "codex-seat"),
+            "{rule:?}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_choice_bypasses_the_routed_seat() {
+        let _evidence = orchestrator_evidence();
+        let present = adapters::everything_installed();
+
+        let (adapter, rule) =
+            resolve_adapter_with_presence(&CtxConfig::default(), Some("claude"), &present)
+                .expect("--agent");
+        assert_eq!((adapter.name(), rule), ("claude", HarnessRule::Explicit));
+
+        let cfg = CtxConfig {
+            agent: Some("claude".to_string()),
+            ..CtxConfig::default()
+        };
+        let (adapter, rule) = resolve_adapter_with_presence(&cfg, None, &present).expect("agent");
+        assert_eq!((adapter.name(), rule), ("claude", HarnessRule::Configured));
+
+        let mut cfg = CtxConfig::default();
+        cfg.chat.model = Some("my-model".to_string());
+        let (_, rule) = resolve_adapter_with_presence(&cfg, None, &present).expect("chat.model");
+        assert_eq!(rule, HarnessRule::FirstEnabledReady);
     }
 
     /// The registry's own aggregated error (naming every candidate and why it

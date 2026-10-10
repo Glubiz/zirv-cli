@@ -20,6 +20,7 @@ use super::super::pace;
 use super::super::permit::{self, WorkerMode};
 use super::super::policy;
 use super::super::result_schema::{self, Schema};
+use super::super::routing;
 use super::super::state::StateDir;
 use super::super::worktree;
 use super::dashboard::*;
@@ -290,6 +291,70 @@ fn run_goal_bootstrap(
     Ok(usage)
 }
 
+/// Resolve `zirv agent auto` to a harness and give an unpinned delegation the model evidence
+/// picks, announcing the choice. Returns whether a model was added to `args.flags`.
+fn apply_worker_routing(
+    args: &mut AgentArgs,
+    cfg: &CtxConfig,
+    state: &StateDir,
+    env: EnvLookup<'_>,
+) -> CtxResult<bool> {
+    let auto = args.name == routing::AUTO;
+    let own_seat = (env(adapters::SEAT_ROLE_ENV).as_deref() == Some("orchestrator") && !args.force)
+        .then(|| env(adapters::AGENT_ENV))
+        .flatten();
+    let session = super::super::mail::session_identity(env).unwrap_or_default();
+    let pick = routing::route_worker(
+        cfg,
+        state,
+        &routing::WorkerRequest {
+            name: &args.name,
+            prompt: &args.prompt,
+            review: args.task_class == Some(super::super::log::TaskClass::Review),
+            model_pinned: flags_pin_model(&args.flags),
+            session: &session,
+            exclude: own_seat.as_deref(),
+        },
+    );
+    let Some(pick) = pick else {
+        if auto {
+            // No evidence yet: `auto` is the harness a plain run would use.
+            args.name = adapters::resolve_default(cfg)?.0.name().to_string();
+            if let Some(message) = same_harness_refusal(args, env) {
+                return Err(message.into());
+            }
+        }
+        return Ok(false);
+    };
+    args.name = pick.harness.clone();
+    if auto && let Some(message) = same_harness_refusal(args, env) {
+        return Err(message.into());
+    }
+    let mut routed = false;
+    if let Some(model) = &pick.model {
+        let adapter = adapters::select(Some(&args.name), &[], cfg)?;
+        let mut flags = adapter.model_args(model);
+        flags.append(&mut args.flags);
+        args.flags = flags;
+        routed = true;
+    }
+    if pick.canary {
+        super::super::attribution::set_process_candidate("canary");
+    }
+    if !args.quiet {
+        eprintln!(
+            "zirv ctx agent: routed to {}{} ({})",
+            pick.harness,
+            pick.model
+                .as_deref()
+                .map(|model| format!(" on {model}"))
+                .unwrap_or_default(),
+            pick.reason
+        );
+    }
+    Ok(routed)
+}
+
 pub fn run_with<W: Write>(
     args: &AgentArgs,
     w: &mut W,
@@ -325,6 +390,8 @@ pub fn run_with<W: Write>(
     super::super::seat::fence(&state)?;
     // Resolve workspace names and skills before allocation so invalid references cannot leave temporary trees.
     let cfg = CtxConfig::load_for_launch(repo, env)?;
+    // Evidence may choose the harness (`auto`) or the model, only where nothing was pinned.
+    let routed_model = !native && apply_worker_routing(args, &cfg, &state, env)?;
     let manifest_skills = if let Some(id) = args.manifest_agent.as_deref() {
         let home = env("HOME")
             .or_else(|| env("USERPROFILE"))
@@ -567,7 +634,8 @@ pub fn run_with<W: Write>(
         },
         &mut refresh_flags,
     );
-    let source_model_explicit = flags_pin_model(&args.flags);
+    // A routed model is a default, not a pin: a reroute may still use the target's own policy.
+    let source_model_explicit = flags_pin_model(&args.flags) && !routed_model;
     let bounds = super::super::fallback::TaskBounds {
         tokens: args.budget_tokens,
         tool_calls: args.max_tool_calls,

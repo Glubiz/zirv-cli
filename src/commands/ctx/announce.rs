@@ -148,6 +148,14 @@ pub enum Event {
     /// picked over another rides `chrome.events`, which a repo cannot
     /// silence (#690).
     HarnessAutoSelected { chosen: String, not_found: String },
+    /// No harness or model was chosen by the operator, so recorded evidence picked both. Said
+    /// on the same unsilenceable channel as `HarnessAutoSelected`: a seat chosen for an
+    /// operator is never chosen silently.
+    HarnessRouted {
+        chosen: String,
+        model: String,
+        reason: String,
+    },
     /// Read the sender from the claimed nudge marker so the notice names the sending
     /// session.
     Nudge {
@@ -469,6 +477,14 @@ impl Event {
             Event::HarnessAutoSelected { chosen, not_found } => format!(
                 "using '{chosen}': '{not_found}' is not installed on this machine. Set `agent` \
                  in ~/.zirv/ctx.toml (or pass --agent) to pin the harness yourself"
+            ),
+            Event::HarnessRouted {
+                chosen,
+                model,
+                reason,
+            } => format!(
+                "routed to '{chosen}' on '{model}' ({reason}). Set `agent` and `[chat] model` \
+                 in ~/.zirv/ctx.toml (or pass --agent) to pin the seat yourself"
             ),
             Event::Nudge { from, disposition } => match disposition {
                 NudgeDisposition::Relaunching => {

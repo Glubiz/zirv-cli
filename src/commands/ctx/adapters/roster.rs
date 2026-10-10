@@ -170,6 +170,17 @@ fn harness_roster_lines(
     if let Some(review_line) = review_roster_line(cfg, &roster_names) {
         lines.push(review_line);
     }
+    // Same verdicts the lines above were built from, so the routing line cannot disagree with them.
+    let listed = |name: &str, _program: &str| {
+        if roster_names.contains(&name) {
+            Liveness::Live
+        } else {
+            Liveness::Absent("not on the roster".to_string())
+        }
+    };
+    if let Some(routing_line) = super::super::routing::roster_line(cfg, &listed) {
+        lines.push(routing_line);
+    }
     let omitted = omitted_texts.len();
     let omitted_bytes = omitted_texts.iter().map(|line| line.len() + 1).sum();
     HarnessRosterReport {
@@ -248,6 +259,8 @@ fn review_roster_line(cfg: &CtxConfig, roster_names: &[&str]) -> Option<String> 
             }
             let note = if choice.configured {
                 "configured".to_string()
+            } else if choice.routed {
+                "routed".to_string()
             } else if equals_seat {
                 "floor tier: the seat is already at the bottom rung".to_string()
             } else {

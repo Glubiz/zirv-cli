@@ -375,10 +375,16 @@ pub trait AgentAdapter: std::fmt::Debug {
         // never a guess of zirv's own. Neither branch ever narrows or widens
         // `manifest.model_tier` itself -- the tier resolved is always the one
         // the manifest already declared.
-        let resolved_model = task
+        let explicit_model = task
             .model
             .as_deref()
             .or_else(|| resolve_tiered_model(&cfg, self.name(), manifest.model_tier));
+        // Only with no pin and no tier entry may evidence choose the model inside this harness.
+        let routed_model = match explicit_model {
+            Some(_) => None,
+            None => super::routing::route_tier(&cfg, self.name(), manifest.model_tier),
+        };
+        let resolved_model = explicit_model.or(routed_model.as_deref());
         if let Some(model) = resolved_model {
             extra.extend(self.model_args(model));
         }

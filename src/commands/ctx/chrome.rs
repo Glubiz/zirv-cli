@@ -108,7 +108,7 @@ impl ChromeCaps {
 /// "configured" from "first enabled and ready", and has no case at all for an
 /// explicit `--agent`, which never reaches `resolve_default` in the first
 /// place.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HarnessRule {
     /// `--agent <name>` on the command line.
     Explicit,
@@ -126,6 +126,9 @@ pub enum HarnessRule {
     /// `chat::announce_harness_choice` carries the full disclosure on the
     /// announcement channel instead.
     FirstInstalledReady { not_found: &'static str },
+    /// No explicit or configured choice, and recorded evidence picked this harness and
+    /// `model` for the seat (`routing::route`); `reason` names the evidence.
+    Routed { model: String, reason: String },
 }
 
 impl HarnessRule {
@@ -139,6 +142,7 @@ impl HarnessRule {
             HarnessRule::FirstInstalledReady { not_found } => {
                 format!("the first installed, ready harness; '{not_found}' is not installed")
             }
+            HarnessRule::Routed { reason, .. } => format!("routed by evidence: {reason}"),
         }
     }
 
@@ -150,6 +154,7 @@ impl HarnessRule {
             HarnessRule::Configured => "configured",
             HarnessRule::FirstEnabledReady => "auto",
             HarnessRule::FirstInstalledReady { .. } => "auto",
+            HarnessRule::Routed { .. } => "routed",
         }
     }
 }
