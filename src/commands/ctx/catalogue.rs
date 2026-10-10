@@ -1123,7 +1123,7 @@ fn rung_is_avoided(
 
 /// [`resolved_ladder`] with `avoid` (lowercased model ids or aliases) applied. An avoided,
 /// unpinned rung is replaced by, in order: a newer non-avoided version of its family; an older
-/// one (not on Claude, whose alias stays the dispatched name); another non-avoided rung of the
+/// one (not on Claude, whose static id may not exist on the account); another non-avoided rung of the
 /// same tier. Never a different tier. When nothing qualifies the rung is kept. An explicit pin
 /// is never replaced. An empty `avoid` returns exactly [`resolved_ladder`]'s ladder.
 pub fn resolved_ladder_avoiding(
