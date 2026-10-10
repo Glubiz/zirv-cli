@@ -600,21 +600,22 @@ pub(crate) fn models_dev_only_ids(registry: &Registry) -> BTreeSet<String> {
 
 /// Run `f` holding the refresher's lock, so a read-modify-write of registry.json,
 /// promotions.json or evidence.json cannot interleave with `models refresh`, which holds it from
-/// load to write. Retries until `wait` has passed; `None` when the lock stayed busy.
-pub(crate) fn with_refresh_lock<T>(
+/// load to write. Retries until `wait` has passed; false when the lock stayed busy.
+pub(crate) fn with_refresh_lock(
     state: &StateDir,
     wait: std::time::Duration,
-    f: impl FnOnce() -> T,
-) -> Option<T> {
+    f: impl FnOnce(),
+) -> bool {
     let _ = std::fs::create_dir_all(state.root());
     let path = state.root().join(REFRESH_LOCK_FILE);
     let deadline = std::time::Instant::now() + wait;
     loop {
         if let Ok(_lock) = state::try_acquire_lock(&path) {
-            return Some(f());
+            f();
+            return true;
         }
         if std::time::Instant::now() >= deadline {
-            return None;
+            return false;
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
@@ -2129,13 +2130,13 @@ mod tests {
     fn the_probe_bookkeeping_waits_for_the_refresh_lock_and_gives_up_when_it_stays_held() {
         let (_tmp, state) = due_state();
         let zero = std::time::Duration::ZERO;
-        assert_eq!(with_refresh_lock(&state, zero, || 7), Some(7));
+        assert!(with_refresh_lock(&state, zero, || {}));
         let _held = state::try_acquire_lock(&state.root().join(REFRESH_LOCK_FILE)).expect("lock");
         let ran = std::cell::Cell::new(false);
-        let skipped = with_refresh_lock(&state, std::time::Duration::from_millis(300), || {
+        let locked = with_refresh_lock(&state, std::time::Duration::from_millis(300), || {
             ran.set(true);
         });
-        assert_eq!(skipped, None);
+        assert!(!locked);
         assert!(!ran.get());
     }
 

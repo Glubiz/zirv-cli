@@ -425,26 +425,23 @@ pub(crate) fn run(
     };
     let refreshed = state::now_secs();
     // Under the refresher's lock: these read-modify-write the files `models refresh` writes.
-    let bookkeeping = models::with_refresh_lock(&state, BOOKKEEPING_LOCK_WAIT, || {
+    let mut failure = None;
+    let locked = models::with_refresh_lock(&state, BOOKKEEPING_LOCK_WAIT, || {
         if let Some(run_id) = &run_id {
             record_availability(&state, env, &promotions, run_id, refreshed);
         }
         if let Err(error) = evidence::refresh(&state, cfg, refreshed) {
-            Some(format!("evidence refresh failed: {error}"))
+            failure = Some(format!("evidence refresh failed: {error}"));
         } else if let Err(error) = promotion::refresh(&state, cfg, refreshed) {
-            Some(format!("promotion refresh failed: {error}"))
-        } else {
-            None
+            failure = Some(format!("promotion refresh failed: {error}"));
         }
     });
-    match bookkeeping {
-        Some(Some(failure)) => outcome = format!("{outcome}; {failure}"),
-        Some(None) => {}
-        None => {
-            outcome = format!(
-                "{outcome}; availability and evidence not recorded: models refresh held its lock"
-            );
-        }
+    if !locked {
+        outcome = format!(
+            "{outcome}; availability and evidence not recorded: models refresh held its lock"
+        );
+    } else if let Some(failure) = failure {
+        outcome = format!("{outcome}; {failure}");
     }
     let done = record(&outcome, run_id, spend);
     append_log(&state, &done);
