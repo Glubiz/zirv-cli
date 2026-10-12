@@ -1163,11 +1163,7 @@ fn store_into(
             .unwrap_or_default()
             .iter()
             .filter_map(|path| std::fs::read_to_string(path).ok())
-            .filter_map(|text| {
-                let marker = text.trim_end().rsplit_once("[truncated; full body: ")?.1;
-                let sidecar = Path::new(marker.strip_suffix(']')?);
-                sidecar.file_name().map(|name| name.to_owned())
-            })
+            .filter_map(|text| Some(truncation_sidecar(&text)?.file_name()?.to_owned()))
             .collect();
         super::state::prune_to_newest_except(&full_dir, keep, &unread_sidecars);
     }
@@ -1321,14 +1317,50 @@ pub(super) fn sent_since(
     to_session: &str,
     since: u64,
 ) -> bool {
+    messages_sent_since(state, repo_slug, from_session, to_session, since)
+        .next()
+        .is_some()
+}
+
+/// Bodies of the worker's directed reports since `since`; a truncated one is replaced by its
+/// `full/` sidecar when that is still readable.
+pub(super) fn full_bodies_sent_since(
+    state: &StateDir,
+    repo_slug: &str,
+    from_session: &str,
+    to_session: &str,
+    since: u64,
+) -> Vec<String> {
+    messages_sent_since(state, repo_slug, from_session, to_session, since)
+        .map(|msg| {
+            truncation_sidecar(&msg.body)
+                .and_then(|sidecar| std::fs::read_to_string(sidecar).ok())
+                .unwrap_or(msg.body)
+        })
+        .collect()
+}
+
+/// The `full/` sidecar a truncated body's trailing marker names.
+fn truncation_sidecar(body: &str) -> Option<&Path> {
+    let marker = body.trim_end().rsplit_once("[truncated; full body: ")?.1;
+    Some(Path::new(marker.strip_suffix(']')?))
+}
+
+fn messages_sent_since<'a>(
+    state: &StateDir,
+    repo_slug: &str,
+    from_session: &str,
+    to_session: &'a str,
+    since: u64,
+) -> impl Iterator<Item = Message> + 'a {
     let from_session = sessions::short_id(from_session);
     let mailbox = state.mail().join(repo_slug);
     [mailbox.clone(), mailbox.join("read")]
-        .iter()
-        .flat_map(|dir| scan_md_files(dir).unwrap_or_default())
+        .into_iter()
+        .flat_map(|dir| scan_md_files(&dir).unwrap_or_default())
         .filter_map(|path| std::fs::read_to_string(path).ok())
         .map(|text| parse_markdown(&text))
-        .any(|msg| {
+        .filter(move |msg| {
             sessions::short_id(&msg.from_session) == from_session
                 && !msg.from_agent.eq_ignore_ascii_case("zirv")
                 && msg.to_session.as_deref() == Some(to_session)
