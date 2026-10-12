@@ -1157,7 +1157,19 @@ fn store_into(
     super::state::prune_to_newest(&dir, keep);
     let full_dir = dir.join("full");
     if full_dir.is_dir() {
-        super::state::prune_to_newest(&full_dir, keep);
+        // Sidecars of already-read messages count against `keep`, so spare the ones an
+        // unread message still points at (#909).
+        let unread_sidecars = scan_md_files(&dir)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|path| std::fs::read_to_string(path).ok())
+            .filter_map(|text| {
+                let marker = text.trim_end().rsplit_once("[truncated; full body: ")?.1;
+                let sidecar = Path::new(marker.strip_suffix(']')?);
+                sidecar.file_name().map(|name| name.to_owned())
+            })
+            .collect();
+        super::state::prune_to_newest_except(&full_dir, keep, &unread_sidecars);
     }
     Ok(path)
 }
@@ -8221,6 +8233,120 @@ This is part of the body too.\n";
             "older than the window is never opened"
         );
         assert!(recent_edges(&state, now, 0).is_empty());
+    }
+
+    /// Issue #909: sidecars of already-read messages count against `keep`, so a busy mailbox
+    /// used to prune the full copy of a message that was still unread.
+    #[test]
+    fn the_full_copy_of_an_unread_message_survives_the_sidecar_prune() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.mail.keep = 3;
+        cfg.mail.max_message_bytes = 512;
+
+        let mut first = sample("s0", 1);
+        first.body = "u".repeat(5_000);
+        let first_path = store(&state, "-work-repo", &first, &cfg).expect("store");
+        let first_body = parse_markdown(&std::fs::read_to_string(&first_path).expect("read")).body;
+        let first_sidecar = sidecar_path_from_marker(&first_body);
+        std::fs::File::options()
+            .write(true)
+            .open(&first_sidecar)
+            .expect("open sidecar")
+            .set_modified(std::time::SystemTime::UNIX_EPOCH)
+            .expect("backdate");
+
+        for index in 1..6u32 {
+            let mut msg = sample(&format!("s{index}"), 1);
+            msg.body = "r".repeat(5_000);
+            let path = store(&state, "-work-repo", &msg, &cfg).expect("store");
+            consume(&state, "-work-repo", &path).expect("consume");
+        }
+
+        assert!(first_path.is_file(), "the first message is still unread");
+        assert_eq!(
+            std::fs::read_to_string(&first_sidecar).ok(),
+            Some("u".repeat(5_000)),
+            "its full copy must outlive the sidecars of newer, already-read messages"
+        );
+    }
+
+    /// Issue #909: every message `zirv ctx inbox` prints truncated must name a full copy that
+    /// exists and holds the whole body, whichever send mode wrote it.
+    #[test]
+    fn every_send_mode_over_the_cap_prints_a_marker_naming_an_existing_full_copy() {
+        let big = format!("{}END", "b".repeat(10_000));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let repo = tmp.path().join("repo");
+        let mut record = sessions::Record::new(
+            "abcdef12-3456-4789-8abc-def012345678",
+            "claude",
+            &repo,
+            sessions::Verb::Exec,
+        );
+        record.role = Some("worker".to_string());
+        let short = record.short.clone();
+        let _guard = sessions::SessionGuard::register(&state, record);
+        let env = env_map(&[
+            (
+                super::super::state::STATE_ENV,
+                state_dir.to_str().expect("utf8"),
+            ),
+            (SESSION_ENV, short.as_str()),
+        ]);
+        let modes = [
+            SendArgs {
+                claim_once: true,
+                ..SendArgs::default()
+            },
+            SendArgs {
+                all: true,
+                ..SendArgs::default()
+            },
+            SendArgs {
+                to_role: Some("worker".to_string()),
+                ..SendArgs::default()
+            },
+            SendArgs {
+                to_session: Some(short.clone()),
+                ..SendArgs::default()
+            },
+        ];
+        for mut args in modes {
+            args.message = Some(big.clone());
+            let mut out = Vec::new();
+            let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+            run_send_with(&args, &mut out, &repo, &|k| env.get(k).cloned(), &mut stdin)
+                .expect("send");
+            let mut printed = Vec::new();
+            run_inbox_with(&inbox_args(false), &mut printed, &repo, &|k| {
+                env.get(k).cloned()
+            })
+            .expect("inbox");
+            let printed = String::from_utf8(printed).expect("utf8");
+            assert!(
+                printed.contains("[truncated; full body: "),
+                "mode {args:?} printed no full-copy path: {printed}"
+            );
+            let sidecar = sidecar_path_from_marker(
+                printed
+                    .split("## Payload\n")
+                    .nth(1)
+                    .map_or(printed.trim_end().split("\n\n").last().unwrap_or(""), |p| {
+                        p.trim_end()
+                    }),
+            );
+            assert_eq!(
+                std::fs::read_to_string(&sidecar).expect("full copy exists"),
+                big,
+                "mode {args:?}"
+            );
+        }
     }
 
     #[test]

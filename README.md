@@ -1140,7 +1140,8 @@ moves a message into or out of — unlike the message itself, a sidecar is
 never relocated into `read/` on consume or into a dead-letter directory once
 its TTL expires, so a marker's path always stays valid for as long as the
 sidecar exists. It is pruned to the same `[mail] keep` as the mailbox
-itself, in its own pass, so it does not accumulate forever either.
+itself, in its own pass, so it does not accumulate forever either — except
+that a sidecar an unread message in the mailbox still names is never pruned.
 
 A delegated worker's own final report is persisted before any report-back
 mail is sent, at
@@ -6570,7 +6571,7 @@ unit of work (a plan text, a diffstat) is consulted on once, and the helper's ow
 | Kind | Reply format | Where it bites |
 |---|---|---|
 | plan | `APPROVE` or `REVISE: <reasons>` | asked when `zirv workflow advance` completes the plan step; while a `revise` is open, advancing any later step is refused with the reason. Revising the plan artifact and re-advancing the plan step asks again, and the new ruling supersedes the old |
-| done | `DONE` or `NOT_DONE: <what is missing>` | asked at the Stop hook once per distinct evidence unit (diffstat, commit and untracked files), with the task (the active workflow's objective, else the latest operator request) in the evidence; the ruling's reason ends with the evidence sources it read (`git diff --stat HEAD`, the active workflow's work folder or `none`, and the task source). A turn end while the session has running native subagents or its active workflow is before the verify step is not a completion claim: no consult, no block. While a `not_done` is open the Stop hook blocks with the reason, at most 3 times per ruling, unless the evidence has moved since (a new commit or file), when the next stop consults fresh; the workflow's final step is refused. A later `done`, or an `ask` ruling of a `done` option when the offered options include a `not done` one, resolves it. Codex's Stop hook blocks the same way |
+| done | `DONE` or `NOT_DONE: <what is missing>` | asked at the Stop hook once per distinct evidence unit (diffstat, commit, tracked changes and the latest `zirv verify`/`zirv test` record), with the task (the active workflow's objective, else the latest operator request) and that verification record's per-check results in the evidence; the ruling's reason ends with the evidence sources it read (`git diff --stat HEAD`, the active workflow's work folder or `none`, the verification record when one exists, and the task source). The helper is told to run single-line commands only, since a read-only sandbox has no writable temp directory for a shell here-document. A turn end while the session has running native subagents or its active workflow is before the verify step is not a completion claim: no consult, no block. While a `not_done` is open the Stop hook blocks with the reason, at most 3 times per ruling, unless the evidence has moved since (a new commit, edit or verification run), when the next stop consults fresh; the workflow's final step is refused. A later `done`, or an `ask` ruling of a `done` option when the offered options include a `not done` one, resolves it. Codex's Stop hook blocks the same way |
 | retry | `RETRY` or `STOP: <reason>` | asked at the third failure of a tool-call streak, in place of the seat deciding; while a `stop` is open the tool-failure hook adds the ruling as context on each further failure, and a successful tool call ends it. It is advisory context, not a mechanical block (a hook cannot stop a tool), and a `retry` never lifts a Jev stop |
 | choice | `CHOICE: <n>` and an optional `REASON:` line | `zirv ctx supervisor ask` |
 

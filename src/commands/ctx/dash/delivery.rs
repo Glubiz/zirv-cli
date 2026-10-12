@@ -683,6 +683,29 @@ pub(super) fn report_settled_pane_with(
         .unwrap_or_else(|| pane.cwd().to_path_buf());
     if pane_mailed_report(pane, state) {
         pane.settled_mail_sent = true;
+        // The worker mailed (often a summary) and may have kept the full report for its final
+        // message: store that and name it, so the inbox never holds only the summary (#909).
+        if let Some(text) = final_message(pane).filter(|text| !text.trim().is_empty()) {
+            let (report, report_truncated) = super::agent::cap_report(Some(&text));
+            let path = super::agent::store_report_only(
+                state,
+                &report_repo,
+                pane.short(),
+                pane.agent(),
+                report.as_deref().unwrap_or_default(),
+                report_truncated,
+            );
+            let body = format!(
+                "pane {} ({}) sent mail and then finished a final message of {} bytes\nfull report: {}",
+                pane.short(),
+                pane.agent(),
+                text.len(),
+                path.display()
+            );
+            if let Err(error) = store_pane_system_mail(pane, &recipient, body, state, cfg) {
+                push_error(errors, format!("settled report: {error}"));
+            }
+        }
         return;
     }
     let recovered = (mail::session_delivery_metrics(state, pane.short(), super::state::now_secs())
@@ -3421,6 +3444,59 @@ mod tests {
         assert!(report.contains("contract_failed:"));
         assert!(!report.contains("secret tool arguments"));
         assert!(!report.contains("hello"), "screen tail must be replaced");
+        pane.finish_shutdown().expect("shutdown");
+    }
+
+    /// #909: a worker that mails a short summary and keeps the full report for its final
+    /// message must not lose that report: the final message is stored and the inbox names it.
+    #[test]
+    fn a_worker_that_mailed_a_summary_still_has_its_final_report_stored_and_named() {
+        use super::super::attention::{self, Authority, Lifecycle, Observation};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut pane = spawn_idle_signal_less_worker_pane(
+            &state,
+            tmp.path(),
+            "dddddddd-2222-4333-8444-555555555555",
+        );
+        pane.set_report_to(Some("aaaa1111".into()));
+        let now = super::super::state::now_secs();
+        for lifecycle in [Lifecycle::Working, Lifecycle::Settled] {
+            attention::record(
+                &state,
+                pane.short(),
+                Observation::new(Authority::QuietHeuristic, "worker lifecycle", 50, now)
+                    .with_lifecycle(lifecycle),
+                now,
+            );
+        }
+        let slug = super::super::state::repo_slug(tmp.path());
+        let cfg = CtxConfig::default();
+        mail::store(
+            &state,
+            &slug,
+            &mail::Message {
+                from_session: pane.short().to_string(),
+                from_agent: "codex".to_string(),
+                to: "any".to_string(),
+                to_session: Some("aaaa1111".to_string()),
+                sent: pane.started_at(),
+                body: "Angle N complete; full evidence follows in the final response.".to_string(),
+            },
+            &cfg,
+        )
+        .expect("worker mail");
+        let full = format!("{}END-OF-REPORT", "evidence line\n".repeat(600));
+        let mut errors = ErrorLog::default();
+        report_settled_pane_with(&mut pane, &state, &cfg, &mut errors, |_| Some(full.clone()));
+        let messages = mail::list(&state, &slug, None, Some("aaaa1111")).expect("mail");
+        let pointer = messages
+            .iter()
+            .map(|(_, msg)| msg.body.as_str())
+            .find_map(|body| body.split("full report: ").nth(1))
+            .expect("the inbox names the stored final report");
+        let stored = std::fs::read_to_string(pointer.trim()).expect("stored report file");
+        assert!(stored.contains("END-OF-REPORT"), "the whole report is kept");
         pane.finish_shutdown().expect("shutdown");
     }
 

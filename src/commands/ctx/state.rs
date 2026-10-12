@@ -998,6 +998,16 @@ pub const KEEP_NEWEST: usize = 200;
 /// Only for directories zirv writes one file per session into. Handoffs, logs
 /// and reports have their own retention and are not touched.
 pub fn prune_to_newest(dir: &Path, keep: usize) {
+    prune_to_newest_except(dir, keep, &std::collections::HashSet::new());
+}
+
+/// [`prune_to_newest`], but a file whose name is in `protected` is never removed (it still
+/// counts toward `keep`).
+pub fn prune_to_newest_except(
+    dir: &Path,
+    keep: usize,
+    protected: &std::collections::HashSet<std::ffi::OsString>,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -1015,6 +1025,12 @@ pub fn prune_to_newest(dir: &Path, keep: usize) {
     // Newest first, so everything past `keep` is the oldest.
     files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
     for (_, path) in files.iter().skip(keep) {
+        if path
+            .file_name()
+            .is_some_and(|name| protected.contains(name))
+        {
+            continue;
+        }
         let _ = std::fs::remove_file(path);
     }
 }
