@@ -287,7 +287,7 @@ const GATES: [GateInfo; 21] = [
     GateInfo {
         key: "gates",
         fixed: None,
-        waits_on: "workflow gate reclassification and artifact-substance check on stage advance",
+        waits_on: "workflow gate reclassification on stage advance",
     },
     GateInfo {
         key: "context",

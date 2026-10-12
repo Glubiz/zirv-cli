@@ -236,6 +236,7 @@ fn error_status(error: &JevError) -> Option<u16> {
         | JevError::UnsafeState
         | JevError::Timeout
         | JevError::Transport(_)
+        | JevError::SandboxProxyDenied(_)
         | JevError::Malformed(_) => None,
     }
 }
