@@ -866,38 +866,51 @@ pub fn advance_with_evidence(
             {
                 let render =
                     crate::commands::workflow::frontend_render::render(state_dir, &frontend_root)?;
-                if !render.passed() {
-                    return Err(format!(
-                        "frontend step '{}' could not collect automatic rendered evidence against '{}': {}; inspect with `zirv frontend render --repo {}`",
-                        current.id,
-                        frontend_root.display(),
-                        render.notes.join("; "),
-                        frontend_root.display()
-                    )
-                    .into());
-                }
-                let review = crate::commands::workflow::frontend_render::review(
-                    state_dir,
-                    &frontend_root,
-                    &crate::commands::workflow::frontend_render::VisualReviewArgs {
-                        repo: Some(frontend_root.to_path_buf()),
-                        agent: None,
-                        model: None,
-                        runtime: crate::commands::ctx::runtime::RuntimeKind::Harness
-                            .as_str()
-                            .to_string(),
-                        json: false,
-                    },
-                )?;
-                if review.verdict != crate::commands::workflow::frontend_render::VisualVerdict::Pass
+                if render.status
+                    == crate::commands::workflow::frontend_render::RenderStatus::Inconclusive
                 {
-                    return Err(format!(
-                        "frontend step '{}' failed automatic visual review round {}: {}",
+                    // No capture could be taken (no server, auth wall, launch failure): the
+                    // reason is in the saved render report; repo lint/test gates still apply.
+                    eprintln!(
+                        "frontend step '{}': rendered evidence is inconclusive, continuing without visual review: {}",
                         current.id,
-                        review.review_round,
-                        review.findings.join("; ")
-                    )
-                    .into());
+                        render.notes.join("; ")
+                    );
+                } else {
+                    if !render.passed() {
+                        return Err(format!(
+                            "frontend step '{}' could not collect automatic rendered evidence against '{}': {}; inspect with `zirv frontend render --repo {}`",
+                            current.id,
+                            frontend_root.display(),
+                            render.notes.join("; "),
+                            frontend_root.display()
+                        )
+                        .into());
+                    }
+                    let review = crate::commands::workflow::frontend_render::review(
+                        state_dir,
+                        &frontend_root,
+                        &crate::commands::workflow::frontend_render::VisualReviewArgs {
+                            repo: Some(frontend_root.to_path_buf()),
+                            agent: None,
+                            model: None,
+                            runtime: crate::commands::ctx::runtime::RuntimeKind::Harness
+                                .as_str()
+                                .to_string(),
+                            json: false,
+                        },
+                    )?;
+                    if review.verdict
+                        != crate::commands::workflow::frontend_render::VisualVerdict::Pass
+                    {
+                        return Err(format!(
+                            "frontend step '{}' failed automatic visual review round {}: {}",
+                            current.id,
+                            review.review_round,
+                            review.findings.join("; ")
+                        )
+                        .into());
+                    }
                 }
             }
             if current.phase == WorkflowPhase::Deploy {

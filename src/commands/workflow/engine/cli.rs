@@ -3377,6 +3377,7 @@ mod tests {
                         seat: None,
                         built_in_only: true,
                         repo: Some(repo.path().to_path_buf()),
+                        workdir: None,
                         json: true,
                     },
                 ),
@@ -3392,6 +3393,45 @@ mod tests {
             .unwrap()
             .expect("workflow still active");
         assert_eq!(stored.team_plan, Some(printed));
+    }
+
+    /// #898: `team plan --workdir` measures that repository's diff, not `--repo`'s.
+    #[test]
+    fn workflow_team_plan_workdir_measures_the_target_repository() {
+        let repo = git_repo_with_pending_files(0);
+        let target = git_repo_with_pending_files(12);
+        let home = tempdir().unwrap();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let root = tempdir().unwrap();
+        let _state_dir_env = crate::commands::ctx::testenv::VarGuard::set(&[(
+            crate::commands::ctx::state::STATE_ENV,
+            Some(root.path().to_str().expect("utf-8 tempdir path")),
+        )]);
+        let args = WorkflowArgs {
+            command: WorkflowSubcommand::Team(crate::commands::workflow::team::TeamArgs {
+                command: crate::commands::workflow::team::TeamCommand::Plan(
+                    crate::commands::workflow::team::TeamPlanArgs {
+                        objective: "fix the crash".into(),
+                        workflow: None,
+                        dry_run: true,
+                        seat: None,
+                        built_in_only: true,
+                        repo: Some(repo.path().to_path_buf()),
+                        workdir: Some(target.path().to_path_buf()),
+                        json: true,
+                    },
+                ),
+            }),
+        };
+        let mut out = Vec::new();
+        assert_eq!(run(&args, &mut out).unwrap(), 0);
+        let printed: crate::commands::workflow::team::TeamPlan =
+            serde_json::from_slice(&out).unwrap();
+        assert!(
+            printed.profile.classification.changed_files >= 12,
+            "{:?}",
+            printed.profile.classification
+        );
     }
 
     /// Issue #541: `zirv workflow team brief <seat>` attaches only the
@@ -3429,6 +3469,7 @@ mod tests {
                         seat: None,
                         built_in_only: true,
                         repo: Some(repo.path().to_path_buf()),
+                        workdir: None,
                         json: true,
                     },
                 ),

@@ -2181,7 +2181,7 @@ zirv workflow resume <id>                         # restore as the active workfl
 zirv workflow context [id]                        # the current step's resolved skill context
 zirv workflow artifacts <id> [--json]              # committed work-product state
 zirv workflow agents list|show <id>|dispatch <id> --adapter <name> --prompt <task>
-zirv workflow team plan "<objective>" [--workflow <id>|active] [--dry-run] [--seat <id>] [--json]
+zirv workflow team plan "<objective>" [--workflow <id>|active] [--dry-run] [--seat <id>] [--workdir <path>] [--json]
 zirv workflow team show [--workflow <id>|active] [--json]
 zirv workflow team brief <seat-id> [--json]       # Agent-tool-ready brief for one compiled seat
 zirv workflow approve <id>                        # approve the current gated step
@@ -2786,9 +2786,11 @@ operator's own `~/.zirv/ctx.toml` or the matching
 ### Team composition
 
 `zirv workflow team plan "<objective>" [--workflow <id>|active] [--dry-run]
-[--seat <manifest-id>] [--json]` compiles the smallest capable team for a
-request: it classifies the objective exactly like `zirv workflow classify`
-(the objective's text can only raise complexity, and with no changed files the
+[--seat <manifest-id>] [--workdir <path>] [--json]` compiles the smallest capable team for a
+request: it classifies the objective exactly like `zirv workflow classify`,
+measuring `--workdir`'s diff instead of `--repo`'s when the work lives in another
+checkout (a dense objective naming five or more inline clauses is at least
+substantial by text alone; the objective's text can only raise complexity, and with no changed files the
 classification says it is text-only and the profile's confidence is low),
 derives the minimal execution profile (`intent`/`complexity`/`risk` →
 `Direct`/`Bounded`/`Orchestrated`, plus which independent-review/test/security

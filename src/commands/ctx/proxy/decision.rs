@@ -594,7 +594,25 @@ fn request_size_floor(request: &str) -> Complexity {
                 })
         })
         .count();
-    if words >= 300 || items >= 8 {
+    // A dense request naming many clauses inline (commas, semicolons, colon lists) is
+    // substantial however few words it takes.
+    // Newlines do not split (list lines count above, plain lines are usually pasted logs) and a
+    // clause opening with a continuation word extends the previous task rather than adding one.
+    let clauses = request
+        .split([',', ';', ':'])
+        .filter(|clause| {
+            let mut words = clause.split_whitespace();
+            let first = words.next().unwrap_or_default().to_ascii_lowercase();
+            words.next().is_some()
+                && ![
+                    "and", "or", "but", "then", "when", "whenever", "after", "before", "if",
+                    "unless", "until", "because", "since", "while", "so", "which", "that", "where",
+                    "on", "in", "at", "with", "for", "to", "from", "by",
+                ]
+                .contains(&first.as_str())
+        })
+        .count();
+    if words >= 300 || items >= 8 || (clauses >= 5 && words >= 30) {
         Complexity::Substantial
     } else if words >= 120 || items >= 3 {
         Complexity::Bounded
@@ -2069,6 +2087,26 @@ fn harness_is_ready(harness: &str, roster: &Roster) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Continuation clauses and pasted log lines do not make a task dense; a list of distinct
+    /// inline requirements still does.
+    #[test]
+    fn clause_floor_ignores_continuations_and_log_lines() {
+        let log = "ERROR connection refused to host db-1 port 5432 retrying later\n".repeat(6);
+        for (text, floor) in [
+            (
+                "Fix the login bug: users get a 500 error, when they click submit, after the session expires, on Safari, but only when cookies are blocked, and the log says invalid token",
+                Complexity::Trivial,
+            ),
+            (log.as_str(), Complexity::Trivial),
+            (
+                "Implement evidence-driven model routing in the zirv Rust CLI: model probation and promotion gate, a 24h automatic benchmark probe scheduler, an evidence store merging benchmark and real-session outcomes, cross-harness router applied at seat/worker/reviewer seams, dated Claude ids",
+                Complexity::Substantial,
+            ),
+        ] {
+            assert_eq!(request_size_floor(text), floor, "{text}");
+        }
+    }
 
     fn sample_decision() -> ProxyDecision {
         ProxyDecision {
