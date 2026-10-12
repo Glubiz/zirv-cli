@@ -151,7 +151,7 @@ pub struct Connection {
     read_deadline: ReadDeadline,
 }
 
-/// The instant after which reads fail; shared with a reader that enforces it (unix only).
+/// The instant after which reads fail; shared with a reader that enforces it (`imp::DeadlineReader`).
 type ReadDeadline = std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>;
 
 impl std::fmt::Debug for Connection {
@@ -173,7 +173,7 @@ impl Connection {
     }
 
     /// Fails every read that would run past `limit` from now, however slowly bytes arrive; `None`
-    /// lifts it. Enforced on unix only.
+    /// lifts it.
     pub fn set_read_deadline(&self, limit: Option<std::time::Duration>) {
         if let Ok(mut deadline) = self.read_deadline.lock() {
             *deadline = limit.map(|limit| std::time::Instant::now() + limit);
@@ -213,6 +213,14 @@ impl Connection {
             }
             return Ok(Some(serde_json::from_str(trimmed)?));
         }
+    }
+
+    /// Sends bytes as-is, so a test can be a peer that never completes its frame.
+    #[cfg(all(test, windows))]
+    pub fn write_raw(&mut self, bytes: &[u8]) -> CtxResult<()> {
+        self.writer.write_all(bytes)?;
+        self.writer.flush()?;
+        Ok(())
     }
 
     pub fn write_frame<T: Serialize>(&mut self, frame: &T) -> CtxResult<()> {
@@ -413,7 +421,7 @@ mod imp {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle};
 
     use windows_sys::Win32::Foundation::{
-        ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+        ERROR_BROKEN_PIPE, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -426,7 +434,7 @@ mod imp {
     use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
-        PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+        PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, PeekNamedPipe,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -611,20 +619,73 @@ mod imp {
         Ok(unsafe { OwnedHandle::from_raw_handle(handle as _) })
     }
 
+    /// Wraps a pipe end. Windows named pipes expose the client's token through
+    /// impersonation rather than a peer-credential socket option; the
+    /// owner-only DACL above is what keeps another user out, and
+    /// `Peer::is_same_user` documents the `None` case.
+    fn connection_over(file: std::fs::File) -> CtxResult<Connection> {
+        let deadline = super::ReadDeadline::default();
+        let reader = DeadlineReader {
+            file: file.try_clone()?,
+            deadline: std::sync::Arc::clone(&deadline),
+        };
+        let mut connection = Connection::new(Box::new(reader), Box::new(file), Peer { uid: None });
+        connection.read_deadline = deadline;
+        Ok(connection)
+    }
+
     fn connection_from(handle: OwnedHandle) -> CtxResult<Connection> {
         // SAFETY: `handle` is a valid pipe handle whose ownership moves into
         // the `File`; `into_raw_handle` gives up this `OwnedHandle`'s claim.
-        let file = unsafe { std::fs::File::from_raw_handle(handle.into_raw_handle()) };
-        let reader = file.try_clone()?;
-        Ok(Connection::new(
-            Box::new(reader),
-            Box::new(file),
-            // Windows named pipes expose the client's token through
-            // impersonation rather than a peer-credential socket option; the
-            // owner-only DACL above is what keeps another user out, and
-            // `Peer::is_same_user` documents the `None` case.
-            Peer { uid: None },
-        ))
+        connection_over(unsafe { std::fs::File::from_raw_handle(handle.into_raw_handle()) })
+    }
+
+    /// Reads from a pipe, failing once the shared deadline has passed. A synchronous pipe read
+    /// cannot time out, so while a deadline is set this polls `PeekNamedPipe` and only reads
+    /// once bytes are waiting (the read then returns at once): a peer that sends nothing, or
+    /// trickles bytes, runs into the same whole-frame deadline as the unix reader.
+    struct DeadlineReader {
+        file: std::fs::File,
+        deadline: super::ReadDeadline,
+    }
+
+    impl std::io::Read for DeadlineReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            loop {
+                let Some(deadline) = self.deadline.lock().ok().and_then(|deadline| *deadline)
+                else {
+                    return std::io::Read::read(&mut self.file, buf);
+                };
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::ErrorKind::TimedOut.into());
+                }
+                let mut available = 0u32;
+                // SAFETY: the handle is live for the call and only the
+                // total-bytes-available out-parameter is requested.
+                let ok = unsafe {
+                    PeekNamedPipe(
+                        self.file.as_raw_handle() as _,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                        &mut available,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 {
+                    let error = std::io::Error::last_os_error();
+                    // The peer closed its end: a clean end of stream, as `ReadFile` reports it.
+                    if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
+                        return Ok(0);
+                    }
+                    return Err(error);
+                }
+                if available > 0 {
+                    return std::io::Read::read(&mut self.file, buf);
+                }
+                std::thread::sleep(POLL);
+            }
+        }
     }
 
     #[derive(Debug)]
@@ -733,14 +794,7 @@ mod imp {
                 .write(true)
                 .open(&name)
             {
-                Ok(file) => {
-                    let reader = file.try_clone()?;
-                    return Ok(Connection::new(
-                        Box::new(reader),
-                        Box::new(file),
-                        Peer { uid: None },
-                    ));
-                }
+                Ok(file) => return connection_over(file),
                 Err(error) => error,
             };
             let transient = matches!(
