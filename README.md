@@ -6707,7 +6707,9 @@ Current Codex versions support lifecycle hooks with the same JSON event shape.
 `zirv setup apply` merges Zirv's handlers into `~/.codex/hooks.json`; review
 and trust new definitions with `/hooks` in Codex. The older
 `zirv ctx hook notify` compatibility entry point remains available for Codex
-versions configured with the external `notify` program. Rollout event parsing
+versions configured with the external `notify` program; it resolves Codex's
+`thread-id` payload to the session's rollout under `$CODEX_HOME/sessions`.
+`zirv ctx hook status` reports a missing Codex hook entry. Rollout event parsing
 is still tracked in [issue #11](https://github.com/Glubiz/zirv-cli/issues/11).
 
 ### Interactive use

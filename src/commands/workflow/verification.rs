@@ -412,7 +412,7 @@ fn wildcard_match(pattern: &[u8], value: &[u8]) -> bool {
 /// ls-files --others` reports them relative to the process's directory, so
 /// running both from a subdirectory (`--repo <subdir>`) mixed two path bases
 /// in one list and content edits then matched nothing.
-fn git_root(repo: &Path) -> PathBuf {
+pub(crate) fn git_root(repo: &Path) -> PathBuf {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)

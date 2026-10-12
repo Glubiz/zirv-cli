@@ -450,6 +450,19 @@ pub(super) fn report_back_reminder_body(report_to: &str) -> String {
     )
 }
 
+/// Whether `pane` itself mailed its directed report to its `report_to` recipient since it
+/// started; the dashboard's own recovered-report mail does not count.
+pub(super) fn pane_mailed_report(pane: &Pane, state: &StateDir) -> bool {
+    let Some(report_to) = pane.report_to() else {
+        return false;
+    };
+    let recipient = sessions::short_id(report_to);
+    let slug = sessions::load_record(state, &recipient)
+        .map(|record| record.repo_slug)
+        .unwrap_or_else(|| super::state::repo_slug(pane.cwd()));
+    mail::sent_since(state, &slug, pane.short(), &recipient, pane.started_at())
+}
+
 /// Once-per-tick (same `FACTS_THROTTLE` cadence as `mail_sweep`, and called
 /// alongside it) one-shot completion reminder: every **worker** pane
 /// (`Verb::Dash`) spawned with a `report_to` address
@@ -476,13 +489,7 @@ pub(super) fn report_back_reminder_sweep(
         if !pane.has_produced_output() || !pane.injectable() {
             continue;
         }
-        let recipient = sessions::short_id(&report_to);
-        let slug = sessions::load_record(state, &recipient)
-            .map(|record| record.repo_slug)
-            .unwrap_or_else(|| super::state::repo_slug(pane.cwd()));
-        if pane.settled_mail_sent
-            || mail::sent_since(state, &slug, pane.short(), &recipient, pane.started_at())
-        {
+        if pane.settled_mail_sent || pane_mailed_report(pane, state) {
             pane.mark_report_reminder_sent();
             continue;
         }
@@ -674,16 +681,7 @@ pub(super) fn report_settled_pane_with(
         .as_ref()
         .map(|record| record.repo.clone())
         .unwrap_or_else(|| pane.cwd().to_path_buf());
-    let slug = recipient_record
-        .map(|record| record.repo_slug)
-        .unwrap_or_else(|| super::state::repo_slug(pane.cwd()));
-    if mail::sent_since(
-        state,
-        &slug,
-        pane.short(),
-        &recipient_short,
-        pane.started_at(),
-    ) {
+    if pane_mailed_report(pane, state) {
         pane.settled_mail_sent = true;
         return;
     }

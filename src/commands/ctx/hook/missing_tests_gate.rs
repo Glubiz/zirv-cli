@@ -171,7 +171,22 @@ pub(super) fn missing_tests_gate_reason(
     }
     // Any doubt here (no git, no repo, ...) reads as "nothing changed": a
     // block is a hard stop, never worth risking on an unreadable repo state.
-    let changed = verification::changed_paths(repo).ok()?;
+    let mut changed = verification::changed_paths(repo).ok()?;
+    // A dirty tree this session inherited (another session's edits, stray untracked files) is
+    // not its own work: count only paths touched after it started. (#908)
+    if let Some(record) = crate::commands::ctx::sessions::load_record(
+        state,
+        &crate::commands::ctx::sessions::short_id(gate_key),
+    ) {
+        let root = verification::git_root(repo);
+        changed.retain(|path| {
+            std::fs::metadata(root.join(path))
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .is_some_and(|age| age.as_secs() >= record.started_at)
+        });
+    }
     let mut has_test_change = false;
     let mut has_non_test_source_change = false;
     for candidate in &changed {
@@ -557,6 +572,68 @@ mod tests {
                 env.get(k).cloned()
             })
             .expect("non-test source change with no test change must block");
+        assert!(reason.contains("test"), "{reason}");
+    }
+
+    /// Registers a codex pane for `short` that started `started_ago_secs` ago, then runs the gate.
+    fn gate_for_registered_codex_pane(
+        started_ago_secs: u64,
+        stale_file_age_secs: u64,
+        short: &str,
+    ) -> Option<String> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        std::fs::create_dir_all(state.sessions()).expect("sessions dir");
+        let repo = git_repo();
+        let file = repo.path().join("src.rs");
+        std::fs::write(&file, "fn main() {}\n").expect("write");
+        let mtime =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(stale_file_age_secs);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .and_then(|f| f.set_modified(mtime))
+            .expect("age the file");
+        let mut record = crate::commands::ctx::sessions::Record::new(
+            short,
+            "codex",
+            repo.path(),
+            crate::commands::ctx::sessions::Verb::Dash,
+        );
+        record.started_at = crate::commands::ctx::state::now_secs() - started_ago_secs;
+        std::fs::write(
+            state.sessions().join(format!("{short}.json")),
+            serde_json::to_string(&record).expect("record json"),
+        )
+        .expect("write record");
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
+        missing_tests_gate_reason(
+            &state,
+            repo.path(),
+            short,
+            short,
+            &CtxConfig::default(),
+            &|k| env.get(k).cloned(),
+        )
+    }
+
+    /// #908: a read-only pane that edited nothing must not be told it edited source because an
+    /// earlier session (or a stray untracked file) left the workdir dirty.
+    #[test]
+    fn a_read_only_codex_pane_over_a_preexisting_dirty_tree_is_never_blocked() {
+        assert_eq!(
+            gate_for_registered_codex_pane(60, 3_600, "codexro1"),
+            None,
+            "a file untouched since before the pane started is not the pane's edit"
+        );
+    }
+
+    /// The counterpart: a file written after the session started still blocks.
+    #[test]
+    fn a_registered_session_that_wrote_source_after_it_started_still_blocks() {
+        let reason = gate_for_registered_codex_pane(3_600, 60, "codexrw1")
+            .expect("an edit made during the session must block");
         assert!(reason.contains("test"), "{reason}");
     }
 

@@ -321,7 +321,18 @@ pub(super) fn account_reaped_pane_spend(
     exit_code: i32,
 ) {
     let usage = pane_transcript_usage(pane, cfg).unwrap_or_default();
-    let exit_code = super::agent::recorded_contract_exit(state, pane.short(), exit_code);
+    let mut exit_code = super::agent::recorded_contract_exit(state, pane.short(), exit_code);
+    // A pane closed (SIGTERM, 128 + 15) after mailing its report and finishing its turn had
+    // already finished; the signal is the close, not a failure. A progress note or question from
+    // a pane that never settled stays a failure. `Unseen` survives a later `Exited` write. (#907)
+    if exit_code == 143 && super::delivery::pane_mailed_report(pane, state) {
+        let status = super::attention::load(state, pane.short());
+        if status.lifecycle == super::attention::Lifecycle::Settled
+            || status.visibility == super::attention::Visibility::Unseen
+        {
+            exit_code = 0;
+        }
+    }
     if let Some(facts) = pane.delegation() {
         let _ = super::log::append_delegation(
             state,
@@ -2001,6 +2012,107 @@ mod tests {
         assert_eq!(row.cache_read_input_tokens, 30);
         assert_eq!(row.output_tokens, 5);
         assert_eq!(row.outcome, "ok");
+    }
+
+    /// #907: reaps a pane that was closed (SIGTERM, exit 143), with or without the worker having
+    /// mailed its report first, and returns the one delegation row it wrote.
+    fn row_for_a_closed_pane(
+        delivered: bool,
+        settled: bool,
+    ) -> crate::commands::ctx::log::DelegationRow {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().to_path_buf();
+        let spec = PaneSpec {
+            agent_name: "codex".to_string(),
+            argv: trivial_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: "6b6b6b6b-2222-4333-8444-555555555555".to_string(),
+            title: "wrk codex".to_string(),
+        };
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            pane::DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+        pane.set_report_to(Some("orch0001".to_string()));
+        pane.set_delegation(pane::DelegationFacts {
+            requester: "orch0001".to_string(),
+            mode: crate::commands::ctx::permit::WorkerMode::ReadOnly,
+            principal: "root/aaaa1111".to_string(),
+            envelope_sha256: None,
+            started_at: Instant::now(),
+        });
+        if delivered {
+            mail::store(
+                &state,
+                &super::super::state::repo_slug(&repo),
+                &mail::Message {
+                    from_session: pane.short().into(),
+                    from_agent: "codex".into(),
+                    to: "any".into(),
+                    to_session: Some("orch0001".into()),
+                    sent: pane.started_at(),
+                    body: "complete report".into(),
+                },
+                &CtxConfig::default(),
+            )
+            .expect("store the worker's own report");
+        }
+        if settled {
+            let observation = crate::commands::ctx::attention::Observation::new(
+                crate::commands::ctx::attention::Authority::AdapterHook,
+                "turn finished",
+                100,
+                1,
+            )
+            .with_lifecycle(crate::commands::ctx::attention::Lifecycle::Working);
+            let _ = crate::commands::ctx::attention::record(&state, pane.short(), observation, 1);
+            let observation = crate::commands::ctx::attention::Observation::new(
+                crate::commands::ctx::attention::Authority::AdapterHook,
+                "turn finished",
+                100,
+                2,
+            )
+            .with_lifecycle(crate::commands::ctx::attention::Lifecycle::Settled);
+            let _ = crate::commands::ctx::attention::record(&state, pane.short(), observation, 2);
+        }
+        account_reaped_pane_spend(&pane, &CtxConfig::default(), &state, 143);
+        let _ = pane.finish_shutdown();
+        let rows = crate::commands::ctx::log::read_delegations(&state, usize::MAX);
+        assert_eq!(rows.len(), 1);
+        rows.into_iter().next().expect("one row")
+    }
+
+    #[test]
+    fn a_pane_closed_after_delivering_its_report_is_logged_completed() {
+        let row = row_for_a_closed_pane(true, true);
+        assert_eq!(row.outcome, "ok");
+        assert_eq!(row.exit_code, 0);
+    }
+
+    #[test]
+    fn a_pane_killed_before_delivering_stays_a_failure() {
+        let row = row_for_a_closed_pane(false, false);
+        assert_eq!(row.outcome, "failed");
+        assert_eq!(row.exit_code, 143);
+    }
+
+    /// A progress note or question mailed by a pane that never finished its turn is not a result.
+    #[test]
+    fn a_pane_that_mailed_but_never_settled_stays_a_failure() {
+        let row = row_for_a_closed_pane(true, false);
+        assert_eq!(row.outcome, "failed");
+        assert_eq!(row.exit_code, 143);
     }
 
     #[cfg(unix)]
