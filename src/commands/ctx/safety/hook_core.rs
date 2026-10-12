@@ -1283,6 +1283,8 @@ mod tests {
         for command in [
             "zirv agent codex --workdir /x/wt338 - < /private/tmp/claude-501/session/scratchpad/brief-338.md",
             "for i in $(seq 1 80); do s=$(zirv ctx status --brief 2>&1); if echo \"$s\" | grep -qE 'x'; then echo READY; exit 0; fi; sleep 30; done",
+            "cat <<EOF\nthe value > does not matter\nEOF",
+            "sed -i 's/best=\\[m for m in msgs if x\\]/best=[]/' /private/tmp/claude-501/s/scratchpad/f.py",
         ] {
             let stdin = serde_json::json!({
                 "tool_name": "Bash",

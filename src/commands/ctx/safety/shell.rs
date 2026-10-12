@@ -656,28 +656,47 @@ fn apply_span_redactions(
 
 /// Parse a bare single-quoted heredoc delimiter, including `<<-`; reject
 /// malformed or differently quoted markers rather than guessing (#136).
-fn parse_single_quoted_heredoc_marker(chars: &[char], start: usize) -> Option<(String, usize)> {
+/// With `expanding`, also accept a double-quoted or bare word delimiter
+/// (bodies that substitute). Returns the delimiter, the marker end, and
+/// whether `<<-` strips leading tabs from the terminator.
+fn parse_heredoc_marker(
+    chars: &[char],
+    start: usize,
+    expanding: bool,
+) -> Option<(String, usize, bool)> {
     let mut i = start + 2;
-    if chars.get(i) == Some(&'-') {
+    let dash = chars.get(i) == Some(&'-');
+    if dash {
         i += 1;
     }
     while matches!(chars.get(i), Some(' ') | Some('\t')) {
         i += 1;
     }
-    if chars.get(i) != Some(&'\'') {
-        return None;
-    }
-    i += 1;
-    let delim_start = i;
-    while matches!(chars.get(i), Some(c) if *c != '\'' && *c != '\n') {
-        i += 1;
-    }
-    if chars.get(i) != Some(&'\'') {
-        return None;
+    let quote = chars.get(i).copied().filter(|c| matches!(c, '\'' | '"'));
+    let delim_start = i + usize::from(quote.is_some());
+    i = delim_start;
+    match quote {
+        Some('"') if !expanding => return None,
+        Some(q) => {
+            while matches!(chars.get(i), Some(c) if *c != q && *c != '\n') {
+                i += 1;
+            }
+            if chars.get(i) != Some(&q) {
+                return None;
+            }
+        }
+        None => {
+            if !expanding || chars.get(i).is_none_or(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            while matches!(chars.get(i), Some(c) if c.is_ascii_alphanumeric() || *c == '_') {
+                i += 1;
+            }
+        }
     }
     let delim: String = chars[delim_start..i].iter().collect();
-    i += 1;
-    (!delim.is_empty()).then_some((delim, i))
+    i += usize::from(quote.is_some());
+    (!delim.is_empty()).then_some((delim, i, dash))
 }
 
 /// Finds the terminator line for a heredoc body starting at `body_start`
@@ -691,6 +710,7 @@ fn find_heredoc_terminator(
     chars: &[char],
     body_start: usize,
     delim: &str,
+    strip_tabs: bool,
 ) -> Option<(usize, usize)> {
     let mut line_start = body_start;
     loop {
@@ -699,7 +719,13 @@ fn find_heredoc_terminator(
             j += 1;
         }
         let line: String = chars[line_start..j].iter().collect();
-        if line.trim_end_matches('\r') == delim {
+        let line = line.trim_end_matches('\r');
+        if (if strip_tabs {
+            line.trim_start_matches('\t')
+        } else {
+            line
+        }) == delim
+        {
             return Some((line_start, j));
         }
         if j >= chars.len() {
@@ -715,13 +741,50 @@ fn find_heredoc_terminator(
 /// rather than risking excessive redaction (#136).
 pub(super) fn redact_single_quoted_heredocs(command: &str) -> String {
     let chars: Vec<char> = command.chars().collect();
-    let redacted = redact_heredocs_scan(&chars, 0);
+    let redacted = redact_heredocs_scan(&chars, 0, false);
     canonical_shell_syntax(&redacted).unwrap_or(redacted)
+}
+
+/// Like [`redact_single_quoted_heredocs`] but for write-target scanning
+/// only: bodies of unquoted and double-quoted heredocs are prose too, unless
+/// they hold a `$(`/backtick substitution that could carry a real write
+/// (those stay visible). Never use this for execution-safety screens.
+pub(super) fn redact_inert_heredocs(command: &str) -> String {
+    let chars: Vec<char> = command.chars().collect();
+    let redacted = redact_heredocs_scan(&chars, 0, true);
+    canonical_shell_syntax(&redacted).unwrap_or(redacted)
+}
+
+/// True when a heredoc body may be executed as code: fail closed, any word
+/// anywhere on its opener line (before or after the marker, whatever wraps it)
+/// naming a shell or interpreter makes the body a script, not prose. A lone
+/// `.` counts only as the first word of a segment.
+fn heredoc_feeds_interpreter(opener_line: &str) -> bool {
+    use super::jev_approve::{
+        JEV_APPROVE_ALWAYS_WRAPPER_PROGRAMS, JEV_APPROVE_INLINE_CODE_INTERPRETERS,
+        JEV_APPROVE_SHELL_PROGRAMS,
+    };
+    opener_line
+        .split(['|', ';', '&', '(', ')', '`', '{', '}'])
+        .any(|segment| {
+            segment
+                .split_whitespace()
+                .enumerate()
+                .filter(|(_, word)| !word.contains('='))
+                .any(|(index, word)| {
+                    let program = word.rsplit('/').next().unwrap_or(word).to_ascii_lowercase();
+                    (index == 0 && word == ".")
+                        || matches!(program.as_str(), "ed" | "ex")
+                        || JEV_APPROVE_SHELL_PROGRAMS.contains(&program.as_str())
+                        || JEV_APPROVE_ALWAYS_WRAPPER_PROGRAMS.contains(&program.as_str())
+                        || JEV_APPROVE_INLINE_CODE_INTERPRETERS.contains(&program.as_str())
+                })
+        })
 }
 
 /// Recurse into live `$(...)` even inside double quotes to find heredocs;
 /// single quotes suppress substitution. Bound recursion depth (#136).
-fn redact_heredocs_scan(chars: &[char], depth: usize) -> String {
+fn redact_heredocs_scan(chars: &[char], depth: usize, expanding: bool) -> String {
     if depth >= MAX_STRUCTURAL_DEPTH {
         return chars.iter().collect();
     }
@@ -770,7 +833,11 @@ fn redact_heredocs_scan(chars: &[char], depth: usize) -> String {
         {
             out.push('$');
             out.push('(');
-            out.push_str(&redact_heredocs_scan(&chars[i + 2..end], depth + 1));
+            out.push_str(&redact_heredocs_scan(
+                &chars[i + 2..end],
+                depth + 1,
+                expanding,
+            ));
             out.push(')');
             i = end + 1;
             continue;
@@ -800,8 +867,9 @@ fn redact_heredocs_scan(chars: &[char], depth: usize) -> String {
         // inspected as a heredoc opener at all.
         if c == '<'
             && chars.get(i + 1) == Some(&'<')
-            && let Some((delim, marker_end)) = parse_single_quoted_heredoc_marker(chars, i)
+            && let Some((delim, marker_end, strip_tabs)) = parse_heredoc_marker(chars, i, expanding)
         {
+            let opener_line_start = out.rfind('\n').map_or(0, |p| p + 1);
             out.extend(chars[i..marker_end].iter());
             i = marker_end;
             // Copy the rest of this opener line without scanning it: only
@@ -810,14 +878,23 @@ fn redact_heredocs_scan(chars: &[char], depth: usize) -> String {
                 out.push(chars[i]);
                 i += 1;
             }
+            let interpreter_stdin =
+                expanding && heredoc_feeds_interpreter(&out[opener_line_start..]);
             if i < chars.len() {
                 out.push('\n');
                 i += 1;
             }
             let body_start = i;
-            match find_heredoc_terminator(chars, i, &delim) {
+            match find_heredoc_terminator(chars, i, &delim, strip_tabs) {
                 Some((term_start, term_end)) => {
-                    if term_start > body_start {
+                    let body_substitutes = interpreter_stdin
+                        || (expanding
+                            && chars[body_start..term_start]
+                                .windows(2)
+                                .any(|w| w == ['$', '('] || w[0] == '`' || w[1] == '`'));
+                    if body_substitutes {
+                        out.extend(chars[body_start..term_start].iter());
+                    } else if term_start > body_start {
                         out.push_str(OPAQUE_HEREDOC_BODY_PLACEHOLDER);
                         out.push('\n');
                     }
