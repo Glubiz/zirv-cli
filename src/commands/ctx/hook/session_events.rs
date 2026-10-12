@@ -498,11 +498,33 @@ const NOTIFY_TRANSCRIPT_KEYS: &[&str] = &["rollout_path", "session_file", "trans
 /// aliasing would let a renamed field parse as an empty transcript path and drop
 /// every turn signal without a word.
 pub fn notify_payload_to_hook(raw: &str) -> CtxResult<HookPayload> {
+    let sessions_root = crate::utils::home_dir()
+        .ok()
+        .map(|home| crate::commands::setup::codex_config_dir(&home).join("sessions"));
+    notify_payload_to_hook_in(raw, sessions_root.as_deref())
+}
+
+/// Codex's real notify payload (`agent-turn-complete`) names its session `thread-id` and carries
+/// no rollout path, so the rollout is found by that id under `sessions_root` (#912).
+fn notify_payload_to_hook_in(raw: &str, sessions_root: Option<&Path>) -> CtxResult<HookPayload> {
     let value: serde_json::Value = serde_json::from_str(raw)?;
+    let thread_id = ["session_id", "thread-id", "thread_id"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+        .unwrap_or_default();
 
     let transcript_path = NOTIFY_TRANSCRIPT_KEYS
         .iter()
         .find_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .or_else(|| {
+            let root = sessions_root.filter(|_| !thread_id.is_empty())?;
+            crate::commands::ctx::adapters::codex::find_rollout(
+                root,
+                &format!("-{thread_id}.jsonl"),
+            )
+            .map(|path| path.display().to_string())
+        })
         .ok_or_else(|| {
             format!(
                 "notify payload carries no known transcript field (tried {}); \
@@ -511,21 +533,16 @@ pub fn notify_payload_to_hook(raw: &str) -> CtxResult<HookPayload> {
                  NOTIFY_TRANSCRIPT_KEYS",
                 NOTIFY_TRANSCRIPT_KEYS.join(", ")
             )
-        })?
-        .to_string();
-
-    let string_at = |key: &str| {
-        value
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    };
+        })?;
 
     Ok(HookPayload {
-        session_id: string_at("session_id"),
+        session_id: thread_id.to_string(),
         transcript_path,
-        cwd: string_at("cwd"),
+        cwd: value
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
         stop_hook_active: false,
         source: String::new(),
         agent_id: String::new(),
@@ -1013,6 +1030,62 @@ mod tests {
         );
         assert_eq!(mapped.cwd, "/work");
         assert!(!mapped.stop_hook_active);
+    }
+
+    /// #912: Codex's real notify payload has `thread-id` and no rollout path; the translation
+    /// finds the rollout by thread id and reaches the same Stop path as a hook payload, so a
+    /// registered session's turn end is scored instead of logged as unmapped.
+    #[test]
+    fn a_real_codex_notify_payload_resolves_its_rollout_and_translates_to_stop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions/2026/10/12");
+        std::fs::create_dir_all(&sessions).expect("mkdir");
+        let thread = "0199aaaa-bbbb-7ccc-8ddd-eeeeffff0000";
+        let rollout = sessions.join(format!("rollout-2026-10-12T10-00-00-{thread}.jsonl"));
+        std::fs::write(&rollout, "").expect("rollout");
+        let raw = format!(
+            "{{\"type\":\"agent-turn-complete\",\"thread-id\":\"{thread}\",\"turn-id\":\"t1\",\"cwd\":\"/work\",\"input-messages\":[],\"last-assistant-message\":\"done\"}}"
+        );
+
+        let mapped = notify_payload_to_hook_in(&raw, Some(&dir.path().join("sessions")))
+            .expect("thread id resolves the rollout");
+        assert_eq!(mapped.session_id, thread);
+        assert_eq!(mapped.transcript_path, rollout.display().to_string());
+        assert_eq!(mapped.cwd, "/work");
+
+        let unknown = raw.replace(thread, "no-such-thread");
+        assert!(
+            notify_payload_to_hook_in(&unknown, Some(&dir.path().join("sessions"))).is_err(),
+            "an unknown thread stays an explicit unmapped error"
+        );
+
+        // End to end through run_notify: the translated payload scores the registered session.
+        let state = dir.path().join("state");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state.display().to_string(),
+        )]
+        .into();
+        let stop_payload = serde_json::to_string(&mapped).expect("serialize");
+        let mut direct = Vec::new();
+        let mut via_notify = Vec::new();
+        run_stop(&mut direct, &stop_payload, &|k| env.get(k).cloned()).expect("stop");
+        run_notify(&mut via_notify, &raw_with_path(&raw, &rollout), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("notify");
+        assert_eq!(
+            direct, via_notify,
+            "notify and Stop agree on the same turn end"
+        );
+    }
+
+    /// The same payload with the rollout path inlined, so `run_notify` (which resolves under the
+    /// real CODEX_HOME) needs no filesystem lookup in the test.
+    fn raw_with_path(raw: &str, rollout: &Path) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(raw).expect("json");
+        value["rollout_path"] = rollout.display().to_string().into();
+        value.to_string()
     }
 
     #[test]

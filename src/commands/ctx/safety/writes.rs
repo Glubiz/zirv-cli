@@ -758,13 +758,21 @@ pub(super) fn is_sed_perl_inplace_flag(token: &str) -> bool {
 /// no `-e`/`-f` anywhere on the line -- not the first positional either
 /// (its own implicit script).
 fn sed_perl_inplace_targets(program: &str, tokens: &[String]) -> Vec<String> {
-    let has_e_or_f = tokens[1..].iter().any(|t| t == "-e" || t == "-f");
+    let is_script_flag = |t: &str| matches!(t, "-e" | "-f" | "--expression" | "--file");
+    let has_e_or_f = tokens[1..]
+        .iter()
+        .any(|t| is_script_flag(t) || t.starts_with("--expression=") || t.starts_with("--file="));
     let mut awaiting_implicit_script = program == "sed" && !has_e_or_f;
     let mut targets = Vec::new();
     let mut i = 1;
     while i < tokens.len() {
         let token = &tokens[i];
-        if token == "-e" || token == "-f" {
+        if is_script_flag(token) {
+            i += 2;
+            continue;
+        }
+        // BSD `sed -i ''`: the empty suffix operand is not a file.
+        if program == "sed" && token == "-i" && tokens.get(i + 1).is_some_and(String::is_empty) {
             i += 2;
             continue;
         }
@@ -864,7 +872,7 @@ pub(crate) fn orchestrator_repo_write_target(
         .flat_map(|root| [format!("{root}/.zirv/work"), format!("{root}/.zirv/memory")])
         .collect();
 
-    let sanitized = redact_single_quoted_heredocs(command);
+    let sanitized = super::shell::redact_inert_heredocs(command);
     // Track only the immediately preceding diff-producing git segment;
     // reset at each other segment before considering a patch-apply exemption.
     let mut previous_diff_producing_git = false;
@@ -1360,6 +1368,168 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    /// Issue #910 part 1: prose in an unquoted or double-quoted heredoc body
+    /// is data, never a redirect; the same body with a real redirect on the
+    /// opener line still denies.
+    #[test]
+    fn orchestrator_repo_write_target_ignores_prose_in_expanding_heredoc_bodies() {
+        let cwd = "/work/repo";
+        for command in [
+            "cat <<EOF\nthe value > does not matter\nEOF",
+            "cat <<\"EOF\"\nsee a -> b and x > does\nEOF",
+            "cat <<-EOF\n\tcd && echo > does\n\tEOF",
+            "cat <<EOF | grep x\nfoo > bar baz\nEOF",
+        ] {
+            assert_eq!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
+                None,
+                "{command}"
+            );
+        }
+        for command in [
+            "cat > src/x.rs <<EOF\nhi > there\nEOF",
+            "cat <<EOF > src/x.rs\nhi > there\nEOF",
+            "cat <<EOF\n$(echo x > src/x.rs)\nEOF",
+        ] {
+            assert!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None)
+                    .is_some(),
+                "{command}"
+            );
+        }
+    }
+
+    /// A heredoc body fed to a shell or interpreter is a script: its writes
+    /// are real whatever the quoting; prose heredocs for other commands stay
+    /// inert.
+    #[test]
+    fn orchestrator_repo_write_target_scans_interpreter_heredoc_bodies() {
+        let cwd = "/work/repo";
+        for command in [
+            "bash <<EOF\necho pwned > src/main.rs\nEOF",
+            "bash <<'EOF'\necho pwned > src/main.rs\nEOF",
+            "sh -s <<EOF\necho pwned > src/main.rs\nEOF",
+            "cat <<EOF | sh\necho pwned > src/main.rs\nEOF",
+            "cat <<EOF | bash\necho pwned > src/main.rs\nEOF",
+            "zsh <<EOF\necho pwned > src/main.rs\nEOF",
+            "python3 <<EOF\necho pwned > src/main.rs\nEOF",
+            "bash <<EOF 2>&1\necho pwned > src/main.rs\nEOF",
+            "bash <<EOF | tee log\necho pwned > src/main.rs\nEOF",
+            "sh <<EOF && echo done\necho pwned > src/main.rs\nEOF",
+            "bash <<EOF; true\necho pwned > src/main.rs\nEOF",
+            "python3 <<EOF || exit 1\necho pwned > src/main.rs\nEOF",
+            "command bash <<EOF\necho pwned > src/main.rs\nEOF",
+            "nohup bash <<EOF\necho pwned > src/main.rs\nEOF",
+            "time bash <<EOF\necho pwned > src/main.rs\nEOF",
+            "timeout 5 bash <<EOF\necho pwned > src/main.rs\nEOF",
+            "nice sh <<EOF\necho pwned > src/main.rs\nEOF",
+            "stdbuf -oL sh <<EOF\necho pwned > src/main.rs\nEOF",
+            "busybox sh <<EOF\necho pwned > src/main.rs\nEOF",
+            "if x; then bash <<EOF\necho pwned > src/main.rs\nEOF",
+            "{ bash <<EOF\necho pwned > src/main.rs\nEOF",
+            "! bash <<EOF\necho pwned > src/main.rs\nEOF",
+            "do bash <<EOF\necho pwned > src/main.rs\nEOF",
+            "else sh <<EOF\necho pwned > src/main.rs\nEOF",
+            ". <<EOF\necho pwned > src/main.rs\nEOF",
+        ] {
+            assert!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None)
+                    .is_some(),
+                "{command}"
+            );
+        }
+        assert_eq!(
+            orchestrator_repo_write_target(
+                "cat > $TMPDIR/x.md <<EOF\nthe value > does not matter\nEOF",
+                cwd,
+                &fake_repo_root_of,
+                &|_| None
+            ),
+            None
+        );
+    }
+
+    /// Issue #910 part 2: `sed -i` is classified by its file operands, so a
+    /// scratchpad file outside any repository is not a repository write
+    /// whatever the expression looks like; real repository targets still deny.
+    #[test]
+    fn orchestrator_repo_write_target_classifies_sed_in_place_by_file_operand() {
+        let cwd = "/work/repo";
+        let expr = "'s/best=\\[m for m in msgs if x\\]/best=[]/'";
+        let outside = "/private/tmp/claude-501/s/scratchpad/f.py";
+        for command in [
+            format!("sed -i {expr} {outside}"),
+            format!("sed -i '' {expr} {outside}"),
+            format!("sed -i.bak {expr} {outside}"),
+            format!("sed --in-place {expr} {outside}"),
+            format!("sed --in-place=.bak {expr} {outside}"),
+            format!("sed -i -e {expr} {outside}"),
+            format!("sed -i -e {expr} -e 's/a/b/' {outside}"),
+            format!("sed -i -E {expr} {outside}"),
+        ] {
+            assert_eq!(
+                orchestrator_repo_write_target(&command, cwd, &fake_repo_root_of, &|_| None),
+                None,
+                "{command}"
+            );
+        }
+        for command in [
+            format!("sed -i '' {expr} src/main.rs"),
+            format!("sed --in-place {expr} src/main.rs"),
+            format!("sed -i -e {expr} src/main.rs"),
+            format!("sed -i -E {expr} /work/repo/src/main.rs"),
+        ] {
+            assert_eq!(
+                orchestrator_repo_write_target(&command, cwd, &fake_repo_root_of, &|_| None),
+                Some(
+                    if command.ends_with("/work/repo/src/main.rs") {
+                        "/work/repo/src/main.rs"
+                    } else {
+                        "src/main.rs"
+                    }
+                    .to_string()
+                ),
+                "{command}"
+            );
+        }
+    }
+
+    /// Issue #889: `->where(` inside a quoted argument is never a redirect,
+    /// and a `kubectl exec ... --` with no local redirect writes nothing.
+    #[test]
+    fn orchestrator_repo_write_target_ignores_redirect_lookalikes_in_quoted_arguments() {
+        let cwd = "/work/repo";
+        for command in [
+            "kubectl --context minikube exec deploy/webserver -- php artisan tinker --execute=\"echo App\\Journey::query()->where('journey_id',1)->count();\" | grep x | tail -5",
+            "kubectl exec deploy/web -- php artisan tinker --execute='$q->where(1)->get();'",
+            "kubectl exec deploy/web -- sh -c \"echo a > /tmp/inside-pod\"",
+            "echo \"a -> b\" | grep x",
+            "kubectl --context minikube exec deploy/webserver -- php artisan tinker --execute=\"\\$j = App\\\\Models\\\\Journey::query()->where('journey_id',1)->first(); echo \\$j->id;\" 2>&1 | grep x | tail -5",
+            "kubectl exec deploy/web -- php artisan tinker --execute=\"echo 1;\n\\$q->where('a',1)->get();\"",
+            "kubectl exec deploy/web -- php artisan tinker --execute=\"\\\"x\\\"->where(1)\"",
+            "kubectl exec deploy/web -- php artisan tinker --execute \"A::where('a','>',1)->count()\"",
+            "kubectl exec deploy/web -- php artisan tinker --execute=\"$(echo A)::query()->where('a',1)->count()\" | head",
+            "kubectl exec deploy/web -- php artisan tinker --execute=\"A::query()->where('it\\'s',1)->count()\" | head",
+            "kubectl exec deploy/web -- php artisan tinker --execute=A::query\\(\\)-\\>where\\(1\\)",
+            "kubectl exec deploy/web -- php artisan tinker --execute=\"A::q()->where('a',1)\"'->get()'",
+        ] {
+            assert_eq!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
+                None,
+                "{command}"
+            );
+        }
+        assert_eq!(
+            orchestrator_repo_write_target(
+                "kubectl exec deploy/web -- ls && echo \"a->b\" > src/x.rs",
+                cwd,
+                &fake_repo_root_of,
+                &|_| None
+            ),
+            Some("src/x.rs".to_string())
+        );
     }
 
     /// Issue #883: relative targets resolve against the effective directory

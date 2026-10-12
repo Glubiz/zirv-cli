@@ -54,6 +54,9 @@ pub enum RenderStatus {
     Passed,
     Failed,
     Unavailable,
+    /// A server or browser was tried but no capture came back (no server, auth wall, launch
+    /// failure): the render proves nothing either way, so the advance gate does not block on it.
+    Inconclusive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,14 +288,19 @@ fn review_root(state: &StateDir, repo: &Path) -> PathBuf {
     frontend_root(state, repo).join("visual-reviews")
 }
 
+/// An io error that names the path it was denied on; a bare `Operation not permitted` names nothing.
+fn at_path(path: &Path) -> impl Fn(std::io::Error) -> std::io::Error + '_ {
+    move |error| std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+}
+
 fn save_render(state: &StateDir, report: &RenderReport) -> CtxResult<()> {
     let root = render_root(state, &report.repo);
-    create_private_dir_all(&root)?;
-    write_private(
-        &root.join(format!("{}.json", report.id)),
-        &serde_json::to_string_pretty(report)?,
-    )?;
-    write_private(&root.join("latest"), &report.id)?;
+    create_private_dir_all(&root).map_err(at_path(&root))?;
+    let report_path = root.join(format!("{}.json", report.id));
+    write_private(&report_path, &serde_json::to_string_pretty(report)?)
+        .map_err(at_path(&report_path))?;
+    let latest = root.join("latest");
+    write_private(&latest, &report.id).map_err(at_path(&latest))?;
     Ok(())
 }
 
@@ -483,7 +491,7 @@ pub(crate) fn render_with_launcher(
         report.base_url = Some(file_base_url(&root)?);
         let base_url = report.base_url.clone().unwrap_or_default();
         if let Err(error) = capture_all(state, &repo, &browser, &base_url, &mut report) {
-            report.status = RenderStatus::Failed;
+            report.status = RenderStatus::Inconclusive;
             report.notes.push(format!("capture failed: {error}"));
         } else if report.captures_complete() {
             report.status = RenderStatus::Passed;
@@ -522,17 +530,25 @@ pub(crate) fn render_with_launcher(
     let result = match wait_for_server(&mut child, port) {
         Ok(true) => capture_all(state, &repo, &browser, &base_url, &mut report),
         Ok(false) => {
-            report.status = RenderStatus::Failed;
-            report
-                .notes
-                .push("frontend server did not become ready within the bounded timeout".into());
+            // A server that exited on its own is a broken build, not missing evidence.
+            if child.try_wait()?.is_some() {
+                report.status = RenderStatus::Failed;
+                report
+                    .notes
+                    .push("frontend server exited during startup".into());
+            } else {
+                report.status = RenderStatus::Inconclusive;
+                report
+                    .notes
+                    .push("frontend server did not become ready within the bounded timeout".into());
+            }
             Ok(())
         }
         Err(error) => Err(error),
     };
     let cleanup = super::terminate_process_tree(&mut child);
     if let Err(error) = result {
-        report.status = RenderStatus::Failed;
+        report.status = RenderStatus::Inconclusive;
         report.notes.push(format!("capture failed: {error}"));
     }
     if let Err(error) = cleanup {
@@ -912,7 +928,8 @@ fn discover_browser_among(
 /// Skip real browser probes in unit-test executables; tests needing one pass explicit candidates.
 fn discover_browser_verbose() -> (Option<String>, Vec<String>) {
     if cfg!(test) {
-        return (None, Vec::new());
+        // Tests never launch a machine browser; one may name a stub explicitly.
+        return (std::env::var("ZIRV_TEST_RENDER_BROWSER").ok(), Vec::new());
     }
     discover_browser_among(machine_browser_candidates())
 }
@@ -923,7 +940,7 @@ pub(crate) struct BrowserProfileDir(PathBuf);
 impl BrowserProfileDir {
     pub(crate) fn new() -> std::io::Result<Self> {
         let path = std::env::temp_dir().join(format!("zirv-browser-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path)?;
+        std::fs::create_dir_all(&path).map_err(at_path(&path))?;
         Ok(Self(path))
     }
 
@@ -983,7 +1000,7 @@ fn capture_all(
     report: &mut RenderReport,
 ) -> CtxResult<()> {
     let output = render_root(state, repo).join(&report.id);
-    create_private_dir_all(&output)?;
+    create_private_dir_all(&output).map_err(at_path(&output))?;
     for route in &report.routes {
         for viewport in &report.viewports {
             let filename = format!(
@@ -1002,7 +1019,7 @@ fn capture_all(
                 )
                 .into());
             }
-            let metadata = std::fs::symlink_metadata(&path)?;
+            let metadata = std::fs::symlink_metadata(&path).map_err(at_path(&path))?;
             if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_CAPTURE_BYTES {
                 return Err(format!("invalid screenshot output '{}'", path.display()).into());
             }
@@ -1110,7 +1127,7 @@ fn capture(browser: &str, url: &str, path: &Path, viewport: Viewport) -> CtxResu
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     super::isolate_process_tree(&mut command);
-    let mut child = command.spawn()?;
+    let mut child = command.spawn().map_err(at_path(Path::new(browser)))?;
     let started = Instant::now();
     while started.elapsed() < BROWSER_TIMEOUT {
         match child.try_wait() {
@@ -1832,6 +1849,127 @@ mod tests {
             .expect("server");
         assert_eq!(server.kind, ServerKind::Vite);
         assert_eq!(server.working_directory, PathBuf::from("apps/frontend"));
+    }
+
+    /// #900: a browser that cannot capture (no server, auth wall) leaves the render inconclusive, not failed.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_capture_is_recorded_as_inconclusive_with_its_reason() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_root = tempfile::tempdir().expect("state root");
+        let state = StateDir::from_root(state_root.path().to_path_buf());
+        let repo = tempfile::tempdir().expect("repo");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("index.html"), "<main>login</main>").expect("index");
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "fixture"]);
+        let bin = tempfile::tempdir().expect("bin");
+        let stub = bin.path().join("browser");
+        std::fs::write(&stub, "#!/bin/sh\nexit 1\n").expect("stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let _guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ZIRV_TEST_RENDER_BROWSER",
+            Some(stub.to_str().expect("utf8")),
+        )]);
+
+        let report = render(&state, repo.path()).expect("a failed capture is not an error");
+
+        assert_eq!(report.status, RenderStatus::Inconclusive, "{report:?}");
+        assert!(!report.passed());
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("browser failed for route")),
+            "{report:?}"
+        );
+    }
+
+    /// A dev server that exits during startup is a crashed build: Failed, not Inconclusive.
+    #[cfg(unix)]
+    #[test]
+    fn a_server_that_exits_during_startup_is_failed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_root = tempfile::tempdir().expect("state root");
+        let state = StateDir::from_root(state_root.path().to_path_buf());
+        let repo = tempfile::tempdir().expect("repo");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(
+            repo.path().join("package.json"),
+            r#"{"scripts":{"dev":"vite"}}"#,
+        )
+        .expect("package");
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "fixture"]);
+        let bin = tempfile::tempdir().expect("bin");
+        let executable = |name: &str, body: &str| {
+            let path = bin.path().join(name);
+            std::fs::write(&path, body).expect("stub");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            path
+        };
+        let browser = executable("browser", "#!/bin/sh\nexit 0\n");
+        executable(
+            "npm",
+            "#!/bin/sh\n[ \"$1\" = \"--version\" ] && exit 0\nexit 1\n",
+        );
+        let path = format!(
+            "{}:{}",
+            bin.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let _guard = crate::commands::ctx::testenv::VarGuard::set(&[
+            (
+                "ZIRV_TEST_RENDER_BROWSER",
+                Some(browser.to_str().expect("utf8")),
+            ),
+            ("PATH", Some(path.as_str())),
+        ]);
+
+        let report = render(&state, repo.path()).expect("a crashed server is not an error");
+
+        assert_eq!(report.status, RenderStatus::Failed, "{report:?}");
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("exited during startup")),
+            "{report:?}"
+        );
+    }
+
+    /// #900: a denied io error names the path it was denied on.
+    #[test]
+    fn io_errors_on_the_render_path_name_the_path() {
+        let path = Path::new("/denied/render/latest");
+        let error = at_path(path)(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            error.to_string().contains("/denied/render/latest"),
+            "{error}"
+        );
     }
 
     #[test]

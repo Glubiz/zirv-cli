@@ -1220,6 +1220,112 @@ fn maybe_offer_statusline_wrap<W: Write>(
     Ok(())
 }
 
+/// Adds `host` to Claude's `sandbox.network.allowedDomains` (backing the settings up first, keeping
+/// every other key). `false` when the entry already exists and nothing was written.
+fn add_claude_sandbox_allowed_domain(home: &Path, host: &str) -> SetupResult<bool> {
+    let settings_path = claude_config_dir(home).join("settings.json");
+    let mut settings = load_json_object(&settings_path)?;
+    let domains = settings
+        .as_object_mut()
+        .ok_or("Claude settings root is not an object")?
+        .entry("sandbox")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or("Claude settings `sandbox` must be an object")?
+        .entry("network")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or("Claude settings `sandbox.network` must be an object")?
+        .entry("allowedDomains")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or("Claude settings `sandbox.network.allowedDomains` must be an array")?;
+    if domains.iter().any(|entry| entry.as_str() == Some(host)) {
+        return Ok(false);
+    }
+    domains.push(Value::String(host.to_string()));
+    write_backup_run(
+        &home.join(".zirv/backups/ai-reset"),
+        BackupKind::Apply,
+        ResetProvider::Claude,
+        ResetScope::Global,
+        &claude_config_dir(home),
+        std::slice::from_ref(&settings_path),
+    )?;
+    std::fs::create_dir_all(claude_config_dir(home))?;
+    ctx::state::write_atomic(
+        &settings_path,
+        &(serde_json::to_string_pretty(&settings)? + "\n"),
+        false,
+    )?;
+    Ok(true)
+}
+
+/// Offers (never silently does) to allow the Jev host through Claude's sandbox proxy. Nothing is
+/// written when not interactive, when `confirm` declines, or when the entry already exists.
+fn offer_jev_sandbox_domain<W: Write>(
+    home: &Path,
+    host: &str,
+    interactive: bool,
+    confirm: impl FnOnce(&str) -> SetupResult<bool>,
+    writer: &mut W,
+) -> SetupResult<()> {
+    if !interactive {
+        return Ok(());
+    }
+    let settings = load_json_object(&claude_config_dir(home).join("settings.json"))?;
+    let present = settings
+        .pointer("/sandbox/network/allowedDomains")
+        .and_then(Value::as_array)
+        .is_some_and(|domains| domains.iter().any(|entry| entry.as_str() == Some(host)));
+    if present {
+        return Ok(());
+    }
+    let prompt = format!(
+        "Jev is configured, and Claude Code's Bash sandbox blocks {host} by default, so Jev calls \
+         from sandboxed commands fall back silently. Add \"{host}\" to sandbox.network.allowedDomains \
+         in your Claude settings? A backup is taken; `zirv setup restore --latest` reverts it."
+    );
+    if !confirm(&prompt)? {
+        writeln!(writer, "Claude sandbox allowedDomains left unchanged")?;
+        return Ok(());
+    }
+    add_claude_sandbox_allowed_domain(home, host)?;
+    writeln!(
+        writer,
+        "added {host} to Claude sandbox.network.allowedDomains"
+    )?;
+    Ok(())
+}
+
+fn maybe_offer_jev_sandbox_domain<W: Write>(
+    repo: &Path,
+    home: &Path,
+    writer: &mut W,
+) -> SetupResult<()> {
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let env = ctx::config::env_from_process();
+    let cfg = ctx::config::CtxConfig::load(repo, &env)?;
+    if !ctx::jev::any_gate_enabled(&cfg.jev) {
+        return Ok(());
+    }
+    let Some(host) = ctx::jev::base_url_host(&cfg.proxy.typesafe.base_url) else {
+        return Ok(());
+    };
+    offer_jev_sandbox_domain(
+        home,
+        &host,
+        interactive,
+        |prompt| {
+            Ok(dialoguer::Confirm::new()
+                .with_prompt(prompt)
+                .default(false)
+                .interact()?)
+        },
+        writer,
+    )
+}
+
 fn install_claude_integration(home: &Path, dry_run: bool) -> SetupResult<(usize, bool)> {
     let settings_path = claude_config_dir(home).join("settings.json");
     if std::fs::symlink_metadata(&settings_path)
@@ -3291,6 +3397,7 @@ fn run_apply_with_predicate<W: Write>(
             )?;
             if !args.dry_run {
                 maybe_offer_statusline_wrap(&repo, &home_dir()?, writer)?;
+                maybe_offer_jev_sandbox_domain(&repo, &home_dir()?, writer)?;
             }
         } else {
             writeln!(writer, "Claude: not installed, skipping hook installation")?;
@@ -4889,6 +4996,38 @@ mod tests {
 
         let error = profile_mutations(&args).expect_err("zero budget must be rejected");
         assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn jev_sandbox_domain_offer_writes_once_only_when_accepted_and_keeps_other_keys() {
+        let home = tempfile::tempdir().expect("home");
+        let settings_path = claude_config_dir(home.path()).join("settings.json");
+        std::fs::create_dir_all(settings_path.parent().expect("parent")).expect("mkdir");
+        let original = json!({"model": "x", "sandbox": {"enabled": true, "network": {"allowedDomains": ["a.example"]}}});
+        std::fs::write(&settings_path, original.to_string()).expect("settings");
+        let host = "api.typesafe.ai";
+        let mut out = Vec::new();
+
+        offer_jev_sandbox_domain(home.path(), host, false, |_| panic!("asked"), &mut out)
+            .expect("non-interactive");
+        offer_jev_sandbox_domain(home.path(), host, true, |_| Ok(false), &mut out)
+            .expect("declined");
+        assert_eq!(load_json_object(&settings_path).expect("read"), original);
+
+        offer_jev_sandbox_domain(home.path(), host, true, |_| Ok(true), &mut out)
+            .expect("accepted");
+        let after = load_json_object(&settings_path).expect("read");
+        assert_eq!(
+            after["sandbox"]["network"]["allowedDomains"],
+            json!(["a.example", host])
+        );
+        assert_eq!(after["model"], "x");
+        assert_eq!(after["sandbox"]["enabled"], true);
+
+        offer_jev_sandbox_domain(home.path(), host, true, |_| panic!("asked again"), &mut out)
+            .expect("already present");
+        assert!(!add_claude_sandbox_allowed_domain(home.path(), host).expect("dup"));
+        assert_eq!(load_json_object(&settings_path).expect("read"), after);
     }
 
     #[test]

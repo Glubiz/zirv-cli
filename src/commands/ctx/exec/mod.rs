@@ -461,6 +461,11 @@ fn run_with_clock_inner<W: Write>(
             })
             .unwrap_or_default();
         turn_env.push((adapters::AGENT_ENV.to_string(), adapter.name().to_string()));
+        // An adapter without turn-signal env (codex) still needs its identity, as in `dash` and
+        // `handover`; hook-side Jev calls find this session's relay through it. (#911)
+        if !turn_env.iter().any(|(k, _)| k == adapters::SESSION_ENV) {
+            turn_env.push((adapters::SESSION_ENV.to_string(), session.to_string()));
+        }
         // Record the actual route for later accounting, not a config guess. (#800)
         let route_tier = execution_model
             .as_deref()
@@ -2213,6 +2218,52 @@ mod tests {
         // The consult marker is consumed: the helper is internal and passes neither variable on.
         assert_eq!(received(true).trim(), "1 unset");
         assert_eq!(received(false).trim(), "unset unset");
+    }
+
+    /// #911: a codex adapter has no turn-signal env, yet its exec worker must still carry the
+    /// session identity the Jev relay and hook-side calls are keyed on, like the claude path.
+    #[test]
+    fn a_codex_exec_worker_carries_its_session_identity() {
+        let received = |agent: &str| {
+            let tmp = crate::commands::ctx::testenv::repo();
+            let home = tmp.path().join("home");
+            let session = "55555555-2222-4333-8444-555555555555";
+            let env = base_env(&tmp.path().join("state"));
+            let log = tmp.path().join("session.log");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+            // SAFETY: CI runs tests single-threaded.
+            unsafe {
+                std::env::set_var("FAKE_AGENT_MODE", "healthy");
+                std::env::set_var("FAKE_AGENT_SESSION_ENV_LOG", &log);
+            }
+            let args = ExecArgs {
+                agent: Some(agent.to_string()),
+                session_id: Some(session.to_string()),
+                transcript: Some(transcript_for(&home, tmp.path(), session)),
+                prompt: Some("do the work".to_string()),
+                max_restarts: Some(2),
+                timeout_secs: Some(60),
+                command: fake_agent_command(session),
+                ..Default::default()
+            };
+            let mut out = Vec::new();
+            let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+            unsafe {
+                std::env::remove_var("FAKE_AGENT_MODE");
+                std::env::remove_var("FAKE_AGENT_SESSION_ENV_LOG");
+            }
+            assert_eq!(code.expect("runs"), 0);
+            std::fs::read_to_string(&log).expect("log")
+        };
+
+        let session = "55555555-2222-4333-8444-555555555555";
+        for agent in ["codex", "claude"] {
+            let log = received(agent);
+            assert!(
+                log.lines().count() > 0 && log.lines().all(|line| line == session),
+                "{agent} worker must export the session it runs under: {log:?}"
+            );
+        }
     }
 
     /// T11: the fail-safe blind delay (T8) actually reaches the injected

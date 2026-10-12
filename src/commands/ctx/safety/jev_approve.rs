@@ -221,7 +221,7 @@ fn jev_approve_capped(value: usize) -> u32 {
 /// Shells: bare invocation is always opaque (a script or an interactive
 /// session), whether or not `-c` follows -- so unlike the inline-code
 /// interpreters below, these never need a flag check of their own.
-const JEV_APPROVE_SHELL_PROGRAMS: &[&str] = &[
+pub(super) const JEV_APPROVE_SHELL_PROGRAMS: &[&str] = &[
     "sh",
     "bash",
     "zsh",
@@ -237,13 +237,13 @@ const JEV_APPROVE_SHELL_PROGRAMS: &[&str] = &[
 /// caller-controlled code with an elevated or indirect trust boundary
 /// (`eval`, `exec`, `sudo`, `doas`), or hands its own argv to something
 /// else entirely (`xargs`, `env`, dot-sourcing via `source`/`.`).
-const JEV_APPROVE_ALWAYS_WRAPPER_PROGRAMS: &[&str] =
+pub(super) const JEV_APPROVE_ALWAYS_WRAPPER_PROGRAMS: &[&str] =
     &["eval", "exec", "xargs", "env", "sudo", "doas", "source"];
 
 /// Script interpreters that are only opaque when given inline code
 /// (`-c`/`-e`) -- `python script.py` reads as an ordinary program; `python
 /// -c "..."` does not.
-const JEV_APPROVE_INLINE_CODE_INTERPRETERS: &[&str] =
+pub(super) const JEV_APPROVE_INLINE_CODE_INTERPRETERS: &[&str] =
     &["python", "python3", "perl", "ruby", "node", "nodejs"];
 
 /// Share one opaque-wrapper predicate between admission and risk facts

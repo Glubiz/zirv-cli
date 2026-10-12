@@ -388,7 +388,32 @@ pub enum JevError {
     Status(u16),
     Timeout,
     Transport(String),
+    /// A sandbox network proxy refused the CONNECT tunnel (403) before Jev was reached: the host
+    /// is not in the sandbox's allowed domains. Carries the proxy's own detail.
+    SandboxProxyDenied(String),
     Malformed(String),
+}
+
+/// The reason prefix a [`JevError::SandboxProxyDenied`] records, which `zirv ctx jev status` keys on.
+const SANDBOX_PROXY_DENIED: &str = "sandbox_proxy_denied";
+
+/// The host of a Jev `base_url` without port or userinfo: the value a Claude Code
+/// `sandbox.network.allowedDomains` entry needs.
+pub(crate) fn base_url_host(base_url: &str) -> Option<String> {
+    let authority = crate::commands::ctx::health::dependency_from_base_url(base_url)?;
+    let host = authority.split(':').next().unwrap_or_default();
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// Maps a transport failure from ureq: a refused CONNECT tunnel (a sandbox proxy answering 403)
+/// is its own error; everything else stays a plain transport error.
+fn transport_error(error: &ureq::Error) -> JevError {
+    match error {
+        ureq::Error::ConnectProxyFailed(detail) if detail.contains("responded 403") => {
+            JevError::SandboxProxyDenied(detail.clone())
+        }
+        other => JevError::Transport(other.to_string()),
+    }
 }
 
 impl std::fmt::Display for JevError {
@@ -403,6 +428,7 @@ impl std::fmt::Display for JevError {
             Self::Status(status) => write!(f, "unexpected status {status}"),
             Self::Timeout => write!(f, "timed out"),
             Self::Transport(detail) => write!(f, "transport error: {detail}"),
+            Self::SandboxProxyDenied(detail) => write!(f, "{SANDBOX_PROXY_DENIED}: {detail}"),
             Self::Malformed(detail) => write!(f, "malformed response: {detail}"),
         }
     }
@@ -989,7 +1015,7 @@ pub(crate) fn send_request(
         Ok(response) => response,
         Err(ureq::Error::StatusCode(status)) => return Err(status_error(status)),
         Err(ureq::Error::Timeout(_)) => return Err(JevError::Timeout),
-        Err(error) => return Err(JevError::Transport(error.to_string())),
+        Err(error) => return Err(transport_error(&error)),
     };
 
     let status = response.status().as_u16();
@@ -1628,6 +1654,8 @@ pub(crate) struct JevRollup {
     /// opening the JEV errors dialog on a click never reads the log files
     /// itself, only the last refresh's own rollup.
     pub recent_errors: Vec<JevErrorEntry>,
+    /// Whether any errored row in the window, kept or truncated away, was a sandbox proxy denial.
+    pub sandbox_denied: bool,
 }
 
 /// One site's folded usage over the rollup window: call volume, cache-hit
@@ -1788,6 +1816,9 @@ pub(crate) fn usage_rollup(
     // but nothing here may rely on that (see this function's own doc
     // comment on torn/out-of-order writes from several call sites), so this
     // sorts explicitly rather than just reversing.
+    let sandbox_denied = recent_errors
+        .iter()
+        .any(|e| e.reason.starts_with(SANDBOX_PROXY_DENIED));
     recent_errors.sort_by_key(|e| std::cmp::Reverse(e.ts));
     recent_errors.truncate(MAX_KEPT_JEV_ERRORS);
     let latest_error_reason = recent_errors.first().map(|e| e.reason.clone());
@@ -1800,6 +1831,7 @@ pub(crate) fn usage_rollup(
         last_call,
         latest_error_reason,
         recent_errors,
+        sandbox_denied,
     }
 }
 
@@ -2289,6 +2321,14 @@ pub fn status(
 
     // Print the usage rollup
     let rollup = usage_rollup(state, ROLLUP_WINDOW_SECS, None);
+    if let Some(host) = base_url_host(&cfg.proxy.typesafe.base_url)
+        && rollup.sandbox_denied
+    {
+        writeln!(
+            writer,
+            "sandbox       proxy denied Jev calls ({SANDBOX_PROXY_DENIED}); remedy: add \"{host}\" to Claude Code sandbox.network.allowedDomains (`zirv setup` offers this)"
+        )?;
+    }
     let window_days = ROLLUP_WINDOW_SECS / 86_400;
     writeln!(writer)?;
     writeln!(writer, "usage (last {window_days}d)")?;
@@ -4402,6 +4442,82 @@ pub(crate) mod tests {
             assert_eq!(gates[key], false, "{key}: {gates}");
         }
         assert_eq!(gates.as_object().map(|g| g.len()), Some(20), "{gates}");
+    }
+
+    /// #913: a sandbox proxy's 403 on CONNECT is its own error; other transport failures are unchanged.
+    #[test]
+    fn a_403_connect_proxy_failure_is_a_sandbox_proxy_denial() {
+        let denied = transport_error(&ureq::Error::ConnectProxyFailed(
+            "proxy server responded 403/403".to_string(),
+        ));
+        assert!(
+            matches!(denied, JevError::SandboxProxyDenied(_)),
+            "{denied:?}"
+        );
+        assert!(denied.to_string().starts_with("sandbox_proxy_denied"));
+        let other_proxy = transport_error(&ureq::Error::ConnectProxyFailed(
+            "proxy server responded 502/Bad Gateway".to_string(),
+        ));
+        assert!(
+            matches!(other_proxy, JevError::Transport(_)),
+            "{other_proxy:?}"
+        );
+        let plain = transport_error(&ureq::Error::ConnectionFailed);
+        assert!(matches!(plain, JevError::Transport(_)), "{plain:?}");
+        assert_eq!(
+            base_url_host("https://api.typesafe.ai:443/v1").as_deref(),
+            Some("api.typesafe.ai")
+        );
+    }
+
+    /// #913: status names the exact host to allow once a denial is on record.
+    #[test]
+    fn status_shows_the_sandbox_allowed_domains_remedy_after_a_proxy_denial() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(state_dir.path().to_path_buf());
+        let cfg = CtxConfig::default();
+        let mut quiet = Vec::new();
+        status(&cfg, &state, &mut quiet).expect("status");
+        assert!(!String::from_utf8_lossy(&quiet).contains("allowedDomains"));
+        record_skip(
+            &state,
+            "review",
+            &JevError::SandboxProxyDenied("proxy server responded 403/403".into()).to_string(),
+        );
+        let mut out = Vec::new();
+        status(&cfg, &state, &mut out).expect("status");
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("add \"api.typesafe.ai\" to Claude Code sandbox.network.allowedDomains"),
+            "{text}"
+        );
+    }
+
+    /// The remedy survives later non-sandbox errors pushing the denial row out of the kept list.
+    #[test]
+    fn the_sandbox_remedy_outlives_the_bounded_error_list() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_path(state_dir.path().to_path_buf());
+        state::create_private_dir_all(state.root()).expect("create state dir");
+        let now = state::now_secs();
+        let mut lines = vec![format!(
+            "{{\"site\":\"review\",\"ts\":{},\"reason\":\"{SANDBOX_PROXY_DENIED}: 403\"}}",
+            now - 1000
+        )];
+        for age in 0..(MAX_KEPT_JEV_ERRORS as u64 + 5) {
+            lines.push(format!(
+                "{{\"site\":\"review\",\"ts\":{},\"reason\":\"other {age}\"}}",
+                now - 500 + age
+            ));
+        }
+        std::fs::write(state.root().join(JEV_SKIPS_FILE), lines.join("\n")).expect("write skips");
+        let mut out = Vec::new();
+        status(&CtxConfig::default(), &state, &mut out).expect("status");
+        assert!(
+            String::from_utf8_lossy(&out).contains("sandbox.network.allowedDomains"),
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
     }
 
     /// #452: `launch_effort` alone is a real gate, so it must start the relay a sandboxed seat needs.

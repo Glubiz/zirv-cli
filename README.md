@@ -1140,7 +1140,8 @@ moves a message into or out of — unlike the message itself, a sidecar is
 never relocated into `read/` on consume or into a dead-letter directory once
 its TTL expires, so a marker's path always stays valid for as long as the
 sidecar exists. It is pruned to the same `[mail] keep` as the mailbox
-itself, in its own pass, so it does not accumulate forever either.
+itself, in its own pass, so it does not accumulate forever either — except
+that a sidecar an unread message in the mailbox still names is never pruned.
 
 A delegated worker's own final report is persisted before any report-back
 mail is sent, at
@@ -2181,7 +2182,7 @@ zirv workflow resume <id>                         # restore as the active workfl
 zirv workflow context [id]                        # the current step's resolved skill context
 zirv workflow artifacts <id> [--json]              # committed work-product state
 zirv workflow agents list|show <id>|dispatch <id> --adapter <name> --prompt <task>
-zirv workflow team plan "<objective>" [--workflow <id>|active] [--dry-run] [--seat <id>] [--json]
+zirv workflow team plan "<objective>" [--workflow <id>|active] [--dry-run] [--seat <id>] [--workdir <path>] [--json]
 zirv workflow team show [--workflow <id>|active] [--json]
 zirv workflow team brief <seat-id> [--json]       # Agent-tool-ready brief for one compiled seat
 zirv workflow approve <id>                        # approve the current gated step
@@ -2786,9 +2787,11 @@ operator's own `~/.zirv/ctx.toml` or the matching
 ### Team composition
 
 `zirv workflow team plan "<objective>" [--workflow <id>|active] [--dry-run]
-[--seat <manifest-id>] [--json]` compiles the smallest capable team for a
-request: it classifies the objective exactly like `zirv workflow classify`
-(the objective's text can only raise complexity, and with no changed files the
+[--seat <manifest-id>] [--workdir <path>] [--json]` compiles the smallest capable team for a
+request: it classifies the objective exactly like `zirv workflow classify`,
+measuring `--workdir`'s diff instead of `--repo`'s when the work lives in another
+checkout (a dense objective naming five or more inline clauses is at least
+substantial by text alone; the objective's text can only raise complexity, and with no changed files the
 classification says it is text-only and the profile's confidence is low),
 derives the minimal execution profile (`intent`/`complexity`/`risk` →
 `Direct`/`Bounded`/`Orchestrated`, plus which independent-review/test/security
@@ -5042,7 +5045,7 @@ cache_ttl_secs = 604800  # 0 disables the cache; ZIRV_CTX_JEV_CACHE_TTL_SECS
 
 Each gate defaults to `false`: Jev is operator-only (no repo config, only `~/.zirv/ctx.toml`, `ZIRV_CTX_JEV_*`, or CLI flags). Endpoint credentials come from `[proxy.typesafe]` (shared with the harness proxy); `zirv ctx jev status [--json]` reports whether Jev is active and why not, distinguishing "no gate enabled" from "gate enabled but credential missing".
 
-**Gate observability.** `zirv ctx jev status` lists every `[jev]` key (the retired `memory` key included) with on/off, a label, and the exact 14-day funnel counts `reached` (a call site was hit), `eligible` (it passed its own preconditions and reached `jev::advise`), `sent` (`net` = a request was dispatched, `cache` = served from the decision cache), `answered` (a valid answer came back) and `acted` (the answer changed behaviour, counted when the site records its effect). A caller-side early return of an enabled gate is counted as `reached` plus an `exit <reason>` line (a static reason code such as `no_credential`, `unsafe_state`, `open_findings`; never text). An enabled gate with zero reach in the window is labelled `dormant` and names the hook or command it waits on (`idle: waits on ...`). `--json` adds `gate_status` (the same rows) and `warnings`.
+**Gate observability.** `zirv ctx jev status` lists every `[jev]` key (the retired `memory` key included) with on/off, a label, and the exact 14-day funnel counts `reached` (a call site was hit), `eligible` (it passed its own preconditions and reached `jev::advise`), `sent` (`net` = a request was dispatched, `cache` = served from the decision cache), `answered` (a valid answer came back) and `acted` (the answer changed behaviour, counted when the site records its effect). A caller-side early return of an enabled gate is counted as `reached` plus an `exit <reason>` line (a static reason code such as `no_credential`, `unsafe_state`, `open_findings`; never text). A Jev call refused by a sandbox network proxy (CONNECT answered 403, as Claude Code's Bash sandbox does for a host outside `sandbox.network.allowedDomains`) is recorded as `sandbox_proxy_denied` rather than a generic transport error, and `jev status` then prints the remedy: add the `[proxy.typesafe] base_url` host (default `api.typesafe.ai`) to Claude Code's `sandbox.network.allowedDomains`. `zirv setup` offers to write that entry into `~/.claude/settings.json` when a gate is on (it asks first, backs the file up, never duplicates the entry, keeps every other key, and writes nothing when non-interactive or declined). An enabled gate with zero reach in the window is labelled `dormant` and names the hook or command it waits on (`idle: waits on ...`). `--json` adds `gate_status` (the same rows) and `warnings`.
 
 | Label | Meaning |
 |---|---|
@@ -6568,7 +6571,7 @@ unit of work (a plan text, a diffstat) is consulted on once, and the helper's ow
 | Kind | Reply format | Where it bites |
 |---|---|---|
 | plan | `APPROVE` or `REVISE: <reasons>` | asked when `zirv workflow advance` completes the plan step; while a `revise` is open, advancing any later step is refused with the reason. Revising the plan artifact and re-advancing the plan step asks again, and the new ruling supersedes the old |
-| done | `DONE` or `NOT_DONE: <what is missing>` | asked at the Stop hook once per distinct evidence unit (diffstat, commit and untracked files), with the task (the active workflow's objective, else the latest operator request) in the evidence; the ruling's reason ends with the evidence sources it read (`git diff --stat HEAD`, the active workflow's work folder or `none`, and the task source). A turn end while the session has running native subagents or its active workflow is before the verify step is not a completion claim: no consult, no block. While a `not_done` is open the Stop hook blocks with the reason, at most 3 times per ruling, unless the evidence has moved since (a new commit or file), when the next stop consults fresh; the workflow's final step is refused. A later `done`, or an `ask` ruling of a `done` option when the offered options include a `not done` one, resolves it. Codex's Stop hook blocks the same way |
+| done | `DONE` or `NOT_DONE: <what is missing>` | asked at the Stop hook once per distinct evidence unit (diffstat, commit, tracked changes and the latest `zirv verify`/`zirv test` record), with the task (the active workflow's objective, else the latest operator request) and that verification record's per-check results in the evidence; the ruling's reason ends with the evidence sources it read (`git diff --stat HEAD`, the active workflow's work folder or `none`, the verification record when one exists, and the task source). The helper is told to run single-line commands only, since a read-only sandbox has no writable temp directory for a shell here-document. A turn end while the session has running native subagents or its active workflow is before the verify step is not a completion claim: no consult, no block. While a `not_done` is open the Stop hook blocks with the reason, at most 3 times per ruling, unless the evidence has moved since (a new commit, edit or verification run), when the next stop consults fresh; the workflow's final step is refused. A later `done`, or an `ask` ruling of a `done` option when the offered options include a `not done` one, resolves it. Codex's Stop hook blocks the same way |
 | retry | `RETRY` or `STOP: <reason>` | asked at the third failure of a tool-call streak, in place of the seat deciding; while a `stop` is open the tool-failure hook adds the ruling as context on each further failure, and a successful tool call ends it. It is advisory context, not a mechanical block (a hook cannot stop a tool), and a `retry` never lifts a Jev stop |
 | choice | `CHOICE: <n>` and an optional `REASON:` line | `zirv ctx supervisor ask` |
 
@@ -6705,7 +6708,9 @@ Current Codex versions support lifecycle hooks with the same JSON event shape.
 `zirv setup apply` merges Zirv's handlers into `~/.codex/hooks.json`; review
 and trust new definitions with `/hooks` in Codex. The older
 `zirv ctx hook notify` compatibility entry point remains available for Codex
-versions configured with the external `notify` program. Rollout event parsing
+versions configured with the external `notify` program; it resolves Codex's
+`thread-id` payload to the session's rollout under `$CODEX_HOME/sessions`.
+`zirv ctx hook status` reports a missing Codex hook entry. Rollout event parsing
 is still tracked in [issue #11](https://github.com/Glubiz/zirv-cli/issues/11).
 
 ### Interactive use

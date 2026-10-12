@@ -822,7 +822,7 @@ fn detect_top_level_help_markers(program: &str, bin_args: &[String], markers: &[
 /// `SessionRef` cannot predict (it carries only the session id, not the
 /// session's start time), so the transcript is found by filename suffix
 /// rather than a computed path.
-fn find_rollout(dir: &Path, filename_suffix: &str) -> Option<PathBuf> {
+pub(crate) fn find_rollout(dir: &Path, filename_suffix: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();

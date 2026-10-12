@@ -1603,6 +1603,22 @@ mod tests {
         );
     }
 
+    /// #917/#898: a dense inline list of subsystems is substantial; short simple tasks stay trivial.
+    #[test]
+    fn plan_classification_floors_dense_inline_clause_lists() {
+        let repo = repo_with_pending_file("src/lib.rs");
+        let dense = "Implement evidence-driven model routing in the zirv Rust CLI: model probation and promotion gate, a 24h automatic benchmark probe scheduler, an evidence store merging benchmark and real-session outcomes, cross-harness router applied at seat/worker/reviewer seams, dated Claude ids";
+        let classification = from_plan_args(&start_args(repo.path(), dense)).unwrap();
+        assert_eq!(classification.complexity, Complexity::Substantial);
+        for short in [
+            "fix typo in README",
+            "rename foo to bar, then run the tests",
+        ] {
+            let classification = from_plan_args(&start_args(repo.path(), short)).unwrap();
+            assert_eq!(classification.complexity, Complexity::Trivial, "{short}");
+        }
+    }
+
     /// Risk is not the only band a declared scope could talk down: complexity
     /// selects the plan step on its own, so a declared one-file scope over
     /// substantial real work dropped planning even where the risk band was

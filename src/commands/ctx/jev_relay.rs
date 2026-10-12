@@ -31,7 +31,7 @@
 //! question's instructions and options must equal a compiled one's, and the body sent to the
 //! vendor is re-serialised from the validated value, never the client's bytes. Each connection
 //! is served on its own thread (at most [`MAX_CONNECTIONS`] at once), so a stalled peer holds
-//! only its own; on unix it is also dropped if the whole request frame has not arrived within
+//! only its own; it is also dropped if the whole request frame has not arrived within
 //! [`READ_DEADLINE`] of acceptance, however slowly its bytes trickle in. The request's `model` is
 //! replaced by the relay's own configured one.
 //!
@@ -236,6 +236,7 @@ fn error_status(error: &JevError) -> Option<u16> {
         | JevError::UnsafeState
         | JevError::Timeout
         | JevError::Transport(_)
+        | JevError::SandboxProxyDenied(_)
         | JevError::Malformed(_) => None,
     }
 }
@@ -1009,6 +1010,92 @@ mod tests {
                 started.elapsed()
             );
         });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_trickling_pipe_client_is_cut_off_within_one_deadline() {
+        let (cfg, state, _dir, _vendor) = relay_case("WINTRICKLE");
+        with_credential(&cfg.proxy.typesafe.credential_env, "secret", || {
+            let _handle =
+                start(&cfg.proxy.typesafe, true, &state, "relay-win-trickle").expect("starts");
+            let endpoint = Endpoint::for_jev_relay(&state, "relay-win-trickle");
+            let mut peer = transport::connect(&endpoint).expect("connect");
+            let started = std::time::Instant::now();
+            // One byte every half second, never a newline: each byte arrives inside the deadline.
+            while started.elapsed() < READ_DEADLINE * 2 {
+                if peer.write_raw(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            assert!(
+                started.elapsed() < READ_DEADLINE + Duration::from_secs(2),
+                "the relay held a trickling peer for {:?}",
+                started.elapsed()
+            );
+        });
+    }
+
+    /// Every slot taken by a peer that sends nothing is freed at the deadline, so a real request
+    /// is answered afterwards.
+    #[cfg(windows)]
+    #[test]
+    fn stalled_pipe_clients_are_closed_and_free_their_slots() {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join("proxy")
+                .join("jev-response.json"),
+        )
+        .expect("fixture");
+        let body: &'static str = Box::leak(text.into_boxed_str());
+        let (stub_url, stub_handle) = one_shot_server(200, body);
+        let state_tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(state_tmp.path().to_path_buf());
+        let session = "relay-win-stalled-slots";
+        with_credential("JEV_RELAY_TEST_WINSTALLED", "secret", || {
+            let cfg = config(stub_url, "JEV_RELAY_TEST_WINSTALLED");
+            let _handle = start(&cfg, true, &state, session).expect("relay starts");
+            let endpoint = Endpoint::for_jev_relay(&state, session);
+            let started = std::time::Instant::now();
+            let stalled: Vec<_> = (0..MAX_CONNECTIONS)
+                .map(|_| {
+                    let mut connection = transport::connect(&endpoint).expect("connect");
+                    let (tx, rx) = mpsc::channel();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(connection.read_frame::<RelayResponseFrame>().ok());
+                    });
+                    rx
+                })
+                .collect();
+            for closed in stalled {
+                let answer = closed
+                    .recv_timeout(READ_DEADLINE + Duration::from_secs(5))
+                    .expect("the relay must close a peer that sends nothing");
+                assert!(
+                    answer.is_none_or(|frame| frame.is_none()),
+                    "no answer frame"
+                );
+            }
+            assert!(
+                started.elapsed() >= READ_DEADLINE,
+                "closed before the deadline"
+            );
+            let mut connection = transport::connect(&endpoint).expect("connect");
+            connection
+                .write_frame(&RelayRequestFrame {
+                    body: sample_request(),
+                })
+                .expect("write");
+            let answer = connection
+                .read_frame::<RelayResponseFrame>()
+                .expect("frame")
+                .expect("an answer once the slots are free");
+            assert_eq!(answer.status, Some(200));
+        });
+        stub_handle.join().expect("stub server must not panic");
     }
 
     #[test]

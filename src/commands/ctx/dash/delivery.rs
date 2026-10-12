@@ -450,6 +450,29 @@ pub(super) fn report_back_reminder_body(report_to: &str) -> String {
     )
 }
 
+/// Whether `pane` itself mailed its directed report to its `report_to` recipient since it
+/// started; the dashboard's own recovered-report mail does not count.
+pub(super) fn pane_mailed_report(pane: &Pane, state: &StateDir) -> bool {
+    let Some(report_to) = pane.report_to() else {
+        return false;
+    };
+    let recipient = sessions::short_id(report_to);
+    mail::sent_since(
+        state,
+        &recipient_slug(pane, state),
+        pane.short(),
+        &recipient,
+        pane.started_at(),
+    )
+}
+
+fn recipient_slug(pane: &Pane, state: &StateDir) -> String {
+    let recipient = pane.report_to().map(sessions::short_id).unwrap_or_default();
+    sessions::load_record(state, &recipient)
+        .map(|record| record.repo_slug)
+        .unwrap_or_else(|| super::state::repo_slug(pane.cwd()))
+}
+
 /// Once-per-tick (same `FACTS_THROTTLE` cadence as `mail_sweep`, and called
 /// alongside it) one-shot completion reminder: every **worker** pane
 /// (`Verb::Dash`) spawned with a `report_to` address
@@ -476,13 +499,7 @@ pub(super) fn report_back_reminder_sweep(
         if !pane.has_produced_output() || !pane.injectable() {
             continue;
         }
-        let recipient = sessions::short_id(&report_to);
-        let slug = sessions::load_record(state, &recipient)
-            .map(|record| record.repo_slug)
-            .unwrap_or_else(|| super::state::repo_slug(pane.cwd()));
-        if pane.settled_mail_sent
-            || mail::sent_since(state, &slug, pane.short(), &recipient, pane.started_at())
-        {
+        if pane.settled_mail_sent || pane_mailed_report(pane, state) {
             pane.mark_report_reminder_sent();
             continue;
         }
@@ -674,17 +691,45 @@ pub(super) fn report_settled_pane_with(
         .as_ref()
         .map(|record| record.repo.clone())
         .unwrap_or_else(|| pane.cwd().to_path_buf());
-    let slug = recipient_record
-        .map(|record| record.repo_slug)
-        .unwrap_or_else(|| super::state::repo_slug(pane.cwd()));
-    if mail::sent_since(
-        state,
-        &slug,
-        pane.short(),
-        &recipient_short,
-        pane.started_at(),
-    ) {
+    if pane_mailed_report(pane, state) {
         pane.settled_mail_sent = true;
+        // The worker mailed (often a summary) and may have kept the full report for its final
+        // message: store that and name it, so the inbox never holds only the summary (#909).
+        // A final message the mail already carries, or that is no longer than it, adds nothing.
+        let mailed = mail::full_bodies_sent_since(
+            state,
+            &recipient_slug(pane, state),
+            pane.short(),
+            &recipient_short,
+            pane.started_at(),
+        );
+        let longest = mailed.iter().map(String::len).max().unwrap_or_default();
+        if let Some(text) = final_message(pane).filter(|text| {
+            let text = text.trim();
+            !text.is_empty()
+                && text.len() > longest
+                && !mailed.iter().any(|body| body.contains(text))
+        }) {
+            let (report, report_truncated) = super::agent::cap_report(Some(&text));
+            let path = super::agent::store_report_only(
+                state,
+                &report_repo,
+                pane.short(),
+                pane.agent(),
+                report.as_deref().unwrap_or_default(),
+                report_truncated,
+            );
+            let body = format!(
+                "pane {} ({}) sent mail and then finished a final message of {} bytes\nfull report: {}",
+                pane.short(),
+                pane.agent(),
+                text.len(),
+                path.display()
+            );
+            if let Err(error) = store_pane_system_mail(pane, &recipient, body, state, cfg) {
+                push_error(errors, format!("settled report: {error}"));
+            }
+        }
         return;
     }
     let recovered = (mail::session_delivery_metrics(state, pane.short(), super::state::now_secs())
@@ -3423,6 +3468,106 @@ mod tests {
         assert!(report.contains("contract_failed:"));
         assert!(!report.contains("secret tool arguments"));
         assert!(!report.contains("hello"), "screen tail must be replaced");
+        pane.finish_shutdown().expect("shutdown");
+    }
+
+    /// #909: a worker that mails a short summary and keeps the full report for its final
+    /// message must not lose that report: the final message is stored and the inbox names it.
+    #[test]
+    fn a_worker_that_mailed_a_summary_still_has_its_final_report_stored_and_named() {
+        use super::super::attention::{self, Authority, Lifecycle, Observation};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut pane = spawn_idle_signal_less_worker_pane(
+            &state,
+            tmp.path(),
+            "dddddddd-2222-4333-8444-555555555555",
+        );
+        pane.set_report_to(Some("aaaa1111".into()));
+        let now = super::super::state::now_secs();
+        for lifecycle in [Lifecycle::Working, Lifecycle::Settled] {
+            attention::record(
+                &state,
+                pane.short(),
+                Observation::new(Authority::QuietHeuristic, "worker lifecycle", 50, now)
+                    .with_lifecycle(lifecycle),
+                now,
+            );
+        }
+        let slug = super::super::state::repo_slug(tmp.path());
+        let cfg = CtxConfig::default();
+        mail::store(
+            &state,
+            &slug,
+            &mail::Message {
+                from_session: pane.short().to_string(),
+                from_agent: "codex".to_string(),
+                to: "any".to_string(),
+                to_session: Some("aaaa1111".to_string()),
+                sent: pane.started_at(),
+                body: "Angle N complete; full evidence follows in the final response.".to_string(),
+            },
+            &cfg,
+        )
+        .expect("worker mail");
+        let full = format!("{}END-OF-REPORT", "evidence line\n".repeat(600));
+        let mut errors = ErrorLog::default();
+        report_settled_pane_with(&mut pane, &state, &cfg, &mut errors, |_| Some(full.clone()));
+        let messages = mail::list(&state, &slug, None, Some("aaaa1111")).expect("mail");
+        let pointer = messages
+            .iter()
+            .map(|(_, msg)| msg.body.as_str())
+            .find_map(|body| body.split("full report: ").nth(1))
+            .expect("the inbox names the stored final report");
+        let stored = std::fs::read_to_string(pointer.trim()).expect("stored report file");
+        assert!(stored.contains("END-OF-REPORT"), "the whole report is kept");
+        pane.finish_shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn a_worker_whose_final_message_repeats_its_mailed_report_gets_no_pointer_mail() {
+        use super::super::attention::{self, Authority, Lifecycle, Observation};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut pane = spawn_idle_signal_less_worker_pane(
+            &state,
+            tmp.path(),
+            "dddddddd-2222-4333-8444-555555555555",
+        );
+        pane.set_report_to(Some("aaaa1111".into()));
+        let now = super::super::state::now_secs();
+        for lifecycle in [Lifecycle::Working, Lifecycle::Settled] {
+            attention::record(
+                &state,
+                pane.short(),
+                Observation::new(Authority::QuietHeuristic, "worker lifecycle", 50, now)
+                    .with_lifecycle(lifecycle),
+                now,
+            );
+        }
+        let slug = super::super::state::repo_slug(tmp.path());
+        let cfg = CtxConfig::default();
+        let report = "Full report: angle N complete, evidence attached.";
+        mail::store(
+            &state,
+            &slug,
+            &mail::Message {
+                from_session: pane.short().to_string(),
+                from_agent: "codex".to_string(),
+                to: "any".to_string(),
+                to_session: Some("aaaa1111".to_string()),
+                sent: pane.started_at(),
+                body: report.to_string(),
+            },
+            &cfg,
+        )
+        .expect("worker mail");
+        let mut errors = ErrorLog::default();
+        report_settled_pane_with(&mut pane, &state, &cfg, &mut errors, |_| {
+            Some(format!("{report}\n"))
+        });
+        let messages = mail::list(&state, &slug, None, Some("aaaa1111")).expect("mail");
+        assert_eq!(messages.len(), 1, "only the worker's own mail");
         pane.finish_shutdown().expect("shutdown");
     }
 

@@ -1069,6 +1069,10 @@ pub struct TeamPlanArgs {
     pub built_in_only: bool,
     #[arg(long)]
     pub repo: Option<PathBuf>,
+    /// Measure this repository's diff for classification instead of `--repo`'s
+    /// (the workflow state and registries still come from `--repo`).
+    #[arg(long)]
+    pub workdir: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
 }
@@ -1132,7 +1136,7 @@ fn run_plan(args: &TeamPlanArgs, writer: &mut impl Write) -> CtxResult<i32> {
         intent: None,
         complexity: None,
         risk: None,
-        repo: Some(repo.clone()),
+        repo: Some(args.workdir.clone().unwrap_or_else(|| repo.clone())),
         branch: None,
         json: false,
     };
