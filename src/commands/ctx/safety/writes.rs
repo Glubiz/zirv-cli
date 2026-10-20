@@ -764,7 +764,15 @@ pub(super) fn is_sed_perl_inplace_flag(token: &str) -> bool {
 /// no `-e`/`-f` anywhere on the line -- not the first positional either
 /// (its own implicit script).
 pub(super) fn sed_perl_inplace_targets(program: &str, tokens: &[String]) -> Vec<String> {
-    let is_script_flag = |t: &str| matches!(t, "-e" | "-f" | "--expression" | "--file");
+    // `-e`/`-f` and clusters ending in `e` (`-pe`, `-ne`) take the script next.
+    let is_script_flag = |t: &str| {
+        matches!(t, "-e" | "-f" | "--expression" | "--file")
+            || (t.starts_with('-')
+                && !t.starts_with("--")
+                && t.len() > 2
+                && t.ends_with('e')
+                && t[1..].chars().all(|c| c.is_ascii_alphabetic() && c != 'i'))
+    };
     let has_e_or_f = tokens[1..]
         .iter()
         .any(|t| is_script_flag(t) || t.starts_with("--expression=") || t.starts_with("--file="));
@@ -1204,6 +1212,7 @@ fn starts_identifier(code: &str, index: usize) -> bool {
 /// positive only costs a dispatched worker, a miss silently keeps a write.
 fn inline_code_write_hit(
     code: &str,
+    program: &str,
     cwd: &str,
     repo_root_of: &dyn Fn(&str) -> Option<String>,
     env: EnvLookup<'_>,
@@ -1248,7 +1257,14 @@ fn inline_code_write_hit(
             }
             if primitive.args {
                 let mut args = path_literals(balanced_args(code, open));
-                if name.to_ascii_lowercase().starts_with("copy") || name.starts_with("cp") {
+                let lowered = name.to_ascii_lowercase();
+                if lowered.contains("write")
+                    || lowered.starts_with("append")
+                    || lowered == "file_put_contents"
+                {
+                    // The data written is a literal too; only the path is a target.
+                    args.truncate(1);
+                } else if lowered.starts_with("copy") || name.starts_with("cp") {
                     args = args.split_off(args.len().saturating_sub(1));
                 }
                 literals.extend(args);
@@ -1311,6 +1327,192 @@ fn inline_code_write_hit(
             }
         }
     }
+    // Downloads and archive extraction: the destination is the second
+    // argument, or the working directory when none is given.
+    for (pattern, whole_args, gate) in [
+        ("urlretrieve(", false, ""),
+        (".extractall(", true, ""),
+        (".extract(", false, "ZipFile"),
+        (".extract(", false, "tarfile"),
+        (".extract(", false, "TarFile"),
+    ] {
+        for (index, _) in code.match_indices(pattern) {
+            if !gate.is_empty() && !code.contains(gate) {
+                continue;
+            }
+            let args = balanced_args(code, index + pattern.len() - 1);
+            let parts = split_top_level(args);
+            let destination = if whole_args {
+                Some(args)
+            } else {
+                parts.get(1).copied()
+            };
+            let literals = match destination.filter(|d| !d.trim().is_empty()) {
+                Some(destination) => path_literals(destination),
+                None if pattern == "urlretrieve(" => continue,
+                None => vec!["./__extracted__".to_string()],
+            };
+            if let Some(hit) = target_hit(literals) {
+                return Some(hit);
+            }
+        }
+    }
+    if matches!(program, "perl" | "ruby") {
+        return script_language_write_hit(code, program == "perl", cwd, repo_root_of, env, depth);
+    }
+    None
+}
+
+/// Words, backticks and `qx`/`%x` of a perl or ruby script that write files
+/// or run a shell command, including the paren-less spellings
+/// (`unlink "f"`, `system "rm f"`).
+fn script_language_write_hit(
+    code: &str,
+    perl: bool,
+    cwd: &str,
+    repo_root_of: &dyn Fn(&str) -> Option<String>,
+    env: EnvLookup<'_>,
+    depth: usize,
+) -> Option<String> {
+    const UNRESOLVED: &str = "<inline interpreter write>";
+    const PERL_FS_WORDS: &[&str] = &[
+        "unlink", "rename", "mkdir", "rmdir", "chmod", "chown", "truncate", "symlink", "link",
+        "utime",
+    ];
+    let nested = |command: &str| {
+        orchestrator_repo_write_target_in(command, cwd, repo_root_of, env, depth + 1)
+    };
+    let target_hit = |targets: Vec<String>| -> Option<String> {
+        if targets.is_empty() {
+            return Some(UNRESOLVED.to_string());
+        }
+        targets
+            .iter()
+            .find_map(|target| repo_write_violation(target, cwd, repo_root_of, env))
+    };
+    // The arguments of a call spelled with or without parentheses.
+    let call_args = |from: usize| -> &str {
+        let rest = &code[from..];
+        let trimmed = rest.trim_start();
+        if trimmed.starts_with('(') {
+            balanced_args(code, from + (rest.len() - trimmed.len()))
+        } else {
+            let mut quote: Option<char> = None;
+            let end = trimmed
+                .char_indices()
+                .find(|&(_, c)| {
+                    match quote {
+                        Some(active) if c == active => quote = None,
+                        Some(_) => {}
+                        None if matches!(c, '\'' | '"') => quote = Some(c),
+                        None if matches!(c, ';' | '\n' | '}') => return true,
+                        None => {}
+                    }
+                    false
+                })
+                .map_or(trimmed.len(), |(i, _)| i);
+            &trimmed[..end]
+        }
+    };
+    let command_of = |args: &str| -> Option<String> {
+        let words: Vec<String> = split_top_level(args)
+            .into_iter()
+            .map(single_literal)
+            .collect::<Option<_>>()?;
+        match words.as_slice() {
+            [] => None,
+            [only] => Some(only.clone()),
+            _ => Some(join_shell_words(&words)),
+        }
+    };
+    let path_literals = |text: &str| -> Vec<String> {
+        string_literals(text)
+            .into_iter()
+            .filter(|l| !l.is_empty() && !NON_PATH_LITERALS.contains(&l.as_str()))
+            .collect()
+    };
+
+    // Backtick strings are shell commands.
+    for (n, part) in code.split('`').enumerate() {
+        if n % 2 == 1
+            && let Some(hit) = nested(part)
+        {
+            return Some(hit);
+        }
+    }
+    let mut words = code.char_indices().peekable();
+    while let Some((start, c)) = words.next() {
+        if !(c.is_ascii_alphabetic() || c == '_' || c == '%') || !starts_identifier(code, start) {
+            continue;
+        }
+        let mut end = start + c.len_utf8();
+        while let Some(&(i, n)) = words.peek() {
+            if n.is_ascii_alphanumeric() || n == '_' {
+                end = i + n.len_utf8();
+                words.next();
+            } else {
+                break;
+            }
+        }
+        let word = &code[start..end];
+        let preceded_by = code[..start].trim_end().chars().next_back();
+        if matches!(preceded_by, Some('.' | '$' | '@' | '&' | ':')) {
+            continue;
+        }
+        match word {
+            "qx" | "%x" => {
+                let rest = code[end..].trim_start();
+                let Some(open) = rest.chars().next() else {
+                    continue;
+                };
+                let close = match open {
+                    '(' => ')',
+                    '{' => '}',
+                    '[' => ']',
+                    '<' => '>',
+                    other => other,
+                };
+                if let Some(len) = rest[open.len_utf8()..].find(close)
+                    && let Some(hit) = nested(&rest[open.len_utf8()..open.len_utf8() + len])
+                {
+                    return Some(hit);
+                }
+            }
+            "system" | "exec" | "spawn" if word != "spawn" || !perl => {
+                let Some(command) = command_of(call_args(end)) else {
+                    return Some(UNRESOLVED.to_string());
+                };
+                if let Some(hit) = nested(&command) {
+                    return Some(hit);
+                }
+            }
+            "open" if perl => {
+                let literals = string_literals(call_args(end));
+                if literals.iter().any(|l| {
+                    l.trim_start().starts_with(['>', '+']) && !l.trim_start().starts_with(">&")
+                }) {
+                    let targets = literals
+                        .iter()
+                        .map(|l| {
+                            l.trim_start()
+                                .trim_start_matches(['>', '+', '<', ' '])
+                                .to_string()
+                        })
+                        .filter(|l| !l.is_empty())
+                        .collect();
+                    if let Some(hit) = target_hit(targets) {
+                        return Some(hit);
+                    }
+                }
+            }
+            _ if perl && PERL_FS_WORDS.contains(&word) => {
+                if let Some(hit) = target_hit(path_literals(call_args(end))) {
+                    return Some(hit);
+                }
+            }
+            _ => {}
+        }
+    }
     None
 }
 
@@ -1343,8 +1545,8 @@ fn orchestrator_repo_write_target_in(
     let (sanitized, code_bodies) = super::shell::redact_inert_heredocs(command);
     // A python/node-style heredoc body is code in that language: judge it
     // by its write primitives, never as shell redirects (`if i>5:`).
-    for body in &code_bodies {
-        if let Some(hit) = inline_code_write_hit(body, cwd, repo_root_of, env, depth) {
+    for (interpreter, body) in &code_bodies {
+        if let Some(hit) = inline_code_write_hit(body, interpreter, cwd, repo_root_of, env, depth) {
             return Some(hit);
         }
     }
@@ -1436,10 +1638,14 @@ fn orchestrator_repo_write_target_in(
 
         // Script text keeps its newlines in the raw tokens; `collapsed` has none.
         let raw_tokens = sql_tokens(segment).unwrap_or_else(|| tokens.clone());
+        // The command's own arguments, shell redirects (`2>&1`, `< /dev/null`) removed.
+        let argv = path_command_tokens(&collapsed)
+            .filter(|argv| argv.first() == tokens.first())
+            .unwrap_or_else(|| tokens.clone());
         if let Some(hit) = nested_command_write_hit(
             &program,
             &collapsed,
-            &tokens,
+            &argv,
             &raw_tokens,
             &cwd,
             repo_root_of,
@@ -1457,10 +1663,10 @@ fn orchestrator_repo_write_target_in(
             }
         }
 
-        if matches!(program.as_str(), "sed" | "perl")
-            && tokens[1..].iter().any(|t| is_sed_perl_inplace_flag(t))
+        if matches!(program.as_str(), "sed" | "perl" | "ruby")
+            && argv[1..].iter().any(|t| is_sed_perl_inplace_flag(t))
         {
-            for target in sed_perl_inplace_targets(&program, &tokens) {
+            for target in sed_perl_inplace_targets(&program, &argv) {
                 if let Some(hit) = repo_write_violation(&target, &cwd, repo_root_of, env) {
                     return Some(hit);
                 }
@@ -1468,17 +1674,23 @@ fn orchestrator_repo_write_target_in(
         }
 
         if matches!(program.as_str(), "cp" | "mv" | "install" | "rsync" | "ln")
-            && let Some(target) = last_non_flag_argument(&tokens)
+            && let Some(target) = last_non_flag_argument(&argv)
             && let Some(hit) = repo_write_violation(target, &cwd, repo_root_of, env)
         {
             return Some(hit);
+        }
+
+        for target in output_file_targets(&program, &argv) {
+            if let Some(hit) = repo_write_violation(&target, &cwd, repo_root_of, env) {
+                return Some(hit);
+            }
         }
 
         if matches!(
             program.as_str(),
             "python" | "python3" | "node" | "ruby" | "perl" | "php"
         ) && let Some(code) = inline_interpreter_code(&raw_tokens)
-            && let Some(hit) = inline_code_write_hit(code, &cwd, repo_root_of, env, depth)
+            && let Some(hit) = inline_code_write_hit(code, &program, &cwd, repo_root_of, env, depth)
         {
             return Some(hit);
         }
@@ -1760,6 +1972,147 @@ fn awk_program_effects(program: &str) -> Vec<AwkEffect> {
         }
     }
     effects
+}
+
+/// The values of one option: `-x V`, `-xV`, a cluster ending in it (`-sSLo V`,
+/// every letter before it from `before`), `--long V` and `--long=V`.
+fn option_values(argv: &[String], short: char, before: &str, longs: &[&str]) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut i = 1;
+    while i < argv.len() {
+        let token = argv[i].as_str();
+        if let Some(long) = longs
+            .iter()
+            .find(|long| token == **long || token.starts_with(&format!("{long}=")))
+        {
+            match token.strip_prefix(&format!("{long}=")) {
+                Some(value) => values.push(value.to_string()),
+                None => {
+                    if let Some(next) = argv.get(i + 1) {
+                        values.push(next.clone());
+                        i += 1;
+                    }
+                }
+            }
+        } else if token.starts_with('-')
+            && !token.starts_with("--")
+            && let Some(position) = token[1..].find(short)
+            && token[1..1 + position].chars().all(|c| before.contains(c))
+        {
+            let rest = &token[1 + position + short.len_utf8()..];
+            if rest.is_empty() {
+                if let Some(next) = argv.get(i + 1) {
+                    values.push(next.clone());
+                    i += 1;
+                }
+            } else {
+                values.push(rest.to_string());
+            }
+        }
+        i += 1;
+    }
+    values
+}
+
+/// Whether `argv` has a bare-letter cluster (or a long option) selecting `letter`.
+fn has_flag(argv: &[String], letters: &str, longs: &[&str]) -> bool {
+    argv[1..].iter().any(|token| {
+        longs.contains(&token.as_str())
+            || (token.starts_with('-')
+                && !token.starts_with("--")
+                && token.len() > 1
+                && token[1..].chars().all(|c| c.is_ascii_alphabetic())
+                && token[1..].contains(|c| letters.contains(c)))
+    })
+}
+
+/// Files a command writes through an output option (`sort -o`, `curl -o`,
+/// `wget -O`) or by unpacking (`tar x`, `unzip`) or downloading into the
+/// working directory. A directory target is named by a file inside it, so
+/// the repository lookup starts in that directory.
+fn output_file_targets(program: &str, argv: &[String]) -> Vec<String> {
+    let in_dir = |dir: &str| format!("{}/__zirv_out__", dir.trim_end_matches('/'));
+    let not_stdout = |value: &String| value != "-" && !value.is_empty();
+    match program {
+        "sort" => option_values(argv, 'o', "rnubdfghiMRsVzc", &["--output"]),
+        "curl" => {
+            let mut targets: Vec<String> = option_values(argv, 'o', "sSLkfgGiIvNq", &["--output"])
+                .into_iter()
+                .filter(not_stdout)
+                .collect();
+            let remote_name = argv[1..].iter().any(|t| {
+                matches!(t.as_str(), "--remote-name" | "--remote-name-all")
+                    || (t.starts_with('-')
+                        && !t.starts_with("--")
+                        && t.len() > 1
+                        && t[1..].chars().all(|c| "sSLkfgGiIvNqO".contains(c))
+                        && t.contains('O'))
+            });
+            if remote_name {
+                let dir = option_values(argv, '\0', "", &["--output-dir"]);
+                targets.push(in_dir(dir.first().map_or(".", String::as_str)));
+            }
+            targets
+        }
+        "wget" => {
+            if has_flag(argv, "", &["--spider"]) {
+                return Vec::new();
+            }
+            let files: Vec<String> = option_values(argv, 'O', "qvcnk", &["--output-document"])
+                .into_iter()
+                .filter(not_stdout)
+                .collect();
+            if !files.is_empty() {
+                return files;
+            }
+            if option_values(argv, 'O', "qvcnk", &["--output-document"]).is_empty() {
+                let dir = option_values(argv, 'P', "qvcnk", &["--directory-prefix"]);
+                return vec![in_dir(dir.first().map_or(".", String::as_str))];
+            }
+            Vec::new()
+        }
+        "tar" => {
+            let mut argv = argv.to_vec();
+            if argv.get(1).is_some_and(|t| {
+                !t.starts_with('-') && !t.is_empty() && t.chars().all(|c| c.is_ascii_alphabetic())
+            }) {
+                argv[1].insert(0, '-');
+            }
+            let extract = has_flag(&argv, "x", &["--extract", "--get"]);
+            let create = has_flag(&argv, "cru", &["--create", "--append", "--update"]);
+            if has_flag(&argv, "O", &["--to-stdout"]) {
+                return Vec::new();
+            }
+            let letters = "xzjJvpkmohPSUcrutf";
+            if extract {
+                let dirs = option_values(&argv, 'C', letters, &["--directory"]);
+                return if dirs.is_empty() {
+                    vec![in_dir(".")]
+                } else {
+                    dirs.iter().map(|dir| in_dir(dir)).collect()
+                };
+            }
+            if create {
+                return option_values(&argv, 'f', letters, &["--file"])
+                    .into_iter()
+                    .filter(not_stdout)
+                    .collect();
+            }
+            Vec::new()
+        }
+        "unzip" => {
+            if has_flag(argv, "lptvZ", &[]) {
+                return Vec::new();
+            }
+            let dirs = option_values(argv, 'd', "oqnjCLUaf", &[]);
+            if dirs.is_empty() {
+                vec![in_dir(".")]
+            } else {
+                dirs.iter().map(|dir| in_dir(dir)).collect()
+            }
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// The files a sed script writes through `w`/`W` commands and the `w` flag of
@@ -2960,6 +3313,162 @@ mod tests {
             "echo $PWD",
             "echo x > /tmp/claude-501/$USER",
             "cd /tmp/claude-501 && echo x > $PWD/a",
+        ]);
+    }
+
+    #[test]
+    fn seat_guard_resolves_node_targets_like_python() {
+        assert_all_allowed(&[
+            "node -e \"require('fs').writeFileSync('/tmp/claude-501/x','y')\"",
+            "node -e \"require('fs').writeFileSync('/tmp/x','y')\"",
+            "node -e \"require('fs').appendFileSync('/tmp/x','y')\"",
+            "node -e \"require('fs').promises.writeFile('/tmp/x','y')\"",
+            "node - <<'EOF'\nrequire('fs').writeFileSync('/tmp/claude-501/x','y')\nEOF",
+        ]);
+        assert_all_denied(&[
+            "node -e \"require('fs').writeFileSync('src/x','y')\"",
+            "node -e \"require('fs').writeFileSync('/tmp/x','y'); require('fs').writeFileSync('src/x','y')\"",
+            "node - <<'EOF'\nrequire('fs').writeFileSync('src/x','y')\nEOF",
+        ]);
+    }
+
+    #[test]
+    fn seat_guard_normalizes_dotdot_after_pwd_substitution() {
+        assert_all_allowed(&[
+            "cp src/main.rs $PWD/../x",
+            "echo x > $PWD/../x",
+            "cp src/main.rs \"$PWD\"/../x",
+        ]);
+        assert_all_denied(&["echo x > $PWD/sub/../a", "cp a $PWD/../repo/src/b"]);
+    }
+
+    /// The same on a real checkout: `$PWD/..` lands beside the repo, not in it.
+    #[test]
+    fn seat_guard_pwd_dotdot_on_a_real_checkout_is_outside_the_repo() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("git marker");
+        std::fs::create_dir_all(repo.join("src")).expect("src");
+        let cwd = repo.to_string_lossy().replace('\\', "/");
+        for (command, denied) in [
+            ("cp src/main.rs $PWD/../x", false),
+            ("echo x > ${PWD}/../x", false),
+            ("echo x > $PWD/../repo/src/x", true),
+            ("cp src/main.rs $PWD/src/x", true),
+        ] {
+            let hit =
+                orchestrator_repo_write_target(command, &cwd, &filesystem_repo_root_of, &|_| None);
+            assert_eq!(hit.is_some(), denied, "{command}: {hit:?}");
+        }
+    }
+
+    #[test]
+    fn seat_guard_screens_xargs_targets_past_redirects_and_shell_payloads() {
+        assert_all_denied(&[
+            "xargs -I{} cp {} src/main.rs < /dev/null",
+            "xargs sh -c 'echo x > src/main.rs' < /dev/null",
+            "xargs bash -c 'echo x > src/main.rs' < /dev/null",
+            "xargs -n1 zsh -c 'touch src/main.rs' < /dev/null",
+            "cp a src/b 2>&1",
+            "mv a src/b < /dev/null",
+        ]);
+        assert_all_allowed(&[
+            "xargs -I{} cp {} /tmp/claude-501/x < /dev/null",
+            "xargs sh -c 'echo hi' < /dev/null",
+            "cp a /tmp/claude-501/b 2>&1",
+        ]);
+    }
+
+    #[test]
+    fn seat_guard_denies_perl_and_ruby_writes() {
+        assert_all_denied(&[
+            "perl -e 'unlink(\"src/main.rs\")'",
+            "perl -e 'unlink \"src/main.rs\"'",
+            "perl -e 'open(F,\">src/main.rs\")'",
+            "perl -e 'open(my $fh, \">>\", \"src/a\")'",
+            "perl -e 'rename(\"a\",\"src/b\")'",
+            "perl -e 'mkdir(\"src/d\")'",
+            "perl -e 'system(\"echo x > src/a\")'",
+            "perl -e 'system \"rm src/a\"'",
+            "perl -e 'system(\"rm\", \"src/a\")'",
+            "perl -e 'print `rm src/a`'",
+            "perl -e 'qx{rm src/a}'",
+            "perl -e 'system($cmd)'",
+            "perl -pi -e 's/a/b/' src/main.rs",
+            "perl -i.bak -pe 's/a/b/' src/main.rs",
+            "perl -pi -e 's/a/b/' $PWD/src/main.rs",
+            "perl <<'EOF'\nunlink(\"src/a\");\nEOF",
+            "ruby -e 'File.write(\"src/a\",\"x\")'",
+            "ruby -e 'File.open(\"src/a\",\"w\") { |f| f.puts 1 }'",
+            "ruby -e 'require \"fileutils\"; FileUtils.rm(\"src/a\")'",
+            "ruby -e 'system(\"rm src/a\")'",
+            "ruby -e 'system \"rm src/a\"'",
+            "ruby -e 'puts `rm src/a`'",
+            "ruby -i -pe '$_.upcase!' src/main.rs",
+            "ruby -pi -e '$_.upcase!' src/main.rs",
+            "ruby <<'EOF'\nFile.write('src/a','x')\nEOF",
+        ]);
+        assert_all_allowed(&[
+            "perl -e 'print \"hi\\n\"'",
+            "perl -ne 'print if /a/' src/main.rs",
+            "perl -e 'unlink(\"/tmp/claude-501/x\")'",
+            "perl -e 'open(F,\">/tmp/claude-501/x\")'",
+            "perl -e 'open(F,\"<src/main.rs\")'",
+            "perl -e 'system(\"ls\")'",
+            "perl -pi -e 's/a/b/' /tmp/claude-501/x",
+            "perl -i -pe 's/a/b/' /tmp/claude-501/x",
+            "ruby -e 'puts 1'",
+            "ruby -e 'File.write(\"/tmp/claude-501/x\",\"y\")'",
+            "ruby -e 'puts File.read(\"src/a\")'",
+        ]);
+    }
+
+    #[test]
+    fn seat_guard_covers_output_file_flags() {
+        assert_all_denied(&[
+            "sort -o src/a f",
+            "sort f --output=src/a",
+            "curl -o src/a http://x",
+            "curl --output src/a http://x",
+            "curl -O http://x/f",
+            "curl -sSLo src/a http://x",
+            "wget -O src/a http://x",
+            "wget --output-document=src/a http://x",
+            "wget http://x/f",
+            "wget -P src http://x",
+            "tar xzf a.tgz -C src",
+            "tar -xf a.tar --directory=src",
+            "tar xf a.tar",
+            "tar czf src/a.tgz x",
+            "unzip -d src a.zip",
+            "unzip a.zip",
+            "unzip -o a.zip",
+            "python3 -c \"import urllib.request; urllib.request.urlretrieve('http://x','src/a')\"",
+            "python3 -c \"import urllib.request; urllib.request.urlretrieve(u, 'src/a')\"",
+            "python3 -c \"import urllib.request; urllib.request.urlretrieve('http://x', p)\"",
+            "python3 -c \"import zipfile; zipfile.ZipFile('/tmp/a.zip').extractall('src')\"",
+            "python3 -c \"import zipfile; zipfile.ZipFile('/tmp/a.zip').extractall()\"",
+        ]);
+        assert_all_allowed(&[
+            "sort -o /tmp/claude-501/o f",
+            "sort f",
+            "curl -o /tmp/claude-501/a http://x",
+            "curl http://x",
+            "curl -o - http://x",
+            "wget -O /tmp/claude-501/a http://x",
+            "wget -O- http://x",
+            "tar xzf a.tgz -C /tmp/claude-501/x",
+            "tar tf a.tar",
+            "tar xf a.tar -O",
+            "tar czf /tmp/claude-501/a.tgz src",
+            "unzip -l a.zip",
+            "unzip -d /tmp/claude-501/x a.zip",
+            "cd /tmp/claude-501 && unzip a.zip",
+            "cd /tmp/claude-501 && tar xf a.tar",
+            "cd /tmp/claude-501 && wget http://x",
+            "cd /tmp/claude-501 && curl -O http://x",
+            "python3 -c \"import urllib.request; urllib.request.urlretrieve('http://x','/tmp/claude-501/a')\"",
+            "python3 -c \"import zipfile; zipfile.ZipFile('/tmp/a.zip').extractall('/tmp/claude-501/x')\"",
         ]);
     }
 

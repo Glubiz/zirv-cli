@@ -760,7 +760,7 @@ pub(super) fn redact_single_quoted_heredocs(command: &str) -> String {
 /// that language's code, not shell: it is redacted from the shell text and
 /// returned for a language-level write scan instead. Never use this for
 /// execution-safety screens.
-pub(super) fn redact_inert_heredocs(command: &str) -> (String, Vec<String>) {
+pub(super) fn redact_inert_heredocs(command: &str) -> (String, Vec<(String, String)>) {
     let chars: Vec<char> = command.chars().collect();
     let mut code_bodies = Vec::new();
     let redacted = redact_heredocs_scan(
@@ -859,7 +859,7 @@ fn redact_heredocs_scan(
     depth: usize,
     mode: Redaction,
     bodies: &mut Vec<HeredocBody>,
-    code_bodies: &mut Vec<String>,
+    code_bodies: &mut Vec<(String, String)>,
     line_prefix: &str,
 ) -> String {
     let expanding = mode != Redaction::SingleQuoted;
@@ -984,7 +984,16 @@ fn redact_heredocs_scan(
             match find_heredoc_terminator(chars, i, &delim, strip_tabs) {
                 Some((term_start, term_end)) => {
                     if code_stdin {
-                        code_bodies.push(chars[body_start..term_start].iter().collect());
+                        let interpreter = super::jev_approve::JEV_APPROVE_INLINE_CODE_INTERPRETERS
+                            .iter()
+                            .find(|name| {
+                                opener_names_program(&opener, &|program, _, _| program == **name)
+                            })
+                            .map_or("", |name| *name);
+                        code_bodies.push((
+                            interpreter.to_string(),
+                            chars[body_start..term_start].iter().collect(),
+                        ));
                     }
                     // A quoted delimiter suppresses expansion, so its body
                     // never carries a live `$(`/backtick.
