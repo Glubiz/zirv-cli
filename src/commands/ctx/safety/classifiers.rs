@@ -3079,6 +3079,7 @@ mod tests {
 
     /// Whether any executable candidate of `command` draws a network verdict,
     /// the way the policy evaluation sees it.
+    #[cfg(unix)]
     fn network_asks(command: &str) -> bool {
         let allow = Outcome {
             verdict: Verdict::Allow,
