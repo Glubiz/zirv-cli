@@ -23,6 +23,7 @@ motion-graphics	-	We need a 15-second launch video and a matching GIF for the pr
 postmortem	-	Last night's outage is resolved. Write the postmortem.
 project-cycle-planning	-	Help me with sprint planning for the next two weeks; we have four engineers and one is on call.
 runbook-authoring	-	Write a runbook for failing over the primary database that someone on call can follow at 3am.
+reverse-engineering	-	Reverse engineer this vendor binary: what does this binary do when it starts, and which endpoints does it contact? Decompile whatever you need.
 saved-object-change-management	-	Update the alert rule for disk usage to fire at 85 percent instead of 90, and edit the dashboard to match.
 simplify	-	This change works, but it is too complicated. Simplify it without changing behaviour.
 stakeholder-summary	-	Write an executive summary of the platform migration for the leadership meeting; they need to decide on funding phase two.
