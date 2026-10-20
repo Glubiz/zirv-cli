@@ -811,50 +811,507 @@ fn last_non_flag_argument(tokens: &[String]) -> Option<&str> {
 fn inline_interpreter_code(tokens: &[String]) -> Option<&str> {
     let mut iter = tokens[1..].iter();
     while let Some(token) = iter.next() {
-        if token == "-c" || token == "-e" {
+        let cluster = token.starts_with('-')
+            && !token.starts_with("--")
+            && token.len() > 1
+            && token.chars().skip(1).all(|c| c.is_ascii_alphabetic())
+            && token.ends_with(['c', 'e', 'p', 'r']);
+        if cluster || matches!(token.as_str(), "--eval" | "--print") {
             return iter.next().map(String::as_str);
         }
     }
     None
 }
 
-/// Plain substring write primitives: present anywhere in inline
-/// interpreter `code` means a write, no further analysis needed.
-const INLINE_WRITE_PRIMITIVES: &[&str] = &[
-    ".write_text(",
-    ".write_bytes(",
-    "os.system(",
-    "shutil.",
-    "writeFile",
-    "writeFileSync",
-    "appendFile",
-    "File.write",
-    "file_put_contents(",
-];
+/// An inline-interpreter call that writes or runs a command. `receiver`/`args`
+/// say which string literals of the call name its target path(s); `gate`, when
+/// non-empty, is a list of spellings one of which must appear in the code for
+/// an otherwise ambiguous name (`.replace(`) to count.
+struct InlinePrimitive {
+    pattern: &'static str,
+    gate: &'static [&'static str],
+    receiver: bool,
+    args: bool,
+}
 
-/// Open-style primitives that only mean a write when paired with a write
-/// mode (see [`INLINE_WRITE_MODE_LITERALS`]) -- an `open('f').read()` is
-/// not a write.
-const INLINE_MODE_GATED_PRIMITIVES: &[&str] = &["open(", "File.open", "fopen("];
+const PATH_GATE: &[&str] = &["Path(", "pathlib", "fs.", "fs/promises", "promises", "fsp."];
 
-const INLINE_WRITE_MODE_LITERALS: &[&str] = &[
-    "'w'", "\"w\"", "'a'", "\"a\"", "'wb'", "\"wb\"", "'ab'", "\"ab\"", "'w+'", "\"w+\"", "'a+'",
-    "\"a+\"", "'x'", "\"x\"",
-];
-
-/// Whether inline interpreter `code` contains a recognized write primitive
-/// -- approximate (a substring scan, not a real parse), deliberately
-/// permissive toward flagging: an orchestrator seat only ever pays for a
-/// false positive here by dispatching a worker it did not strictly need,
-/// never by silently keeping a real write.
-fn inline_code_has_write_primitive(code: &str) -> bool {
-    if INLINE_WRITE_PRIMITIVES.iter().any(|p| code.contains(p)) {
-        return true;
+const fn call(pattern: &'static str) -> InlinePrimitive {
+    InlinePrimitive {
+        pattern,
+        gate: &[],
+        receiver: false,
+        args: true,
     }
-    INLINE_MODE_GATED_PRIMITIVES
+}
+
+const fn method(pattern: &'static str, gate: &'static [&'static str]) -> InlinePrimitive {
+    InlinePrimitive {
+        pattern,
+        gate,
+        receiver: true,
+        args: true,
+    }
+}
+
+/// Filesystem-writing calls of python, node, ruby and php. Qualified names
+/// only, so `list.remove(x)` and `"a".replace(..)` stay reads.
+const INLINE_FS_PRIMITIVES: &[InlinePrimitive] = &[
+    call("os.rename("),
+    call("os.renames("),
+    call("os.replace("),
+    call("os.remove("),
+    call("os.unlink("),
+    call("os.truncate("),
+    call("os.makedirs("),
+    call("os.mkdir("),
+    call("os.rmdir("),
+    call("os.removedirs("),
+    call("os.symlink("),
+    call("os.link("),
+    call("os.chmod("),
+    call("os.chown("),
+    call("renameSync("),
+    call("copyFileSync("),
+    call("cpSync("),
+    call("rmSync("),
+    call("rmdirSync("),
+    call("unlinkSync("),
+    call("mkdirSync("),
+    call("appendFileSync("),
+    call("writeFileSync("),
+    call("truncateSync("),
+    call("symlinkSync("),
+    call("linkSync("),
+    call("chmodSync("),
+    call("createWriteStream("),
+    call("writeFile("),
+    call("appendFile("),
+    call("File.write("),
+    call("File.binwrite("),
+    call("IO.write("),
+    call("File.delete("),
+    call("File.rename("),
+    call("File.unlink("),
+    call("Dir.mkdir("),
+    call("file_put_contents("),
+    InlinePrimitive {
+        pattern: ".write_text(",
+        gate: &[],
+        receiver: true,
+        args: false,
+    },
+    InlinePrimitive {
+        pattern: ".write_bytes(",
+        gate: &[],
+        receiver: true,
+        args: false,
+    },
+    method(".unlink(", &[]),
+    method(".touch(", &[]),
+    method(".mkdir(", &[]),
+    method(".rmdir(", &[]),
+    method(".chmod(", &[]),
+    method(".symlink_to(", &[]),
+    method(".hardlink_to(", &[]),
+    method(".rename(", PATH_GATE),
+    method(".replace(", PATH_GATE),
+    method(".rm(", PATH_GATE),
+    method(".cp(", PATH_GATE),
+    method(".copyFile(", PATH_GATE),
+    method(".truncate(", PATH_GATE),
+];
+
+/// Module prefixes whose every function is a filesystem mutation
+/// (`shutil.rmtree(`, `FileUtils.mv(`); `fileinput.` only edits in place.
+const INLINE_FS_PREFIXES: &[(&str, &str)] = &[
+    ("shutil.", ""),
+    ("FileUtils.", ""),
+    ("fileinput.", "inplace"),
+];
+
+/// Calls that run a shell command line or program from a string or list.
+const INLINE_SHELL_PRIMITIVES: &[InlinePrimitive] = &[
+    call("os.system("),
+    call("os.popen("),
+    call("subprocess.run("),
+    call("subprocess.call("),
+    call("subprocess.check_call("),
+    call("subprocess.check_output("),
+    call("subprocess.Popen("),
+    call("subprocess.getoutput("),
+    call("subprocess.getstatusoutput("),
+    call("execSync("),
+    call("execFileSync("),
+    call("spawnSync("),
+    call("shell_exec("),
+    call("system("),
+    InlinePrimitive {
+        pattern: "exec(",
+        gate: &["child_process"],
+        receiver: false,
+        args: true,
+    },
+    InlinePrimitive {
+        pattern: "execFile(",
+        gate: &["child_process"],
+        receiver: false,
+        args: true,
+    },
+    InlinePrimitive {
+        pattern: "spawn(",
+        gate: &["child_process"],
+        receiver: false,
+        args: true,
+    },
+];
+
+/// Open-style calls that only mean a write when given a write mode -- an
+/// `open('f').read()` is not a write.
+const INLINE_OPEN_PRIMITIVES: &[&str] = &["open(", "File.open(", "fopen("];
+
+/// String literals that are modes, encodings or module names, never a path.
+const NON_PATH_LITERALS: &[&str] = &[
+    "r",
+    "w",
+    "a",
+    "x",
+    "rb",
+    "wb",
+    "ab",
+    "xb",
+    "rt",
+    "wt",
+    "at",
+    "r+",
+    "w+",
+    "a+",
+    "x+",
+    "rb+",
+    "wb+",
+    "ab+",
+    "utf-8",
+    "utf8",
+    "utf-16",
+    "ascii",
+    "latin-1",
+    "latin1",
+    "fs",
+    "fs/promises",
+    "node:fs",
+    "node:fs/promises",
+    "os",
+    "path",
+    "child_process",
+    "node:child_process",
+    "shutil",
+    "pathlib",
+];
+
+/// How deep wrapper, `eval`, `xargs` and interpreter-string recursion goes
+/// before the guard gives up and treats the nesting itself as a write.
+const SEAT_GUARD_DEPTH_LIMIT: usize = 4;
+
+/// The string literals of `text` (single, double, backtick and triple
+/// quoted), contents only, in order. An unterminated literal ends the scan.
+fn string_literals(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut literals = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let quote = chars[i];
+        if !matches!(quote, '\'' | '"' | '`') {
+            i += 1;
+            continue;
+        }
+        let triple = chars.get(i + 1) == Some(&quote) && chars.get(i + 2) == Some(&quote);
+        let width = if triple { 3 } else { 1 };
+        let mut j = i + width;
+        let mut content = String::new();
+        loop {
+            let Some(&c) = chars.get(j) else {
+                return literals;
+            };
+            if c == '\\' {
+                if let Some(&next) = chars.get(j + 1) {
+                    content.push(next);
+                }
+                j += 2;
+                continue;
+            }
+            let closes = if triple {
+                c == quote && chars.get(j + 1) == Some(&quote) && chars.get(j + 2) == Some(&quote)
+            } else {
+                c == quote
+            };
+            if closes {
+                break;
+            }
+            content.push(c);
+            j += 1;
+        }
+        literals.push(content);
+        i = j + width;
+    }
+    literals
+}
+
+/// The text between the `(` at byte `open` of `code` and its matching `)`,
+/// or to the end when unbalanced. Quotes and nesting are respected.
+fn balanced_args(code: &str, open: usize) -> &str {
+    let start = open + 1;
+    let mut depth = 1usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (offset, c) in code[start..].char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if let Some(active) = quote {
+            if c == active {
+                quote = None;
+            }
+        } else if matches!(c, '\'' | '"' | '`') {
+            quote = Some(c);
+        } else if matches!(c, '(' | '[' | '{') {
+            depth += 1;
+        } else if matches!(c, ')' | ']' | '}') {
+            depth -= 1;
+            if depth == 0 {
+                return &code[start..start + offset];
+            }
+        }
+    }
+    &code[start..]
+}
+
+/// Split `text` at commas that are outside quotes and brackets.
+fn split_top_level(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut start = 0;
+    for (index, c) in text.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if let Some(active) = quote {
+            if c == active {
+                quote = None;
+            }
+        } else if matches!(c, '\'' | '"' | '`') {
+            quote = Some(c);
+        } else if matches!(c, '(' | '[' | '{') {
+            depth += 1;
+        } else if matches!(c, ')' | ']' | '}') {
+            depth = depth.saturating_sub(1);
+        } else if c == ',' && depth == 0 {
+            parts.push(text[start..index].trim());
+            start = index + 1;
+        }
+    }
+    parts.push(text[start..].trim());
+    parts
+}
+
+/// The content of `text` when it is exactly one string literal
+/// (`f"..."`/`b'...'` prefixes allowed).
+fn single_literal(text: &str) -> Option<String> {
+    let body = text
+        .trim()
+        .trim_start_matches(['f', 'F', 'b', 'B', 'r', 'R', 'u', 'U']);
+    let quote = body
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '\'' | '"' | '`'))?;
+    let literals = string_literals(body);
+    (literals.len() == 1 && body.len() >= 2 && body.ends_with(quote))
+        .then(|| literals.into_iter().next())
+        .flatten()
+}
+
+/// Quote `words` into one shell command line.
+fn join_shell_words(words: &[String]) -> String {
+    words
         .iter()
-        .any(|p| code.contains(p))
-        && INLINE_WRITE_MODE_LITERALS.iter().any(|m| code.contains(m))
+        .map(|word| {
+            let plain = !word.is_empty()
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "/._-=:,+@%".contains(c));
+            if plain {
+                word.clone()
+            } else {
+                format!("'{}'", word.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The shell command line a subprocess-style call runs, when it is spelled
+/// entirely with literals: `('echo x > f')`, `(['rm', 'f'])` or node's
+/// `('cp', ['a', 'b'])`. `None` for anything built at run time.
+fn shell_command_from_args(args: &str) -> Option<String> {
+    let parts = split_top_level(args);
+    let first = *parts.first()?;
+    let list_words = |list: &str| -> Option<Vec<String>> {
+        let inner = list.trim().strip_prefix('[')?.strip_suffix(']')?;
+        split_top_level(inner)
+            .into_iter()
+            .filter(|element| !element.is_empty())
+            .map(single_literal)
+            .collect()
+    };
+    if first.starts_with('[') {
+        return Some(join_shell_words(&list_words(first)?));
+    }
+    let literal = single_literal(first)?;
+    match parts.get(1).filter(|second| second.starts_with('[')) {
+        Some(list) => {
+            let mut words = vec![literal];
+            words.extend(list_words(list)?);
+            Some(join_shell_words(&words))
+        }
+        None => Some(literal),
+    }
+}
+
+fn is_write_mode(literal: &str) -> bool {
+    literal.chars().all(|c| "rwaxbtU+".contains(c)) && literal.contains(['w', 'a', 'x', '+'])
+}
+
+/// Whether `code`'s occurrence of `pattern` at byte `index` starts a name
+/// rather than the tail of a longer identifier.
+fn starts_identifier(code: &str, index: usize) -> bool {
+    !code[..index]
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The write an inline interpreter script (`python3 -c`, `node -e`, or a
+/// heredoc body fed to one) performs on the repository, if any. Each write
+/// primitive's string-literal path targets are resolved like a shell
+/// redirect's: outside the repository (the scratchpad) or in `.zirv/work` and
+/// `.zirv/memory` is allowed, and a target that is not a literal cannot be
+/// resolved and counts as a write. Shell strings handed to `os.system`,
+/// `subprocess` or `child_process` are screened as shell. Approximate by
+/// design (a text scan, not a parse) and biased toward flagging: a false
+/// positive only costs a dispatched worker, a miss silently keeps a write.
+fn inline_code_write_hit(
+    code: &str,
+    cwd: &str,
+    repo_root_of: &dyn Fn(&str) -> Option<String>,
+    env: EnvLookup<'_>,
+    depth: usize,
+) -> Option<String> {
+    const UNRESOLVED: &str = "<inline interpreter write>";
+    let path_literals = |text: &str| -> Vec<String> {
+        string_literals(text)
+            .into_iter()
+            .filter(|l| !l.is_empty() && !NON_PATH_LITERALS.contains(&l.as_str()))
+            .collect()
+    };
+    let target_hit = |literals: Vec<String>| -> Option<String> {
+        if literals.is_empty() {
+            return Some(UNRESOLVED.to_string());
+        }
+        literals
+            .iter()
+            .find_map(|target| repo_write_violation(target, cwd, repo_root_of, env))
+    };
+    let receiver_of = |index: usize| {
+        let start = code[..index].rfind([';', '\n']).map_or(0, |p| p + 1);
+        &code[start..index]
+    };
+    let gated = |gate: &[&str]| gate.is_empty() || gate.iter().any(|g| code.contains(g));
+
+    for primitive in INLINE_FS_PRIMITIVES {
+        for (index, _) in code.match_indices(primitive.pattern) {
+            if !gated(primitive.gate)
+                || (!primitive.pattern.starts_with('.') && !starts_identifier(code, index))
+            {
+                continue;
+            }
+            let open = index + primitive.pattern.len() - 1;
+            let name = primitive
+                .pattern
+                .trim_start_matches('.')
+                .trim_end_matches('(');
+            let mut literals = Vec::new();
+            if primitive.receiver {
+                literals.extend(path_literals(receiver_of(index)));
+            }
+            if primitive.args {
+                let mut args = path_literals(balanced_args(code, open));
+                if name.to_ascii_lowercase().starts_with("copy") || name.starts_with("cp") {
+                    args = args.split_off(args.len().saturating_sub(1));
+                }
+                literals.extend(args);
+            }
+            if let Some(hit) = target_hit(literals) {
+                return Some(hit);
+            }
+        }
+    }
+    for (prefix, gate) in INLINE_FS_PREFIXES {
+        for (index, _) in code.match_indices(prefix) {
+            let rest = &code[index + prefix.len()..];
+            let name_len = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            if name_len == 0
+                || !rest[name_len..].starts_with('(')
+                || !starts_identifier(code, index)
+                || (!gate.is_empty() && !code.contains(gate))
+            {
+                continue;
+            }
+            let open = index + prefix.len() + name_len;
+            let mut literals = path_literals(balanced_args(code, open));
+            if rest.starts_with("copy") {
+                literals = literals.split_off(literals.len().saturating_sub(1));
+            }
+            if let Some(hit) = target_hit(literals) {
+                return Some(hit);
+            }
+        }
+    }
+    for pattern in INLINE_OPEN_PRIMITIVES {
+        for (index, _) in code.match_indices(pattern) {
+            if !starts_identifier(code, index) && !code[..index].ends_with('.') {
+                continue;
+            }
+            let args = balanced_args(code, index + pattern.len() - 1);
+            if !string_literals(args).iter().any(|l| is_write_mode(l)) {
+                continue;
+            }
+            if let Some(hit) = target_hit(path_literals(args)) {
+                return Some(hit);
+            }
+        }
+    }
+    for primitive in INLINE_SHELL_PRIMITIVES {
+        for (index, _) in code.match_indices(primitive.pattern) {
+            if !gated(primitive.gate) || !starts_identifier(code, index) {
+                continue;
+            }
+            let args = balanced_args(code, index + primitive.pattern.len() - 1);
+            let Some(command) = shell_command_from_args(args) else {
+                return Some(UNRESOLVED.to_string());
+            };
+            if let Some(hit) =
+                orchestrator_repo_write_target_in(&command, cwd, repo_root_of, env, depth + 1)
+            {
+                return Some(hit);
+            }
+        }
+    }
+    None
 }
 
 /// An orchestrator seat must not directly write any repository, including a
@@ -868,28 +1325,28 @@ pub(crate) fn orchestrator_repo_write_target(
     repo_root_of: &dyn Fn(&str) -> Option<String>,
     env: EnvLookup<'_>,
 ) -> Option<String> {
-    // (d)'s own approximation needs SOME allowed-roots list to check an
-    // inline interpreter's code text against, but has no structured target
-    // path to resolve a repo for -- `cwd` itself may already be the repo
-    // root, and a bare trailing `.` is lexically stripped by `Path::parent`
-    // (landing one level too high), so a synthetic nested leaf is probed
-    // instead of `cwd` directly, making `repo_root_of`'s own "starts at the
-    // parent" contract land exactly on `cwd`.
-    let cwd_allowed_roots: Vec<String> = repo_root_of(&format!("{cwd}/__zirv_cwd_probe__"))
-        .into_iter()
-        .flat_map(|root| [format!("{root}/.zirv/work"), format!("{root}/.zirv/memory")])
-        .collect();
+    orchestrator_repo_write_target_in(command, cwd, repo_root_of, env, 0)
+}
 
+/// [`orchestrator_repo_write_target`] for a command found `depth` levels
+/// down inside a wrapper, `eval`, `xargs` or interpreter string.
+fn orchestrator_repo_write_target_in(
+    command: &str,
+    cwd: &str,
+    repo_root_of: &dyn Fn(&str) -> Option<String>,
+    env: EnvLookup<'_>,
+    depth: usize,
+) -> Option<String> {
+    if depth > SEAT_GUARD_DEPTH_LIMIT {
+        return Some("<nested command too deep to screen>".to_string());
+    }
     let (sanitized, code_bodies) = super::shell::redact_inert_heredocs(command);
     // A python/node-style heredoc body is code in that language: judge it
     // by its write primitives, never as shell redirects (`if i>5:`).
-    if code_bodies.iter().any(|body| {
-        inline_code_has_write_primitive(body)
-            && !cwd_allowed_roots
-                .iter()
-                .any(|root| body.contains(root.as_str()))
-    }) {
-        return Some("<inline interpreter write>".to_string());
+    for body in &code_bodies {
+        if let Some(hit) = inline_code_write_hit(body, cwd, repo_root_of, env, depth) {
+            return Some(hit);
+        }
     }
     // Track only the immediately preceding diff-producing git segment;
     // reset at each other segment before considering a patch-apply exemption.
@@ -907,6 +1364,8 @@ pub(crate) fn orchestrator_repo_write_target(
         if *join != Join::And {
             cwd = session_cwd.clone();
         }
+        // `$PWD`, `${PWD}`, `$(pwd)` and `` `pwd` `` are the tracked directory.
+        let segment = &substitute_pwd(segment, &cwd);
         let collapsed = collapse_whitespace(segment);
         let Some(tokens) = sql_tokens(&collapsed) else {
             previous_diff_producing_git = false;
@@ -975,6 +1434,21 @@ pub(crate) fn orchestrator_repo_write_target(
         }
         previous_diff_producing_git = false;
 
+        // Script text keeps its newlines in the raw tokens; `collapsed` has none.
+        let raw_tokens = sql_tokens(segment).unwrap_or_else(|| tokens.clone());
+        if let Some(hit) = nested_command_write_hit(
+            &program,
+            &collapsed,
+            &tokens,
+            &raw_tokens,
+            &cwd,
+            repo_root_of,
+            env,
+            depth,
+        ) {
+            return Some(hit);
+        }
+
         if let Some(targets) = segment_write_targets(&neutralize_heredoc_operator(segment)) {
             for target in &targets {
                 if let Some(hit) = repo_write_violation(target, &cwd, repo_root_of, env) {
@@ -1003,16 +1477,356 @@ pub(crate) fn orchestrator_repo_write_target(
         if matches!(
             program.as_str(),
             "python" | "python3" | "node" | "ruby" | "perl" | "php"
-        ) && let Some(code) = inline_interpreter_code(&tokens)
-            && inline_code_has_write_primitive(code)
-            && !cwd_allowed_roots
-                .iter()
-                .any(|root| code.contains(root.as_str()))
+        ) && let Some(code) = inline_interpreter_code(&raw_tokens)
+            && let Some(hit) = inline_code_write_hit(code, &cwd, repo_root_of, env, depth)
         {
-            return Some("<inline interpreter write>".to_string());
+            return Some(hit);
         }
     }
     None
+}
+
+/// Replace `$PWD`, `${PWD}`, `$(pwd)` and `` `pwd` `` in `segment` with `cwd`
+/// (single-quoted when bare, raw inside double quotes, untouched inside single
+/// quotes), so a target spelled through them is judged by where it lands.
+fn substitute_pwd(segment: &str, cwd: &str) -> String {
+    if !segment.contains(['$', '`']) || cwd.contains(['\'', '"', '$', '`', '\\']) {
+        return segment.to_string();
+    }
+    let mut out = String::with_capacity(segment.len());
+    let mut quote: Option<char> = None;
+    let mut rest = segment;
+    while let Some(c) = rest.chars().next() {
+        if quote == Some('\'') {
+            if c == '\'' {
+                quote = None;
+            }
+        } else if c == '\'' && quote.is_none() {
+            quote = Some('\'');
+        } else if c == '"' {
+            quote = if quote.is_some() { None } else { Some('"') };
+        } else if let Some(spelling) = ["${PWD}", "$(pwd)", "`pwd`", "$PWD"]
+            .iter()
+            .find(|spelling| rest.starts_with(**spelling))
+            && !(*spelling == "$PWD"
+                && rest[4..]
+                    .chars()
+                    .next()
+                    .is_some_and(|n| n.is_ascii_alphanumeric() || n == '_'))
+        {
+            if quote.is_some() {
+                out.push_str(cwd);
+            } else {
+                out.push('\'');
+                out.push_str(cwd);
+                out.push('\'');
+            }
+            rest = &rest[spelling.len()..];
+            continue;
+        }
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
+}
+
+/// Commands whose real work is another command or script: shell `-c`
+/// payloads, `env`/launcher prefixes, `eval`, `xargs`, `awk`, and `sed`'s
+/// `w` commands. Each is screened as the command it runs; whatever it
+/// would write through an argument that stdin or a script supplies and this
+/// guard cannot resolve counts as a write.
+#[allow(clippy::too_many_arguments)]
+fn nested_command_write_hit(
+    program: &str,
+    collapsed: &str,
+    tokens: &[String],
+    raw_tokens: &[String],
+    cwd: &str,
+    repo_root_of: &dyn Fn(&str) -> Option<String>,
+    env: EnvLookup<'_>,
+    depth: usize,
+) -> Option<String> {
+    let nested = |command: &str| {
+        orchestrator_repo_write_target_in(command, cwd, repo_root_of, env, depth + 1)
+    };
+    let target_hit = |target: &str| repo_write_violation(target, cwd, repo_root_of, env);
+    // `xargs` is also a launcher prefix, but its stdin-supplied arguments
+    // need their own screen.
+    if program == "xargs" {
+        return xargs_write_hit(&tokens[1..], &nested);
+    }
+    if let Some(inner) = super::shell::unwrap_shell_wrapper(collapsed)
+        .or_else(|| super::shell::unwrap_env_prefix(collapsed))
+        .or_else(|| super::shell::unwrap_launcher_prefix(collapsed))
+    {
+        return nested(&inner);
+    }
+    match program {
+        "eval" => nested(&tokens[1..].join(" ")),
+        "awk" | "gawk" | "mawk" | "nawk" => {
+            let mut operands = Vec::new();
+            let mut program_text = None;
+            let mut inplace = false;
+            let mut words = raw_tokens[1..].iter();
+            while let Some(word) = words.next() {
+                match word.as_str() {
+                    "-f" | "--file" => return None,
+                    "-F" | "-v" | "-e" | "--source" => {
+                        words.next();
+                    }
+                    "-i" => inplace |= words.next().is_some_and(|v| v == "inplace"),
+                    _ if word.starts_with("-iinplace") => inplace = true,
+                    _ if word.starts_with('-') && program_text.is_none() => {}
+                    _ if program_text.is_none() => program_text = Some(word.as_str()),
+                    _ => operands.push(word.as_str()),
+                }
+            }
+            if inplace && let Some(hit) = operands.iter().find_map(|t| target_hit(t)) {
+                return Some(hit);
+            }
+            for effect in awk_program_effects(program_text?) {
+                let hit = match effect {
+                    AwkEffect::Target(target) => target_hit(&target),
+                    AwkEffect::Command(command) => nested(&command),
+                    AwkEffect::Unresolved => Some("<awk write>".to_string()),
+                };
+                if hit.is_some() {
+                    return hit;
+                }
+            }
+            None
+        }
+        "sed" => {
+            let mut scripts = Vec::new();
+            let mut words = raw_tokens[1..].iter().peekable();
+            let mut explicit = false;
+            while let Some(word) = words.next() {
+                let cluster_e = word.starts_with('-')
+                    && !word.starts_with("--")
+                    && word.len() > 1
+                    && word.ends_with('e')
+                    && word.chars().skip(1).all(|c| c.is_ascii_alphabetic());
+                if word == "-e" || word == "--expression" || cluster_e {
+                    explicit = true;
+                    scripts.extend(words.next().cloned());
+                } else if let Some(script) = word.strip_prefix("--expression=") {
+                    explicit = true;
+                    scripts.push(script.to_string());
+                } else if word == "-f" || word == "--file" || word == "-l" {
+                    explicit |= word != "-l";
+                    words.next();
+                } else if !explicit && !word.starts_with('-') {
+                    scripts.push(word.clone());
+                    explicit = true;
+                }
+            }
+            scripts
+                .iter()
+                .flat_map(|script| sed_write_files(script))
+                .find_map(|file| target_hit(&file))
+        }
+        _ => None,
+    }
+}
+
+/// `xargs`' own options skipped, the command it runs is screened; one that
+/// writes through arguments read from stdin has no resolvable target unless a
+/// `-I`/`-J` placeholder pins where they land.
+fn xargs_write_hit(args: &[String], nested: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let mut placeholder = false;
+    let mut i = 0;
+    while i < args.len() && args[i].starts_with('-') {
+        let flag = args[i].as_str();
+        if flag == "--" {
+            i += 1;
+            break;
+        }
+        match flag {
+            "-I" | "-J" | "-L" | "-n" | "-P" | "-s" | "-d" | "-E" | "-a" => {
+                placeholder |= matches!(flag, "-I" | "-J");
+                i += 1;
+            }
+            _ => placeholder |= flag.starts_with("-I") || flag.starts_with("-J") || flag == "-i",
+        }
+        i += 1;
+    }
+    let command = args.get(i..).unwrap_or_default();
+    let program = sql_program_name(command.first()?);
+    if let Some(hit) = nested(&join_shell_words(command)) {
+        return Some(hit);
+    }
+    let inplace = command.iter().any(|t| is_sed_perl_inplace_flag(t));
+    let stdin_target = matches!(
+        program.as_str(),
+        "rm" | "touch"
+            | "mkdir"
+            | "truncate"
+            | "tee"
+            | "chmod"
+            | "chown"
+            | "rmdir"
+            | "unlink"
+            | "mv"
+            | "cp"
+            | "install"
+            | "ln"
+            | "rsync"
+    ) || (matches!(program.as_str(), "sed" | "perl") && inplace);
+    (stdin_target && !placeholder).then(|| "<xargs write>".to_string())
+}
+
+/// What an awk program does outside plain output.
+enum AwkEffect {
+    /// `print > "file"` / `>> "file"` with a literal path.
+    Target(String),
+    /// `print | "cmd"` or `system("cmd")` with a literal command.
+    Command(String),
+    /// A redirect, pipe or `system` whose destination is computed.
+    Unresolved,
+}
+
+/// The file and command effects of awk program text.
+fn awk_program_effects(program: &str) -> Vec<AwkEffect> {
+    let chars: Vec<char> = program.chars().collect();
+    let mut effects = Vec::new();
+    let starts = |i: usize, word: &str| {
+        chars[i..].iter().take(word.len()).collect::<String>() == word
+            && (i == 0 || !(chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_'))
+    };
+    let skip_string = |mut i: usize| {
+        i += 1;
+        while i < chars.len() && chars[i] != '"' {
+            i += usize::from(chars[i] == '\\') + 1;
+        }
+        i + 1
+    };
+    let classify = |text: &str, literal: fn(String) -> AwkEffect| {
+        single_literal(text).map_or(AwkEffect::Unresolved, literal)
+    };
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '"' {
+            i = skip_string(i);
+        } else if starts(i, "print") {
+            let mut depth = 0i32;
+            let mut k = i + if starts(i, "printf") { 6 } else { 5 };
+            while k < chars.len() {
+                match chars[k] {
+                    '"' => {
+                        k = skip_string(k);
+                        continue;
+                    }
+                    '(' | '[' => depth += 1,
+                    ')' | ']' => depth -= 1,
+                    ';' | '\n' | '}' if depth <= 0 => break,
+                    '>' | '|'
+                        if depth == 0
+                            && !matches!(chars.get(k + 1), Some('|' | '='))
+                            && !(chars[k] == '|' && chars[k - 1] == '|') =>
+                    {
+                        let pipe = chars[k] == '|';
+                        let mut e = k + 1 + usize::from(chars.get(k + 1) == Some(&'>'));
+                        let begin = e;
+                        while e < chars.len() && !matches!(chars[e], ';' | '\n' | '}') {
+                            e += if chars[e] == '"' {
+                                skip_string(e) - e
+                            } else {
+                                1
+                            };
+                        }
+                        let text: String = chars[begin..e.min(chars.len())].iter().collect();
+                        effects.push(if pipe {
+                            classify(&text, AwkEffect::Command)
+                        } else {
+                            classify(&text, AwkEffect::Target)
+                        });
+                        k = e;
+                        break;
+                    }
+                    _ => {}
+                }
+                k += 1;
+            }
+            i = k;
+        } else if starts(i, "system") && chars.get(i + 6) == Some(&'(') {
+            let args = balanced_args(
+                program,
+                program.char_indices().nth(i + 6).map_or(0, |p| p.0),
+            );
+            effects.push(classify(args, AwkEffect::Command));
+            i += 7;
+        } else {
+            i += 1;
+        }
+    }
+    effects
+}
+
+/// The files a sed script writes through `w`/`W` commands and the `w` flag of
+/// `s`.
+fn sed_write_files(script: &str) -> Vec<String> {
+    let chars: Vec<char> = script.chars().collect();
+    let mut files = Vec::new();
+    let rest_of_line = |from: usize| {
+        let end = chars[from..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map_or(chars.len(), |p| from + p);
+        (
+            chars[from..end]
+                .iter()
+                .collect::<String>()
+                .trim()
+                .to_string(),
+            end,
+        )
+    };
+    // The index after the next unescaped `delim`.
+    let skip_part = |from: usize, delim: char| {
+        let mut i = from;
+        while i < chars.len() && chars[i] != delim {
+            i += usize::from(chars[i] == '\\') + 1;
+        }
+        i + 1
+    };
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            c if c.is_whitespace()
+                || matches!(c, ';' | '{' | '}' | '!' | ',' | '$' | '~' | '+')
+                || c.is_ascii_digit() =>
+            {
+                i += 1;
+            }
+            '/' => i = skip_part(i + 1, '/'),
+            '\\' if i + 1 < chars.len() => i = skip_part(i + 2, chars[i + 1]),
+            's' | 'y' if i + 1 < chars.len() => {
+                let is_s = chars[i] == 's';
+                let delim = chars[i + 1];
+                i = skip_part(skip_part(i + 2, delim), delim);
+                while i < chars.len() && !matches!(chars[i], ';' | '\n' | '}') {
+                    if is_s && chars[i] == 'w' {
+                        let (file, end) = rest_of_line(i + 1);
+                        files.push(file);
+                        i = end;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            'w' | 'W' => {
+                let (file, end) = rest_of_line(i + 1);
+                files.push(file);
+                i = end;
+            }
+            'a' | 'i' | 'c' | 'r' | 'R' | ':' | 'b' | 't' | 'T' => {
+                i = rest_of_line(i + 1).1;
+            }
+            _ => i += 1,
+        }
+    }
+    files.retain(|file| !file.is_empty());
+    files
 }
 
 /// Require every normalized candidate to be allowed or unmatched before
@@ -1938,6 +2752,215 @@ mod tests {
             orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
             None
         );
+    }
+
+    /// The seat-guard verdict for `command` run from the repo root `/work/repo`.
+    fn seat_hit(command: &str) -> Option<String> {
+        orchestrator_repo_write_target(command, "/work/repo", &fake_repo_root_of, &|_| None)
+    }
+
+    /// Every command must be denied; the failure lists the ones that were not.
+    fn assert_all_denied(commands: &[&str]) {
+        let missed: Vec<&&str> = commands.iter().filter(|c| seat_hit(c).is_none()).collect();
+        assert!(missed.is_empty(), "not denied: {missed:#?}");
+    }
+
+    /// Every command must stay allowed; the failure lists the ones denied.
+    fn assert_all_allowed(commands: &[&str]) {
+        let denied: Vec<String> = commands
+            .iter()
+            .filter_map(|c| seat_hit(c).map(|hit| format!("{c} -> {hit}")))
+            .collect();
+        assert!(denied.is_empty(), "wrongly denied: {denied:#?}");
+    }
+
+    #[test]
+    fn seat_guard_denies_python_filesystem_writes_inline_and_in_heredocs() {
+        assert_all_denied(&[
+            "python3 -c \"import os; os.rename('src/a.py','src/b.py')\"",
+            "python3 -c \"import os; os.replace('a','src/b')\"",
+            "python3 -c \"import os; os.remove('src/a.py')\"",
+            "python3 -c \"import os; os.unlink('src/a.py')\"",
+            "python3 -c \"import os; os.truncate('src/a.py', 0)\"",
+            "python3 -c \"import os; os.makedirs('src/new')\"",
+            "python3 -c \"import os; os.mkdir('src/new')\"",
+            "python3 -c \"import shutil; shutil.copy('/tmp/claude-501/a','src/b')\"",
+            "python3 -c \"import shutil; shutil.rmtree('src')\"",
+            "python3 -c \"from pathlib import Path; Path('src/x').unlink()\"",
+            "python3 -c \"from pathlib import Path; Path('src/x').touch()\"",
+            "python3 -c \"from pathlib import Path; Path('src/d').mkdir()\"",
+            "python3 -c \"from pathlib import Path; Path('a').rename('src/b')\"",
+            "python3 -c \"from pathlib import Path; Path('a').replace('src/b')\"",
+            "python3 -c \"import fileinput\nfor l in fileinput.input('src/a.py', inplace=True): print(l)\"",
+            "python3 -c \"import os,sys; os.remove(sys.argv[1])\"",
+            "python3 -c \"from pathlib import Path; p = Path('x'); p.unlink()\"",
+            "python3 - <<'EOF'\nimport os\nos.rename('src/a','src/b')\nEOF",
+            "python3 - <<'EOF'\nimport shutil\nshutil.move('src/a','src/b')\nEOF",
+            "python3 - <<'EOF'\nfrom pathlib import Path\nPath('src/a').unlink()\nEOF",
+            "python3 - <<'EOF'\nimport os, sys\nos.remove(sys.argv[1])\nEOF",
+        ]);
+    }
+
+    #[test]
+    fn seat_guard_denies_node_filesystem_writes() {
+        assert_all_denied(&[
+            "node -e \"require('fs').renameSync('src/a','src/b')\"",
+            "node -e \"require('fs').copyFileSync('/tmp/claude-501/x','src/b')\"",
+            "node -e \"require('fs').rmSync('src/a')\"",
+            "node -e \"require('fs').unlinkSync('src/a')\"",
+            "node -e \"require('fs').mkdirSync('src/d')\"",
+            "node -e \"require('fs').appendFileSync('src/a','x')\"",
+            "node -e \"require('fs').createWriteStream('src/a')\"",
+            "node -e \"require('fs').promises.rename('src/a','src/b')\"",
+            "node -e \"require('fs/promises').rm('src/a')\"",
+            "node - <<'EOF'\nrequire('fs').rmSync('src/a')\nEOF",
+        ]);
+    }
+
+    #[test]
+    fn seat_guard_screens_shell_strings_passed_to_interpreters() {
+        assert_all_denied(&[
+            "python3 -c \"import os; os.system('echo x > src/a.rs')\"",
+            "python3 -c \"import subprocess; subprocess.run('echo x > src/a.rs', shell=True)\"",
+            "python3 -c \"import subprocess; subprocess.run(['rm','src/a.rs'])\"",
+            "python3 -c \"import subprocess; subprocess.run(['cp','a','src/b'])\"",
+            "python3 -c \"import os; os.system(cmd)\"",
+            "python3 -c \"import subprocess; subprocess.run(cmd)\"",
+            "node -e \"require('child_process').execSync('rm src/a')\"",
+            "node -e \"require('child_process').spawnSync('cp', ['a','src/b'])\"",
+            "python3 - <<'EOF'\nimport os\nos.system('echo x > src/a.rs')\nEOF",
+        ]);
+    }
+
+    #[test]
+    fn seat_guard_keeps_read_only_and_out_of_repo_interpreter_code_allowed() {
+        assert_all_allowed(&[
+            "python3 -c \"import json; print(json.dumps({'a': 1}))\"",
+            "python3 -c \"print('a-b'.replace('-','_'))\"",
+            "python3 -c \"import os; print(os.listdir('.'))\"",
+            "python3 -c \"import subprocess; subprocess.run(['git','log'])\"",
+            "python3 -c \"import os; os.system('ls')\"",
+            "python3 -c \"import os; os.rename('/tmp/claude-501/a','/tmp/claude-501/b')\"",
+            "python3 -c \"from pathlib import Path; Path('/tmp/claude-501/x').write_text('hello')\"",
+            "python3 -c \"import shutil; shutil.copy('/tmp/claude-501/a','/tmp/claude-501/b')\"",
+            "python3 -c \"open('/work/repo/.zirv/work/o.txt','w').write('a')\"",
+            "python3 -c \"import os; os.remove('/work/repo/.zirv/work/old.txt')\"",
+            "node -e \"require('fs').copyFileSync('/tmp/claude-501/x','/tmp/claude-501/y')\"",
+            "node -e \"console.log(require('fs').readFileSync('src/a','utf8'))\"",
+            "python3 - <<'EOF'\nimport os\nprint(os.listdir('.'))\nEOF",
+        ]);
+    }
+
+    /// Only the resolved target decides: naming `.zirv/work` in a comment or
+    /// string must not exempt a write to the repository.
+    #[test]
+    fn seat_guard_exempts_by_resolved_target_not_by_text() {
+        assert_all_denied(&[
+            "python3 -c \"# /work/repo/.zirv/work\nimport os; os.remove('src/a')\"",
+            "python3 -c \"import os; os.remove('src/a')  # /work/repo/.zirv/memory\"",
+            "python3 -c \"print('/work/repo/.zirv/work'); open('src/a','w').write('x')\"",
+            "python3 - <<'EOF'\n# /work/repo/.zirv/work\nopen('src/a','w').write('x')\nEOF",
+            "python3 - <<'EOF'\nprint('/work/repo/.zirv/memory')\nimport os; os.remove('src/a')\nEOF",
+        ]);
+    }
+
+    #[test]
+    fn seat_guard_recurses_into_shell_wrappers_and_eval() {
+        assert_all_denied(&[
+            "bash -c 'echo x > src/a.rs'",
+            "sh -c \"cp a src/b\"",
+            "zsh -c 'touch src/a'",
+            "env sh -c 'echo x > src/a'",
+            "eval \"echo x > src/a\"",
+            "eval echo x '>' src/a",
+            "bash -c \"sh -c 'echo x > src/a'\"",
+            "nohup sh -c 'echo x > src/a'",
+        ]);
+        assert_all_allowed(&[
+            "bash -c 'echo hi'",
+            "bash -c 'echo x > /tmp/claude-501/a'",
+            "env sh -c 'ls'",
+            "eval \"echo hi\"",
+        ]);
+    }
+
+    #[test]
+    fn seat_guard_denies_xargs_that_writes() {
+        assert_all_denied(&[
+            "find . -name x | xargs rm",
+            "ls | xargs -0 rm -f",
+            "ls | xargs cp -t /work/repo/src",
+            "echo a | xargs tee src/a",
+            "ls | xargs -I{} mv {} src/{}",
+            "ls | xargs touch",
+            "ls | xargs sed -i 's/a/b/'",
+            "ls | xargs sh -c 'echo x > src/a'",
+        ]);
+        assert_all_allowed(&[
+            "ls | xargs echo",
+            "ls | xargs grep foo",
+            "ls | xargs wc -l",
+            "ls | xargs sed 's/a/b/'",
+            "ls | xargs -I{} cp {} /tmp/claude-501/{}",
+        ]);
+    }
+
+    #[test]
+    fn seat_guard_denies_awk_redirects_and_system() {
+        assert_all_denied(&[
+            "awk '{print > \"src/a.txt\"}' f",
+            "awk '{print >> \"src/a.txt\"}' f",
+            "awk 'BEGIN{system(\"rm src/a\")}'",
+            "awk '{print | \"tee src/a\"}' f",
+            "awk '{print > $1}' f",
+            "awk '{printf \"%s\\n\", $1 > \"src/a.txt\"}' f",
+            "gawk -i inplace '{print}' src/a.txt",
+        ]);
+        assert_all_allowed(&[
+            "awk '$1 > 5 {print $1}' f",
+            "awk '{print}' f",
+            "awk '{print > \"/tmp/claude-501/a\"}' f",
+            "awk 'BEGIN{system(\"ls\")}'",
+            "awk '{ if ($1 > 2) print $1 }' f",
+        ]);
+    }
+
+    #[test]
+    fn seat_guard_denies_sed_write_commands() {
+        assert_all_denied(&[
+            "sed -n 'w src/a.txt' f",
+            "sed 's/a/b/w src/a.txt' f",
+            "sed -e '/x/w src/o' f",
+            "sed 'W src/o' f",
+            "sed -n '/a/{p;w src/o\n}' f",
+        ]);
+        assert_all_allowed(&[
+            "sed -n '1,5p' f",
+            "sed 's/a/b/' f",
+            "sed 's/w/x/g' f",
+            "sed -n '/w/p' f",
+            "sed -n 'w /tmp/claude-501/o' f",
+            "sed 's/a/b/w /tmp/claude-501/o' f",
+        ]);
+    }
+
+    #[test]
+    fn seat_guard_resolves_pwd_spellings_to_the_repo() {
+        assert_all_denied(&[
+            "echo x > $PWD/src/a.rs",
+            "echo x > ${PWD}/a",
+            "echo x > $(pwd)/a",
+            "echo x > `pwd`/a",
+            "touch $PWD/a",
+            "cp a $PWD/b",
+            "echo x | tee $PWD/a",
+            "echo x > \"$PWD/a\"",
+        ]);
+        assert_all_allowed(&[
+            "echo $PWD",
+            "echo x > /tmp/claude-501/$USER",
+            "cd /tmp/claude-501 && echo x > $PWD/a",
+        ]);
     }
 
     /// `filesystem_repo_root_of` walks up from a target's PARENT (the
