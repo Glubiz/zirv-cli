@@ -95,6 +95,16 @@ pub(super) fn operator_config_approval(outcome: &Outcome) -> bool {
 }
 
 pub(super) fn apply_network_outcome(command: &str, original: &str, base: Outcome) -> Outcome {
+    // The candidate list also carries the whole multi-line command with its
+    // newlines collapsed to spaces, which glues the next line's words onto
+    // the last request as if they were its arguments; the newline-bearing
+    // candidate and each line are classified on their own.
+    if original.contains('\n')
+        && !command.contains('\n')
+        && command == collapse_whitespace(&redact_single_quoted_heredocs(original))
+    {
+        return base;
+    }
     let Some(network) = network_outcome_in(command, original) else {
         return base;
     };

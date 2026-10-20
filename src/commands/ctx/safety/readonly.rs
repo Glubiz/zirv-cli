@@ -78,61 +78,360 @@ pub(super) fn elasticsearch_query_tokens(
     tokens: &[String],
     original: &str,
 ) -> Vec<String> {
+    let original = redact_inert_heredocs(original).0;
+    let original = original.as_str();
     let mut out = tokens.to_vec();
     if raw_words.len() != tokens.len() {
         return out;
     }
     let roots = super::adapters::scratchpad_roots(&std::env::temp_dir());
     for i in 1..tokens.len() {
-        if !matches!(
-            tokens[i - 1].as_str(),
+        let previous = tokens[i - 1].as_str();
+        let raw = raw_words[i].as_str();
+        if matches!(
+            previous,
             "-d" | "--data" | "--data-raw" | "--data-binary" | "--json"
         ) {
-            continue;
-        }
-        let raw = raw_words[i].as_str();
-        let token = tokens[i].as_str();
-        if let Some(path) = token.strip_prefix('@') {
-            let expanded = ["$TMPDIR", "${TMPDIR}"]
+            let candidates = match expand_word(raw, original, 0) {
+                Some(values) => values,
+                None if tokens[i].starts_with('@') => vec![tokens[i].clone()],
+                None => continue,
+            };
+            if candidates
                 .iter()
-                .find_map(|var| path.strip_prefix(var))
-                .and_then(|tail| {
-                    let tmp = std::env::var("TMPDIR").ok()?;
-                    (!tmp.is_empty()).then(|| format!("{}{tail}", tmp.trim_end_matches('/')))
-                })
-                .unwrap_or_else(|| path.to_string());
-            if !expanded.is_empty()
-                && expanded != "-"
-                && !sensitive_upload_path(&expanded)
-                && target_is_confined(&expanded, &roots)
+                .all(|value| inline_body_or_scratch_file(value, original, &roots))
             {
                 out[i] = "{}".to_string();
             }
-        } else if is_single_quoted_word(raw) {
-            out[i] = token.replace('\\', "");
-        } else if raw.starts_with('"')
-            && raw.ends_with('"')
-            && let Some(name) = token
-                .strip_prefix('$')
-                .map(|name| name.trim_matches(['{', '}']))
-            && !name.is_empty()
-            && let Some((value, single_quoted)) = literal_shell_assignment(original, name)
+        } else if raw.contains('$')
+            && !previous.starts_with("--header")
+            && !QUERY_VALUE_FLAGS.contains(&previous)
+            && let Some(urls) = expand_word(raw, original, 0)
+            && urls.iter().all(|url| url.starts_with("http"))
         {
-            out[i] = if single_quoted {
-                value.replace('\\', "")
-            } else {
-                value
-            };
+            // A request URL built from same-command literals: judge the
+            // first expansion that is not an acceptable query route.
+            out[i] = urls
+                .iter()
+                .find(|url| elasticsearch_query_url_allows_post(url).is_none())
+                .unwrap_or(&urls[0])
+                .clone();
         }
     }
     out
 }
 
-fn is_single_quoted_word(raw: &str) -> bool {
-    raw.len() >= 2
-        && raw.starts_with('\'')
-        && raw.ends_with('\'')
-        && !raw[1..raw.len() - 1].contains('\'')
+/// curl options whose next word is their value, never a request URL.
+const QUERY_VALUE_FLAGS: &[&str] = &[
+    "-H",
+    "-u",
+    "-A",
+    "-m",
+    "-w",
+    "-o",
+    "-X",
+    "-e",
+    "-b",
+    "-c",
+    "-d",
+    "--user",
+    "--user-agent",
+    "--max-time",
+    "--connect-timeout",
+    "--write-out",
+    "--output",
+    "--request",
+    "--method",
+    "--data",
+    "--data-raw",
+    "--data-binary",
+    "--json",
+    "--referer",
+    "--cookie",
+];
+
+/// Whether one expanded data operand is a literal body or a screened
+/// scratchpad file (`@path`, relative paths resolved against a leading
+/// `cd` into the scratchpad).
+fn inline_body_or_scratch_file(value: &str, original: &str, roots: &[String]) -> bool {
+    let Some(path) = value.strip_prefix('@') else {
+        return !value.contains(['$', '`']);
+    };
+    let tmp = std::env::var("TMPDIR").ok().filter(|tmp| !tmp.is_empty());
+    let path = ["$TMPDIR", "${TMPDIR}"]
+        .iter()
+        .find_map(|var| path.strip_prefix(var))
+        .and_then(|tail| {
+            tmp.as_ref()
+                .map(|tmp| format!("{}{tail}", tmp.trim_end_matches('/')))
+        })
+        .unwrap_or_else(|| path.to_string());
+    let path = if !path.is_empty() && !path.starts_with(['/', '~', '$']) && !path.contains("..") {
+        match scratch_cd_base(original, roots) {
+            Some(base) => format!("{base}/{path}"),
+            None => path,
+        }
+    } else {
+        path
+    };
+    !path.is_empty()
+        && path != "-"
+        && !sensitive_upload_path(&path)
+        && target_is_confined(&path, roots)
+}
+
+/// The directory a leading `cd` moves into, when it is a literal scratchpad
+/// path or `$TMPDIR`, and no other `cd` appears in the command.
+fn scratch_cd_base(original: &str, roots: &[String]) -> Option<String> {
+    let mut base = None;
+    for (index, (segment, _, _)) in tokenize_segments_joined(original).iter().enumerate() {
+        let words: Vec<String> = tokenize_quoted(&segment.chars().collect::<Vec<_>>())
+            .into_iter()
+            .map(|word| word.text)
+            .collect();
+        let first = words.first().map(String::as_str);
+        if first != Some("cd") {
+            if words
+                .iter()
+                .any(|word| matches!(word.as_str(), "cd" | "pushd" | "popd"))
+            {
+                return None;
+            }
+            continue;
+        }
+        if index != 0 || words.len() != 2 || base.is_some() {
+            return None;
+        }
+        let dir = match words[1].trim_matches('"') {
+            "$TMPDIR" | "${TMPDIR}" => std::env::var("TMPDIR").ok()?,
+            literal => expand_word(literal, original, 1)?.into_iter().next()?,
+        };
+        let dir = dir.trim_end_matches('/').to_string();
+        if !target_is_confined(&dir, roots) {
+            return None;
+        }
+        base = Some(dir);
+    }
+    base
+}
+
+/// Expand a raw shell word into every literal string it can produce: single-
+/// and double-quoted text, and `$NAME`/`${NAME}` references to same-command
+/// literal variables or literal `for` lists. Command substitution, backticks,
+/// positional parameters, escapes other than `\"` and `\\`, and an unquoted
+/// expansion that could word-split or glob all yield `None`.
+fn expand_word(raw: &str, original: &str, depth: u8) -> Option<Vec<String>> {
+    const SPECIAL_UNQUOTED: &[char] =
+        &['`', '\\', '~', '(', ')', ';', '|', '<', '>', '&', '!', '#'];
+    let chars: Vec<char> = raw.chars().collect();
+    let mut results = vec![String::new()];
+    let mut i = 0;
+    let mut quote: Option<char> = None;
+    while i < chars.len() {
+        let c = chars[i];
+        let mut piece: Option<Vec<String>> = None;
+        match (quote, c) {
+            (None, '\'') => {
+                let end = chars[i + 1..].iter().position(|&ch| ch == '\'')? + i + 1;
+                piece = Some(vec![chars[i + 1..end].iter().collect()]);
+                i = end;
+            }
+            (None, '"') => quote = Some('"'),
+            (Some(_), '"') => quote = None,
+            (Some('"'), '\\') => {
+                let next = *chars.get(i + 1)?;
+                if !matches!(next, '"' | '\\') {
+                    return None;
+                }
+                piece = Some(vec![next.to_string()]);
+                i += 1;
+            }
+            (_, '$') => {
+                if depth > 0 {
+                    return None;
+                }
+                let braced = chars.get(i + 1) == Some(&'{');
+                let start = i + 1 + usize::from(braced);
+                let mut end = start;
+                while chars
+                    .get(end)
+                    .is_some_and(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                {
+                    end += 1;
+                }
+                if end == start || (braced && chars.get(end) != Some(&'}')) {
+                    return None;
+                }
+                let name: String = chars[start..end].iter().collect();
+                let values = variable_values(original, &name)?;
+                if quote.is_none()
+                    && values.iter().any(|v| {
+                        v.is_empty()
+                            || v.contains(|ch: char| ch.is_whitespace() || "*?[".contains(ch))
+                    })
+                {
+                    return None;
+                }
+                piece = Some(values);
+                i = end - usize::from(!braced);
+            }
+            (None, ch) if SPECIAL_UNQUOTED.contains(&ch) => return None,
+            (Some('"'), '`') => return None,
+            (_, ch) => piece = Some(vec![ch.to_string()]),
+        }
+        if let Some(piece) = piece {
+            if results.len() * piece.len() > 32 {
+                return None;
+            }
+            results = results
+                .iter()
+                .flat_map(|prefix| piece.iter().map(move |p| format!("{prefix}{p}")))
+                .collect();
+        }
+        i += 1;
+    }
+    quote.is_none().then_some(results)
+}
+
+/// The literal value(s) a same-command variable can hold at its use.
+fn variable_values(original: &str, name: &str) -> Option<Vec<String>> {
+    if let Some((value, _)) = literal_shell_assignment(original, name) {
+        return Some(vec![value]);
+    }
+    loop_variable_values(original, name)
+}
+
+/// The elements of the one `for NAME in <literal words>` loop that binds
+/// `name`, when nothing else assigns or reads it before the loop.
+fn loop_variable_values(original: &str, name: &str) -> Option<Vec<String>> {
+    let prefix = format!("{name}=");
+    let mut values: Option<Vec<String>> = None;
+    for (segment, _, _) in tokenize_segments_joined(original) {
+        let words: Vec<String> = tokenize_quoted(&segment.chars().collect::<Vec<_>>())
+            .into_iter()
+            .map(|word| word.text)
+            .collect();
+        if words
+            .iter()
+            .any(|word| MUTATING_BUILTINS.contains(&word.as_str()))
+            || matches!(words.first().map(String::as_str), Some("source" | "."))
+        {
+            return None;
+        }
+        if words.first().map(String::as_str) == Some("for")
+            && words.get(1).map(String::as_str) == Some(name)
+            && words.get(2).map(String::as_str) == Some("in")
+        {
+            if values.is_some() {
+                return None;
+            }
+            let mut elements = Vec::new();
+            for word in &words[3..] {
+                elements.extend(expand_word(word, original, 1)?);
+            }
+            values = Some(elements);
+            continue;
+        }
+        if words
+            .iter()
+            .any(|word| word.starts_with(&prefix) || word == name)
+            || (values.is_none() && mentions_variable(&segment, name))
+        {
+            return None;
+        }
+    }
+    values.filter(|elements| !elements.is_empty())
+}
+
+/// Builtins that can bind or change a shell variable behind the scan's back.
+const MUTATING_BUILTINS: &[&str] = &[
+    "read",
+    "eval",
+    "declare",
+    "typeset",
+    "local",
+    "unset",
+    "readonly",
+    "mapfile",
+    "readarray",
+    "getopts",
+    "let",
+];
+
+/// Splice a same-command `NAME=(...)` array of fixed curl words into the
+/// request wherever `"${NAME[@]}"` appears.
+pub(super) fn expand_option_arrays(
+    raw_words: &[String],
+    tokens: &[String],
+    original: &str,
+) -> (Vec<String>, Vec<String>) {
+    let mut raw_out = Vec::new();
+    let mut token_out = Vec::new();
+    if raw_words.len() != tokens.len() {
+        return (raw_words.to_vec(), tokens.to_vec());
+    }
+    for (raw, token) in raw_words.iter().zip(tokens) {
+        let name = raw
+            .strip_prefix("\"${")
+            .and_then(|rest| rest.strip_suffix("[@]}\""));
+        let elements = name.and_then(|name| literal_array_words(original, name));
+        let Some(elements) = elements else {
+            raw_out.push(raw.clone());
+            token_out.push(token.clone());
+            continue;
+        };
+        for element in elements {
+            let Some(parsed) =
+                sql_tokens(&element).and_then(|t| (t.len() == 1).then(|| t[0].clone()))
+            else {
+                return (raw_words.to_vec(), tokens.to_vec());
+            };
+            raw_out.push(element);
+            token_out.push(parsed);
+        }
+    }
+    (raw_out, token_out)
+}
+
+/// The raw words of the single standalone `NAME=(...)` array assignment that
+/// precedes every use of `name`.
+fn literal_array_words(original: &str, name: &str) -> Option<Vec<String>> {
+    let prefix = format!("{name}=(");
+    let mut found = None;
+    for (segment, piped, _) in tokenize_segments_joined(original) {
+        let trimmed = segment.trim();
+        let words: Vec<String> = tokenize_quoted(&trimmed.chars().collect::<Vec<_>>())
+            .into_iter()
+            .map(|word| word.text)
+            .collect();
+        if words
+            .iter()
+            .any(|word| MUTATING_BUILTINS.contains(&word.as_str()))
+            || matches!(words.first().map(String::as_str), Some("source" | "."))
+        {
+            return None;
+        }
+        let Some(body) = trimmed.strip_prefix(&prefix) else {
+            if found.is_none() && trimmed.contains(&format!("{name}[")) {
+                return None;
+            }
+            if trimmed.contains(&prefix) {
+                return None;
+            }
+            continue;
+        };
+        if found.is_some() || piped {
+            return None;
+        }
+        let body = body.strip_suffix(')')?;
+        found = Some(
+            tokenize_quoted(&body.chars().collect::<Vec<_>>())
+                .into_iter()
+                .map(|word| word.text)
+                .collect::<Vec<_>>(),
+        );
+    }
+    found
 }
 
 fn mentions_variable(text: &str, name: &str) -> bool {
@@ -157,22 +456,10 @@ fn literal_shell_assignment(original: &str, name: &str) -> Option<(String, bool)
             .into_iter()
             .map(|word| word.text)
             .collect();
-        if words.iter().any(|word| {
-            matches!(
-                word.as_str(),
-                "read"
-                    | "eval"
-                    | "declare"
-                    | "typeset"
-                    | "local"
-                    | "unset"
-                    | "readonly"
-                    | "mapfile"
-                    | "readarray"
-                    | "getopts"
-                    | "let"
-            ) || word == name
-        }) || matches!(words.first().map(String::as_str), Some("source" | "."))
+        if words
+            .iter()
+            .any(|word| MUTATING_BUILTINS.contains(&word.as_str()) || word == name)
+            || matches!(words.first().map(String::as_str), Some("source" | "."))
         {
             return None;
         }
