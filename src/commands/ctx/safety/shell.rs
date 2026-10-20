@@ -742,7 +742,14 @@ fn find_heredoc_terminator(
 /// rather than risking excessive redaction (#136).
 pub(super) fn redact_single_quoted_heredocs(command: &str) -> String {
     let chars: Vec<char> = command.chars().collect();
-    let redacted = redact_heredocs_scan(&chars, 0, false, &mut Vec::new());
+    let redacted = redact_heredocs_scan(
+        &chars,
+        0,
+        Redaction::SingleQuoted,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        "",
+    );
     canonical_shell_syntax(&redacted).unwrap_or(redacted)
 }
 
@@ -756,23 +763,54 @@ pub(super) fn redact_single_quoted_heredocs(command: &str) -> String {
 pub(super) fn redact_inert_heredocs(command: &str) -> (String, Vec<String>) {
     let chars: Vec<char> = command.chars().collect();
     let mut code_bodies = Vec::new();
-    let redacted = redact_heredocs_scan(&chars, 0, true, &mut code_bodies);
+    let redacted = redact_heredocs_scan(
+        &chars,
+        0,
+        Redaction::Inert,
+        &mut Vec::new(),
+        &mut code_bodies,
+        "",
+    );
     (
         canonical_shell_syntax(&redacted).unwrap_or(redacted),
         code_bodies,
     )
 }
 
-/// True when a heredoc body may be executed as code: fail closed, any word
-/// anywhere on its opener line (before or after the marker, whatever wraps it)
-/// naming a shell or interpreter makes the body a script, not prose. A lone
-/// `.` counts only as the first word of a segment. Without `include_code`
-/// only shells and wrappers count, not the python/node-style interpreters.
-fn heredoc_feeds_interpreter(opener_line: &str, include_code: bool) -> bool {
-    use super::jev_approve::{
-        JEV_APPROVE_ALWAYS_WRAPPER_PROGRAMS, JEV_APPROVE_INLINE_CODE_INTERPRETERS,
-        JEV_APPROVE_SHELL_PROGRAMS,
-    };
+/// One heredoc body cut out by [`redact_all_heredocs`].
+pub(super) struct HeredocBody {
+    /// The line that opened the heredoc, up to its end.
+    pub(super) opener: String,
+    pub(super) body: String,
+    /// An unquoted delimiter: the outer shell expands `$(...)` in the body.
+    pub(super) expands: bool,
+}
+
+/// Redact every heredoc body, quoted or not, and return the bodies so a
+/// caller can screen each one by what it feeds (#922 retry screen).
+pub(super) fn redact_all_heredocs(command: &str) -> (String, Vec<HeredocBody>) {
+    let chars: Vec<char> = command.chars().collect();
+    let mut bodies = Vec::new();
+    let redacted =
+        redact_heredocs_scan(&chars, 0, Redaction::All, &mut bodies, &mut Vec::new(), "");
+    (
+        canonical_shell_syntax(&redacted).unwrap_or(redacted),
+        bodies,
+    )
+}
+
+/// Which heredoc bodies [`redact_heredocs_scan`] replaces.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Redaction {
+    /// Only bodies of single-quoted delimiters.
+    SingleQuoted,
+    /// Every body that neither feeds an interpreter nor substitutes.
+    Inert,
+    /// Every body, collected for the caller.
+    All,
+}
+
+fn opener_names_program(opener_line: &str, names: &dyn Fn(&str, usize, &str) -> bool) -> bool {
     opener_line
         .split(['|', ';', '&', '(', ')', '`', '{', '}'])
         .any(|segment| {
@@ -782,24 +820,49 @@ fn heredoc_feeds_interpreter(opener_line: &str, include_code: bool) -> bool {
                 .filter(|(_, word)| !word.contains('='))
                 .any(|(index, word)| {
                     let program = word.rsplit('/').next().unwrap_or(word).to_ascii_lowercase();
-                    (index == 0 && word == ".")
-                        || matches!(program.as_str(), "ed" | "ex")
-                        || JEV_APPROVE_SHELL_PROGRAMS.contains(&program.as_str())
-                        || JEV_APPROVE_ALWAYS_WRAPPER_PROGRAMS.contains(&program.as_str())
-                        || (include_code
-                            && JEV_APPROVE_INLINE_CODE_INTERPRETERS.contains(&program.as_str()))
+                    names(&program, index, word)
                 })
         })
 }
 
+/// True when a heredoc body may be executed as code: fail closed, any word
+/// anywhere on its opener line (before or after the marker, whatever wraps it)
+/// naming a shell or interpreter makes the body a script, not prose. A lone
+/// `.` counts only as the first word of a segment.
+pub(super) fn heredoc_feeds_interpreter(opener_line: &str) -> bool {
+    use super::jev_approve::JEV_APPROVE_INLINE_CODE_INTERPRETERS;
+    heredoc_feeds_shell(opener_line)
+        || opener_names_program(opener_line, &|program, _, _| {
+            matches!(program, "ed" | "ex")
+                || JEV_APPROVE_INLINE_CODE_INTERPRETERS.contains(&program)
+        })
+}
+
+/// True when a heredoc body may run as shell commands: a shell, `.`/`source`
+/// or an argv-forwarding wrapper names it on the opener line.
+pub(super) fn heredoc_feeds_shell(opener_line: &str) -> bool {
+    use super::jev_approve::{JEV_APPROVE_ALWAYS_WRAPPER_PROGRAMS, JEV_APPROVE_SHELL_PROGRAMS};
+    opener_names_program(opener_line, &|program, index, word| {
+        (index == 0 && word == ".")
+            || JEV_APPROVE_SHELL_PROGRAMS.contains(&program)
+            || JEV_APPROVE_ALWAYS_WRAPPER_PROGRAMS.contains(&program)
+    })
+}
+
 /// Recurse into live `$(...)` even inside double quotes to find heredocs;
 /// single quotes suppress substitution. Bound recursion depth (#136).
+/// `code_bodies` collects bodies fed to a python/node-style interpreter.
+/// `line_prefix` is the enclosing line up to the `$(`, so an opener inside
+/// `bash -c "$(cat <<'EOF'` still names the shell that runs the body.
 fn redact_heredocs_scan(
     chars: &[char],
     depth: usize,
-    expanding: bool,
+    mode: Redaction,
+    bodies: &mut Vec<HeredocBody>,
     code_bodies: &mut Vec<String>,
+    line_prefix: &str,
 ) -> String {
+    let expanding = mode != Redaction::SingleQuoted;
     if depth >= MAX_STRUCTURAL_DEPTH {
         return chars.iter().collect();
     }
@@ -846,13 +909,18 @@ fn redact_heredocs_scan(
             && quote != Some('\'')
             && let Some(end) = command_substitution_end(chars, i + 2, 0)
         {
+            let line_start = out.rfind('\n').map_or(0, |p| p + 1);
+            let outer_prefix = if line_start == 0 { line_prefix } else { "" };
+            let inner_prefix = format!("{outer_prefix}{}$(", &out[line_start..]);
             out.push('$');
             out.push('(');
             out.push_str(&redact_heredocs_scan(
                 &chars[i + 2..end],
                 depth + 1,
-                expanding,
+                mode,
+                bodies,
                 code_bodies,
+                &inner_prefix,
             ));
             out.push(')');
             i = end + 1;
@@ -887,6 +955,7 @@ fn redact_heredocs_scan(
                 parse_heredoc_marker(chars, i, expanding)
         {
             let opener_line_start = out.rfind('\n').map_or(0, |p| p + 1);
+            let expands = !chars[i..marker_end].iter().any(|c| matches!(c, '\'' | '"'));
             out.extend(chars[i..marker_end].iter());
             i = marker_end;
             // Copy the rest of this opener line without scanning it: only
@@ -895,10 +964,18 @@ fn redact_heredocs_scan(
                 out.push(chars[i]);
                 i += 1;
             }
-            let opener_line = &out[opener_line_start..];
-            let interpreter_stdin = expanding && heredoc_feeds_interpreter(opener_line, false);
-            let code_stdin =
-                expanding && !interpreter_stdin && heredoc_feeds_interpreter(opener_line, true);
+            let outer_prefix = if opener_line_start == 0 {
+                line_prefix
+            } else {
+                ""
+            };
+            let opener = format!("{outer_prefix}{}", &out[opener_line_start..]);
+            let interpreter_stdin = expanding
+                && (heredoc_feeds_shell(&opener)
+                    || opener_names_program(&opener, &|program, _, _| {
+                        matches!(program, "ed" | "ex")
+                    }));
+            let code_stdin = expanding && !interpreter_stdin && heredoc_feeds_interpreter(&opener);
             if i < chars.len() {
                 out.push('\n');
                 i += 1;
@@ -911,12 +988,20 @@ fn redact_heredocs_scan(
                     }
                     // A quoted delimiter suppresses expansion, so its body
                     // never carries a live `$(`/backtick.
-                    let body_substitutes = interpreter_stdin
-                        || (expanding
-                            && !quoted
-                            && chars[body_start..term_start]
-                                .windows(2)
-                                .any(|w| w == ['$', '('] || w[0] == '`' || w[1] == '`'));
+                    let body_substitutes = mode != Redaction::All
+                        && (interpreter_stdin
+                            || (expanding
+                                && !quoted
+                                && chars[body_start..term_start]
+                                    .windows(2)
+                                    .any(|w| w == ['$', '('] || w[0] == '`' || w[1] == '`')));
+                    if mode == Redaction::All {
+                        bodies.push(HeredocBody {
+                            opener,
+                            body: chars[body_start..term_start].iter().collect(),
+                            expands,
+                        });
+                    }
                     if body_substitutes {
                         out.extend(chars[body_start..term_start].iter());
                     } else if term_start > body_start {
@@ -1491,6 +1576,32 @@ pub(crate) fn unwrap_compact_run_wrapper(segment: &str) -> Option<String> {
     (!inner.is_empty()).then_some(inner)
 }
 
+/// Unwrap the caller-supplied child of `zirv ctx exec|wrap|run|statusline ...
+/// -- <argv>` and `zirv ctx usage ... tee -- <argv>`: clap takes these
+/// children only after `--`, so the child carries its own verdict (#326).
+pub(crate) fn unwrap_zirv_child_command(segment: &str) -> Option<String> {
+    if split_segments(segment).len() > 1 {
+        return None;
+    }
+    let collapsed = collapse_whitespace(segment);
+    let tokens: Vec<&str> = collapsed.split(' ').filter(|t| !t.is_empty()).collect();
+    if sql_program_name(tokens.first()?) != "zirv" || !tokens.get(1)?.eq_ignore_ascii_case("ctx") {
+        return None;
+    }
+    let verb = tokens.get(2)?.to_ascii_lowercase();
+    let launches = match verb.as_str() {
+        "exec" | "wrap" | "run" | "statusline" => true,
+        "usage" => tokens.iter().skip(3).any(|t| t.eq_ignore_ascii_case("tee")),
+        _ => false,
+    };
+    if !launches {
+        return None;
+    }
+    let separator = tokens.iter().position(|t| *t == "--")?;
+    let inner = tokens[separator + 1..].join(" ");
+    (!inner.is_empty()).then_some(inner)
+}
+
 fn push_candidate(candidates: &mut Vec<String>, candidate: String) {
     if candidates.len() < MAX_STRUCTURAL_CANDIDATES && !candidates.contains(&candidate) {
         candidates.push(candidate);
@@ -1668,7 +1779,9 @@ fn visit_executable_nodes(command: &str, depth: usize, candidates: &mut Vec<Stri
         }
         // Recurse into the transparent launcher's inner argv; retain the outer
         // candidate for explicit narrowing rules (#326).
-        if let Some(inner) = unwrap_compact_run_wrapper(collapsed) {
+        if let Some(inner) =
+            unwrap_compact_run_wrapper(collapsed).or_else(|| unwrap_zirv_child_command(collapsed))
+        {
             visit_executable_nodes(&inner, depth + 1, candidates);
         }
         // Extract substitutions from unredacted segment text so live commands
@@ -2340,11 +2453,23 @@ mod tests {
                 .any(|candidate| candidate.contains("zirv ctx run")),
             "the wrapper text must survive when there is nothing to unwrap"
         );
+        // #922: `ctx run` is a base-allowed built-in, so a wrapper launching
+        // nothing is allowed, while any child it does launch decides.
         assert_eq!(
             evaluate(&policy, "zirv ctx run --compact --", LaunchMode::Headless).verdict,
-            evaluate(&policy, "zirv ctx frobnicate", LaunchMode::Headless).verdict,
-            "a wrapper launching nothing is just an unmatched zirv command"
+            Verdict::Allow,
+            "a wrapper launching nothing is a harmless built-in"
         );
+        for command in [
+            "zirv ctx run --compact -- rm -rf ~/x",
+            "zirv ctx run --agent claude -- rm -rf ~/x",
+        ] {
+            assert_ne!(
+                evaluate(&policy, command, LaunchMode::Headless).verdict,
+                Verdict::Allow,
+                "{command}"
+            );
+        }
     }
 
     /// The function itself peels one layer, like every other unwrapper in

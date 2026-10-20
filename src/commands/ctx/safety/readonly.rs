@@ -1225,18 +1225,23 @@ mod tests {
 
     #[test]
     fn retry_redirects_resolve_under_payload_cwd_and_input_is_not_a_write() {
+        // #922: a retry may write outside the repository; only protected
+        // paths ask, so the unconfined rows moved up here.
         for command in [
             "OUT=/work/repo/logs; cargo test > $OUT/result.log",
             "cargo test > result.log",
             "cargo test < /tmp/input.txt",
+            "OUT=/work/other; cargo test > $OUT/result.log",
+            "cargo test > ../outside.log",
         ] {
             let output = literal_retry_hook(command, true, "/work/repo");
             assert_eq!(output["permissionDecision"], "allow", "{command}: {output}");
         }
         for command in [
-            "OUT=/work/other; cargo test > $OUT/result.log",
             "cd /etc; cargo test > passwd",
-            "cargo test > ../outside.log",
+            "cd /etc && cargo test >> hosts",
+            "cd /work/repo/../../etc; cargo test > passwd",
+            "cargo test > ../../etc/passwd",
         ] {
             let output = literal_retry_hook(command, true, "/work/repo");
             assert_eq!(output["permissionDecision"], "ask", "{command}: {output}");
@@ -1273,7 +1278,7 @@ mod tests {
                             output["permissionDecisionReason"]
                                 .as_str()
                                 .unwrap()
-                                .contains("<sandbox: read-only escape>"),
+                                .contains("<sandbox: allow-verdict retry>"),
                             "{command}: {output}"
                         );
                     }
@@ -1294,7 +1299,7 @@ mod tests {
                 output["permissionDecisionReason"]
                     .as_str()
                     .unwrap()
-                    .contains("<sandbox: read-only escape>"),
+                    .contains("<sandbox: allow-verdict retry>"),
                 "{output}"
             );
         }

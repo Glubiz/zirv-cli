@@ -614,7 +614,7 @@ fn is_loopback_ipv4(host: &str) -> bool {
         && parts[1..].iter().all(|part| part.parse::<u8>().is_ok())
 }
 
-fn sensitive_credential_path(raw: &str) -> bool {
+pub(super) fn sensitive_credential_path(raw: &str) -> bool {
     let path = raw
         .trim_start_matches('@')
         .trim_matches(['\'', '"'])
@@ -795,7 +795,7 @@ fn is_home_directory_path(path: &str) -> bool {
 /// path qualifies only when [`is_home_directory_path`] holds for the
 /// directory containing `.zirv`, so a repository's own `.zirv/` is never
 /// mistaken for it.
-fn operator_zirv_path(raw: &str) -> bool {
+pub(super) fn operator_zirv_path(raw: &str) -> bool {
     let path = raw
         .trim_start_matches('@')
         .trim_matches(['\'', '"'])

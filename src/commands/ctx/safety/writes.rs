@@ -763,7 +763,7 @@ pub(super) fn is_sed_perl_inplace_flag(token: &str) -> bool {
 /// script/expression consumed by an `-e`/`-f` flag, and -- for `sed` with
 /// no `-e`/`-f` anywhere on the line -- not the first positional either
 /// (its own implicit script).
-fn sed_perl_inplace_targets(program: &str, tokens: &[String]) -> Vec<String> {
+pub(super) fn sed_perl_inplace_targets(program: &str, tokens: &[String]) -> Vec<String> {
     let is_script_flag = |t: &str| matches!(t, "-e" | "-f" | "--expression" | "--file");
     let has_e_or_f = tokens[1..]
         .iter()
@@ -2187,12 +2187,14 @@ mod tests {
     #[test]
     fn literal_assignment_retry_keeps_unconfined_tainted_and_credential_targets_blocked() {
         let scratch = scratchpad_write_root(&std::env::temp_dir());
+        // #922: `S=$HOME/x; echo y > $S/z` left this list and the `S=$HOME`
+        // reassignment now writes a startup file: an ordinary user directory
+        // is not a protected path, so a retry may write it.
         for command in [
             "S=/etc; echo x > $S/passwd".to_string(),
-            "S=$HOME/x; echo y > $S/z".to_string(),
             format!("S={scratch}; cat ~/.ssh/id_rsa > $S/k"),
             format!("S={scratch}; S=/etc; echo x > $S/passwd"),
-            format!("S={scratch}; S=$HOME; echo x > $S/out"),
+            format!("S={scratch}; S=$HOME; echo x > $S/.zshrc"),
             format!("S={scratch}; cat /dev/null > /etc/passwd"),
         ] {
             let output = literal_retry_hook(&command, true, "/work/repo");

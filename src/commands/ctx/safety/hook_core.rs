@@ -600,9 +600,9 @@ fn run_check_hook_inner<W: Write>(
             }),
         };
     }
-    // Preserve semantic Deny before considering unsandboxed retries. Read-only
-    // forge calls and operator-cleared segments still pass credential/root
-    // screens; unsafe or merely asked commands retain escalation (#147).
+    // Preserve semantic Deny and explicit Ask before considering unsandboxed
+    // retries. An allowed command runs silently unless the danger screen
+    // trips; asked commands retain escalation (#147, #922).
     if payload.tool_input.dangerously_disable_sandbox
         && outcome.verdict != Verdict::Deny
         && !operator_config_approval(&outcome)
@@ -613,36 +613,6 @@ fn run_check_hook_inner<W: Write>(
             .is_some_and(|rule| rule.pattern == "<scratchpad: confined write>");
         outcome = if already_scratchpad_confined {
             outcome
-        } else if outcome.verdict == Verdict::Allow
-            && is_sandbox_bypass_safe_gh_command(&effective_command)
-        {
-            Outcome {
-                verdict: Verdict::Allow,
-                matched: Some(Rule {
-                    pattern: "<sandbox: read-only gh>".to_string(),
-                    origin: Origin::BuiltIn,
-                }),
-            }
-        } else if outcome.verdict == Verdict::Allow
-            && is_reserved_zirv_escape_safe(&effective_command)
-        {
-            Outcome {
-                verdict: Verdict::Allow,
-                matched: Some(Rule {
-                    pattern: "<sandbox: reserved zirv built-in>".to_string(),
-                    origin: Origin::BuiltIn,
-                }),
-            }
-        } else if outcome.verdict == Verdict::Allow
-            && is_read_only_escape_safe(&effective_command, &scratchpad_roots)
-        {
-            Outcome {
-                verdict: Verdict::Allow,
-                matched: Some(Rule {
-                    pattern: "<sandbox: read-only escape>".to_string(),
-                    origin: Origin::BuiltIn,
-                }),
-            }
         } else if is_mixed_confined_write_and_read_only_escape_safe(
             &cfg.safety,
             &effective_command,
@@ -678,7 +648,8 @@ fn run_check_hook_inner<W: Write>(
             &effective_command,
             &outcome,
             &scratchpad_roots,
-        ) && allow_verdict_retry_clears_escape_screen(
+        ) && !retry_trips_danger_screen(
+            &cfg.safety,
             &effective_command,
             &scratchpad_roots,
             cwd,

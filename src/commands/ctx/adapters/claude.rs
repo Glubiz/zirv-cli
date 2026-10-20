@@ -4951,11 +4951,11 @@ mod tests {
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx hook install *)")));
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx exec *)")));
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx wrap *)")));
-        // `usage`'s own `tee` subcommand launches an arbitrary trailing
-        // statusline command, so a wildcard `usage *` entry would also cover
-        // `usage tee -- <cmd>` -- unlike the escape-safe retry path, a
-        // native permission/sandbox glob cannot see the fourth token.
-        assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx usage *)")));
+        // #922: `usage *` takes the verb's own flags. It also covers `usage
+        // tee -- <cmd>`, so the hook denies a tee child that needs approval
+        // and the sandbox exclusion keeps the exact `zirv ctx usage` form.
+        assert!(permission_allow.contains(&serde_json::json!("Bash(zirv ctx usage *)")));
+        assert!(permission_allow.contains(&serde_json::json!("Bash(zirv ctx measure *)")));
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv setup *)")));
         assert!(permission_allow.contains(&serde_json::json!("Bash(zirv test *)")));
         assert!(permission_allow.contains(&serde_json::json!("Bash(zirv verify *)")));
@@ -5862,7 +5862,7 @@ mod tests {
         assert!(!allow_arg.contains("Bash(zirv ctx *)"));
         assert!(!allow_arg.contains("Bash(zirv ctx exec *)"));
         assert!(!allow_arg.contains("Bash(zirv ctx wrap *)"));
-        assert!(!allow_arg.contains("Bash(zirv ctx usage *)"));
+        assert!(allow_arg.contains("Bash(zirv ctx usage *)"));
         assert!(!allow_arg.contains("Bash(zirv setup *)"));
         assert!(!allow_arg.contains("Bash(zirv benchmark *)"));
         assert!(allow_arg.contains("Bash(zirv benchmark plan *)"));

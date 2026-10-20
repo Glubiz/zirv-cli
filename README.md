@@ -7666,7 +7666,14 @@ safety verdict allows and whose every segment is a prompt-free built-in zirv
 invocation (`zirv` or the running binary's own path; only `ZIRV_*` env prefixes,
 and only on `ctx`), a literal `cd`, or a read-only filter, with each
 `$(...)`/backtick body held to the same rule. It never prints deny or ask, so
-every refusal and a matching deny rule still win.
+every refusal and a matching deny rule still win. The hook's own base policy is
+wider (#922): every built-in is allowed in both launch modes except the posture
+list, and a launcher (`ctx exec`/`wrap`/`run`/`statusline`, `ctx usage tee`)
+takes its wrapped child's verdict. Posture, credential and metered commands keep
+asking, also on an unsandboxed retry: the mutating `setup` and `ctx config`
+verbs, `benchmark run`, `ctx api`, `ctx obfuscate reveal`/`purge`, `ctx provider
+init`/`login`/`credential`, `ctx supervisor override`, `ctx hook install`, and a
+launch verb whose flags pin its permission or sandbox posture.
 
 Same-command literal variable assignments are resolved when judging scratchpad-confined writes and redirects under the hook payload's cwd on an unsandboxed retry. A variable must have a single literal assignment in a simple command list; functions, traps, shell-variable mutations and ambiguous expansions disable resolution. Unresolved targets still require approval on a retry. A `CLAUDE_CODE_TMPDIR` already ending in `claude-<uid>` is used as-is; on macOS, scratchpad roots include both `/tmp/...` and `/private/tmp/...` spellings.
 Elasticsearch GET/POST query endpoints (`/_search`, `/_msearch`, `/_count`, `/_field_caps`, `/_explain` and `/_explain/<id>`, `/_validate/query`, `/_sql`, `/_eql/search`, `/_search/template`, `/_render/template`, and Kibana's `/internal/search/es`, also under `/s/<space>/`) are read-only for the network classifier and retry screen when every request URL matches a query route and any body is inline. GET-only reads (`/_mapping`, `/_resolve/index/<name>`) qualify without a POST or body. For the network classifier a body also counts as inline when it is a fully single-quoted string, a double-quoted `"$VAR"` whose single literal assignment (no `$`/backtick, no re-assignment, made before the request) is in the same command, or `@file` under the session scratchpad/`$TMPDIR` that passes the credential-path screen. `-F`/`-T`/`--upload-file`, stdin uploads, any other dynamic body, client config files, unknown query options and non-query routes disqualify this exception; explicit ask/deny rules still apply.
@@ -7674,6 +7681,28 @@ Elasticsearch GET/POST query endpoints (`/_search`, `/_msearch`, `/_count`, `/_f
 `sqlite3` opened read-only (`-readonly`, or a `file:` URI whose only `mode` is `ro`) may run several statements and the read-only dot-commands (`.tables`, `.schema`, `.indexes`, `.databases`, `.headers`, `.mode`, `.dump`, ...) without asking. `.shell`, `.system`, `.load`, `.output`, `.once`, `.save`, `.backup`, `.import`, `.excel`, `.open`, `.read`, `writefile()`, `ATTACH`, comments and any non-read-only statement still ask. Without a read-only open, every argument after the database counts as a statement, so more than one asks.
 
 The orchestrator-seat write guard treats a quoted heredoc body as data (even with backticks or `$(`), and a heredoc fed to `python`/`node`/`ruby`/`perl` as that language's code: it denies only on a file-write primitive, not on `>` in the script.
+
+**Unsandboxed retries (#922).** When Claude retries a command with
+`dangerouslyDisableSandbox`, a base Deny stays Deny and an Ask from an explicit
+rule stays Ask (Deny headlessly). A base Allow, from a rule or the launch mode's
+default, runs without a prompt unless a danger screen trips on any segment: a
+credential or project-secret read; a write, redirect or download into a protected
+path (shell startup files, credential stores, `~/.claude` settings, hooks, skills,
+agents and commands, the operator's `~/.zirv`, `/etc`, `/usr`, `/bin`, `/sbin`,
+`/System`, `/Library`) or `sudo`/`doas`; a secret-named variable assigned from a
+substitution; a posture zirv command (by basename, so a path-qualified or
+`env`-prefixed `zirv` counts) or a repo script; a process signal other than
+`kill -0`; a cluster-changing `kubectl` verb or a Laravel migrate/wipe/seed; a
+root-wide `find`; or a shell running a script, `-c` payload or heredoc that trips
+any of these (a script it cannot read keeps asking). Writes into the repository,
+worktrees, the scratchpad, `$TMPDIR` and other user directories are fine.
+Variable targets resolve through the command's own assignments and loop lists; a
+value computed by a substitution or argument trips only when the command spells a
+protected path, and one set by `read`, `source`, `eval`, `+=` or an array always
+trips. Heredoc bodies are data, except a shell's, which is screened, and an
+interpreter's (python, node, ...), which gets a text check for credential
+material and protected paths. A `[safety] escape_allow` match still clears a base
+Allow retry through its own credential and redirect screen.
 
 The analyzer evaluates the most restrictive result across quote-aware compound
 segments (`;`, `&`, `&&`, `||`, pipes and newlines), nested
