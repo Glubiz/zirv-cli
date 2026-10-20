@@ -214,6 +214,12 @@ pub(super) fn segment_redirect_targets(segment: &str) -> Option<Vec<String>> {
 /// Shell redirects belong to the shell, not to tee/mkdir's path operands.
 /// Inspect raw words so a quoted filename such as `'>log'` stays an argument.
 pub(super) fn path_command_tokens(segment: &str) -> Option<Vec<String>> {
+    sql_tokens(&path_command_raw_words(segment)?.join(" "))
+}
+
+/// [`path_command_tokens`]' words with their quotes still on, redirects
+/// removed.
+pub(super) fn path_command_raw_words(segment: &str) -> Option<Vec<String>> {
     let quoted = tokenize_quoted(&segment.chars().collect::<Vec<_>>());
     let mut words = quoted.iter();
     let mut tokens = Vec::new();
@@ -230,7 +236,7 @@ pub(super) fn path_command_tokens(segment: &str) -> Option<Vec<String>> {
         }
         tokens.push(raw.to_string());
     }
-    sql_tokens(&tokens.join(" "))
+    Some(tokens)
 }
 
 pub(super) fn segment_write_targets(segment: &str) -> Option<Vec<String>> {

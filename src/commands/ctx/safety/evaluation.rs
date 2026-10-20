@@ -94,8 +94,8 @@ pub(super) fn operator_config_approval(outcome: &Outcome) -> bool {
         })
 }
 
-pub(super) fn apply_network_outcome(command: &str, base: Outcome) -> Outcome {
-    let Some(network) = network_outcome(command) else {
+pub(super) fn apply_network_outcome(command: &str, original: &str, base: Outcome) -> Outcome {
+    let Some(network) = network_outcome_in(command, original) else {
         return base;
     };
     if verdict_rank(network.verdict) > verdict_rank(base.verdict) {

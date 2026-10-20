@@ -407,7 +407,7 @@ pub(super) fn evaluate_candidate_outcome(
     let outcome = apply_sql_outcome(policy, candidate, base);
     let outcome = apply_credential_outcome(candidate, outcome);
     let outcome = apply_operator_config_outcome(candidate, outcome);
-    let outcome = apply_network_outcome(candidate, outcome);
+    let outcome = apply_network_outcome(candidate, original, outcome);
     let outcome = apply_recursive_delete_outcome(candidate, original, outcome);
     let outcome = apply_vcs_outcome(candidate, outcome, scratchpad_roots);
     let outcome = apply_distribution_outcome(candidate, outcome);

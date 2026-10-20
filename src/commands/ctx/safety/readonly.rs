@@ -9,23 +9,30 @@ pub(super) fn is_elasticsearch_read_only_query(tokens: &[String]) -> bool {
     curl_wget_read_only_options(tokens, None, true)
 }
 
-fn is_elasticsearch_query_url(url: &str) -> bool {
-    let Some(rest) = url
+/// `Some(true)` for a read-only query route that also accepts a POST body,
+/// `Some(false)` for a read-only route that is GET-only (a POST to `_mapping`
+/// updates it), `None` for anything else.
+fn elasticsearch_query_url_allows_post(url: &str) -> Option<bool> {
+    let rest = url
         .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-    else {
-        return false;
-    };
-    let Some((host, path)) = rest.split_once('/') else {
-        return false;
-    };
+        .or_else(|| url.strip_prefix("http://"))?;
+    let (host, path) = rest.split_once('/')?;
     if host.is_empty() || url.contains(['$', '`', '\\', '{', '}']) {
-        return false;
+        return None;
     }
     let path = path.split(['?', '#']).next().unwrap_or_default();
     // Match API routes, not suffixes: POST /index/_doc/_search indexes a
     // document whose id is `_search`; POST /_scripts/_search stores a script.
     let parts: Vec<_> = path.split('/').collect();
+    // Kibana's search proxy, optionally under a space: exactly this route,
+    // not its `/<id>` poll/cancel children.
+    let kibana_route = match parts.as_slice() {
+        ["s", space, rest @ ..] if !space.is_empty() => rest,
+        rest => rest,
+    };
+    if kibana_route == ["internal", "search", "es"] {
+        return Some(true);
+    }
     let index = parts
         .first()
         .copied()
@@ -36,13 +43,13 @@ fn is_elasticsearch_query_url(url: &str) -> bool {
         || index.contains("%5c")
         || matches!(index.as_str(), "" | "." | "..")
     {
-        return false;
+        return None;
     }
     let route = match parts.as_slice() {
         [index, rest @ ..] if !index.starts_with('_') || *index == "_all" => rest,
         route => route,
     };
-    matches!(
+    if matches!(
         route,
         ["_search" | "_msearch" | "_count" | "_field_caps" | "_explain" | "_sql"]
             | ["_validate", "query"]
@@ -50,6 +57,157 @@ fn is_elasticsearch_query_url(url: &str) -> bool {
             | ["_search", "template"]
             | ["_render", "template"]
     ) || matches!(route, ["_explain", id] if !id.is_empty())
+    {
+        return Some(true);
+    }
+    matches!(
+        route,
+        ["_mapping"] | ["_mapping", "field", _] | ["_resolve", "index", _]
+    )
+    .then_some(false)
+}
+
+/// Rewrite the data operands of an Elasticsearch query so the inline-body
+/// check can judge what the shell will actually send: a fully single-quoted
+/// body loses its (literal) backslashes, a double-quoted `"$VAR"` becomes the
+/// literal the same command assigned it, and an `@file` under the session
+/// scratchpad that passes the credential screen becomes an inline stand-in.
+/// Every other operand is left for `is_inline_query_body` to reject.
+pub(super) fn elasticsearch_query_tokens(
+    raw_words: &[String],
+    tokens: &[String],
+    original: &str,
+) -> Vec<String> {
+    let mut out = tokens.to_vec();
+    if raw_words.len() != tokens.len() {
+        return out;
+    }
+    let roots = super::adapters::scratchpad_roots(&std::env::temp_dir());
+    for i in 1..tokens.len() {
+        if !matches!(
+            tokens[i - 1].as_str(),
+            "-d" | "--data" | "--data-raw" | "--data-binary" | "--json"
+        ) {
+            continue;
+        }
+        let raw = raw_words[i].as_str();
+        let token = tokens[i].as_str();
+        if let Some(path) = token.strip_prefix('@') {
+            let expanded = ["$TMPDIR", "${TMPDIR}"]
+                .iter()
+                .find_map(|var| path.strip_prefix(var))
+                .and_then(|tail| {
+                    let tmp = std::env::var("TMPDIR").ok()?;
+                    (!tmp.is_empty()).then(|| format!("{}{tail}", tmp.trim_end_matches('/')))
+                })
+                .unwrap_or_else(|| path.to_string());
+            if !expanded.is_empty()
+                && expanded != "-"
+                && !sensitive_upload_path(&expanded)
+                && target_is_confined(&expanded, &roots)
+            {
+                out[i] = "{}".to_string();
+            }
+        } else if is_single_quoted_word(raw) {
+            out[i] = token.replace('\\', "");
+        } else if raw.starts_with('"')
+            && raw.ends_with('"')
+            && let Some(name) = token
+                .strip_prefix('$')
+                .map(|name| name.trim_matches(['{', '}']))
+            && !name.is_empty()
+            && let Some((value, single_quoted)) = literal_shell_assignment(original, name)
+        {
+            out[i] = if single_quoted {
+                value.replace('\\', "")
+            } else {
+                value
+            };
+        }
+    }
+    out
+}
+
+fn is_single_quoted_word(raw: &str) -> bool {
+    raw.len() >= 2
+        && raw.starts_with('\'')
+        && raw.ends_with('\'')
+        && !raw[1..raw.len() - 1].contains('\'')
+}
+
+fn mentions_variable(text: &str, name: &str) -> bool {
+    text.match_indices('$').any(|(i, _)| {
+        let rest = &text[i + 1..];
+        let rest = rest.strip_prefix('{').unwrap_or(rest);
+        rest.strip_prefix(name).is_some_and(|after| {
+            !after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+        })
+    })
+}
+
+/// The literal a standalone `NAME=<literal>` statement gives `name` in
+/// `original`, and whether it was single-quoted. Only a single assignment that
+/// precedes every use, with no `$`, backtick or backslash in an unquoted or
+/// double-quoted value and no construct that could re-assign it, qualifies.
+fn literal_shell_assignment(original: &str, name: &str) -> Option<(String, bool)> {
+    let prefix = format!("{name}=");
+    let mut found = None;
+    for (segment, piped, _) in tokenize_segments_joined(original) {
+        let words: Vec<String> = tokenize_quoted(&segment.chars().collect::<Vec<_>>())
+            .into_iter()
+            .map(|word| word.text)
+            .collect();
+        if words.iter().any(|word| {
+            matches!(
+                word.as_str(),
+                "read"
+                    | "eval"
+                    | "declare"
+                    | "typeset"
+                    | "local"
+                    | "unset"
+                    | "readonly"
+                    | "mapfile"
+                    | "readarray"
+                    | "getopts"
+                    | "let"
+            ) || word == name
+        }) || matches!(words.first().map(String::as_str), Some("source" | "."))
+        {
+            return None;
+        }
+        let body = match words.first().map(String::as_str) {
+            Some("export") => &words[1..],
+            _ => &words[..],
+        };
+        let assigns = body.iter().any(|word| word.starts_with(&prefix));
+        if !assigns {
+            if found.is_none() && mentions_variable(&segment, name) {
+                return None;
+            }
+            continue;
+        }
+        if found.is_some() || piped || !body.iter().all(|word| is_shell_identifier_assignment(word))
+        {
+            return None;
+        }
+        let raw = body.iter().find_map(|word| word.strip_prefix(&prefix))?;
+        let inner = |quote: char| {
+            raw.strip_prefix(quote)
+                .and_then(|rest| rest.strip_suffix(quote))
+                .filter(|inner| !inner.contains(quote))
+        };
+        found = Some(if let Some(inner) = inner('\'') {
+            (inner.to_string(), true)
+        } else {
+            let literal = inner('"').unwrap_or(raw);
+            if literal.is_empty() || literal.contains(['$', '`', '\\', '\'', '"']) {
+                return None;
+            }
+            (literal.to_string(), false)
+        });
+    }
+    found
 }
 
 fn is_inline_query_body(flag: &str, value: &str) -> bool {
@@ -81,6 +239,7 @@ fn curl_wget_read_only_options(
         return false;
     }
     let mut query_urls = 0;
+    let mut get_only_urls = 0;
     let mut i = 1;
     while i < tokens.len() {
         let token = tokens[i].as_str();
@@ -108,25 +267,29 @@ fn curl_wget_read_only_options(
             }
             "--post-file" | "--body-file" => return false,
             "--url" if query => {
-                if !tokens
+                let Some(allows_post) = tokens
                     .get(i + 1)
-                    .is_some_and(|url| is_elasticsearch_query_url(url))
-                {
+                    .and_then(|url| elasticsearch_query_url_allows_post(url))
+                else {
                     return false;
-                }
+                };
                 query_urls += 1;
+                get_only_urls += usize::from(!allows_post);
                 i += 1;
             }
             _ if query && token.starts_with("--url=") => {
-                if !is_elasticsearch_query_url(&token["--url=".len()..]) {
+                let Some(allows_post) =
+                    elasticsearch_query_url_allows_post(&token["--url=".len()..])
+                else {
                     return false;
-                }
+                };
                 query_urls += 1;
+                get_only_urls += usize::from(!allows_post);
             }
             // Consume ordinary metadata operands so a URL in a header or
             // user agent cannot masquerade as the request destination.
             "-H" | "--header" | "-u" | "--user" | "-A" | "--user-agent" | "-m"
-            | "--connect-timeout" | "--max-time"
+            | "--connect-timeout" | "--max-time" | "-w" | "--write-out"
                 if query =>
             {
                 if tokens.get(i + 1).is_none_or(|value| value.starts_with('@')) {
@@ -242,7 +405,7 @@ fn curl_wget_read_only_options(
                             }
                             break;
                         }
-                        'H' | 'u' | 'A' | 'm' if query => {
+                        'H' | 'u' | 'A' | 'm' | 'w' if query => {
                             let rest: String = chars[j + 1..].iter().collect();
                             if rest.is_empty() {
                                 consumed_next_token = true;
@@ -303,16 +466,32 @@ fn curl_wget_read_only_options(
                 }
             }
             _ if query => {
-                if !is_elasticsearch_query_url(token) {
+                let Some(allows_post) = elasticsearch_query_url_allows_post(token) else {
                     return false;
-                }
+                };
                 query_urls += 1;
+                get_only_urls += usize::from(!allows_post);
             }
             _ => {}
         }
         i += 1;
     }
+    if get_only_urls > 0 && tokens.iter().any(|token| sends_post_or_body(token)) {
+        return false;
+    }
     !query || query_urls > 0
+}
+
+/// Whether one curl/wget argument selects POST or carries a request body.
+fn sends_post_or_body(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    let cluster = token.starts_with('-') && !token.starts_with("--");
+    lower == "post"
+        || lower.ends_with("=post")
+        || ["--data", "--json", "--post", "--body"]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+        || (cluster && (token.contains('d') || lower.ends_with("post")))
 }
 
 /// Accept read-only kubectl verbs after global flags; reject Secret reads and
