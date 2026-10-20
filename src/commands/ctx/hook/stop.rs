@@ -51,6 +51,22 @@ fn diagnostics_stop_nudge(
 }
 
 /// The agent's latest final message, the supervisor's evidence channel for work outside the cwd.
+/// Nothing is read until the supervisor needs it; the key (transcript size and mtime) lets it skip
+/// an unchanged transcript.
+fn claim_key(transcript: &str) -> String {
+    std::fs::metadata(transcript)
+        .ok()
+        .and_then(|meta| {
+            let modified = meta
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?;
+            Some(format!("{}:{}", meta.len(), modified.as_nanos()))
+        })
+        .unwrap_or_default()
+}
+
 fn final_message(env: EnvLookup<'_>, transcript: &str) -> Option<String> {
     if transcript.is_empty() {
         return None;
@@ -87,7 +103,10 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         &payload.repo(),
         &stable_short,
         &hook_session,
-        &|| final_message(env, &payload.transcript_path),
+        &crate::commands::ctx::supervisor::Claim {
+            key: claim_key(&payload.transcript_path),
+            read: &|| final_message(env, &payload.transcript_path),
+        },
     ) {
         let _ = writeln!(w, "{}", with_stop_block(None, &reason));
         return Ok(0);
@@ -327,7 +346,10 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
                     adapter.as_deref(),
                 )
             },
-            &|| final_message(env, &payload.transcript_path),
+            &crate::commands::ctx::supervisor::Claim {
+                key: claim_key(&payload.transcript_path),
+                read: &|| final_message(env, &payload.transcript_path),
+            },
         );
     }
 

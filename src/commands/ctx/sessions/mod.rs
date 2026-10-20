@@ -453,6 +453,9 @@ pub fn short_is_live(state: &StateDir, short: &str) -> bool {
     load_record(state, short).is_some_and(|record| record_is_alive(&record))
 }
 
+/// With no session record the start time is unknown: evidence readers look back this far.
+pub(crate) const UNKNOWN_START_WINDOW_SECS: u64 = 24 * 60 * 60;
+
 /// Read one record without liveness judgment or registry cleanup. (#169)
 pub fn load_record(state: &StateDir, short: &str) -> Option<Record> {
     std::fs::read_to_string(record_path(state, short))

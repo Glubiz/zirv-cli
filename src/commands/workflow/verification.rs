@@ -481,22 +481,9 @@ pub fn changed_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
 /// Paths a session may have written source into: tracked changes against HEAD (minus `.zirv/work`
 /// and `.zirv/memory`) plus untracked files, except those under any hidden component
 /// (`.zirv/`, `.claude/`, `.idea/`, `.DS_Store`). (#922)
-pub fn candidate_edit_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
+pub fn candidate_edit_paths(repo: &Path) -> CtxResult<CandidateEdits> {
     let root = git_root(repo);
-    let mut paths = Vec::new();
-    for (args, untracked) in [
-        (&["diff", "--name-only", "-z", "HEAD"][..], false),
-        (
-            &[
-                "ls-files",
-                "-z",
-                "--others",
-                "--exclude-standard",
-                "--full-name",
-            ][..],
-            true,
-        ),
-    ] {
+    let git_list = |args: &[&str]| -> CtxResult<Vec<PathBuf>> {
         let output = git_at(&root).args(args).output()?;
         if !output.status.success() {
             return Err(format!(
@@ -505,18 +492,64 @@ pub fn candidate_edit_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
             )
             .into());
         }
-        paths.extend(git_paths(&output.stdout).filter(|path| {
-            if untracked {
-                return !path
-                    .components()
-                    .any(|part| part.as_os_str().to_string_lossy().starts_with('.'));
-            }
+        Ok(git_paths(&output.stdout).collect())
+    };
+    let is_hidden = |path: &Path| {
+        path.components()
+            .any(|part| part.as_os_str().to_string_lossy().starts_with('.'))
+    };
+    let mut tracked: Vec<PathBuf> = git_list(&["diff", "--name-only", "-z", "HEAD"])?
+        .into_iter()
+        .filter(|path| {
             !super::classify::is_workflow_work_path(path) && !path.starts_with(".zirv/memory")
-        }));
+        })
+        .collect();
+    // Untracked directories come back collapsed; each is expanded only until the cap is reached.
+    // Plain files first, so a big collapsed directory never crowds a lone new file out.
+    let (dirs, mut untracked): (Vec<PathBuf>, Vec<PathBuf>) = git_list(&[
+        "ls-files",
+        "-z",
+        "--others",
+        "--exclude-standard",
+        "--full-name",
+        "--directory",
+    ])?
+    .into_iter()
+    .filter(|entry| !is_hidden(entry))
+    .partition(|entry| entry.to_string_lossy().ends_with('/'));
+    untracked.truncate(UNTRACKED_CANDIDATES_MAX);
+    for dir in dirs {
+        if untracked.len() >= UNTRACKED_CANDIDATES_MAX {
+            break;
+        }
+        let dir = dir.to_string_lossy().into_owned();
+        let inside = git_list(&[
+            "ls-files",
+            "-z",
+            "--others",
+            "--exclude-standard",
+            "--full-name",
+            "--",
+            &dir,
+        ])?;
+        untracked.extend(inside.into_iter().filter(|path| !is_hidden(path)));
     }
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
+    untracked.truncate(UNTRACKED_CANDIDATES_MAX);
+    tracked.sort();
+    tracked.dedup();
+    untracked.sort();
+    untracked.dedup();
+    Ok(CandidateEdits { tracked, untracked })
+}
+
+/// How many untracked files `candidate_edit_paths` lists at most.
+const UNTRACKED_CANDIDATES_MAX: usize = 200;
+
+/// Tracked changes against HEAD and visible untracked files, kept apart: only the untracked ones
+/// need a recency bound when the session start is unknown.
+pub struct CandidateEdits {
+    pub tracked: Vec<PathBuf>,
+    pub untracked: Vec<PathBuf>,
 }
 
 fn changed_paths_at_root(root: &Path) -> CtxResult<Vec<PathBuf>> {
@@ -3444,6 +3477,57 @@ mod tests {
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "base"]);
         repo
+    }
+
+    /// #922 review: untracked candidates are capped, hidden paths are skipped, and an untracked
+    /// directory is expanded only up to the cap rather than listed wholesale.
+    #[test]
+    fn candidate_edit_paths_caps_untracked_files_and_skips_hidden_ones() {
+        let repo = git_repo();
+        std::fs::create_dir_all(repo.path().join("bulk")).unwrap();
+        for n in 0..(UNTRACKED_CANDIDATES_MAX + 50) {
+            std::fs::write(repo.path().join(format!("bulk/f{n}.txt")), "x").unwrap();
+        }
+        std::fs::create_dir_all(repo.path().join(".idea")).unwrap();
+        std::fs::write(repo.path().join(".idea/w.xml"), "x").unwrap();
+        std::fs::write(repo.path().join(".DS_Store"), "x").unwrap();
+        std::fs::write(repo.path().join("new_mod.rs"), "x").unwrap();
+        std::fs::write(repo.path().join("tracked.txt"), "two\n").unwrap();
+        let edits = candidate_edit_paths(repo.path()).unwrap();
+        assert_eq!(edits.tracked, vec![PathBuf::from("tracked.txt")]);
+        assert_eq!(edits.untracked.len(), UNTRACKED_CANDIDATES_MAX);
+        assert!(edits.untracked.iter().all(
+            |path| !path.to_string_lossy().contains(".idea") && path != Path::new(".DS_Store")
+        ));
+    }
+
+    /// #922 review round 2: a large earlier untracked directory must not crowd a plain untracked
+    /// source file out of the capped candidate list.
+    #[test]
+    fn a_big_untracked_directory_does_not_hide_a_later_untracked_source_file() {
+        let repo = git_repo();
+        std::fs::create_dir_all(repo.path().join("aaa")).unwrap();
+        for n in 0..(UNTRACKED_CANDIDATES_MAX + 50) {
+            std::fs::write(repo.path().join(format!("aaa/f{n}.txt")), "x").unwrap();
+        }
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/lib.rs"), "x").unwrap();
+        for args in [vec!["add", "src/lib.rs"], vec!["commit", "-q", "-m", "lib"]] {
+            let status = Command::new("git")
+                .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+                .args(&args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        std::fs::write(repo.path().join("src/new_mod.rs"), "x").unwrap();
+        let edits = candidate_edit_paths(repo.path()).unwrap();
+        assert!(
+            edits.untracked.contains(&PathBuf::from("src/new_mod.rs")),
+            "{:?}",
+            edits.untracked.len()
+        );
     }
 
     /// Every state-touching run in this module writes under `state_root`, so a
