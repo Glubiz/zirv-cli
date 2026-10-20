@@ -817,6 +817,8 @@ fn inline_interpreter_code(tokens: &[String]) -> Option<&str> {
 const INLINE_WRITE_PRIMITIVES: &[&str] = &[
     ".write_text(",
     ".write_bytes(",
+    "os.system(",
+    "shutil.",
     "writeFile",
     "writeFileSync",
     "appendFile",
@@ -872,7 +874,17 @@ pub(crate) fn orchestrator_repo_write_target(
         .flat_map(|root| [format!("{root}/.zirv/work"), format!("{root}/.zirv/memory")])
         .collect();
 
-    let sanitized = super::shell::redact_inert_heredocs(command);
+    let (sanitized, code_bodies) = super::shell::redact_inert_heredocs(command);
+    // A python/node-style heredoc body is code in that language: judge it
+    // by its write primitives, never as shell redirects (`if i>5:`).
+    if code_bodies.iter().any(|body| {
+        inline_code_has_write_primitive(body)
+            && !cwd_allowed_roots
+                .iter()
+                .any(|root| body.contains(root.as_str()))
+    }) {
+        return Some("<inline interpreter write>".to_string());
+    }
     // Track only the immediately preceding diff-producing git segment;
     // reset at each other segment before considering a patch-apply exemption.
     let mut previous_diff_producing_git = false;
@@ -1414,12 +1426,12 @@ mod tests {
             "cat <<EOF | sh\necho pwned > src/main.rs\nEOF",
             "cat <<EOF | bash\necho pwned > src/main.rs\nEOF",
             "zsh <<EOF\necho pwned > src/main.rs\nEOF",
-            "python3 <<EOF\necho pwned > src/main.rs\nEOF",
+            "python3 <<EOF\nopen('src/main.rs','w').write('x')\nEOF",
             "bash <<EOF 2>&1\necho pwned > src/main.rs\nEOF",
             "bash <<EOF | tee log\necho pwned > src/main.rs\nEOF",
             "sh <<EOF && echo done\necho pwned > src/main.rs\nEOF",
             "bash <<EOF; true\necho pwned > src/main.rs\nEOF",
-            "python3 <<EOF || exit 1\necho pwned > src/main.rs\nEOF",
+            "python3 <<EOF || exit 1\nopen('src/main.rs','w').write('x')\nEOF",
             "command bash <<EOF\necho pwned > src/main.rs\nEOF",
             "nohup bash <<EOF\necho pwned > src/main.rs\nEOF",
             "time bash <<EOF\necho pwned > src/main.rs\nEOF",
@@ -1678,6 +1690,129 @@ mod tests {
             "git -C /w diff | git apply",
             "git diff main | git apply -",
             "git format-patch --stdout | git am",
+        ] {
+            assert_eq!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
+                None,
+                "{command}"
+            );
+        }
+    }
+
+    /// #923: a quoted heredoc body is data even when it holds backticks or
+    /// `$(`; only an unquoted body with a live substitution stays visible.
+    #[test]
+    fn orchestrator_repo_write_target_treats_quoted_heredoc_bodies_as_data() {
+        let cwd = "/work/repo";
+        for command in [
+            "cat >> /private/tmp/claude-501/s/scratchpad/record.md <<'EOF'\n## Cost\na >5% cost, `code` and $(x)\nEOF",
+            "cat >> $TMPDIR/record.md <<'EOF'\na >5% cost with `ticks`\nEOF",
+            "cat > /tmp/claude-501/r.md <<\"EOF\"\nrow >5% and $(not run)\nEOF",
+            "glab mr update 349 --description \"$(cat <<'EOF'\nFields show <style> style when the value comes from the style `x` $(y)\nEOF\n)\"",
+            "cat <<-'EOF'\n\tcost >5%, `x`\n\tEOF",
+        ] {
+            assert_eq!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
+                None,
+                "{command}"
+            );
+        }
+        for command in [
+            "cat > src/x.rs <<'EOF'\nfn main() {}\nEOF",
+            "cat >> src/x.rs <<'EOF'\na >5% `x` $(y)\nEOF",
+            "cat <<'EOF' > src/x.rs\na `x`\nEOF",
+        ] {
+            assert!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None)
+                    .is_some(),
+                "{command}"
+            );
+        }
+    }
+
+    /// #923: a heredoc fed to an interpreter is scanned as that language's
+    /// code, not as shell, so a comparison operator is not a redirect while
+    /// a real write primitive still is.
+    #[test]
+    fn orchestrator_repo_write_target_scans_interpreter_heredocs_as_code_not_shell() {
+        let cwd = "/work/repo";
+        for command in [
+            "python3 -I - \"$R\" <<'EOF'\nimport sys\nif x and i>5:\n    print(i)\nEOF",
+            "python3 - <<'EOF'\nprint(open('src/x.py').read())\nEOF",
+            "node - <<'EOF'\nif (a>5) console.log(a)\nEOF",
+        ] {
+            assert_eq!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
+                None,
+                "{command}"
+            );
+        }
+        for command in [
+            "python3 - <<'EOF'\nopen('src/x.py','w').write('a')\nEOF",
+            "python3 - <<'EOF'\nfrom pathlib import Path\nPath('src/x.py').write_text('a')\nEOF",
+            "node - <<'EOF'\nrequire('fs').writeFileSync('src/x.js','a')\nEOF",
+            "bash <<'EOF'\nif [ 1 ]; then echo x > src/x.rs; fi\nEOF",
+        ] {
+            assert!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None)
+                    .is_some(),
+                "{command}"
+            );
+        }
+    }
+
+    /// #923/#924 follow-up: descriptor duplication, null sinks, quoted sed
+    /// expressions, prose and heredoc shapes seen in the wild are not writes.
+    #[test]
+    fn orchestrator_repo_write_target_ignores_recorded_false_targets() {
+        let cwd = "/work/repo";
+        for command in [
+            "cargo build 2>&1 | tail -3",
+            "cargo build 2>/dev/null",
+            "cargo build >/dev/null 2>&1",
+            "cargo build &>/dev/null",
+            "cargo build >&2",
+            "cat <<EOF\nEOF",
+            "git commit -m \"fix x > where y does z\"",
+            "echo 'if a > where then does' | grep x",
+            "sed -n 's/-ge 90 \\]\\]/-ge 95 ]]/p' src/x.sh",
+            "sed -i 's/-ge 90 \\]\\]/-ge 95 ]]/' /private/tmp/claude-501/s/scratchpad/x.sh",
+            "sed -i 's#^B = .*#B = 2#' /private/tmp/claude-501/s/scratchpad/x.toml",
+            "git push -q -u origin feat/x <<EOF\nnote > where\nEOF",
+            "git push -q -u origin feat/x 2>&1 <<'EOF'\nnote > does\nEOF",
+        ] {
+            assert_eq!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),
+                None,
+                "{command}"
+            );
+        }
+        for command in [
+            "echo x > README.md",
+            "echo x >README.md 2>&1",
+            "sed -i 's/a/b/' src/file.rs",
+            "cargo build 2>&1 > src/out.log",
+        ] {
+            assert!(
+                orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None)
+                    .is_some(),
+                "{command}"
+            );
+        }
+    }
+
+    /// #923: a write whose target resolves outside the repository (the
+    /// session scratchpad, `$TMPDIR`, `/tmp/claude-<uid>`) is not a
+    /// repository write, relative or absolute.
+    #[test]
+    fn orchestrator_repo_write_target_ignores_out_of_repo_targets() {
+        let cwd = "/work/repo";
+        for command in [
+            "echo x > /private/tmp/claude-501/s/scratchpad/a.md",
+            "echo x >> /tmp/claude-501/a.md",
+            "echo x > ../elsewhere/a.md",
+            "cd /private/tmp/claude-501/s/scratchpad && echo x > a.md",
+            "tee /tmp/claude-501/a.md < /dev/null",
         ] {
             assert_eq!(
                 orchestrator_repo_write_target(command, cwd, &fake_repo_root_of, &|_| None),

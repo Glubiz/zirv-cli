@@ -658,12 +658,13 @@ fn apply_span_redactions(
 /// malformed or differently quoted markers rather than guessing (#136).
 /// With `expanding`, also accept a double-quoted or bare word delimiter
 /// (bodies that substitute). Returns the delimiter, the marker end, and
-/// whether `<<-` strips leading tabs from the terminator.
+/// whether `<<-` strips leading tabs from the terminator, and whether the
+/// delimiter was quoted (a quoted body never expands).
 fn parse_heredoc_marker(
     chars: &[char],
     start: usize,
     expanding: bool,
-) -> Option<(String, usize, bool)> {
+) -> Option<(String, usize, bool, bool)> {
     let mut i = start + 2;
     let dash = chars.get(i) == Some(&'-');
     if dash {
@@ -696,7 +697,7 @@ fn parse_heredoc_marker(
     }
     let delim: String = chars[delim_start..i].iter().collect();
     i += usize::from(quote.is_some());
-    (!delim.is_empty()).then_some((delim, i, dash))
+    (!delim.is_empty()).then_some((delim, i, dash, quote.is_some()))
 }
 
 /// Finds the terminator line for a heredoc body starting at `body_start`
@@ -741,25 +742,33 @@ fn find_heredoc_terminator(
 /// rather than risking excessive redaction (#136).
 pub(super) fn redact_single_quoted_heredocs(command: &str) -> String {
     let chars: Vec<char> = command.chars().collect();
-    let redacted = redact_heredocs_scan(&chars, 0, false);
+    let redacted = redact_heredocs_scan(&chars, 0, false, &mut Vec::new());
     canonical_shell_syntax(&redacted).unwrap_or(redacted)
 }
 
 /// Like [`redact_single_quoted_heredocs`] but for write-target scanning
 /// only: bodies of unquoted and double-quoted heredocs are prose too, unless
 /// they hold a `$(`/backtick substitution that could carry a real write
-/// (those stay visible). Never use this for execution-safety screens.
-pub(super) fn redact_inert_heredocs(command: &str) -> String {
+/// (those stay visible). A body fed to a python/node/ruby/perl interpreter is
+/// that language's code, not shell: it is redacted from the shell text and
+/// returned for a language-level write scan instead. Never use this for
+/// execution-safety screens.
+pub(super) fn redact_inert_heredocs(command: &str) -> (String, Vec<String>) {
     let chars: Vec<char> = command.chars().collect();
-    let redacted = redact_heredocs_scan(&chars, 0, true);
-    canonical_shell_syntax(&redacted).unwrap_or(redacted)
+    let mut code_bodies = Vec::new();
+    let redacted = redact_heredocs_scan(&chars, 0, true, &mut code_bodies);
+    (
+        canonical_shell_syntax(&redacted).unwrap_or(redacted),
+        code_bodies,
+    )
 }
 
 /// True when a heredoc body may be executed as code: fail closed, any word
 /// anywhere on its opener line (before or after the marker, whatever wraps it)
 /// naming a shell or interpreter makes the body a script, not prose. A lone
-/// `.` counts only as the first word of a segment.
-fn heredoc_feeds_interpreter(opener_line: &str) -> bool {
+/// `.` counts only as the first word of a segment. Without `include_code`
+/// only shells and wrappers count, not the python/node-style interpreters.
+fn heredoc_feeds_interpreter(opener_line: &str, include_code: bool) -> bool {
     use super::jev_approve::{
         JEV_APPROVE_ALWAYS_WRAPPER_PROGRAMS, JEV_APPROVE_INLINE_CODE_INTERPRETERS,
         JEV_APPROVE_SHELL_PROGRAMS,
@@ -777,14 +786,20 @@ fn heredoc_feeds_interpreter(opener_line: &str) -> bool {
                         || matches!(program.as_str(), "ed" | "ex")
                         || JEV_APPROVE_SHELL_PROGRAMS.contains(&program.as_str())
                         || JEV_APPROVE_ALWAYS_WRAPPER_PROGRAMS.contains(&program.as_str())
-                        || JEV_APPROVE_INLINE_CODE_INTERPRETERS.contains(&program.as_str())
+                        || (include_code
+                            && JEV_APPROVE_INLINE_CODE_INTERPRETERS.contains(&program.as_str()))
                 })
         })
 }
 
 /// Recurse into live `$(...)` even inside double quotes to find heredocs;
 /// single quotes suppress substitution. Bound recursion depth (#136).
-fn redact_heredocs_scan(chars: &[char], depth: usize, expanding: bool) -> String {
+fn redact_heredocs_scan(
+    chars: &[char],
+    depth: usize,
+    expanding: bool,
+    code_bodies: &mut Vec<String>,
+) -> String {
     if depth >= MAX_STRUCTURAL_DEPTH {
         return chars.iter().collect();
     }
@@ -837,6 +852,7 @@ fn redact_heredocs_scan(chars: &[char], depth: usize, expanding: bool) -> String
                 &chars[i + 2..end],
                 depth + 1,
                 expanding,
+                code_bodies,
             ));
             out.push(')');
             i = end + 1;
@@ -867,7 +883,8 @@ fn redact_heredocs_scan(chars: &[char], depth: usize, expanding: bool) -> String
         // inspected as a heredoc opener at all.
         if c == '<'
             && chars.get(i + 1) == Some(&'<')
-            && let Some((delim, marker_end, strip_tabs)) = parse_heredoc_marker(chars, i, expanding)
+            && let Some((delim, marker_end, strip_tabs, quoted)) =
+                parse_heredoc_marker(chars, i, expanding)
         {
             let opener_line_start = out.rfind('\n').map_or(0, |p| p + 1);
             out.extend(chars[i..marker_end].iter());
@@ -878,8 +895,10 @@ fn redact_heredocs_scan(chars: &[char], depth: usize, expanding: bool) -> String
                 out.push(chars[i]);
                 i += 1;
             }
-            let interpreter_stdin =
-                expanding && heredoc_feeds_interpreter(&out[opener_line_start..]);
+            let opener_line = &out[opener_line_start..];
+            let interpreter_stdin = expanding && heredoc_feeds_interpreter(opener_line, false);
+            let code_stdin =
+                expanding && !interpreter_stdin && heredoc_feeds_interpreter(opener_line, true);
             if i < chars.len() {
                 out.push('\n');
                 i += 1;
@@ -887,8 +906,14 @@ fn redact_heredocs_scan(chars: &[char], depth: usize, expanding: bool) -> String
             let body_start = i;
             match find_heredoc_terminator(chars, i, &delim, strip_tabs) {
                 Some((term_start, term_end)) => {
+                    if code_stdin {
+                        code_bodies.push(chars[body_start..term_start].iter().collect());
+                    }
+                    // A quoted delimiter suppresses expansion, so its body
+                    // never carries a live `$(`/backtick.
                     let body_substitutes = interpreter_stdin
                         || (expanding
+                            && !quoted
                             && chars[body_start..term_start]
                                 .windows(2)
                                 .any(|w| w == ['$', '('] || w[0] == '`' || w[1] == '`'));
