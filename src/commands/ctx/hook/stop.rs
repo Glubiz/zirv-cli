@@ -50,6 +50,36 @@ fn diagnostics_stop_nudge(
     )
 }
 
+/// The agent's latest final message, the supervisor's evidence channel for work outside the cwd.
+/// Nothing is read until the supervisor needs it; the key (transcript size and mtime) lets it skip
+/// an unchanged transcript.
+fn claim_key(transcript: &str) -> String {
+    std::fs::metadata(transcript)
+        .ok()
+        .and_then(|meta| {
+            let modified = meta
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?;
+            Some(format!("{}:{}", meta.len(), modified.as_nanos()))
+        })
+        .unwrap_or_default()
+}
+
+fn final_message(env: EnvLookup<'_>, transcript: &str) -> Option<String> {
+    if transcript.is_empty() {
+        return None;
+    }
+    let adapter = adapters::select_for_identity(
+        env(adapters::AGENT_ENV).as_deref(),
+        &[],
+        &CtxConfig::default(),
+    )
+    .ok()?;
+    adapter.final_assistant_message(&std::fs::read_to_string(transcript).ok()?)
+}
+
 pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
     // Every early return is deliberate: a hook that errors must still exit 0.
     let Ok(payload) = HookPayload::parse(stdin) else {
@@ -68,11 +98,15 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     // three blocks per ruling is what stops the loop. The shape is the documented
     // `{"decision":"block","reason":...}` (https://code.claude.com/docs/en/hooks).
     let hook_session = env(SESSION_ENV).unwrap_or_else(|| payload.session_id.clone());
-    if let Some(reason) = crate::commands::ctx::supervisor::stop_block(
+    if let Some(reason) = crate::commands::ctx::supervisor::stop_block_claimed(
         env,
         &payload.repo(),
         &stable_short,
         &hook_session,
+        &crate::commands::ctx::supervisor::Claim {
+            key: claim_key(&payload.transcript_path),
+            read: &|| final_message(env, &payload.transcript_path),
+        },
     ) {
         let _ = writeln!(w, "{}", with_stop_block(None, &reason));
         return Ok(0);
@@ -311,6 +345,10 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
                     &jsonl,
                     adapter.as_deref(),
                 )
+            },
+            &crate::commands::ctx::supervisor::Claim {
+                key: claim_key(&payload.transcript_path),
+                read: &|| final_message(env, &payload.transcript_path),
             },
         );
     }

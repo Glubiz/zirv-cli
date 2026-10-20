@@ -235,8 +235,7 @@ pub use policy::{glob_match, resolve};
 pub(crate) use prompt_free::permission_request_command_is_prompt_free;
 pub(crate) use readonly::is_read_only_escape_safe;
 pub(crate) use retry::{
-    SANDBOX_DENY_READ_HOME_PATHS, command_fails_escape_screen, is_reserved_zirv_escape_safe,
-    text_names_credential_material,
+    SANDBOX_DENY_READ_HOME_PATHS, command_fails_escape_screen, text_names_credential_material,
 };
 pub use rules::{builtin_allow, builtin_ask, builtin_deny};
 pub(crate) use rules::{
@@ -282,6 +281,15 @@ mod tests {
             .into_iter()
             .find(|root| root.starts_with("/tmp/claude-"))
             .expect("real claude scratchpad root")
+    }
+
+    /// Every segment of `command` is a retry-safe reserved zirv built-in.
+    pub(super) fn is_reserved_zirv_escape_safe(command: &str) -> bool {
+        let candidates = normalize_segments(command);
+        !candidates.is_empty()
+            && candidates
+                .iter()
+                .all(|candidate| is_reserved_zirv_escape_safe_segment(candidate))
     }
 
     pub(super) fn table(text: &str) -> Option<toml::Value> {

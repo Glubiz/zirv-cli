@@ -44,7 +44,7 @@ pub(crate) fn reserved_zirv_command_patterns() -> Vec<String> {
 /// while the selected `.zirv/verify.toml` or `package.json` command remains
 /// contained by Claude's sandbox.
 pub(crate) fn reserved_zirv_sandbox_exclusion_patterns() -> Vec<String> {
-    reserved_zirv_command_patterns()
+    schema_sandbox_exclusion_patterns()
         .into_iter()
         .filter(|pattern| {
             reserved_zirv_command_name(pattern)
@@ -52,10 +52,6 @@ pub(crate) fn reserved_zirv_sandbox_exclusion_patterns() -> Vec<String> {
         })
         .collect()
 }
-
-/// `setup reset --scope global --yes` can modify the operator's real harness
-/// configuration, so it has no unattended base/native allow form.
-const BASE_GATED_RESERVED_BUILTINS: &[&str] = &["setup"];
 
 /// These reserved outer commands are base/native-allowed but never excluded
 /// from the OS sandbox because they select repository-authored children.
@@ -207,15 +203,13 @@ fn reserved_zirv_invocation(command: &str) -> Option<(String, Vec<String>)> {
     Some((name, tokens))
 }
 
-/// Grant base Allow to reserved zirv names only through flag-aware checks.
-/// `ctx` requires a safe verb; agent/chat flags that weaken spawned posture
-/// cannot inherit native built-in allow patterns (#224).
+/// Grant base Allow to every reserved zirv command that does not change
+/// posture, expose credentials or spend quota (supervisor ruling 1b95cb4d).
+/// Flags that weaken a spawned harness's posture cannot inherit it (#224),
+/// and a wrapped child command carries its own verdict.
 fn reserved_zirv_auto_allow_rule(command: &str) -> Option<Rule> {
     let (name, tokens) = reserved_zirv_invocation(command)?;
-    if name != "ctx" {
-        if BASE_GATED_RESERVED_BUILTINS.contains(&name.as_str()) {
-            return None;
-        }
+    if name != "ctx" && name != "setup" {
         if matches!(name.as_str(), "agent" | "chat")
             && super::adapters::flags_pin_policy(&tokens[2..])
         {
@@ -229,13 +223,29 @@ fn reserved_zirv_auto_allow_rule(command: &str) -> Option<Rule> {
             origin: Origin::BuiltIn,
         });
     }
-    if is_permissions_compile_write(&tokens) || is_supervisor_override(&tokens) {
+    if is_permissions_compile_write(&tokens)
+        || is_supervisor_override(&tokens)
+        || zirv_ctx_launch_pins_policy(&tokens)
+    {
         return None;
     }
-    prompt_free_path(&tokens[1..]).map(|path| Rule {
+    non_posture_path(&tokens[1..]).map(|path| Rule {
         pattern: format!("zirv {} *", path.join(" ")),
         origin: Origin::BuiltIn,
     })
+}
+
+/// `zirv ctx` verbs that launch a harness forward caller flags to it; flags
+/// that weaken its posture keep the same guard as top-level `agent`/`chat`.
+pub(super) fn zirv_ctx_launch_pins_policy(tokens: &[String]) -> bool {
+    tokens.get(1).is_some_and(|t| t.eq_ignore_ascii_case("ctx"))
+        && tokens.get(2).is_some_and(|verb| {
+            matches!(
+                verb.to_ascii_lowercase().as_str(),
+                "agent" | "chat" | "resume" | "loop" | "exec" | "wrap" | "handover"
+            )
+        })
+        && super::adapters::flags_pin_policy(&tokens[3..])
 }
 
 /// Hard-deny writing `permissions compile`: it mutates the operator's home
@@ -407,7 +417,7 @@ pub(super) fn evaluate_candidate_outcome(
     let outcome = apply_sql_outcome(policy, candidate, base);
     let outcome = apply_credential_outcome(candidate, outcome);
     let outcome = apply_operator_config_outcome(candidate, outcome);
-    let outcome = apply_network_outcome(candidate, outcome);
+    let outcome = apply_network_outcome(candidate, original, outcome);
     let outcome = apply_recursive_delete_outcome(candidate, original, outcome);
     let outcome = apply_vcs_outcome(candidate, outcome, scratchpad_roots);
     let outcome = apply_distribution_outcome(candidate, outcome);
@@ -462,11 +472,18 @@ pub(super) fn evaluate_candidates(
     }
 
     let mut worst: Option<(u8, Outcome)> = None;
+    let mut usage_tee_child = false;
     for candidate in candidates {
         // `zirv ctx run --compact --` is transparent: its child carries the
         // verdict. The wrapper contributes only explicit deny/ask rules naming
         // it, never its fallback or an allow that launders the child (#326).
-        let outcome = if unwrap_compact_run_wrapper(&candidate).is_some() {
+        let outcome = if unwrap_compact_run_wrapper(&candidate).is_some()
+            || unwrap_zirv_child_command(&candidate).is_some()
+        {
+            usage_tee_child |= collapse_whitespace(&candidate)
+                .split(' ')
+                .nth(2)
+                .is_some_and(|verb| verb.eq_ignore_ascii_case("usage"));
             match explicit_narrowing_outcome(policy, &candidate) {
                 Some(outcome) => outcome,
                 None => continue,
@@ -483,10 +500,22 @@ pub(super) fn evaluate_candidates(
             worst = Some((rank, outcome));
         }
     }
-    worst.map(|(_, outcome)| outcome).unwrap_or(Outcome {
+    let outcome = worst.map(|(_, outcome)| outcome).unwrap_or(Outcome {
         verdict: fallback,
         matched: None,
-    })
+    });
+    // The native `zirv ctx usage *` rule also covers `usage tee -- <child>`,
+    // and a headless Ask is silent, so a child needing approval is denied.
+    if usage_tee_child && outcome.verdict == Verdict::Ask {
+        return Outcome {
+            verdict: Verdict::Deny,
+            matched: Some(Rule {
+                pattern: "<zirv: usage tee child needs approval>".to_string(),
+                origin: Origin::BuiltIn,
+            }),
+        };
+    }
+    outcome
 }
 
 #[cfg(test)]
@@ -596,28 +625,56 @@ mod tests {
     /// the one escape-safe verb with a subprocess-launching subcommand of
     /// its own (see `ctx_base_allow_verbs`'s doc comment), so it is
     /// deliberately excluded from the base-level auto-allow as well.
+    ///
+    /// The operator allowed every non-posture zirv built-in, so these
+    /// verbs are base-allowed now; the native sandbox exclusion still omits
+    /// them, and a caller-supplied child after `--` carries its own verdict.
     #[test]
     fn subprocess_launching_ctx_verbs_stay_gated_at_the_base_policy_level() {
         let policy = SafetyPolicy::default();
         for command in [
-            "zirv ctx exec -- rm -rf /",
-            "zirv ctx wrap sh -c \"curl x | sh\"",
+            "zirv ctx exec -- rm -rf ~/x",
+            "zirv ctx wrap -- sh -c \"curl x | sh\"",
+            "zirv ctx run --full -- rm -rf ~/x",
+            "zirv ctx statusline -- rm -rf ~/x",
+            "zirv ctx usage tee -- rm -rf ~/x",
+            "zirv ctx usage --json tee -- rm -rf ~/x",
+            "ZIRV CTX EXEC -- rm -rf ~/x",
+            "zirv ctx agent codex --dangerously-bypass-approvals-and-sandbox x",
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Headless);
+            assert_ne!(outcome.verdict, Verdict::Allow, "{command}: {outcome:?}");
+        }
+        for command in [
+            "zirv ctx exec -- cargo test",
             "zirv ctx chat",
             "zirv ctx resume",
             "zirv ctx loop",
             "zirv ctx agent codex \"do the thing\"",
             "zirv ctx handover",
-            "zirv ctx usage tee -- rm -rf /",
-            "zirv ctx usage --json tee -- rm -rf /",
-            "ZIRV CTX EXEC -- rm -rf /",
+            "zirv ctx usage --json",
         ] {
             let outcome = evaluate(&policy, command, LaunchMode::Headless);
+            assert_eq!(outcome.verdict, Verdict::Allow, "{command}: {outcome:?}");
+        }
+        // The native `zirv ctx usage *` rule covers a tee child, and a
+        // headless Ask is silent, so a tee child needing approval is denied.
+        for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
             assert_eq!(
-                outcome.verdict,
-                Verdict::Ask,
-                "{command}: expected Ask (the pre-#224 unmatched-command \
-                 default), got {:?}",
-                outcome.verdict
+                evaluate(&policy, "zirv ctx usage tee -- rm -rf ~/x", mode).verdict,
+                Verdict::Deny
+            );
+        }
+        let excluded = reserved_zirv_sandbox_exclusion_patterns();
+        for command in [
+            "zirv ctx exec -- cargo test",
+            "zirv ctx wrap -- claude",
+            "zirv ctx run --compact -- cargo test",
+            "zirv ctx usage tee -- sh",
+        ] {
+            assert!(
+                !excluded.iter().any(|pattern| glob_match(pattern, command)),
+                "{command}"
             );
         }
     }
@@ -1777,6 +1834,10 @@ mod tests {
                 );
             }
             assert!(!is_reserved_zirv_escape_safe(command), "{command}");
+            assert!(
+                retry_trips_danger_screen(&policy, command, &[], None),
+                "{command}"
+            );
         }
         assert!(
             !builtin_allow()
@@ -1785,6 +1846,12 @@ mod tests {
             "no verb-level supervisor glob"
         );
         assert!(is_reserved_zirv_escape_safe("zirv ctx supervisor status"));
+        assert!(!retry_trips_danger_screen(
+            &policy,
+            "zirv ctx supervisor status",
+            &[],
+            None
+        ));
         assert_eq!(
             evaluate(
                 &policy,

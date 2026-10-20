@@ -8,28 +8,15 @@ use std::sync::OnceLock;
 
 use super::*;
 
-/// Built-in command paths that are never prompt-free, with the reason. A
-/// path excludes its whole subtree. Everything else the schema lists is
-/// prompt-free; repo-authored scripts are not built-ins and never match.
-pub(super) const PROMPT_FREE_EXCLUSIONS: &[(&str, &str)] = &[
-    ("setup", "rewrites harness configuration and can reset it"),
+/// Built-in command paths that change posture, expose credentials or spend
+/// quota: never prompt-free, never base-allowed, and they keep asking on an
+/// unsandboxed retry (supervisor ruling 1b95cb4d). A path excludes its whole
+/// subtree; mutating `setup` and `ctx config` leaves join them in
+/// [`is_posture_path`].
+pub(super) const POSTURE_EXCLUSIONS: &[(&str, &str)] = &[
     (
         "benchmark run",
         "spends real model quota on every candidate",
-    ),
-    ("ctx exec", "supervises a caller-supplied headless command"),
-    ("ctx wrap", "runs a caller-supplied interactive command"),
-    ("ctx run", "runs a caller-supplied command"),
-    ("ctx loop", "runs headless sessions in a loop"),
-    ("ctx chat", "starts a nested interactive harness session"),
-    ("ctx resume", "starts a nested interactive harness session"),
-    (
-        "ctx agent",
-        "dispatches a worker; only the guarded top-level alias is allowed",
-    ),
-    (
-        "ctx handover",
-        "swaps the seat's harness in place and relaunches it",
     ),
     (
         "ctx api",
@@ -48,15 +35,6 @@ pub(super) const PROMPT_FREE_EXCLUSIONS: &[(&str, &str)] = &[
         "creates the operator's ~/.zirv/native.toml",
     ),
     (
-        "ctx measure baseline",
-        "writes the operator's committed measure baseline under ~/.zirv",
-    ),
-    (
-        "ctx capabilities",
-        "`--probe` spawns every configured MCP server command",
-    ),
-    ("ctx usage tee", "runs a caller-supplied statusline command"),
-    (
         "ctx supervisor override",
         "lifts a binding supervisor ruling and is operator-only",
     ),
@@ -72,6 +50,38 @@ pub(super) const PROMPT_FREE_EXCLUSIONS: &[(&str, &str)] = &[
         "ctx provider credential",
         "stores a provider secret on the machine",
     ),
+    ("update", "replaces the running zirv binary with a download"),
+];
+
+/// Further built-in paths kept out of the native allow list and the sandbox
+/// exclusions, with the reason. They launch a caller-supplied command or a
+/// nested session, so they stay sandboxed natively; the base policy allows
+/// them and lets a wrapped child carry its own verdict.
+pub(super) const PROMPT_FREE_EXCLUSIONS: &[(&str, &str)] = &[
+    ("setup", "rewrites harness configuration and can reset it"),
+    ("ctx exec", "supervises a caller-supplied headless command"),
+    ("ctx wrap", "runs a caller-supplied interactive command"),
+    ("ctx run", "runs a caller-supplied command"),
+    ("ctx loop", "runs headless sessions in a loop"),
+    ("ctx chat", "starts a nested interactive harness session"),
+    ("ctx resume", "starts a nested interactive harness session"),
+    (
+        "ctx agent",
+        "dispatches a worker; only the guarded top-level alias is allowed",
+    ),
+    (
+        "ctx handover",
+        "swaps the seat's harness in place and relaunches it",
+    ),
+    (
+        "ctx measure baseline",
+        "writes the operator's committed measure baseline under ~/.zirv",
+    ),
+    (
+        "ctx capabilities",
+        "`--probe` spawns every configured MCP server command",
+    ),
+    ("ctx usage tee", "runs a caller-supplied statusline command"),
 ];
 
 /// Top-level aliases that main.rs resolves to a canonical built-in.
@@ -82,27 +92,54 @@ const ROOT_ALIASES: &[(&str, &str)] = &[
     ("c", "create"),
 ];
 
+/// Which exclusion set a walk of the policy tree honours: every exclusion
+/// (native allow rules, sandbox exclusions, the `PermissionRequest` hook) or
+/// only the posture ones (the base policy and the unsandboxed retry).
+#[derive(Clone, Copy)]
+enum Gate {
+    PromptFree,
+    Posture,
+}
+
 #[derive(Default)]
 struct PolicyNode {
     children: BTreeMap<String, PolicyNode>,
     // Whether this path is itself runnable (a leaf, or an optional subcommand).
     leaf: bool,
     excluded: bool,
+    posture: bool,
 }
 
 impl PolicyNode {
-    fn clean(&self) -> bool {
-        !self.excluded && self.children.values().all(PolicyNode::clean)
+    fn blocked(&self, gate: Gate) -> bool {
+        match gate {
+            Gate::PromptFree => self.excluded,
+            Gate::Posture => self.posture,
+        }
+    }
+
+    fn clean(&self, gate: Gate) -> bool {
+        !self.blocked(gate) && self.children.values().all(|child| child.clean(gate))
     }
 }
 
-fn is_excluded_path(words: &[&str], mutating_leaf: bool) -> bool {
-    let named = PROMPT_FREE_EXCLUSIONS.iter().any(|(path, _)| {
+fn names_path(table: &[(&str, &str)], words: &[&str]) -> bool {
+    table.iter().any(|(path, _)| {
         let excluded: Vec<&str> = path.split(' ').collect();
         words.starts_with(&excluded)
-    });
-    // Mutating `ctx config` leaves write the operator's own configuration.
-    named || (mutating_leaf && words.starts_with(&["ctx", "config"]))
+    })
+}
+
+/// Mutating `setup` and `ctx config` leaves rewrite the operator's own
+/// harness or zirv configuration.
+fn is_posture_path(words: &[&str], mutating_leaf: bool) -> bool {
+    names_path(POSTURE_EXCLUSIONS, words)
+        || (mutating_leaf
+            && (words.starts_with(&["ctx", "config"]) || words.starts_with(&["setup"])))
+}
+
+fn is_excluded_path(words: &[&str], mutating_leaf: bool) -> bool {
+    is_posture_path(words, mutating_leaf) || names_path(PROMPT_FREE_EXCLUSIONS, words)
 }
 
 fn policy_tree() -> &'static PolicyNode {
@@ -125,7 +162,9 @@ fn policy_tree() -> &'static PolicyNode {
                     .entry(words[depth - 1].to_string())
                     .or_default();
                 let is_leaf = depth == words.len();
-                node.excluded |= is_excluded_path(&words[..depth], is_leaf && entry.mutating);
+                let mutating_leaf = is_leaf && entry.mutating;
+                node.excluded |= is_excluded_path(&words[..depth], mutating_leaf);
+                node.posture |= is_posture_path(&words[..depth], mutating_leaf);
                 node.leaf |= is_leaf;
             }
         }
@@ -141,47 +180,77 @@ fn canonical_root(name: &str) -> String {
         .map_or(lower, |(_, canonical)| (*canonical).to_string())
 }
 
-fn emit_rules(node: &PolicyNode, path: &str, out: &mut Vec<String>) {
-    if node.clean() {
+/// `with_args` widens a runnable parent whose excluded children are launch-
+/// only to `zirv <path> *`, so its own flags match natively; the sandbox
+/// exclusion form stays exact so an excluded child is never unsandboxed.
+fn emit_rules(node: &PolicyNode, path: &str, with_args: bool, out: &mut Vec<String>) {
+    if node.clean(Gate::PromptFree) {
         out.push(format!("zirv {path} *"));
         return;
     }
-    // A runnable parent with an excluded child gets only its exact form: a
-    // trailing wildcard would also cover the excluded child.
     if node.leaf && !node.excluded {
-        out.push(format!("zirv {path}"));
+        if with_args && node.clean(Gate::Posture) {
+            out.push(format!("zirv {path} *"));
+        } else {
+            out.push(format!("zirv {path}"));
+        }
     }
     for (name, child) in &node.children {
-        emit_rules(child, &format!("{path} {name}"), out);
+        emit_rules(child, &format!("{path} {name}"), with_args, out);
     }
 }
 
-/// Native allow patterns for every prompt-free built-in, walking the schema.
-pub(super) fn schema_allow_patterns() -> Vec<String> {
+fn schema_patterns(with_args: bool) -> Vec<String> {
     let mut out = Vec::new();
     for name in crate::utils::RESERVED_COMMANDS {
         if let Some(node) = policy_tree().children.get(&canonical_root(name)) {
-            emit_rules(node, name, &mut out);
+            emit_rules(node, name, with_args, &mut out);
         }
     }
     out
 }
 
-/// The built-in command path (`["ctx", "send"]`) the arguments after `zirv`
-/// resolve to, when that path is prompt-free. Leading flags before a
-/// subcommand are refused rather than guessed at.
-pub(super) fn prompt_free_path(args: &[String]) -> Option<Vec<String>> {
-    let root = canonical_root(args.first()?);
-    let mut node = policy_tree().children.get(&root)?;
+/// Native allow patterns for every prompt-free built-in, walking the schema.
+pub(super) fn schema_allow_patterns() -> Vec<String> {
+    schema_patterns(true)
+}
+
+/// The sandbox-exclusion subset of [`schema_allow_patterns`]: a parent whose
+/// child launches a caller-supplied command keeps only its exact form.
+pub(super) fn schema_sandbox_exclusion_patterns() -> Vec<String> {
+    schema_patterns(false)
+}
+
+/// Where a walk of the arguments after `zirv` ends: a built-in path the gate
+/// clears, a path (or a child named later) the gate blocks, or no built-in.
+enum Walk {
+    Clean(Vec<String>),
+    Blocked,
+    Unknown,
+}
+
+/// Leading flags before a subcommand are refused rather than guessed at.
+fn walk(args: &[String], gate: Gate) -> Walk {
+    let Some(first) = args.first() else {
+        return Walk::Unknown;
+    };
+    let root = canonical_root(first);
+    let Some(mut node) = policy_tree().children.get(&root) else {
+        return Walk::Unknown;
+    };
     let mut path = vec![root];
     let mut index = 1usize;
     loop {
         let rest = &args[index..];
         if matches!(rest, [flag] if flag == "--help" || flag == "-h") {
-            return Some(path);
+            return Walk::Clean(path);
         }
         if node.children.is_empty() {
-            return (!node.excluded).then_some(path);
+            return if node.blocked(gate) {
+                Walk::Blocked
+            } else {
+                Walk::Clean(path)
+            };
         }
         if let Some((name, child)) = rest
             .first()
@@ -193,20 +262,51 @@ pub(super) fn prompt_free_path(args: &[String]) -> Option<Vec<String>> {
             continue;
         }
         if rest.first().is_some_and(|token| token == "help") {
-            return Some(path);
+            return Walk::Clean(path);
         }
-        if !node.leaf || node.excluded {
-            return None;
+        if node.blocked(gate) {
+            return Walk::Blocked;
+        }
+        if !node.leaf {
+            return Walk::Unknown;
         }
         // Positional arguments after an optional subcommand slot: a later
-        // token naming an excluded child could still be parsed as it.
-        let names_excluded_child = rest.iter().any(|token| {
+        // token naming a blocked child could still be parsed as it.
+        let names_blocked_child = rest.iter().any(|token| {
             node.children
                 .get(&token.to_ascii_lowercase())
-                .is_some_and(|child| !child.clean())
+                .is_some_and(|child| !child.clean(gate))
         });
-        return (!names_excluded_child).then_some(path);
+        return if names_blocked_child {
+            Walk::Blocked
+        } else {
+            Walk::Clean(path)
+        };
     }
+}
+
+/// The built-in command path (`["ctx", "send"]`) the arguments after `zirv`
+/// resolve to, when that path is prompt-free.
+pub(super) fn prompt_free_path(args: &[String]) -> Option<Vec<String>> {
+    match walk(args, Gate::PromptFree) {
+        Walk::Clean(path) => Some(path),
+        Walk::Blocked | Walk::Unknown => None,
+    }
+}
+
+/// The built-in path the arguments after `zirv` resolve to, unless it changes
+/// posture, exposes credentials or spends quota.
+pub(super) fn non_posture_path(args: &[String]) -> Option<Vec<String>> {
+    match walk(args, Gate::Posture) {
+        Walk::Clean(path) => Some(path),
+        Walk::Blocked | Walk::Unknown => None,
+    }
+}
+
+/// Whether the arguments after `zirv` name a posture, credential or metered
+/// built-in. Repo scripts and unknown names are not built-ins.
+pub(super) fn names_posture_builtin(args: &[String]) -> bool {
+    matches!(walk(args, Gate::Posture), Walk::Blocked)
 }
 
 /// Upper bound on a command the hook will parse; Claude Code stops
@@ -678,20 +778,28 @@ mod tests {
 
     #[test]
     fn every_schema_leaf_is_allowed_or_named_in_the_exclusions() {
-        let patterns = schema_allow_patterns();
+        let allow = schema_allow_patterns();
+        let sandbox = schema_sandbox_exclusion_patterns();
         let entries = crate::commands::command_schema::command_entries().expect("schema");
         for entry in &entries {
             let command = entry.path.clone();
-            let covered = patterns.iter().any(|pattern| glob_match(pattern, &command));
+            let allowed = allow.iter().any(|pattern| glob_match(pattern, &command));
+            let unsandboxed = sandbox.iter().any(|pattern| glob_match(pattern, &command));
             let words: Vec<&str> = command
                 .strip_prefix("zirv ")
                 .unwrap_or(&command)
                 .split(' ')
                 .collect();
             let excluded = is_excluded_path(&words, entry.mutating);
+            let posture = is_posture_path(&words, entry.mutating);
             assert!(
-                covered != excluded,
-                "{command}: covered={covered} excluded={excluded}"
+                unsandboxed != excluded,
+                "{command}: unsandboxed={unsandboxed} excluded={excluded}"
+            );
+            // A launch-only exclusion may sit under its parent's `*` rule.
+            assert!(
+                (allowed || excluded) && !(allowed && posture),
+                "{command}: allowed={allowed} excluded={excluded} posture={posture}"
             );
         }
     }
@@ -699,7 +807,7 @@ mod tests {
     #[test]
     fn every_exclusion_names_a_real_schema_path() {
         let entries = crate::commands::command_schema::command_entries().expect("schema");
-        for (path, reason) in PROMPT_FREE_EXCLUSIONS {
+        for (path, reason) in POSTURE_EXCLUSIONS.iter().chain(PROMPT_FREE_EXCLUSIONS) {
             assert!(!reason.is_empty());
             let full = format!("zirv {path}");
             assert!(
@@ -714,11 +822,11 @@ mod tests {
     #[test]
     fn generated_rules_keep_excluded_subtrees_and_repo_scripts_out() {
         let patterns = schema_allow_patterns();
+        let sandbox = schema_sandbox_exclusion_patterns();
         for command in [
             "zirv ctx exec -- x",
             "zirv ctx wrap sh",
             "zirv ctx config set a b",
-            "zirv ctx usage tee -- sh",
             "zirv setup apply",
             "zirv my-repo-script",
         ] {
@@ -738,5 +846,34 @@ mod tests {
                 "{command}"
             );
         }
+        // A child that runs a caller-supplied command never leaves the sandbox.
+        for command in [
+            "zirv ctx usage tee -- sh",
+            "zirv ctx usage --json tee -- sh",
+        ] {
+            assert!(
+                !sandbox.iter().any(|pattern| glob_match(pattern, command)),
+                "{command}"
+            );
+        }
+    }
+
+    /// The native rule for a runnable parent with launch-only children takes
+    /// its own flags; an exact `zirv ctx usage` prompted for every flag.
+    #[test]
+    fn a_parent_with_launch_only_children_allows_its_own_flags() {
+        let patterns = schema_allow_patterns();
+        for command in ["zirv ctx usage --sessions 5", "zirv ctx measure --json"] {
+            assert!(
+                patterns.iter().any(|pattern| glob_match(pattern, command)),
+                "{command}: {patterns:?}"
+            );
+        }
+        assert!(patterns.iter().any(|pattern| pattern == "zirv ctx usage *"));
+        assert!(
+            patterns
+                .iter()
+                .any(|pattern| pattern == "zirv ctx measure *")
+        );
     }
 }

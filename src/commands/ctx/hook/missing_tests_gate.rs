@@ -171,22 +171,41 @@ pub(super) fn missing_tests_gate_reason(
     }
     // Any doubt here (no git, no repo, ...) reads as "nothing changed": a
     // block is a hard stop, never worth risking on an unreadable repo state.
-    let mut changed = verification::changed_paths(repo).ok()?;
-    // A dirty tree this session inherited (another session's edits, stray untracked files) is
-    // not its own work: count only paths touched after it started. (#908)
-    if let Some(record) = crate::commands::ctx::sessions::load_record(
+    // Tracked edits plus visible untracked files; workflow and hidden paths never owe a test. (#922)
+    let candidates = verification::candidate_edit_paths(repo).ok()?;
+    // A dirty tree this session inherited (another session's edits) is not its own work: count
+    // only paths touched after it started. (#908) Without a session record the start is unknown:
+    // tracked changes stay unfiltered, but untracked files must be recent.
+    let started_at = crate::commands::ctx::sessions::load_record(
         state,
         &crate::commands::ctx::sessions::short_id(gate_key),
-    ) {
-        let root = verification::git_root(repo);
-        changed.retain(|path| {
-            std::fs::metadata(root.join(path))
-                .and_then(|meta| meta.modified())
-                .ok()
-                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-                .is_some_and(|age| age.as_secs() >= record.started_at)
-        });
-    }
+    )
+    .map(|record| record.started_at);
+    let root = verification::git_root(repo);
+    let touched_since = |path: &PathBuf, since: u64| {
+        std::fs::metadata(root.join(path))
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_some_and(|age| age.as_secs() >= since)
+    };
+    let untracked_since = started_at.unwrap_or_else(|| {
+        crate::commands::ctx::state::now_secs()
+            .saturating_sub(crate::commands::ctx::sessions::UNKNOWN_START_WINDOW_SECS)
+    });
+    let mut changed: Vec<PathBuf> = candidates
+        .tracked
+        .into_iter()
+        .filter(|path| started_at.is_none_or(|since| touched_since(path, since)))
+        .chain(
+            candidates
+                .untracked
+                .into_iter()
+                .filter(|path| touched_since(path, untracked_since)),
+        )
+        .collect();
+    changed.sort();
+    changed.dedup();
     let mut has_test_change = false;
     let mut has_non_test_source_change = false;
     for candidate in &changed {
@@ -629,6 +648,152 @@ mod tests {
         );
     }
 
+    /// #922: a read-only pane over a main checkout holding fresh untracked noise has an empty
+    /// `git diff`, so it is never told it edited source.
+    #[test]
+    fn a_read_only_pane_with_untracked_noise_and_an_empty_diff_is_never_blocked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        std::fs::create_dir_all(state.sessions()).expect("sessions dir");
+        let repo = git_repo();
+        std::fs::create_dir_all(repo.path().join(".zirv/memory")).expect("mkdir");
+        std::fs::write(repo.path().join(".DS_Store"), "x").expect("write");
+        std::fs::write(repo.path().join(".zirv/memory/facts.json"), "{}").expect("write");
+        let mut record = crate::commands::ctx::sessions::Record::new(
+            "codexro2",
+            "codex",
+            repo.path(),
+            crate::commands::ctx::sessions::Verb::Dash,
+        );
+        record.started_at = crate::commands::ctx::state::now_secs() - 3_600;
+        std::fs::write(
+            state.sessions().join("codexro2.json"),
+            serde_json::to_string(&record).expect("record json"),
+        )
+        .expect("write record");
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
+        assert_eq!(
+            missing_tests_gate_reason(
+                &state,
+                repo.path(),
+                "codexro2",
+                "codexro2",
+                &CtxConfig::default(),
+                &|k| env.get(k).cloned(),
+            ),
+            None
+        );
+    }
+
+    /// #922: a writing analysis pane that only adds untracked files under `.zirv/work/` (and
+    /// `.zirv/memory/`) owes no test.
+    #[test]
+    fn a_writing_pane_that_only_adds_untracked_workflow_files_is_never_blocked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::create_dir_all(repo.path().join(".zirv/work/wf")).expect("mkdir");
+        std::fs::create_dir_all(repo.path().join(".zirv/memory")).expect("mkdir");
+        std::fs::write(repo.path().join(".zirv/work/wf/analysis.py"), "x = 1\n").expect("write");
+        std::fs::write(repo.path().join(".zirv/memory/facts.json"), "{}").expect("write");
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
+        assert_eq!(
+            missing_tests_gate_reason(
+                &state,
+                repo.path(),
+                "sess-922",
+                "sess-922",
+                &CtxConfig::default(),
+                &|k| env.get(k).cloned(),
+            ),
+            None
+        );
+    }
+
+    /// #922 review: with no session record an old untracked file is not this session's work.
+    #[test]
+    fn without_a_session_record_an_old_untracked_file_is_not_counted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        let file = repo.path().join("legacy.rs");
+        std::fs::write(&file, "pub fn old() {}\n").expect("write");
+        let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .and_then(|f| f.set_modified(mtime))
+            .expect("age the file");
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
+        assert_eq!(
+            missing_tests_gate_reason(
+                &state,
+                repo.path(),
+                "sess-922c",
+                "sess-922c",
+                &CtxConfig::default(),
+                &|k| env.get(k).cloned(),
+            ),
+            None
+        );
+    }
+
+    /// #922 review round 2: an earlier untracked directory with hundreds of files must not hide
+    /// the new source module from the gate.
+    #[test]
+    fn a_big_untracked_directory_does_not_hide_a_new_module_from_the_gate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::create_dir_all(repo.path().join("src")).expect("mkdir");
+        std::fs::write(repo.path().join("src/lib.rs"), "pub fn f() {}\n").expect("write");
+        commit_all(repo.path(), "add src/lib.rs");
+        std::fs::create_dir_all(repo.path().join("aaa")).expect("mkdir");
+        for n in 0..250 {
+            std::fs::write(repo.path().join(format!("aaa/f{n}.txt")), "x").expect("write");
+        }
+        std::fs::write(repo.path().join("src/new_mod.rs"), "pub fn g() {}\n").expect("write");
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
+        assert!(
+            missing_tests_gate_reason(
+                &state,
+                repo.path(),
+                "sess-922d",
+                "sess-922d",
+                &CtxConfig::default(),
+                &|k| env.get(k).cloned(),
+            )
+            .is_some(),
+            "the new module must still be seen"
+        );
+    }
+
+    /// #922: a writing session that adds a new untracked source module and no test is blocked.
+    #[test]
+    fn a_session_adding_an_untracked_source_module_without_a_test_is_blocked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::create_dir_all(repo.path().join("src")).expect("mkdir");
+        std::fs::write(repo.path().join("src/new_mod.rs"), "pub fn f() {}\n").expect("write");
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
+        let reason = missing_tests_gate_reason(
+            &state,
+            repo.path(),
+            "sess-922b",
+            "sess-922b",
+            &CtxConfig::default(),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("a new untracked module with no test must block");
+        assert!(reason.contains("test"), "{reason}");
+    }
+
     /// The counterpart: a file written after the session started still blocks.
     #[test]
     fn a_registered_session_that_wrote_source_after_it_started_still_blocks() {
@@ -644,8 +809,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(dir.path().to_path_buf());
         let repo = git_repo();
-        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
         std::fs::create_dir_all(repo.path().join("tests")).expect("mkdir");
+        std::fs::write(repo.path().join("tests/src_test.rs"), "// old\n").expect("write");
+        commit_all(repo.path(), "add test file");
+        std::fs::write(repo.path().join("src.rs"), "fn main() {}\n").expect("write");
         std::fs::write(repo.path().join("tests/src_test.rs"), "// test\n").expect("write");
         let cfg = CtxConfig::default();
         let env: std::collections::HashMap<String, String> =

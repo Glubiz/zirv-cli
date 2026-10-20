@@ -15,7 +15,9 @@ pub fn flags_pin_policy(flags: &[String]) -> bool {
         "-a",
         "--approve-for-me",
         "--dangerously-skip-permissions",
+        "--allow-dangerously-skip-permissions",
         "--dangerously-bypass-approvals-and-sandbox",
+        "--yolo",
     ];
     const CODEX_CONFIG_OVERRIDE_KEYS: &[&str] =
         &["approval_policy", "sandbox_mode", "default_permissions"];
@@ -916,6 +918,11 @@ mod tests {
         assert!(flags_pin_policy(&[
             "--dangerously-bypass-approvals-and-sandbox".to_string()
         ]));
+        // Claude's opt-in bypass toggle and codex's `--yolo` alias.
+        assert!(flags_pin_policy(&[
+            "--allow-dangerously-skip-permissions".to_string()
+        ]));
+        assert!(flags_pin_policy(&["--yolo".to_string()]));
     }
 
     /// Issue "codex approval hell" (2026-08-26): before this, `-c

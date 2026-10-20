@@ -4923,7 +4923,7 @@ mod tests {
             .as_array()
             .expect("reserved built-in permission rules");
         for name in crate::utils::RESERVED_COMMANDS {
-            if matches!(*name, "ctx" | "setup" | "benchmark") {
+            if matches!(*name, "ctx" | "setup" | "benchmark" | "update") {
                 continue;
             }
             let expected = serde_json::json!(format!("Bash(zirv {name} *)"));
@@ -4932,6 +4932,8 @@ mod tests {
                 "reserved permission rule {expected} missing from {settings}"
             );
         }
+        // The self-replacing `update` is a posture command.
+        assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv update *)")));
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv *)")));
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx *)")));
         for family in PROMPT_FREE_COMMAND_FAMILIES {
@@ -4951,11 +4953,11 @@ mod tests {
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx hook install *)")));
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx exec *)")));
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx wrap *)")));
-        // `usage`'s own `tee` subcommand launches an arbitrary trailing
-        // statusline command, so a wildcard `usage *` entry would also cover
-        // `usage tee -- <cmd>` -- unlike the escape-safe retry path, a
-        // native permission/sandbox glob cannot see the fourth token.
-        assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx usage *)")));
+        // `usage *` takes the verb's own flags. It also covers `usage
+        // tee -- <cmd>`, so the hook denies a tee child that needs approval
+        // and the sandbox exclusion keeps the exact `zirv ctx usage` form.
+        assert!(permission_allow.contains(&serde_json::json!("Bash(zirv ctx usage *)")));
+        assert!(permission_allow.contains(&serde_json::json!("Bash(zirv ctx measure *)")));
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv setup *)")));
         assert!(permission_allow.contains(&serde_json::json!("Bash(zirv test *)")));
         assert!(permission_allow.contains(&serde_json::json!("Bash(zirv verify *)")));
@@ -4970,7 +4972,7 @@ mod tests {
             for name in crate::utils::RESERVED_COMMANDS {
                 if matches!(
                     *name,
-                    "ctx" | "setup" | "benchmark" | "test" | "verify" | "frontend"
+                    "ctx" | "setup" | "benchmark" | "test" | "verify" | "frontend" | "update"
                 ) {
                     continue;
                 }
@@ -4980,6 +4982,7 @@ mod tests {
                     "reserved sandbox exclusion {expected} missing from {settings}"
                 );
             }
+            assert!(!exclusions.contains(&serde_json::json!("zirv update *")));
             assert!(!exclusions.contains(&serde_json::json!("zirv *")));
             assert!(!exclusions.contains(&serde_json::json!("zirv ctx *")));
             for family in PROMPT_FREE_COMMAND_FAMILIES {
@@ -5847,7 +5850,7 @@ mod tests {
             .find(|a| a.starts_with("--allowedTools="))
             .expect("an --allowedTools= token");
         for name in crate::utils::RESERVED_COMMANDS {
-            if matches!(*name, "ctx" | "setup" | "benchmark") {
+            if matches!(*name, "ctx" | "setup" | "benchmark" | "update") {
                 continue;
             }
             let rule = format!("Bash(zirv {name} *)");
@@ -5856,13 +5859,14 @@ mod tests {
                 "allow rule '{rule}' missing from {allow_arg}"
             );
         }
+        assert!(!allow_arg.contains("Bash(zirv update"));
         assert!(allow_arg.contains("Bash(cargo *)"));
         assert!(allow_arg.contains("Bash(zirv ctx status *)"));
         assert!(!allow_arg.contains("Bash(zirv *)"));
         assert!(!allow_arg.contains("Bash(zirv ctx *)"));
         assert!(!allow_arg.contains("Bash(zirv ctx exec *)"));
         assert!(!allow_arg.contains("Bash(zirv ctx wrap *)"));
-        assert!(!allow_arg.contains("Bash(zirv ctx usage *)"));
+        assert!(allow_arg.contains("Bash(zirv ctx usage *)"));
         assert!(!allow_arg.contains("Bash(zirv setup *)"));
         assert!(!allow_arg.contains("Bash(zirv benchmark *)"));
         assert!(allow_arg.contains("Bash(zirv benchmark plan *)"));

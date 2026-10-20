@@ -6571,7 +6571,7 @@ unit of work (a plan text, a diffstat) is consulted on once, and the helper's ow
 | Kind | Reply format | Where it bites |
 |---|---|---|
 | plan | `APPROVE` or `REVISE: <reasons>` | asked when `zirv workflow advance` completes the plan step; while a `revise` is open, advancing any later step is refused with the reason. Revising the plan artifact and re-advancing the plan step asks again, and the new ruling supersedes the old |
-| done | `DONE` or `NOT_DONE: <what is missing>` | asked at the Stop hook once per distinct evidence unit (diffstat, commit, tracked changes and the latest `zirv verify`/`zirv test` record), with the task (the active workflow's objective, else the latest operator request) and that verification record's per-check results in the evidence; the ruling's reason ends with the evidence sources it read (`git diff --stat HEAD`, the active workflow's work folder or `none`, the verification record when one exists, and the task source). The helper is told to run single-line commands only, since a read-only sandbox has no writable temp directory for a shell here-document. A turn end while the session has running native subagents or its active workflow is before the verify step is not a completion claim: no consult, no block. While a `not_done` is open the Stop hook blocks with the reason, at most 3 times per ruling, unless the evidence has moved since (a new commit, edit or verification run), when the next stop consults fresh; the workflow's final step is refused. A later `done`, or an `ask` ruling of a `done` option when the offered options include a `not done` one, resolves it. Codex's Stop hook blocks the same way |
+| done | `DONE` or `NOT_DONE: <what is missing>` | asked at the Stop hook once per distinct evidence unit (diffstat, commit, tracked changes, the latest `zirv verify`/`zirv test` record, commits since the session started in the repo's other linked worktrees, and the real commits the agent cites), with the task (the active workflow's objective, else the latest operator request) and that verification record's per-check results in the evidence; the agent can attach evidence without an operator override by stating it in its final message: that message goes to the consult as labelled untrusted data (never instructions), commit ids in it are resolved against git, and citing a new real commit or review link is new evidence that releases a standing `not_done` and consults fresh; the ruling's reason ends with the evidence sources it read (`git diff --stat HEAD`, linked worktree commits and the agent's final message when present, the active workflow's work folder or `none`, the verification record when one exists, and the task source). The helper is told to run single-line commands only, since a read-only sandbox has no writable temp directory for a shell here-document. A turn end while the session has running native subagents or its active workflow is before the verify step is not a completion claim: no consult, no block. While a `not_done` is open the Stop hook blocks with the reason, at most 3 times per ruling, unless the evidence has moved since (a new commit, edit or verification run), when the next stop consults fresh; the workflow's final step is refused. A later `done`, or an `ask` ruling of a `done` option when the offered options include a `not done` one, resolves it. Codex's Stop hook blocks the same way |
 | retry | `RETRY` or `STOP: <reason>` | asked at the third failure of a tool-call streak, in place of the seat deciding; while a `stop` is open the tool-failure hook adds the ruling as context on each further failure, and a successful tool call ends it. It is advisory context, not a mechanical block (a hook cannot stop a tool), and a `retry` never lifts a Jev stop |
 | choice | `CHOICE: <n>` and an optional `REASON:` line | `zirv ctx supervisor ask` |
 
@@ -7666,10 +7666,82 @@ safety verdict allows and whose every segment is a prompt-free built-in zirv
 invocation (`zirv` or the running binary's own path; only `ZIRV_*` env prefixes,
 and only on `ctx`), a literal `cd`, or a read-only filter, with each
 `$(...)`/backtick body held to the same rule. It never prints deny or ask, so
-every refusal and a matching deny rule still win.
+every refusal and a matching deny rule still win. The hook's own base policy is
+wider: every built-in is allowed in both launch modes except the posture
+list, and a launcher (`ctx exec`/`wrap`/`run`/`statusline`, `ctx usage tee`)
+takes its wrapped child's verdict. Posture, credential and metered commands keep
+asking, also on an unsandboxed retry: the mutating `setup` and `ctx config`
+verbs, `benchmark run`, `ctx api`, `ctx obfuscate reveal`/`purge`, `ctx provider
+init`/`login`/`credential`, `ctx supervisor override`, `ctx hook install` (and any
+hook uninstall/remove/disable), the self-replacing `update`, and a launch verb
+whose flags pin its permission or sandbox posture (every bypass spelling,
+`--allow-dangerously-skip-permissions` and `--yolo` included).
 
 Same-command literal variable assignments are resolved when judging scratchpad-confined writes and redirects under the hook payload's cwd on an unsandboxed retry. A variable must have a single literal assignment in a simple command list; functions, traps, shell-variable mutations and ambiguous expansions disable resolution. Unresolved targets still require approval on a retry. A `CLAUDE_CODE_TMPDIR` already ending in `claude-<uid>` is used as-is; on macOS, scratchpad roots include both `/tmp/...` and `/private/tmp/...` spellings.
-Elasticsearch GET/POST query endpoints (`/_search`, `/_msearch`, `/_count`, `/_field_caps`, `/_explain` and `/_explain/<id>`, `/_validate/query`, `/_sql`, `/_eql/search`, `/_search/template`, `/_render/template`) are read-only for the network classifier and retry screen when every request URL matches a query route and any body is inline. File/stdin uploads, dynamic bodies, client config files, unknown query options and non-query routes disqualify this exception; explicit ask/deny rules still apply.
+Elasticsearch GET/POST query endpoints (`/_search`, `/_msearch`, `/_count`, `/_field_caps`, `/_explain` and `/_explain/<id>`, `/_validate/query`, `/_sql`, `/_eql/search`, `/_search/template`, `/_render/template`, and Kibana's `/internal/search/es`, also under `/s/<space>/`) are read-only for the network classifier when every request URL matches a query route and any body is inline. That carve-out relies on the sandbox's network proxy, so an unsandboxed retry of such a query still asks when it carries a substitution (`$(cat token)`) or a secret-named variable. GET-only reads (`/_mapping`, `/_resolve/index/<name>`) qualify without a POST or body. For the network classifier a body also counts as inline when it is a fully single-quoted string, a double-quoted `"$VAR"` whose single literal assignment (no `$`/backtick, no re-assignment, made before the request) is in the same command, or `@file` under the session scratchpad/`$TMPDIR` that passes the credential-path screen (a relative path counts after a leading `cd` into the scratchpad). The same literal resolution covers a request URL or body built from literal variables, quoted pieces and `for` lists of literal words (`"$B/idx/_search"`, `'...'"$base"'...'`), and a same-command `NAME=(...)` option array spliced in as `"${NAME[@]}"`; an unresolvable `"${NAME[@]}"` on a curl/wget counts as a possible mutation. `-F`/`-T`/`--upload-file`, stdin uploads, any other dynamic body, client config files, unknown query options and non-query routes disqualify this exception; explicit ask/deny rules still apply.
+
+`sqlite3`, with or without `-readonly`, may run several statements and read-only dot-commands (`.tables`, `.schema`, `.indexes`, `.databases`, `.headers`, `.mode`, `.dump`, ...) without asking, when every statement is a read: `SELECT`, `WITH ... SELECT`, `EXPLAIN`, or a non-assigning reporting `PRAGMA` (`table_info`, `index_list`, ...). Redirects and pipes on sqlite's own output are ignored, and the database may be named through `Application\ Support`, a variable or a split-quoted `file:` URI. `.shell`, `.system`, `.load`, `.output`, `.once`, `.save`, `.backup`, `.import`, `.excel`, `.open`, `.read`, `writefile()`, `ATTACH`, `--` comments, assigning `PRAGMA`s and any write still ask. Every argument after the database counts as a statement, so `sqlite3 db "select 1" "drop table t"` asks.
+
+The orchestrator-seat write guard treats a quoted heredoc body as data (even with backticks or `$(`), and a heredoc fed to `python`/`node`/`ruby`/`perl` as that language's code: it denies only on a file-write primitive, not on `>` in the script.
+
+**Unsandboxed retries.** When Claude retries a command with
+`dangerouslyDisableSandbox`, a base Deny stays Deny and an Ask from an explicit
+rule stays Ask (Deny headlessly). A base Allow, from a rule or the launch mode's
+default, runs without a prompt unless a danger screen trips on any segment. The
+retry loses the sandbox's filesystem deny lists and network proxy, so the screen
+gates every retry path, `[safety] escape_allow` and scratchpad-confined writes
+included, and trips on: a credential or project-secret read (also `~/.claude`
+token files, `~/.claude.json`, `~/.pgpass`, `~/.gnupg`, keychains, shell history,
+browser cookie/login stores and `/proc/*/environ`; `.env.example`, `.sample`,
+`.template` and `.dist` are not secrets, and `ls`/`stat`/`du`/`file`/`tree` or a
+`find` without `-exec`/`-delete` of a credential or protected directory reads
+nothing); a write, redirect or download into a protected path (shell
+startup files, credential stores, `~/.gitconfig`, `~/.config/git`,
+`~/Library/LaunchAgents`, all of `~/.claude`, any `.claude` settings, hooks,
+skills, agents, commands and rules, `.git/hooks` and `.git/config`, the operator's
+`~/.zirv`, `/etc`, `/usr`, `/bin`, `/sbin`, `/System`, `/Library`) or
+`sudo`/`doas`; a `git config --global`/`--system` write, a git `-c` or config key
+that runs a command (`core.sshCommand`, `core.pager`, `core.editor`,
+`credential.*`, `alias.*`, `*.command`, `protocol.*.allow`, ...), a persisted
+`core.hooksPath` in any config file, or a `-c core.hooksPath` outside the
+repository; `crontab` other than `-l`; `launchctl`
+`load`/`unload`/`bootstrap`/`bootout`/`submit`/`enable`/`disable`/`kickstart`/
+`setenv`/`unsetenv`/`remove`; `defaults write`; `spctl --master-disable`/
+`--global-disable`/`--add`, `csrutil`, `nvram`, `sysadminctl`, `dscl` writes,
+`pmset` other than `-g`, `networksetup`/`systemsetup -set*`, `scutil --set`,
+`diskutil erase*`/`partition*`/`unmount*`, `tmutil delete`/`disable`, `kextload`
+and `kmutil load`; any `osascript` (Apple Events are off inside the sandbox);
+`chmod`/`chown` on `/`, `/Users`, `/home` or a whole home; `docker run` with
+`--privileged`, a host `--pid`/`--network`/`--ipc`/`--uts`/`--userns`, `--cap-add
+SYS_ADMIN`/`ALL`, an unconfined `--security-opt`, `--device`, or a host-root,
+protected-path or docker-socket mount; a network call (`curl`, `wget`, `ssh`,
+`scp`, `rsync`, `nc`, ...) carrying a substitution or a secret-named variable,
+uploading a file from outside the scratchpad, or sending stdin fed by a pipe
+(`env | curl -d @- ...`, `... | nc host port`); a
+secret-named variable assigned from a substitution; a posture zirv command (by
+basename, so a path-qualified or `env`-prefixed `zirv` counts) or a repo script;
+a process signal other than `kill -0`; a cluster-changing `kubectl` verb or a
+Laravel migrate/wipe/seed; a root-wide `find`; or a shell (`fish` and `eval`
+included) running a script, `-c` payload or heredoc that trips any of these (a
+script it cannot read, or an `eval` payload with an expansion, keeps asking).
+Writes into the repository, worktrees, the scratchpad, `$TMPDIR` and other user
+directories are fine. Variable targets resolve through the command's own
+assignments and loop lists; a value computed by a substitution or argument trips
+only when the command spells a protected path, and one set by `read`, `source`,
+`eval`, `+=` or an array always trips. A glob word is expanded against the
+filesystem at decision time and every match screened; more than 256 matches, or
+no match under a credential or protected directory (`~/.claude/kibana-t*`), asks.
+Heredoc bodies are data, except a shell's,
+which is screened. Interpreter code (python, node, ruby, perl, inline
+or from a heredoc), awk programs and sed scripts get a code check: credential
+material and protected paths, including absolute home spellings and paths joined
+onto a home accessor (`Path.home() / '.zshrc'`); a write primitive combined with
+a home accessor (`os.environ['HOME']`, `expanduser`, `Path.home()`,
+`os.homedir()`, `process.env.HOME`, `$ENV{HOME}`, `glob('~')`) whatever the
+target spells, while code that only reads HOME stays silent; each shell string handed to
+`os.system`, `subprocess`, `child_process`, `system` or backticks
+is screened like a `-c` payload; sed `e` and writes to a protected file
+via `w` ask. A plain `subprocess.run(['git', 'status'])` stays silent.
 
 The analyzer evaluates the most restrictive result across quote-aware compound
 segments (`;`, `&`, `&&`, `||`, pipes and newlines), nested
