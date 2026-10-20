@@ -467,6 +467,8 @@ pub(super) mod tests {
         };
         git(&["init", "-q"]);
         std::fs::write(repo.path().join("tracked.txt"), "one\n").expect("write");
+        // A tracked source file: the missing-tests gate counts tracked edits only (#922).
+        std::fs::write(repo.path().join("src.rs"), "fn old() {}\n").expect("write");
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "base"]);
         repo

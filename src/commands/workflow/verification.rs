@@ -478,6 +478,29 @@ pub fn changed_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
     changed_paths_at_root(&git_root(repo))
 }
 
+/// Tracked paths that differ from HEAD only: untracked files (stray, another session's, workflow
+/// bookkeeping) are never listed, and `.zirv/work` / `.zirv/memory` are excluded. (#922)
+pub fn tracked_changed_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
+    let output = git_at(&git_root(repo))
+        .args(["diff", "--name-only", "-z", "HEAD"])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "cannot inspect changed paths: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let mut paths: Vec<PathBuf> = git_paths(&output.stdout)
+        .filter(|path| {
+            !super::classify::is_workflow_work_path(path) && !path.starts_with(".zirv/memory")
+        })
+        .collect();
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
 fn changed_paths_at_root(root: &Path) -> CtxResult<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for args in [
