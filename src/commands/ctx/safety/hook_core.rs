@@ -602,7 +602,9 @@ fn run_check_hook_inner<W: Write>(
     }
     // Preserve semantic Deny and explicit Ask before considering unsandboxed
     // retries. An allowed command runs silently unless the danger screen
-    // trips; asked commands retain escalation (#147, #922).
+    // trips; asked commands retain escalation (#147, #922). Every retry path
+    // loses the sandbox's filesystem and network limits, so the screen gates
+    // the scratchpad, mixed and escape_allow paths too.
     if payload.tool_input.dangerously_disable_sandbox
         && outcome.verdict != Verdict::Deny
         && !operator_config_approval(&outcome)
@@ -611,7 +613,22 @@ fn run_check_hook_inner<W: Write>(
             .matched
             .as_ref()
             .is_some_and(|rule| rule.pattern == "<scratchpad: confined write>");
-        outcome = if already_scratchpad_confined {
+        let unsandboxed_retry = Outcome {
+            verdict: if mode.is_interactive() {
+                Verdict::Ask
+            } else {
+                Verdict::Deny
+            },
+            matched: Some(Rule {
+                pattern: "<sandbox: unsandboxed retry>".to_string(),
+                origin: Origin::BuiltIn,
+            }),
+        };
+        let trips_danger =
+            retry_trips_danger_screen(&cfg.safety, &effective_command, &scratchpad_roots, cwd);
+        outcome = if trips_danger {
+            unsandboxed_retry
+        } else if already_scratchpad_confined {
             outcome
         } else if is_mixed_confined_write_and_read_only_escape_safe(
             &cfg.safety,
@@ -648,11 +665,6 @@ fn run_check_hook_inner<W: Write>(
             &effective_command,
             &outcome,
             &scratchpad_roots,
-        ) && !retry_trips_danger_screen(
-            &cfg.safety,
-            &effective_command,
-            &scratchpad_roots,
-            cwd,
         ) {
             Outcome {
                 verdict: Verdict::Allow,
@@ -662,17 +674,7 @@ fn run_check_hook_inner<W: Write>(
                 }),
             }
         } else {
-            Outcome {
-                verdict: if mode.is_interactive() {
-                    Verdict::Ask
-                } else {
-                    Verdict::Deny
-                },
-                matched: Some(Rule {
-                    pattern: "<sandbox: unsandboxed retry>".to_string(),
-                    origin: Origin::BuiltIn,
-                }),
-            }
+            unsandboxed_retry
         };
     }
     // Count prior denials before logging this one, then include the current

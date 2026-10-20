@@ -4923,7 +4923,7 @@ mod tests {
             .as_array()
             .expect("reserved built-in permission rules");
         for name in crate::utils::RESERVED_COMMANDS {
-            if matches!(*name, "ctx" | "setup" | "benchmark") {
+            if matches!(*name, "ctx" | "setup" | "benchmark" | "update") {
                 continue;
             }
             let expected = serde_json::json!(format!("Bash(zirv {name} *)"));
@@ -4932,6 +4932,8 @@ mod tests {
                 "reserved permission rule {expected} missing from {settings}"
             );
         }
+        // The self-replacing `update` is a posture command (#922).
+        assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv update *)")));
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv *)")));
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx *)")));
         for family in PROMPT_FREE_COMMAND_FAMILIES {
@@ -4970,7 +4972,7 @@ mod tests {
             for name in crate::utils::RESERVED_COMMANDS {
                 if matches!(
                     *name,
-                    "ctx" | "setup" | "benchmark" | "test" | "verify" | "frontend"
+                    "ctx" | "setup" | "benchmark" | "test" | "verify" | "frontend" | "update"
                 ) {
                     continue;
                 }
@@ -4980,6 +4982,7 @@ mod tests {
                     "reserved sandbox exclusion {expected} missing from {settings}"
                 );
             }
+            assert!(!exclusions.contains(&serde_json::json!("zirv update *")));
             assert!(!exclusions.contains(&serde_json::json!("zirv *")));
             assert!(!exclusions.contains(&serde_json::json!("zirv ctx *")));
             for family in PROMPT_FREE_COMMAND_FAMILIES {
@@ -5847,7 +5850,7 @@ mod tests {
             .find(|a| a.starts_with("--allowedTools="))
             .expect("an --allowedTools= token");
         for name in crate::utils::RESERVED_COMMANDS {
-            if matches!(*name, "ctx" | "setup" | "benchmark") {
+            if matches!(*name, "ctx" | "setup" | "benchmark" | "update") {
                 continue;
             }
             let rule = format!("Bash(zirv {name} *)");
@@ -5856,6 +5859,7 @@ mod tests {
                 "allow rule '{rule}' missing from {allow_arg}"
             );
         }
+        assert!(!allow_arg.contains("Bash(zirv update"));
         assert!(allow_arg.contains("Bash(cargo *)"));
         assert!(allow_arg.contains("Bash(zirv ctx status *)"));
         assert!(!allow_arg.contains("Bash(zirv *)"));

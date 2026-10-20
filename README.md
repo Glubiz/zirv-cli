@@ -7672,11 +7672,13 @@ list, and a launcher (`ctx exec`/`wrap`/`run`/`statusline`, `ctx usage tee`)
 takes its wrapped child's verdict. Posture, credential and metered commands keep
 asking, also on an unsandboxed retry: the mutating `setup` and `ctx config`
 verbs, `benchmark run`, `ctx api`, `ctx obfuscate reveal`/`purge`, `ctx provider
-init`/`login`/`credential`, `ctx supervisor override`, `ctx hook install`, and a
-launch verb whose flags pin its permission or sandbox posture.
+init`/`login`/`credential`, `ctx supervisor override`, `ctx hook install` (and any
+hook uninstall/remove/disable), the self-replacing `update`, and a launch verb
+whose flags pin its permission or sandbox posture (every bypass spelling,
+`--allow-dangerously-skip-permissions` and `--yolo` included).
 
 Same-command literal variable assignments are resolved when judging scratchpad-confined writes and redirects under the hook payload's cwd on an unsandboxed retry. A variable must have a single literal assignment in a simple command list; functions, traps, shell-variable mutations and ambiguous expansions disable resolution. Unresolved targets still require approval on a retry. A `CLAUDE_CODE_TMPDIR` already ending in `claude-<uid>` is used as-is; on macOS, scratchpad roots include both `/tmp/...` and `/private/tmp/...` spellings.
-Elasticsearch GET/POST query endpoints (`/_search`, `/_msearch`, `/_count`, `/_field_caps`, `/_explain` and `/_explain/<id>`, `/_validate/query`, `/_sql`, `/_eql/search`, `/_search/template`, `/_render/template`, and Kibana's `/internal/search/es`, also under `/s/<space>/`) are read-only for the network classifier and retry screen when every request URL matches a query route and any body is inline. GET-only reads (`/_mapping`, `/_resolve/index/<name>`) qualify without a POST or body. For the network classifier a body also counts as inline when it is a fully single-quoted string, a double-quoted `"$VAR"` whose single literal assignment (no `$`/backtick, no re-assignment, made before the request) is in the same command, or `@file` under the session scratchpad/`$TMPDIR` that passes the credential-path screen (a relative path counts after a leading `cd` into the scratchpad). The same literal resolution covers a request URL or body built from literal variables, quoted pieces and `for` lists of literal words (`"$B/idx/_search"`, `'...'"$base"'...'`), and a same-command `NAME=(...)` option array spliced in as `"${NAME[@]}"`; an unresolvable `"${NAME[@]}"` on a curl/wget counts as a possible mutation. `-F`/`-T`/`--upload-file`, stdin uploads, any other dynamic body, client config files, unknown query options and non-query routes disqualify this exception; explicit ask/deny rules still apply.
+Elasticsearch GET/POST query endpoints (`/_search`, `/_msearch`, `/_count`, `/_field_caps`, `/_explain` and `/_explain/<id>`, `/_validate/query`, `/_sql`, `/_eql/search`, `/_search/template`, `/_render/template`, and Kibana's `/internal/search/es`, also under `/s/<space>/`) are read-only for the network classifier when every request URL matches a query route and any body is inline. That carve-out relies on the sandbox's network proxy, so an unsandboxed retry of such a query still asks when it carries a substitution (`$(cat token)`) or a secret-named variable. GET-only reads (`/_mapping`, `/_resolve/index/<name>`) qualify without a POST or body. For the network classifier a body also counts as inline when it is a fully single-quoted string, a double-quoted `"$VAR"` whose single literal assignment (no `$`/backtick, no re-assignment, made before the request) is in the same command, or `@file` under the session scratchpad/`$TMPDIR` that passes the credential-path screen (a relative path counts after a leading `cd` into the scratchpad). The same literal resolution covers a request URL or body built from literal variables, quoted pieces and `for` lists of literal words (`"$B/idx/_search"`, `'...'"$base"'...'`), and a same-command `NAME=(...)` option array spliced in as `"${NAME[@]}"`; an unresolvable `"${NAME[@]}"` on a curl/wget counts as a possible mutation. `-F`/`-T`/`--upload-file`, stdin uploads, any other dynamic body, client config files, unknown query options and non-query routes disqualify this exception; explicit ask/deny rules still apply.
 
 `sqlite3`, with or without `-readonly`, may run several statements and read-only dot-commands (`.tables`, `.schema`, `.indexes`, `.databases`, `.headers`, `.mode`, `.dump`, ...) without asking, when every statement is a read: `SELECT`, `WITH ... SELECT`, `EXPLAIN`, or a non-assigning reporting `PRAGMA` (`table_info`, `index_list`, ...). Redirects and pipes on sqlite's own output are ignored, and the database may be named through `Application\ Support`, a variable or a split-quoted `file:` URI. `.shell`, `.system`, `.load`, `.output`, `.once`, `.save`, `.backup`, `.import`, `.excel`, `.open`, `.read`, `writefile()`, `ATTACH`, `--` comments, assigning `PRAGMA`s and any write still ask. Every argument after the database counts as a statement, so `sqlite3 db "select 1" "drop table t"` asks.
 
@@ -7685,24 +7687,43 @@ The orchestrator-seat write guard treats a quoted heredoc body as data (even wit
 **Unsandboxed retries (#922).** When Claude retries a command with
 `dangerouslyDisableSandbox`, a base Deny stays Deny and an Ask from an explicit
 rule stays Ask (Deny headlessly). A base Allow, from a rule or the launch mode's
-default, runs without a prompt unless a danger screen trips on any segment: a
-credential or project-secret read; a write, redirect or download into a protected
-path (shell startup files, credential stores, `~/.claude` settings, hooks, skills,
-agents and commands, the operator's `~/.zirv`, `/etc`, `/usr`, `/bin`, `/sbin`,
-`/System`, `/Library`) or `sudo`/`doas`; a secret-named variable assigned from a
-substitution; a posture zirv command (by basename, so a path-qualified or
-`env`-prefixed `zirv` counts) or a repo script; a process signal other than
-`kill -0`; a cluster-changing `kubectl` verb or a Laravel migrate/wipe/seed; a
-root-wide `find`; or a shell running a script, `-c` payload or heredoc that trips
-any of these (a script it cannot read keeps asking). Writes into the repository,
-worktrees, the scratchpad, `$TMPDIR` and other user directories are fine.
-Variable targets resolve through the command's own assignments and loop lists; a
-value computed by a substitution or argument trips only when the command spells a
-protected path, and one set by `read`, `source`, `eval`, `+=` or an array always
-trips. Heredoc bodies are data, except a shell's, which is screened, and an
-interpreter's (python, node, ...), which gets a text check for credential
-material and protected paths. A `[safety] escape_allow` match still clears a base
-Allow retry through its own credential and redirect screen.
+default, runs without a prompt unless a danger screen trips on any segment. The
+retry loses the sandbox's filesystem deny lists and network proxy, so the screen
+gates every retry path, `[safety] escape_allow` and scratchpad-confined writes
+included, and trips on: a credential or project-secret read (also `~/.claude`
+token files, `~/.claude.json`, `~/.pgpass`, `~/.gnupg`, keychains, shell history,
+browser cookie/login stores, `/proc/*/environ`, and a bare `env`/`printenv`/
+`export -p`/`set`); a write, redirect or download into a protected path (shell
+startup files, credential stores, `~/.gitconfig`, `~/.config/git`,
+`~/Library/LaunchAgents`, all of `~/.claude`, any `.claude` settings, hooks,
+skills, agents, commands and rules, `.git/hooks` and `.git/config`, the operator's
+`~/.zirv`, `/etc`, `/usr`, `/bin`, `/sbin`, `/System`, `/Library`) or
+`sudo`/`doas`; a `git config --global`/`--system` write, a git `-c` or config key
+that runs a command (`core.sshCommand`, `core.pager`, `core.editor`,
+`credential.*`, `alias.*`, `*.command`, ...) or a `core.hooksPath` outside the
+repository; `crontab` other than `-l`; `launchctl load`/`bootstrap`/`submit`;
+`defaults write`; `chmod`/`chown` on `/` or a whole home; `docker run
+--privileged` or a host-root, protected-path or docker-socket mount; a network
+call (`curl`, `wget`, `ssh`, `scp`, `rsync`, `nc`, ...) carrying a substitution or
+a secret-named variable, or uploading a file from outside the scratchpad; a
+secret-named variable assigned from a substitution; a posture zirv command (by
+basename, so a path-qualified or `env`-prefixed `zirv` counts) or a repo script;
+a process signal other than `kill -0`; a cluster-changing `kubectl` verb or a
+Laravel migrate/wipe/seed; a root-wide `find`; or a shell (`fish` and `eval`
+included) running a script, `-c` payload or heredoc that trips any of these (a
+script it cannot read, or an `eval` payload with an expansion, keeps asking).
+Writes into the repository, worktrees, the scratchpad, `$TMPDIR` and other user
+directories are fine. Variable targets resolve through the command's own
+assignments and loop lists; a value computed by a substitution or argument trips
+only when the command spells a protected path, and one set by `read`, `source`,
+`eval`, `+=` or an array always trips. Heredoc bodies are data, except a shell's,
+which is screened. Interpreter code (python, node, ruby, perl, osascript, inline
+or from a heredoc), awk programs and sed scripts get a code check: credential
+material and protected paths, including absolute home spellings and paths joined
+onto a home accessor (`Path.home() / '.zshrc'`); each shell string handed to
+`os.system`, `subprocess`, `child_process`, `system`, backticks or `do shell
+script` is screened like a `-c` payload; sed `e` and writes to a protected file
+via `w` ask. A plain `subprocess.run(['git', 'status'])` stays silent.
 
 The analyzer evaluates the most restrictive result across quote-aware compound
 segments (`;`, `&`, `&&`, `||`, pipes and newlines), nested

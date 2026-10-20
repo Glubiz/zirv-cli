@@ -763,7 +763,7 @@ pub(super) fn is_sensitive_file_access(command: &str, sensitive_path: fn(&str) -
 /// Path prefixes that name the operator's own home directory in the shells
 /// this module classifies, so `~/.zirv`, `$HOME/.zirv`, `%USERPROFILE%` and
 /// `$env:USERPROFILE` spellings all resolve to the same directory.
-const HOME_PATH_PREFIXES: &[&str] = &[
+pub(super) const HOME_PATH_PREFIXES: &[&str] = &[
     "~",
     "$home",
     "${home}",
@@ -779,7 +779,7 @@ const HOME_PATH_PREFIXES: &[&str] = &[
 /// already-expanded `.zirv` path is the OPERATOR's configuration layer only
 /// when it sits directly in one; `/srv/repo/.zirv` is a checkout's own
 /// directory and stays writable.
-fn is_home_directory_path(path: &str) -> bool {
+pub(super) fn is_home_directory_path(path: &str) -> bool {
     let path = path.strip_prefix('/').unwrap_or(path);
     let path = match path.split_once(':') {
         Some((drive, rest)) if drive.len() == 1 => rest.strip_prefix('/').unwrap_or(rest),

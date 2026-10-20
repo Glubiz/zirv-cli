@@ -50,6 +50,7 @@ pub(super) const POSTURE_EXCLUSIONS: &[(&str, &str)] = &[
         "ctx provider credential",
         "stores a provider secret on the machine",
     ),
+    ("update", "replaces the running zirv binary with a download"),
 ];
 
 /// Further built-in paths kept out of the native allow list and the sandbox
