@@ -2031,7 +2031,7 @@ fn strings<const N: usize>(values: [&str; N]) -> Vec<OsString> {
     values.into_iter().map(OsString::from).collect()
 }
 
-fn shell_quote_for_classification(value: &str) -> String {
+pub(crate) fn shell_quote_for_classification(value: &str) -> String {
     if value
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || b"_./:@%+=,-".contains(&byte))

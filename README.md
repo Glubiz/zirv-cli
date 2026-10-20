@@ -7667,7 +7667,7 @@ invocation (`zirv` or the running binary's own path; only `ZIRV_*` env prefixes,
 and only on `ctx`), a literal `cd`, or a read-only filter, with each
 `$(...)`/backtick body held to the same rule. It never prints deny or ask, so
 every refusal and a matching deny rule still win. The hook's own base policy is
-wider (#922): every built-in is allowed in both launch modes except the posture
+wider: every built-in is allowed in both launch modes except the posture
 list, and a launcher (`ctx exec`/`wrap`/`run`/`statusline`, `ctx usage tee`)
 takes its wrapped child's verdict. Posture, credential and metered commands keep
 asking, also on an unsandboxed retry: the mutating `setup` and `ctx config`
@@ -7684,7 +7684,7 @@ Elasticsearch GET/POST query endpoints (`/_search`, `/_msearch`, `/_count`, `/_f
 
 The orchestrator-seat write guard treats a quoted heredoc body as data (even with backticks or `$(`), and a heredoc fed to `python`/`node`/`ruby`/`perl` as that language's code: it denies only on a file-write primitive, not on `>` in the script.
 
-**Unsandboxed retries (#922).** When Claude retries a command with
+**Unsandboxed retries.** When Claude retries a command with
 `dangerouslyDisableSandbox`, a base Deny stays Deny and an Ask from an explicit
 rule stays Ask (Deny headlessly). A base Allow, from a rule or the launch mode's
 default, runs without a prompt unless a danger screen trips on any segment. The
@@ -7692,20 +7692,32 @@ retry loses the sandbox's filesystem deny lists and network proxy, so the screen
 gates every retry path, `[safety] escape_allow` and scratchpad-confined writes
 included, and trips on: a credential or project-secret read (also `~/.claude`
 token files, `~/.claude.json`, `~/.pgpass`, `~/.gnupg`, keychains, shell history,
-browser cookie/login stores, `/proc/*/environ`, and a bare `env`/`printenv`/
-`export -p`/`set`); a write, redirect or download into a protected path (shell
+browser cookie/login stores and `/proc/*/environ`; `.env.example`, `.sample`,
+`.template` and `.dist` are not secrets, and `ls`/`stat`/`du`/`file`/`tree` or a
+`find` without `-exec`/`-delete` of a credential or protected directory reads
+nothing); a write, redirect or download into a protected path (shell
 startup files, credential stores, `~/.gitconfig`, `~/.config/git`,
 `~/Library/LaunchAgents`, all of `~/.claude`, any `.claude` settings, hooks,
 skills, agents, commands and rules, `.git/hooks` and `.git/config`, the operator's
 `~/.zirv`, `/etc`, `/usr`, `/bin`, `/sbin`, `/System`, `/Library`) or
 `sudo`/`doas`; a `git config --global`/`--system` write, a git `-c` or config key
 that runs a command (`core.sshCommand`, `core.pager`, `core.editor`,
-`credential.*`, `alias.*`, `*.command`, ...) or a `core.hooksPath` outside the
-repository; `crontab` other than `-l`; `launchctl load`/`bootstrap`/`submit`;
-`defaults write`; `chmod`/`chown` on `/` or a whole home; `docker run
---privileged` or a host-root, protected-path or docker-socket mount; a network
-call (`curl`, `wget`, `ssh`, `scp`, `rsync`, `nc`, ...) carrying a substitution or
-a secret-named variable, or uploading a file from outside the scratchpad; a
+`credential.*`, `alias.*`, `*.command`, `protocol.*.allow`, ...), a persisted
+`core.hooksPath` in any config file, or a `-c core.hooksPath` outside the
+repository; `crontab` other than `-l`; `launchctl`
+`load`/`unload`/`bootstrap`/`bootout`/`submit`/`enable`/`disable`/`kickstart`/
+`setenv`/`unsetenv`/`remove`; `defaults write`; `spctl --master-disable`/
+`--global-disable`/`--add`, `csrutil`, `nvram`, `sysadminctl`, `dscl` writes,
+`pmset` other than `-g`, `networksetup`/`systemsetup -set*`, `scutil --set`,
+`diskutil erase*`/`partition*`/`unmount*`, `tmutil delete`/`disable`, `kextload`
+and `kmutil load`; any `osascript` (Apple Events are off inside the sandbox);
+`chmod`/`chown` on `/`, `/Users`, `/home` or a whole home; `docker run` with
+`--privileged`, a host `--pid`/`--network`/`--ipc`/`--uts`/`--userns`, `--cap-add
+SYS_ADMIN`/`ALL`, an unconfined `--security-opt`, `--device`, or a host-root,
+protected-path or docker-socket mount; a network call (`curl`, `wget`, `ssh`,
+`scp`, `rsync`, `nc`, ...) carrying a substitution or a secret-named variable,
+uploading a file from outside the scratchpad, or sending stdin fed by a pipe
+(`env | curl -d @- ...`, `... | nc host port`); a
 secret-named variable assigned from a substitution; a posture zirv command (by
 basename, so a path-qualified or `env`-prefixed `zirv` counts) or a repo script;
 a process signal other than `kill -0`; a cluster-changing `kubectl` verb or a
@@ -7716,13 +7728,19 @@ Writes into the repository, worktrees, the scratchpad, `$TMPDIR` and other user
 directories are fine. Variable targets resolve through the command's own
 assignments and loop lists; a value computed by a substitution or argument trips
 only when the command spells a protected path, and one set by `read`, `source`,
-`eval`, `+=` or an array always trips. Heredoc bodies are data, except a shell's,
-which is screened. Interpreter code (python, node, ruby, perl, osascript, inline
+`eval`, `+=` or an array always trips. A glob word is expanded against the
+filesystem at decision time and every match screened; more than 256 matches, or
+no match under a credential or protected directory (`~/.claude/kibana-t*`), asks.
+Heredoc bodies are data, except a shell's,
+which is screened. Interpreter code (python, node, ruby, perl, inline
 or from a heredoc), awk programs and sed scripts get a code check: credential
 material and protected paths, including absolute home spellings and paths joined
-onto a home accessor (`Path.home() / '.zshrc'`); each shell string handed to
-`os.system`, `subprocess`, `child_process`, `system`, backticks or `do shell
-script` is screened like a `-c` payload; sed `e` and writes to a protected file
+onto a home accessor (`Path.home() / '.zshrc'`); a write primitive combined with
+a home accessor (`os.environ['HOME']`, `expanduser`, `Path.home()`,
+`os.homedir()`, `process.env.HOME`, `$ENV{HOME}`, `glob('~')`) whatever the
+target spells, while code that only reads HOME stays silent; each shell string handed to
+`os.system`, `subprocess`, `child_process`, `system` or backticks
+is screened like a `-c` payload; sed `e` and writes to a protected file
 via `w` ask. A plain `subprocess.run(['git', 'status'])` stays silent.
 
 The analyzer evaluates the most restrictive result across quote-aware compound
