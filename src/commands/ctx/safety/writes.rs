@@ -3719,7 +3719,7 @@ mod tests {
     #[test]
     fn literal_assignment_retry_keeps_unconfined_tainted_and_credential_targets_blocked() {
         let scratch = scratchpad_write_root(&std::env::temp_dir());
-        // #922: `S=$HOME/x; echo y > $S/z` left this list and the `S=$HOME`
+        // `S=$HOME/x; echo y > $S/z` left this list and the `S=$HOME`
         // reassignment now writes a startup file: an ordinary user directory
         // is not a protected path, so a retry may write it.
         for command in [

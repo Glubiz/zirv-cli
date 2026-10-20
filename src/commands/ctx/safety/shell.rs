@@ -787,7 +787,7 @@ pub(super) struct HeredocBody {
 }
 
 /// Redact every heredoc body, quoted or not, and return the bodies so a
-/// caller can screen each one by what it feeds (#922 retry screen).
+/// caller can screen each one by what it feeds (retry screen).
 pub(super) fn redact_all_heredocs(command: &str) -> (String, Vec<HeredocBody>) {
     let chars: Vec<char> = command.chars().collect();
     let mut bodies = Vec::new();
@@ -2462,7 +2462,7 @@ mod tests {
                 .any(|candidate| candidate.contains("zirv ctx run")),
             "the wrapper text must survive when there is nothing to unwrap"
         );
-        // #922: `ctx run` is a base-allowed built-in, so a wrapper launching
+        // `ctx run` is a base-allowed built-in, so a wrapper launching
         // nothing is allowed, while any child it does launch decides.
         assert_eq!(
             evaluate(&policy, "zirv ctx run --compact --", LaunchMode::Headless).verdict,

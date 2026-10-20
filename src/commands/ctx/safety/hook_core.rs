@@ -602,7 +602,7 @@ fn run_check_hook_inner<W: Write>(
     }
     // Preserve semantic Deny and explicit Ask before considering unsandboxed
     // retries. An allowed command runs silently unless the danger screen
-    // trips; asked commands retain escalation (#147, #922). Every retry path
+    // trips; asked commands retain escalation (#147). Every retry path
     // loses the sandbox's filesystem and network limits, so the screen gates
     // the scratchpad, mixed and escape_allow paths too.
     if payload.tool_input.dangerously_disable_sandbox

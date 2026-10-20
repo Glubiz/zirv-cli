@@ -626,7 +626,7 @@ mod tests {
     /// its own (see `ctx_base_allow_verbs`'s doc comment), so it is
     /// deliberately excluded from the base-level auto-allow as well.
     ///
-    /// #922: the operator allowed every non-posture zirv built-in, so these
+    /// The operator allowed every non-posture zirv built-in, so these
     /// verbs are base-allowed now; the native sandbox exclusion still omits
     /// them, and a caller-supplied child after `--` carries its own verdict.
     #[test]

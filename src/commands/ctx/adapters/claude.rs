@@ -4932,7 +4932,7 @@ mod tests {
                 "reserved permission rule {expected} missing from {settings}"
             );
         }
-        // The self-replacing `update` is a posture command (#922).
+        // The self-replacing `update` is a posture command.
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv update *)")));
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv *)")));
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx *)")));
@@ -4953,7 +4953,7 @@ mod tests {
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx hook install *)")));
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx exec *)")));
         assert!(!permission_allow.contains(&serde_json::json!("Bash(zirv ctx wrap *)")));
-        // #922: `usage *` takes the verb's own flags. It also covers `usage
+        // `usage *` takes the verb's own flags. It also covers `usage
         // tee -- <cmd>`, so the hook denies a tee child that needs approval
         // and the sandbox exclusion keeps the exact `zirv ctx usage` form.
         assert!(permission_allow.contains(&serde_json::json!("Bash(zirv ctx usage *)")));

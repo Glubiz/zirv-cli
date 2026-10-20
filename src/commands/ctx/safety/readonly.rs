@@ -1512,7 +1512,7 @@ mod tests {
 
     #[test]
     fn retry_redirects_resolve_under_payload_cwd_and_input_is_not_a_write() {
-        // #922: a retry may write outside the repository; only protected
+        // A retry may write outside the repository; only protected
         // paths ask, so the unconfined rows moved up here.
         for command in [
             "OUT=/work/repo/logs; cargo test > $OUT/result.log",

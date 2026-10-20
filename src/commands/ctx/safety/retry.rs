@@ -2904,7 +2904,7 @@ mod tests {
     /// Issue #307/#321: harmless, ordinary-workflow commands carrying
     /// `dangerouslyDisableSandbox: true` (the unsandboxed retry a non-Windows
     /// OS sandbox forces once a supervised session's tool call cannot run
-    /// inside it) clear silently rather than prompt or deny. #922: every
+    /// inside it) clear silently rather than prompt or deny. Every
     /// non-posture built-in qualifies, `zirv test` included -- the operator
     /// ruled that a retry may run non-destructive commands.
     #[test]
@@ -3229,7 +3229,7 @@ mod tests {
         let empty: HashMap<String, String> = HashMap::new();
         let cfg = CtxConfig::load(repo.path(), &|key| empty.get(key).cloned()).expect("loads");
 
-        // #922: `test`/`verify`/`frontend`, `chat` and the child-wrapping
+        // `test`/`verify`/`frontend`, `chat` and the child-wrapping
         // verbs left this list: they are non-posture built-ins, and a wrapped
         // child now carries its own verdict.
         for command in [
@@ -3275,7 +3275,7 @@ mod tests {
         }
     }
 
-    // -- #922: a retry screens for danger, not for proof of safety ----------
+    // -- a retry screens for danger, not for proof of safety ----------
 
     fn interactive_retry(command: &str) -> (String, String) {
         interactive_retry_with_home(command, &[])
@@ -4586,7 +4586,7 @@ mod tests {
     /// (`-o /etc/passwd`) -- genuinely disqualifying post-#168 too -- to keep
     /// exercising this corpus's own "must never silently allow" invariant.
     ///
-    /// #922: a retry now screens for danger rather than proof of safety, so
+    /// A retry now screens for danger rather than proof of safety, so
     /// a redirect into an ordinary path (`> /tmp/x`) no longer escalates;
     /// the dangerous rows of the old unit corpus moved here.
     #[test]
