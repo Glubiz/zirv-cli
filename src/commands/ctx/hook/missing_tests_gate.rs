@@ -171,9 +171,8 @@ pub(super) fn missing_tests_gate_reason(
     }
     // Any doubt here (no git, no repo, ...) reads as "nothing changed": a
     // block is a hard stop, never worth risking on an unreadable repo state.
-    // Tracked edits only: untracked files (stray, `.zirv/work`, `.zirv/memory`) are never source
-    // the session owes a test for. (#922)
-    let mut changed = verification::tracked_changed_paths(repo).ok()?;
+    // Tracked edits plus visible untracked files; workflow and hidden paths never owe a test. (#922)
+    let mut changed = verification::candidate_edit_paths(repo).ok()?;
     // A dirty tree this session inherited (another session's edits) is not its own work: count
     // only paths touched after it started. (#908)
     if let Some(record) = crate::commands::ctx::sessions::load_record(
@@ -693,6 +692,28 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// #922: a writing session that adds a new untracked source module and no test is blocked.
+    #[test]
+    fn a_session_adding_an_untracked_source_module_without_a_test_is_blocked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let repo = git_repo();
+        std::fs::create_dir_all(repo.path().join("src")).expect("mkdir");
+        std::fs::write(repo.path().join("src/new_mod.rs"), "pub fn f() {}\n").expect("write");
+        let env: std::collections::HashMap<String, String> =
+            [(adapters::HEADLESS_ENV.to_string(), "1".to_string())].into();
+        let reason = missing_tests_gate_reason(
+            &state,
+            repo.path(),
+            "sess-922b",
+            "sess-922b",
+            &CtxConfig::default(),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("a new untracked module with no test must block");
+        assert!(reason.contains("test"), "{reason}");
     }
 
     /// The counterpart: a file written after the session started still blocks.

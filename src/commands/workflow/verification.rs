@@ -478,24 +478,42 @@ pub fn changed_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
     changed_paths_at_root(&git_root(repo))
 }
 
-/// Tracked paths that differ from HEAD only: untracked files (stray, another session's, workflow
-/// bookkeeping) are never listed, and `.zirv/work` / `.zirv/memory` are excluded. (#922)
-pub fn tracked_changed_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
-    let output = git_at(&git_root(repo))
-        .args(["diff", "--name-only", "-z", "HEAD"])
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "cannot inspect changed paths: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    let mut paths: Vec<PathBuf> = git_paths(&output.stdout)
-        .filter(|path| {
+/// Paths a session may have written source into: tracked changes against HEAD (minus `.zirv/work`
+/// and `.zirv/memory`) plus untracked files, except those under any hidden component
+/// (`.zirv/`, `.claude/`, `.idea/`, `.DS_Store`). (#922)
+pub fn candidate_edit_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
+    let root = git_root(repo);
+    let mut paths = Vec::new();
+    for (args, untracked) in [
+        (&["diff", "--name-only", "-z", "HEAD"][..], false),
+        (
+            &[
+                "ls-files",
+                "-z",
+                "--others",
+                "--exclude-standard",
+                "--full-name",
+            ][..],
+            true,
+        ),
+    ] {
+        let output = git_at(&root).args(args).output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "cannot inspect changed paths: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+        paths.extend(git_paths(&output.stdout).filter(|path| {
+            if untracked {
+                return !path
+                    .components()
+                    .any(|part| part.as_os_str().to_string_lossy().starts_with('.'));
+            }
             !super::classify::is_workflow_work_path(path) && !path.starts_with(".zirv/memory")
-        })
-        .collect();
+        }));
+    }
     paths.sort();
     paths.dedup();
     Ok(paths)
