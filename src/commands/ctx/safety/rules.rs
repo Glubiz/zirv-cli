@@ -414,7 +414,7 @@ pub(super) fn evaluate_candidate_outcome(
     scratchpad_roots: &[String],
 ) -> Outcome {
     let base = evaluate_single(policy, candidate, fallback);
-    let outcome = apply_sql_outcome(policy, candidate, base);
+    let outcome = apply_sql_outcome(policy, candidate, original, base);
     let outcome = apply_credential_outcome(candidate, outcome);
     let outcome = apply_operator_config_outcome(candidate, outcome);
     let outcome = apply_network_outcome(candidate, original, outcome);

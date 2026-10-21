@@ -6,11 +6,16 @@ use super::*;
 /// preserving explicit policy precedence. Keeping this rule in one helper is
 /// what makes direct, compound, and shell-wrapped client invocations obey the
 /// same narrowing/widening contract.
-pub(super) fn apply_sql_outcome(policy: &SafetyPolicy, command: &str, base: Outcome) -> Outcome {
+pub(super) fn apply_sql_outcome(
+    policy: &SafetyPolicy,
+    command: &str,
+    original: &str,
+    base: Outcome,
+) -> Outcome {
     if policy.sql == SqlMode::Off {
         return base;
     }
-    let Some(sql) = sql_outcome(command) else {
+    let Some(sql) = psql_heredoc_outcome(command, original).or_else(|| sql_outcome(command)) else {
         return base;
     };
     match (base.verdict, sql.verdict) {

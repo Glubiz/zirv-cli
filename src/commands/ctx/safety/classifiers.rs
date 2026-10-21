@@ -1224,6 +1224,9 @@ enum SqlInvocation {
     Statement(String),
     /// A psql run whose every `-c` item is visible on argv, in order.
     PsqlScript(Vec<String>),
+    /// A psql with no `-c`: its script comes from stdin or an interactive
+    /// session.
+    PsqlStdin,
     /// A recognized client whose statement this function cannot see at all:
     /// read from stdin, read from a script file, typed into an interactive
     /// shell, split across two flags, or hidden behind an unbalanced quote.
@@ -1303,17 +1306,19 @@ pub(crate) fn sql_program_name(first_token: &str) -> String {
 /// at all, which is how [`sql_outcome`] stays silent about every command that
 /// has nothing to do with SQL.
 fn sql_invocation(command: &str) -> Option<SqlInvocation> {
-    let bare = collapse_whitespace(command);
+    // Newlines stay: a `--` comment ends at one, so flattening them would hide
+    // the statements that follow it.
+    let bare = command.trim().to_string();
     // A pipeline or list candidate: only the client's own segment is its argv.
     let bare = split_segments(&bare)
         .into_iter()
         .next()
-        .map_or(bare, |segment| collapse_whitespace(&segment));
+        .map_or(bare, |segment| segment.trim().to_string());
     let Some(tokens) = sql_tokens(&bare) else {
         // An unbalanced quote. If the program still names a client, this is a
         // recognized invocation whose statement cannot be read -- opaque, not
         // "not a DB command".
-        let program = sql_program_name(bare.split(' ').next().unwrap_or(""));
+        let program = sql_program_name(bare.split_whitespace().next().unwrap_or(""));
         return SQL_CLIS
             .iter()
             .any(|(name, _)| *name == program)
@@ -1499,8 +1504,75 @@ fn psql_invocation(tokens: &[String]) -> Option<SqlInvocation> {
     if informational {
         return None;
     }
-    // No `-c`: the script comes from stdin or an interactive session.
-    Some(SqlInvocation::Opaque)
+    Some(SqlInvocation::PsqlStdin)
+}
+
+/// A psql reading a quoted heredoc is a script on argv in all but name: Allow
+/// it when every item of the body passes the `-c` script rules. `None` leaves
+/// the ordinary classification (Ask) in place.
+pub(super) fn psql_heredoc_outcome(candidate: &str, original: &str) -> Option<Outcome> {
+    if !candidate.contains("<<") || !matches!(sql_invocation(candidate)?, SqlInvocation::PsqlStdin)
+    {
+        return None;
+    }
+    let (_, bodies) = redact_all_heredocs(original);
+    let [heredoc] = bodies.as_slice() else {
+        return None;
+    };
+    // The heredoc must feed this psql, not another command in the pipeline.
+    let opener = split_segments(&heredoc.opener)
+        .into_iter()
+        .find(|segment| segment.contains("<<"))?;
+    if heredoc.expands || !matches!(sql_invocation(&opener)?, SqlInvocation::PsqlStdin) {
+        return None;
+    }
+    let items = psql_script_items(&heredoc.body)?;
+    if items.is_empty() || !items.iter().all(|item| is_psql_item_read_only(item)) {
+        return None;
+    }
+    Some(Outcome {
+        verdict: Verdict::Allow,
+        matched: Some(Rule {
+            pattern: "<sql: a read-only psql script>".to_string(),
+            origin: Origin::BuiltIn,
+        }),
+    })
+}
+
+/// Splits a psql script into items: each backslash meta-command line, and the
+/// SQL between them (a trailing `\gset` stays with its query).
+fn psql_script_items(script: &str) -> Option<Vec<String>> {
+    let chars: Vec<char> = script.chars().collect();
+    let view = psql_code_view(script)?;
+    let mut items = Vec::new();
+    let mut sql = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if view[i] != '\\' {
+            sql.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let end = chars[i..]
+            .iter()
+            .position(|c| *c == '\n')
+            .map_or(chars.len(), |offset| i + offset);
+        let meta: String = chars[i..end].iter().collect();
+        if meta.split_whitespace().next() == Some("\\gset") && !sql.trim().is_empty() {
+            items.push(format!("{sql}{meta}"));
+            sql.clear();
+        } else {
+            if !sql.trim().is_empty() {
+                items.push(std::mem::take(&mut sql));
+            }
+            items.push(meta);
+        }
+        i = end;
+    }
+    if !sql.trim().is_empty() {
+        items.push(sql);
+    }
+    Some(items)
 }
 
 /// Text of `sql` with quoted strings, quoted identifiers, dollar quotes and
@@ -1545,7 +1617,11 @@ fn psql_code_view(sql: &str) -> Option<Vec<char>> {
                     .find(|&j| chars[j..j + closing.len()] == closing[..])?;
                 i = end + closing.len();
             }
-            '-' if chars.get(i + 1) == Some(&'-') => i = chars.len(),
+            '-' if chars.get(i + 1) == Some(&'-') => {
+                while i < chars.len() && !matches!(chars[i], '\n' | '\r') {
+                    i += 1;
+                }
+            }
             '/' if chars.get(i + 1) == Some(&'*') => {
                 let end = (i + 2..chars.len().saturating_sub(1))
                     .find(|&j| chars[j] == '*' && chars[j + 1] == '/')?;
@@ -1605,7 +1681,9 @@ fn is_psql_session_setting(statement: &str) -> bool {
 }
 
 fn is_psql_meta_command_read_only(item: &str) -> bool {
-    if item.contains(['`', '|', '>']) || item[1..].contains('\\') {
+    // A quote that never closes on this line would swallow the lines after it.
+    if item.contains(['`', '|', '>']) || item[1..].contains('\\') || psql_code_view(item).is_none()
+    {
         return false;
     }
     let word = item.split_whitespace().next().unwrap_or_default();
@@ -1919,7 +1997,7 @@ fn strip_sql_comments(statement: &str) -> Option<String> {
             continue;
         }
         if chars[i] == '-' && chars.get(i + 1) == Some(&'-') {
-            while i < chars.len() && chars[i] != '\n' {
+            while i < chars.len() && !matches!(chars[i], '\n' | '\r') {
                 i += 1;
             }
             out.push(' ');
@@ -2991,6 +3069,12 @@ mod tests {
             "sqlite3 app.db",
             // Two statements on one command line.
             "psql -c 'SELECT 1' -c 'DROP TABLE t'",
+            // A `--` comment ends at the newline; what follows it runs.
+            "psql -c 'select 1 -- x\n; drop table t'",
+            "psql -c 'select 1 -- x\ndrop table t'",
+            "psql -c 'select 1 -- x\r; drop table t'",
+            "psql -c 'select 1' -c 'select 2 -- x\ndrop table t'",
+            "mysql -e \"select 1 -- x\ndrop table t\"",
             // Unbalanced quoting: the statement cannot be seen.
             "psql -c \"SELECT 1",
             // A flag with nothing after it.
@@ -3041,6 +3125,64 @@ mod tests {
             Verdict::Allow,
             "{docker}"
         );
+    }
+
+    #[test]
+    fn a_comment_ends_at_the_newline_so_later_lines_are_still_judged() {
+        for command in [
+            "psql -c 'SELECT 1 -- note\n, 2'",
+            "psql -c 'SELECT 1 -- note\n'",
+            "psql -c 'SELECT 1; -- note\nSELECT 2'",
+        ] {
+            let outcome = sql_outcome(command).expect(command);
+            assert_eq!(outcome.verdict, Verdict::Allow, "{command}: {outcome:?}");
+        }
+    }
+
+    const PSQL_BENCH_BODY: &str = "\\set n 5\n\\pset format unaligned\n\\timing on\nSET plan_cache_mode = force_generic_plan;\nSELECT count(*) AS c\n  FROM t -- rows\n  WHERE id > 1 \\gset\nEXPLAIN (ANALYZE, BUFFERS)\nSELECT 1;\n";
+
+    #[test]
+    fn a_quoted_heredoc_psql_script_of_read_only_items_allows() {
+        let policy = SafetyPolicy::default();
+        for opener in [
+            "psql -d bench <<'SQL'",
+            "psql -h db -U app -X -q <<\"SQL\"",
+            "psql -d bench <<-'SQL'",
+        ] {
+            let command = format!("{opener}\n{PSQL_BENCH_BODY}SQL");
+            let outcome = evaluate(&policy, &command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, Verdict::Allow, "{command}: {outcome:?}");
+            assert!(
+                outcome
+                    .matched
+                    .is_some_and(|rule| rule.pattern.starts_with("<sql:")),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn heredoc_psql_scripts_ask_unless_quoted_and_every_item_is_provable() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "psql -d bench <<'SQL'\n\\! id\nSQL",
+            "psql -d bench <<'SQL'\nSELECT 1;\n\\o |sh\nSELECT 2;\nSQL",
+            "psql -d bench <<'SQL'\nSELECT 1;\nDROP TABLE t;\nSQL",
+            "psql -d bench <<'SQL'\nSELECT 1 -- x\n; DROP TABLE t;\nSQL",
+            "psql -d bench <<'SQL'\n\\set v '; DROP TABLE t'\nSELECT 1 :v;\nSQL",
+            "psql -d bench <<'SQL'\n\\echo 'x\nDROP TABLE t;\n'\nSQL",
+            "psql -d bench <<'SQL'\nSELECT 1 \\g\nSQL",
+            "psql -d bench <<SQL\nSELECT 1;\nSQL",
+            "psql -d bench <<<'SELECT 1'",
+            "psql -f x.sql <<'SQL'\nSELECT 1;\nSQL",
+            "cat x.sql | psql -d bench",
+            "cat <<'SQL' | psql -d bench\nSELECT 1;\nSQL",
+            "psql -d bench < x.sql",
+            "psql -d bench <<'SQL'\nSELECT 1;\nSQL\npsql -d bench <<'SQL'\nDROP TABLE t;\nSQL",
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
+        }
     }
 
     #[test]
