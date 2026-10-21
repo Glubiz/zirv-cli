@@ -335,7 +335,10 @@ pub(super) fn resolve_shell_variables(
             .map(|word| word.text)
             .collect();
         let first = words.first().map(String::as_str);
-        if words
+        if words.iter().any(|word| {
+            word.strip_prefix("IFS")
+                .is_some_and(|rest| rest.starts_with(['=', '+', '[']))
+        }) || words
             .iter()
             .any(|word| MUTATING_BUILTINS.contains(&word.as_str()))
             || matches!(first, Some("source" | "."))
@@ -377,7 +380,10 @@ pub(super) fn resolve_shell_variables(
             }
             (_, '$') => match dollar_reference(&chars, i) {
                 Some((name, end)) => {
+                    // zsh reads `$W:h`, `$W[1]` and friends as a transform of the value.
+                    let zsh_suffix = chars.get(end).is_some_and(|ch| ":[(^~=#".contains(*ch));
                     let value = match state.get(&name) {
+                        _ if zsh_suffix => None,
                         Some(value) => value.clone(),
                         None => shell_env
                             .iter()

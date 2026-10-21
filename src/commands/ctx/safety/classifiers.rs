@@ -409,7 +409,7 @@ fn is_concrete_vcs_path(path: &str) -> bool {
 
 /// Match complete `.claude/worktrees/` or `.zirv/worktrees/` components so
 /// similarly named paths cannot inherit the agent-cleanup exception (#306).
-fn is_agent_worktree_root(path: &str) -> bool {
+pub(super) fn is_agent_worktree_root(path: &str) -> bool {
     let normalized = path.replace('\\', "/");
     // Reject `..` before matching a worktree marker: it can escape the root.
     if normalized.contains("..") {

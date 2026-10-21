@@ -1062,6 +1062,10 @@ pub(crate) fn strip_program_dir(segment: &str) -> String {
     let Some(program) = parts.next() else {
         return segment.to_string();
     };
+    // A leading `NAME=/value` is an assignment, not a program path to basename.
+    if is_shell_identifier_assignment(program) {
+        return segment.to_string();
+    }
     let bare = program.rsplit(['/', '\\']).next().unwrap_or(program);
     match parts.next() {
         Some(rest) if !rest.is_empty() => format!("{bare} {rest}"),

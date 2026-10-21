@@ -569,8 +569,9 @@ const FIND_EXEC_SAFE_PROGRAMS: &[&str] = &[
 
 /// Ask for any `find -exec`/`-ok` action whose program is not proven safe;
 /// unknown executables cannot inherit an ordinary read verdict. `rmdir` only
-/// removes empty directories, except Windows `rmdir /s`, which recurses.
-fn is_risky_find_exec(command: &str) -> bool {
+/// removes empty directories, except Windows `rmdir /s`, which recurses, and
+/// only beneath a start path that is relative, temp, scratchpad or a worktree.
+fn is_risky_find_exec(command: &str, scratchpad_roots: &[String]) -> bool {
     let Some(tokens) = sql_tokens(&collapse_whitespace(command)) else {
         return false;
     };
@@ -580,6 +581,19 @@ fn is_risky_find_exec(command: &str) -> bool {
     if sql_program_name(first) != "find" {
         return false;
     }
+    let options = tokens[1..]
+        .iter()
+        .take_while(|token| matches!(token.as_str(), "-H" | "-L" | "-P"))
+        .count();
+    let start_paths = tokens[1 + options..]
+        .iter()
+        .take_while(|token| !token.starts_with(['-', '(', '!']));
+    let starts_confined = start_paths
+        .into_iter()
+        .all(|path| find_start_path_confined(path, scratchpad_roots))
+        && !tokens
+            .get(1 + options)
+            .is_some_and(|token| token.starts_with("-D") || token.starts_with("-O"));
     let mut i = 1;
     while i < tokens.len() {
         let lower = tokens[i].to_ascii_lowercase();
@@ -593,9 +607,8 @@ fn is_risky_find_exec(command: &str) -> bool {
                     .iter()
                     .take_while(|token| !matches!(token.as_str(), ";" | "\\;" | "+"))
                     .any(|token| token.eq_ignore_ascii_case("/s"));
-            if recursive_rmdir
-                || !(FIND_EXEC_SAFE_PROGRAMS.contains(&program.as_str()) || program == "rmdir")
-            {
+            let safe_rmdir = program == "rmdir" && !recursive_rmdir && starts_confined;
+            if !(FIND_EXEC_SAFE_PROGRAMS.contains(&program.as_str()) || safe_rmdir) {
                 return true;
             }
         }
@@ -604,8 +617,34 @@ fn is_risky_find_exec(command: &str) -> bool {
     false
 }
 
-pub(super) fn apply_find_exec_outcome(command: &str, base: Outcome) -> Outcome {
-    if !is_risky_find_exec(command) || base.verdict != Verdict::Allow {
+/// A `find` start path that is relative without `..`, or an absolute literal
+/// strictly below a temp root, a scratchpad root or an agent worktree root.
+fn find_start_path_confined(path: &str, scratchpad_roots: &[String]) -> bool {
+    let path = strip_quotes(path).replace('\\', "/");
+    if path.is_empty()
+        || path.contains(['$', '`', '~', '*', '?'])
+        || path.split('/').any(|p| p == "..")
+    {
+        return false;
+    }
+    if split_absolute_root(&path).is_none() {
+        return true;
+    }
+    is_agent_worktree_root(&path)
+        || target_strictly_below_scratchpad(&path, scratchpad_roots)
+        || lexically_normalize_absolute(&path).is_some_and(|resolved| {
+            temp_delete_roots()
+                .iter()
+                .any(|root| path_strictly_below(&resolved, root))
+        })
+}
+
+pub(super) fn apply_find_exec_outcome(
+    command: &str,
+    base: Outcome,
+    scratchpad_roots: &[String],
+) -> Outcome {
+    if !is_risky_find_exec(command, scratchpad_roots) || base.verdict != Verdict::Allow {
         return base;
     }
     Outcome {
@@ -1383,6 +1422,107 @@ mod tests {
         ] {
             let outcome = evaluate(&policy, command, LaunchMode::Interactive);
             assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn find_exec_rmdir_needs_every_start_path_confined() {
+        let roots = vec!["/var/scratch/claude".to_string()];
+        let verdict = |command: &str| {
+            evaluate_with_scratchpad_roots(
+                &SafetyPolicy::default(),
+                command,
+                LaunchMode::Interactive,
+                &roots,
+                None,
+                None,
+                0,
+            )
+            .verdict
+        };
+        for path in [
+            ".",
+            "sub/dir",
+            "/tmp/zz/x",
+            "/var/scratch/claude/x",
+            "D:/repo/.claude/worktrees/x",
+        ] {
+            let command = format!("find {path} -type d -empty -exec rmdir {{}} \\;");
+            assert_eq!(verdict(&command), Verdict::Allow, "{command}");
+        }
+        for path in [
+            "/",
+            "~",
+            "../x",
+            "/var/scratch/claudeX",
+            "/home/u",
+            ". /",
+            "/tmp/zz/../..",
+        ] {
+            let command = format!("find {path} -type d -empty -exec rmdir {{}} \\;");
+            assert_eq!(verdict(&command), Verdict::Ask, "{command}");
+        }
+        assert_eq!(
+            verdict("find -L / -type d -exec rmdir {} \\;"),
+            Verdict::Ask,
+            "a leading -L must not hide the start path"
+        );
+    }
+
+    #[test]
+    fn a_zsh_modifier_or_subscript_after_a_resolved_name_stays_unresolved() {
+        for command in [
+            "W=/tmp/x; rm -rf $W:h:h",
+            "W=/tmp/x; rm -rf $W[1]",
+            "W=/tmp/x; rm -rf $W:h",
+            "W=/tmp/x; rm -rf ${W}:h",
+            "W=/tmp/x; rm -rf ${W}[1]",
+        ] {
+            let outcome = evaluate(&SafetyPolicy::default(), command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
+        }
+        let env = [("TMPDIR", "/tmp/claude-501/zz")];
+        for command in [
+            "rm -rf $TMPDIR:h:h",
+            "rm -rf $TMPDIR:h",
+            "rm -rf $TMPDIR[1]",
+        ] {
+            let outcome = evaluate_with_shell_env(command, &env);
+            assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn an_ifs_assignment_disables_variable_resolution() {
+        for command in [
+            "W=/tmp/claude-501/x; IFS=/; rm -rf $W",
+            "IFS=/; W=/tmp/claude-501/x; rm -rf $W",
+        ] {
+            let outcome = evaluate(&SafetyPolicy::default(), command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
+        }
+    }
+
+    /// A leading `NAME=value` whose value holds `/` must be stripped as an
+    /// assignment, not basenamed into the program position.
+    #[test]
+    fn a_leading_assignment_with_a_slash_does_not_hide_the_command() {
+        let policy = SafetyPolicy::default();
+        for (command, expected) in [
+            ("FOO=/x sudo ls", Verdict::Deny),
+            ("FOO=/x git push --force origin main", Verdict::Ask),
+            ("X=a/b rm -rf /", Verdict::Ask),
+            ("FOO=/x git reset --hard", Verdict::Ask),
+            ("FOO=/x kubectl delete ns x", Verdict::Ask),
+            ("FOO=/x rm -rf $HOME", Verdict::Ask),
+            (
+                "W=D:/repo/.claude/worktrees/x git -C D:/repo worktree remove --force $W",
+                Verdict::Ask,
+            ),
+            ("FOO=1 sudo ls", Verdict::Deny),
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, expected, "{command}: {outcome:?}");
         }
     }
 

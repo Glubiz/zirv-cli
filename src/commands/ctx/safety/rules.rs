@@ -439,7 +439,7 @@ pub(super) fn evaluate_candidate_outcome(
     let outcome = apply_distribution_outcome(candidate, outcome);
     let outcome = apply_orchestrator_outcome(candidate, outcome);
     let outcome = apply_pipe_to_shell_outcome(candidate, outcome);
-    apply_find_exec_outcome(candidate, outcome)
+    apply_find_exec_outcome(candidate, outcome, scratchpad_roots)
 }
 
 /// Fold the raw command and normalized executable candidates to the

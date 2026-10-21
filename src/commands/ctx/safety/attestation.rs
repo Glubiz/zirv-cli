@@ -46,6 +46,8 @@ pub(super) struct AttestedEvaluation {
     pub(super) launch_fingerprint: Option<String>,
     pub(super) status: &'static str,
     pub(super) divergence: SnapshotDivergence,
+    /// The boundary facts the verdict was judged with, reusable for per-segment checks.
+    pub(super) facts: EvalFacts,
 }
 
 /// Evaluate with the resolved policy when attestation is invalid: a broken
@@ -83,6 +85,7 @@ fn self_healed_evaluation(
         launch_fingerprint,
         status: "self-healed",
         divergence: SnapshotDivergence::Unchanged,
+        facts: facts.clone(),
     }
 }
 
@@ -132,6 +135,7 @@ pub(super) fn evaluate_with_attestation_evidence(
                     launch_fingerprint: None,
                     status: "not-present",
                     divergence: SnapshotDivergence::Unchanged,
+                    facts,
                 };
             }
             (Some(fingerprint), Some(path)) => (fingerprint, path),
@@ -225,6 +229,7 @@ pub(super) fn evaluate_with_attestation_evidence(
         launch_fingerprint: Some(expected_fingerprint),
         status: "valid",
         divergence,
+        facts,
     }
 }
 

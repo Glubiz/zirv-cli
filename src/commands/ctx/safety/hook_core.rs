@@ -132,7 +132,7 @@ fn matching_segment(
     mode: super::adapters::LaunchMode,
     scratchpad_roots: &[String],
     cwd: Option<&Path>,
-    env: EnvLookup<'_>,
+    facts: &EvalFacts,
 ) -> Option<String> {
     let segments = split_segments(command);
     // An unmatched default applies to every segment alike, so none is singled out.
@@ -141,16 +141,8 @@ fn matching_segment(
     }
     segments.into_iter().find(|segment| {
         let segment = segment.trim();
-        let alone = evaluate_with_facts(
-            policy,
-            segment,
-            mode,
-            scratchpad_roots,
-            None,
-            cwd,
-            0,
-            &eval_facts(segment, cwd, env),
-        );
+        let alone =
+            evaluate_with_facts(policy, segment, mode, scratchpad_roots, None, cwd, 0, facts);
         alone.verdict == outcome.verdict
             && alone.matched.as_ref().map(|rule| &rule.pattern)
                 == outcome.matched.as_ref().map(|rule| &rule.pattern)
@@ -900,7 +892,7 @@ fn run_check_hook_inner<W: Write>(
                 mode,
                 &scratchpad_roots,
                 cwd,
-                env,
+                &evidence.facts,
             )
         })
         .flatten();
@@ -1006,15 +998,14 @@ pub(super) fn eval_facts(command: &str, cwd: Option<&Path>, env: EnvLookup<'_>) 
         .filter_map(|name| env(name).map(|value| (name.to_string(), value)))
         .collect();
     let ignored_generated = cwd
-        .zip(recursive_delete_targets(command))
-        .map(|(cwd, targets)| {
-            targets
-                .into_iter()
-                .filter(|target| {
-                    !generated_path(target)
-                        && nested_generated_path(target)
-                        && git_ignores_untracked(cwd, target)
-                })
+        .map(|cwd| {
+            split_segments(command)
+                .iter()
+                .filter_map(|segment| recursive_delete_targets(segment))
+                .flatten()
+                .filter(|target| !generated_path(target) && nested_generated_path(target))
+                .take(GIT_FACT_TARGET_CAP)
+                .filter(|target| git_ignores_untracked(cwd, target))
                 .collect()
         })
         .unwrap_or_default();
@@ -1026,6 +1017,9 @@ pub(super) fn eval_facts(command: &str, cwd: Option<&Path>, env: EnvLookup<'_>) 
 
 const GIT_FACT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Most nested targets one hook call asks git about; the rest count as not ignored.
+const GIT_FACT_TARGET_CAP: usize = 4;
+
 /// `git check-ignore` confirms the path is ignored and `git ls-files` that it
 /// holds no tracked file, so deleting it loses nothing git can restore.
 fn git_ignores_untracked(cwd: &Path, target: &str) -> bool {
@@ -1035,7 +1029,22 @@ fn git_ignores_untracked(cwd: &Path, target: &str) -> bool {
 
 /// Stdout of a successful git run bounded by [`GIT_FACT_TIMEOUT`].
 fn git_stdout(cwd: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let mut child = std::process::Command::new("git")
+    let no_hooks = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let mut command = std::process::Command::new("git");
+    // The hook runs unsandboxed in an agent-controlled checkout: repo config
+    // must not be able to execute anything (`core.fsmonitor`, hooks).
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(name);
+        }
+    }
+    let mut child = command
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("-c")
+        .arg(format!("core.hooksPath={no_hooks}"))
         .arg("-C")
         .arg(cwd)
         .args(args)
@@ -1114,6 +1123,50 @@ mod tests {
                 .ignored_generated
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn eval_facts_checks_every_segment_but_caps_the_git_work() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path();
+        git(root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "dist/\n").expect("write");
+        std::fs::create_dir_all(root.join("web/dist")).expect("mkdir");
+        let none = |_: &str| None;
+        let compound = (0..10)
+            .map(|i| format!("rm -rf web/dist/x{i}"))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        let facts = eval_facts(&compound, Some(root), &none);
+        assert_eq!(facts.ignored_generated.len(), GIT_FACT_TARGET_CAP);
+        assert_eq!(facts.ignored_generated[0], "web/dist/x0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eval_facts_never_runs_a_repo_configured_fsmonitor() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path();
+        git(root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "dist/\n").expect("write");
+        std::fs::create_dir_all(root.join("web/dist")).expect("mkdir");
+        let marker = root.join("marker");
+        let script = root.join("fsmonitor.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch {}\nprintf '\\0'\n", marker.display()),
+        )
+        .expect("write");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        git(
+            root,
+            &["config", "core.fsmonitor", &script.display().to_string()],
+        );
+        let none = |_: &str| None;
+        let facts = eval_facts("rm -rf web/dist", Some(root), &none);
+        assert_eq!(facts.ignored_generated, ["web/dist"]);
+        assert!(!marker.exists(), "the repo's fsmonitor command ran");
     }
 
     #[test]
