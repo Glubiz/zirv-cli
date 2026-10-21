@@ -7560,7 +7560,8 @@ downloads, loopback requests and dry runs stay silent. Irreversible package or
 release publication/deletion, credential-store access, secret-file uploads, privilege
 escalation, download-to-shell pipelines, and attacks on zirv itself are denied.
 Local reads or copies of project secret files (`.env`, `.env.*`, `*.pem`, `*.key`)
-ask; `.env.example`, `.env.sample`, `.env.template`, `.env.dist`, and `.env.test`
+ask (an output-redirect target such as `> master.key` is a write, not a read);
+`.env.example`, `.env.sample`, `.env.template`, `.env.dist`, and `.env.test`
 templates stay silent.
 
 The shipped allow set also covers `zirv report bug|feature`, absolute-path
@@ -7657,8 +7658,12 @@ permission mode except `dontAsk` as interactive, including `auto` and
 `ZIRV_CTX_LAUNCH_MODE=interactive` overrides either case to interactive.
 With SQL classification on, one
 provably read-only `SELECT`/`EXPLAIN`/`SHOW` through a recognized client runs
-silently; write-shaped, multi-statement, stdin/script-fed, malformed, or CTE
-input asks conservatively.
+silently; write-shaped, stdin/script-fed, malformed, or CTE input asks
+conservatively. A `psql` run whose `-c` items (including getopt clusters such
+as `-Atc`) are all reads, plain session `SET`/`RESET`, or allow-listed
+meta-commands (`\set`, `\pset`, `\timing`, `\gset`, the `\d` family, ...) also
+runs silently; `--version`/`--help` are not SQL invocations. Backtick, `|`,
+`>`, `:var` interpolation, `-f`/`-o`/`-L` and everything else asks.
 
 With the default `interactive_default = "allow"`, the hook answers "allow" for commands no rule matches and suppresses the harness's own permission prompt, so enabling the hook widens what runs without a prompt; set `[safety] interactive_default = "ask"` in `~/.zirv/ctx.toml` to keep the harness's prompt for unmatched commands.
 

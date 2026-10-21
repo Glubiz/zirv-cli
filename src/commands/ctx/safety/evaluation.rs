@@ -27,7 +27,7 @@ pub(super) fn apply_credential_outcome(command: &str, base: Outcome) -> Outcome 
     }
     let (verdict, pattern) = if is_sensitive_credential_access(command) {
         (Verdict::Deny, "<credential: sensitive-file access>")
-    } else if is_sensitive_file_access(command, |path| project_secret_path(path, false)) {
+    } else if is_project_secret_read(command) {
         (Verdict::Ask, "<project secret file read>")
     } else {
         return base;
