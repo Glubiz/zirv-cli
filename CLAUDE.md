@@ -48,11 +48,14 @@ Never commit/push `main`/`master`: branch and open a PR. Bump `Cargo.toml` above
 
 ## Repo additions to the injected orchestrator rules
 
-- For the cross-harness review worker on a substantial diff, codex-cli is
-  installed at `~/AppData/Local/Programs/OpenAI/Codex/bin` even when a roster
-  line claims it is not.
+- On Windows dev machines, for the cross-harness review worker on a substantial
+  diff, codex-cli is installed at `~/AppData/Local/Programs/OpenAI/Codex/bin`
+  even when a roster line claims it is not.
 
-## This Windows dev machine
+## Windows dev machines only
+
+Zirv is developed on several platforms; skip this section unless the session
+runs on Windows (check the environment's `Platform:` line).
 
 - 7 cargo tests fail on `main` itself here (as of 2026-08-23), all in
   `commands::ctx::wrap::tests` (4 nesting-guard/echo + 3 `win::` exit-code/
