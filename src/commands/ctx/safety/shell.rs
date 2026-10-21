@@ -1062,6 +1062,13 @@ pub(crate) fn strip_program_dir(segment: &str) -> String {
     let Some(program) = parts.next() else {
         return segment.to_string();
     };
+    // A leading assignment (`NAME=/value`, quoted, `+=`, `[i]=`) is not a program path to basename.
+    if tokenize_quoted(&segment.chars().collect::<Vec<_>>())
+        .first()
+        .is_some_and(|word| is_leading_assignment(&word.text))
+    {
+        return segment.to_string();
+    }
     let bare = program.rsplit(['/', '\\']).next().unwrap_or(program);
     match parts.next() {
         Some(rest) if !rest.is_empty() => format!("{bare} {rest}"),
@@ -1230,6 +1237,30 @@ fn is_inline_command_flag(flag: &str) -> bool {
 /// assignment -- a `-`-prefixed token never reaches this check in the first
 /// place, but a bare positional like `a=b` (not a real assignment token
 /// shape) still needs the identifier shape enforced.
+/// A word that begins `NAME=`, `NAME+=` or `NAME[subscript]=`, however its
+/// value is quoted or escaped.
+fn is_leading_assignment(word: &str) -> bool {
+    let name_end = word
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(word.len());
+    let (name, rest) = word.split_at(name_end);
+    if !name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    {
+        return false;
+    }
+    let rest = match rest.strip_prefix('[') {
+        Some(subscripted) => match subscripted.find(']') {
+            Some(close) => &subscripted[close + 1..],
+            None => return false,
+        },
+        None => rest,
+    };
+    rest.starts_with('=') || rest.starts_with("+=")
+}
+
 pub(crate) fn is_shell_identifier_assignment(token: &str) -> bool {
     let Some((name, _value)) = token.split_once('=') else {
         return false;
@@ -1248,7 +1279,11 @@ pub(crate) fn is_shell_identifier_assignment(token: &str) -> bool {
 pub(crate) fn unwrap_env_prefix(segment: &str) -> Option<String> {
     let bare = strip_program_dir(segment);
     let collapsed = collapse_whitespace(&bare);
-    let tokens: Vec<&str> = collapsed.split(' ').filter(|t| !t.is_empty()).collect();
+    let words: Vec<String> = tokenize_quoted(&collapsed.chars().collect::<Vec<_>>())
+        .into_iter()
+        .map(|word| word.text)
+        .collect();
+    let tokens: Vec<&str> = words.iter().map(String::as_str).collect();
     let first = *tokens.first()?;
 
     if sql_program_name(first) == "env" {
@@ -1260,7 +1295,7 @@ pub(crate) fn unwrap_env_prefix(segment: &str) -> Option<String> {
                 Some(t) if t.starts_with("--split-string=") => return None,
                 Some(t) if t.starts_with("--chdir=") => i += 1,
                 Some(t) if t.starts_with('-') => i += 1,
-                Some(t) if is_shell_identifier_assignment(t) => i += 1,
+                Some(t) if is_leading_assignment(t) => i += 1,
                 _ => break,
             }
         }
@@ -1268,10 +1303,7 @@ pub(crate) fn unwrap_env_prefix(segment: &str) -> Option<String> {
     }
 
     let mut i = 0usize;
-    while tokens
-        .get(i)
-        .is_some_and(|t| is_shell_identifier_assignment(t))
-    {
+    while tokens.get(i).is_some_and(|t| is_leading_assignment(t)) {
         i += 1;
     }
     if i == 0 || i >= tokens.len() {

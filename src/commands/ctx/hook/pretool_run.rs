@@ -1628,8 +1628,10 @@ mod tests {
     /// specific `deny`/`ask` rule always outranks the unmatched-command
     /// `default` (`safety::evaluate`'s own precedence). `rm -rf /` matches
     /// the shipped `[safety] ask` rule `rm -rf *` (not a hard `deny`), so the
-    /// real verdict here is `ask`, carrying the `BLOCKED: rm /` instruction
-    /// suffix `blocked_instruction_suffix` appends to any real `deny`/`ask`.
+    /// real verdict here is `ask`, carrying the `BLOCKED: `rm -rf /` matched
+    /// `rm -rf *`.` instruction suffix `blocked_instruction_suffix` appends to
+    /// a `deny`/`ask` nobody can answer (an answerable ask reads `Approval
+    /// needed: ...`).
     /// Issue #769: this is exactly the "safety deny/ask path" consolidation
     /// must keep intact -- the merged hook now carries this REAL verdict
     /// itself (before, only the separate `zirv ctx safety check` process

@@ -9,24 +9,47 @@ use super::*;
 // Path classification is lexical; the hook caller must reject symlinked
 // targets and ancestors before allowing generated cleanup.
 pub(super) fn generated_path(path: &str) -> bool {
+    let normalized = lowercase_relative_in_repo_path(path);
+    let relative = normalized.as_deref().unwrap_or_default();
+    is_generated_dir_name(relative.split('/').next().unwrap_or(relative))
+}
+
+/// A generated-directory name at any depth below the first component, for a
+/// target that [`generated_path`] does not already cover. Such a target needs
+/// the hook's `git check-ignore` fact before it may be cleaned up. `.git`,
+/// `.zirv` and secret-looking components never qualify.
+pub(super) fn nested_generated_path(path: &str) -> bool {
+    let Some(relative) = lowercase_relative_in_repo_path(path) else {
+        return false;
+    };
+    let components: Vec<&str> = relative.split('/').collect();
+    !is_generated_dir_name(components[0])
+        && components.iter().any(|part| is_generated_dir_name(part))
+        && !components
+            .iter()
+            .any(|part| matches!(*part, ".git" | ".zirv"))
+        && !sensitive_upload_path(&relative)
+}
+
+fn lowercase_relative_in_repo_path(path: &str) -> Option<String> {
     let normalized = path
         .trim_matches(['\'', '"'])
         .replace('\\', "/")
         .to_ascii_lowercase();
     let relative = normalized.strip_prefix("./").unwrap_or(normalized.as_str());
-    if relative.is_empty()
+    let in_repo = !(relative.is_empty()
         || relative == "."
         || relative.starts_with('/')
         || relative.starts_with('~')
         || relative.contains(':')
         || relative.contains("..")
-        || relative.contains(['$', '%', '`'])
-    {
-        return false;
-    }
-    let root = relative.split('/').next().unwrap_or(relative);
+        || relative.contains(['$', '%', '`']));
+    in_repo.then(|| relative.to_string())
+}
+
+fn is_generated_dir_name(name: &str) -> bool {
     matches!(
-        root,
+        name,
         "target"
             | "node_modules"
             | ".next"
@@ -77,19 +100,17 @@ pub(super) fn is_recursive_delete(command: &str) -> bool {
     }
 }
 
-pub(super) fn provably_generated_cleanup(command: &str) -> bool {
+/// The targets of a single plain recursive delete command, before any judgement
+/// about which paths are generated.
+pub(super) fn recursive_delete_targets(command: &str) -> Option<Vec<String>> {
     if split_segments(command).len() != 1
         || !command_substitutions(command).is_empty()
         || unwrap_shell_wrapper(command).is_some()
     {
-        return false;
+        return None;
     }
-    let Some(tokens) = sql_tokens(&collapse_whitespace(command)) else {
-        return false;
-    };
-    let Some(first) = tokens.first() else {
-        return false;
-    };
+    let tokens = sql_tokens(&collapse_whitespace(command))?;
+    let first = tokens.first()?;
     let program = normalized_delete_program(first);
     let mut recursive = false;
     let mut targets = Vec::new();
@@ -116,13 +137,23 @@ pub(super) fn provably_generated_cleanup(command: &str) -> bool {
                 recursive |= lower == "/s";
                 matches!(lower.as_str(), "/s" | "/q")
             }
-            _ => return false,
+            _ => return None,
         };
         if !allowed_flag {
-            targets.push(token.as_str());
+            targets.push(token.clone());
         }
     }
-    recursive && !targets.is_empty() && targets.iter().all(|target| generated_path(target))
+    (recursive && !targets.is_empty()).then_some(targets)
+}
+
+/// `ignored` holds the nested targets the hook confirmed git-ignored and
+/// untracked; a root-level generated name needs no such fact.
+pub(super) fn provably_generated_cleanup(command: &str, ignored: &[String]) -> bool {
+    recursive_delete_targets(command).is_some_and(|targets| {
+        targets.iter().all(|target| {
+            generated_path(target) || (ignored.contains(target) && nested_generated_path(target))
+        })
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -378,7 +409,7 @@ fn is_concrete_vcs_path(path: &str) -> bool {
 
 /// Match complete `.claude/worktrees/` or `.zirv/worktrees/` components so
 /// similarly named paths cannot inherit the agent-cleanup exception (#306).
-fn is_agent_worktree_root(path: &str) -> bool {
+pub(super) fn is_agent_worktree_root(path: &str) -> bool {
     let normalized = path.replace('\\', "/");
     // Reject `..` before matching a worktree marker: it can escape the root.
     if normalized.contains("..") {
@@ -411,6 +442,11 @@ pub(super) fn is_destructive_vcs_action(command: &str, scratchpad_roots: &[Strin
         .iter()
         .map(|token| token.to_ascii_lowercase())
         .collect();
+    let short_cluster_has = |wanted: char| {
+        args.iter().any(|token| {
+            token.starts_with('-') && !token.starts_with("--") && token.contains(wanted)
+        })
+    };
     match action.as_str() {
         "push" => lower.iter().any(|token| {
             token == "-f"
@@ -472,16 +508,31 @@ pub(super) fn is_destructive_vcs_action(command: &str, scratchpad_roots: &[Strin
         "branch" => {
             // Forced branch deletion can discard unmerged commits; plain deletion
             // refuses unmerged branches and remains recoverable.
-            let short_cluster_has = |wanted: char| {
-                args.iter().any(|token| {
-                    token.starts_with('-') && !token.starts_with("--") && token.contains(wanted)
-                })
-            };
             // `-D` is a forced delete on its own, bundled (`-Dr`) or not.
             let force_deletes = short_cluster_has('D');
             let deletes = short_cluster_has('d') || lower.iter().any(|token| token == "--delete");
             let forces = short_cluster_has('f') || lower.iter().any(|token| token == "--force");
             force_deletes || (deletes && forces)
+        }
+        // Deleting a ref is a force delete: `-d`, a zero or empty new value, or
+        // `--stdin` input that may carry either.
+        "update-ref" => {
+            let mut operands = Vec::new();
+            let mut skip_value = false;
+            for token in args {
+                if skip_value {
+                    skip_value = false;
+                } else if token == "-m" {
+                    skip_value = true;
+                } else if !token.starts_with('-') {
+                    operands.push(token.as_str());
+                }
+            }
+            let zeroes_ref = operands.get(1).is_some_and(|new_value| {
+                new_value.is_empty()
+                    || (new_value.len() >= 4 && new_value.chars().all(|c| c == '0'))
+            });
+            short_cluster_has('d') || lower.iter().any(|token| token == "--stdin") || zeroes_ref
         }
         "stash" => lower
             .first()
@@ -550,6 +601,15 @@ pub(super) fn is_destructive_vcs_action(command: &str, scratchpad_roots: &[Strin
 // Destination-aware network mutation classifier
 // ---------------------------------------------------------------------
 
+/// Single-letter short flags (`-F` vs `-f`) are distinct options; longer names
+/// (`-Body`, `--data`) are case-insensitive.
+fn flag_name_matches(candidate: &str, name: &str) -> bool {
+    if name.len() == 2 {
+        return candidate == name;
+    }
+    candidate.eq_ignore_ascii_case(name)
+}
+
 pub(super) fn option_value<'a>(
     tokens: &'a [String],
     index: usize,
@@ -557,12 +617,12 @@ pub(super) fn option_value<'a>(
 ) -> Option<&'a str> {
     let token = tokens.get(index)?;
     for name in names {
-        if token.eq_ignore_ascii_case(name) {
+        if flag_name_matches(token, name) {
             return tokens.get(index + 1).map(String::as_str);
         }
         if token
             .get(..name.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(name))
+            .is_some_and(|prefix| flag_name_matches(prefix, name))
             && let Some(rest) = token.get(name.len()..)
             && let Some(value) = rest.strip_prefix('=')
         {
@@ -572,7 +632,7 @@ pub(super) fn option_value<'a>(
     for name in names.iter().filter(|name| name.len() == 2) {
         if token
             .get(..2)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(name))
+            .is_some_and(|prefix| flag_name_matches(prefix, name))
             && let Some(rest) = token.get(2..)
             && !rest.is_empty()
         {
@@ -748,16 +808,62 @@ pub(super) fn is_file_access_program(program: &str) -> bool {
 }
 
 pub(super) fn is_sensitive_file_access(command: &str, sensitive_path: fn(&str) -> bool) -> bool {
-    let Some(tokens) = sql_tokens(&collapse_whitespace(command)) else {
+    sensitive_file_access(command, sensitive_path, false)
+}
+
+/// A project secret file named as an operand, not as an output-redirect
+/// target: `> master.key` creates the file, it does not read it.
+pub(super) fn is_project_secret_read(command: &str) -> bool {
+    sensitive_file_access(command, |path| project_secret_path(path, false), true)
+}
+
+/// The operand a `>`, `>>`, `>|`, `&>` or `N>` token carries, or `Some("")`
+/// when the target is the next token.
+fn redirect_out_target(token: &str) -> Option<&str> {
+    let rest = token.trim_start_matches(|c: char| c.is_ascii_digit());
+    let rest = rest.strip_prefix('&').unwrap_or(rest);
+    let rest = rest.strip_prefix('>')?;
+    Some(rest.trim_start_matches(['>', '|']))
+}
+
+fn sensitive_file_access(
+    command: &str,
+    sensitive_path: fn(&str) -> bool,
+    skip_redirect_targets: bool,
+) -> bool {
+    let collapsed = collapse_whitespace(command);
+    let Some(tokens) = sql_tokens(&collapsed) else {
         return false;
     };
     let Some(first) = tokens.first() else {
         return false;
     };
     let program = sql_program_name(first);
-    let file_access_program =
-        is_file_access_program(&program) || (program == "echo" && command.contains('>'));
-    file_access_program && tokens.iter().skip(1).any(|token| sensitive_path(token))
+    let is_echo_write = program == "echo" && command.contains('>');
+    if !(is_file_access_program(&program) || is_echo_write) {
+        return false;
+    }
+    // `sql_tokens` strips quotes; a quoted `'>'` is an operand, so operators
+    // are recognised on the raw words, which must line up with the tokens.
+    let chars: Vec<char> = collapsed.chars().collect();
+    let raw_words: Vec<String> = tokenize_quoted(&chars)
+        .into_iter()
+        .map(|word| word.text)
+        .collect();
+    let skip_redirect_targets =
+        skip_redirect_targets && !is_echo_write && raw_words.len() == tokens.len();
+    let mut after_bare_operator = false;
+    for (index, token) in tokens.iter().enumerate().skip(1) {
+        let target = skip_redirect_targets
+            .then(|| redirect_out_target(&raw_words[index]))
+            .flatten();
+        let is_target = after_bare_operator || target.is_some_and(|target| !target.is_empty());
+        after_bare_operator = target == Some("");
+        if !is_target && sensitive_path(token) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Path prefixes that name the operator's own home directory in the shells
@@ -1100,6 +1206,16 @@ pub(super) fn network_outcome_in(command: &str, original: &str) -> Option<Outcom
             "<network: credential-file upload>",
         ));
     }
+    if matches!(program.as_str(), "curl" | "wget") {
+        let outputs = output_file_targets(&program, &tokens);
+        if outputs.iter().any(|path| sensitive_credential_path(path)) {
+            return Some(network_rule(
+                Verdict::Deny,
+                "<network: download into a credential file>",
+            ));
+        }
+        mutating |= outputs.iter().any(|path| project_secret_path(path, false));
+    }
     if is_elasticsearch_read_only_query(&elasticsearch_query_tokens(&raw_words, &tokens, original))
     {
         return None;
@@ -1141,6 +1257,11 @@ enum SqlInvocation {
     ReadOnlySession(Vec<String>),
     /// Exactly one inline statement, visible on argv.
     Statement(String),
+    /// A psql run whose every `-c` item is visible on argv, in order.
+    PsqlScript(Vec<String>),
+    /// A psql with no `-c`: its script comes from stdin or an interactive
+    /// session.
+    PsqlStdin,
     /// A recognized client whose statement this function cannot see at all:
     /// read from stdin, read from a script file, typed into an interactive
     /// shell, split across two flags, or hidden behind an unbalanced quote.
@@ -1220,17 +1341,19 @@ pub(crate) fn sql_program_name(first_token: &str) -> String {
 /// at all, which is how [`sql_outcome`] stays silent about every command that
 /// has nothing to do with SQL.
 fn sql_invocation(command: &str) -> Option<SqlInvocation> {
-    let bare = collapse_whitespace(command);
+    // Newlines stay: a `--` comment ends at one, so flattening them would hide
+    // the statements that follow it.
+    let bare = command.trim().to_string();
     // A pipeline or list candidate: only the client's own segment is its argv.
     let bare = split_segments(&bare)
         .into_iter()
         .next()
-        .map_or(bare, |segment| collapse_whitespace(&segment));
+        .map_or(bare, |segment| segment.trim().to_string());
     let Some(tokens) = sql_tokens(&bare) else {
         // An unbalanced quote. If the program still names a client, this is a
         // recognized invocation whose statement cannot be read -- opaque, not
         // "not a DB command".
-        let program = sql_program_name(bare.split(' ').next().unwrap_or(""));
+        let program = sql_program_name(bare.split_whitespace().next().unwrap_or(""));
         return SQL_CLIS
             .iter()
             .any(|(name, _)| *name == program)
@@ -1243,6 +1366,9 @@ fn sql_invocation(command: &str) -> Option<SqlInvocation> {
         && let Some(items) = path_command_tokens(&bare).and_then(|t| sqlite_session_items(&t))
     {
         return Some(SqlInvocation::ReadOnlySession(items));
+    }
+    if program == "psql" {
+        return psql_invocation(&tokens);
     }
 
     let mut statements: Vec<String> = Vec::new();
@@ -1295,6 +1421,432 @@ fn sql_invocation(command: &str) -> Option<SqlInvocation> {
         // either way, not a single provably read-only statement.
         Some(SqlInvocation::Opaque)
     }
+}
+
+/// psql short options that take a value: the rest of the cluster, else the
+/// next token.
+const PSQL_VALUE_LETTERS: &str = "cdfFhLoPpRTUv";
+
+/// Every long option psql 16 accepts.
+const PSQL_LONG_OPTIONS: &[&str] = &[
+    "echo-all",
+    "no-align",
+    "command",
+    "dbname",
+    "echo-queries",
+    "echo-errors",
+    "echo-hidden",
+    "file",
+    "field-separator",
+    "host",
+    "html",
+    "list",
+    "log-file",
+    "no-readline",
+    "output",
+    "port",
+    "pset",
+    "quiet",
+    "record-separator",
+    "single-step",
+    "single-line",
+    "tuples-only",
+    "table-attr",
+    "username",
+    "set",
+    "variable",
+    "version",
+    "no-password",
+    "password",
+    "expanded",
+    "no-psqlrc",
+    "field-separator-zero",
+    "record-separator-zero",
+    "single-transaction",
+    "help",
+    "csv",
+];
+
+/// psql short options that take no value.
+const PSQL_PLAIN_LETTERS: &str = "aAbeEHlnqsStwWxXz01";
+
+/// psql meta-commands that only set session state, print, or describe.
+const PSQL_READ_ONLY_META: &[&str] = &[
+    "\\set",
+    "\\unset",
+    "\\gset",
+    "\\pset",
+    "\\timing",
+    "\\x",
+    "\\a",
+    "\\t",
+    "\\echo",
+    "\\qecho",
+    "\\conninfo",
+    "\\d",
+    "\\dt",
+    "\\di",
+    "\\dn",
+    "\\df",
+    "\\dv",
+    "\\dm",
+    "\\ds",
+    "\\du",
+    "\\dx",
+    "\\l",
+];
+
+/// Session settings that change how later text is lexed or who runs it.
+const PSQL_GUARDED_SETTINGS: &[&str] = &[
+    "standard_conforming_strings",
+    "backslash_quote",
+    "escape_string_warning",
+    "client_encoding",
+    "names",
+    "role",
+    "authorization",
+    "transaction",
+    "constraints",
+];
+
+/// The `-c` items of a psql invocation, walking short-option clusters the way
+/// getopt does. `None` when its arguments only ask for the version or help.
+fn psql_invocation(tokens: &[String]) -> Option<SqlInvocation> {
+    let mut items = Vec::new();
+    let mut informational = false;
+    let mut i = 1;
+    while i < tokens.len() {
+        let token = tokens[i].as_str();
+        i += 1;
+        if token == "--" {
+            break;
+        }
+        if let Some(long) = token.strip_prefix("--") {
+            let (name, inline) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (long, None),
+            };
+            // getopt_long accepts any unambiguous prefix of a long option.
+            let candidates: Vec<&str> = PSQL_LONG_OPTIONS
+                .iter()
+                .copied()
+                .filter(|option| option.starts_with(name))
+                .collect();
+            let resolved = match candidates.as_slice() {
+                _ if candidates.contains(&name) => Some(name),
+                [only] => Some(*only),
+                _ => None,
+            };
+            match resolved {
+                Some("version" | "help") => informational = true,
+                Some("file" | "output" | "log-file") => return Some(SqlInvocation::Opaque),
+                Some("command") => match inline.or_else(|| tokens.get(i).map(String::as_str)) {
+                    Some(statement) => {
+                        items.push(statement.to_string());
+                        i += usize::from(inline.is_none());
+                    }
+                    None => return Some(SqlInvocation::Opaque),
+                },
+                Some(_) => {}
+                // An ambiguous prefix is an error in psql; one that could be a
+                // file, output or command option is not worth reasoning about.
+                None => {
+                    if candidates
+                        .iter()
+                        .any(|option| matches!(*option, "file" | "output" | "log-file" | "command"))
+                    {
+                        return Some(SqlInvocation::Opaque);
+                    }
+                }
+            }
+            continue;
+        }
+        let Some(cluster) = token
+            .strip_prefix('-')
+            .filter(|cluster| !cluster.is_empty())
+        else {
+            continue;
+        };
+        for (offset, letter) in cluster.char_indices() {
+            if letter == '?' || letter == 'V' {
+                informational = true;
+            } else if PSQL_VALUE_LETTERS.contains(letter) {
+                if matches!(letter, 'f' | 'o' | 'L') {
+                    return Some(SqlInvocation::Opaque);
+                }
+                let rest = &cluster[offset + letter.len_utf8()..];
+                let value = if rest.is_empty() {
+                    let next = tokens.get(i).map(String::as_str);
+                    i += 1;
+                    next
+                } else {
+                    Some(rest)
+                };
+                let Some(value) = value else {
+                    return Some(SqlInvocation::Opaque);
+                };
+                if letter == 'c' {
+                    items.push(value.to_string());
+                }
+                break;
+            } else if !PSQL_PLAIN_LETTERS.contains(letter) {
+                return Some(SqlInvocation::Opaque);
+            }
+        }
+    }
+    if !items.is_empty() {
+        return Some(SqlInvocation::PsqlScript(items));
+    }
+    if informational {
+        return None;
+    }
+    Some(SqlInvocation::PsqlStdin)
+}
+
+/// A psql reading a quoted heredoc is a script on argv in all but name: Allow
+/// it when every item of the body passes the `-c` script rules. `None` leaves
+/// the ordinary classification (Ask) in place.
+pub(super) fn psql_heredoc_outcome(candidate: &str, original: &str) -> Option<Outcome> {
+    if !candidate.contains("<<") || !matches!(sql_invocation(candidate)?, SqlInvocation::PsqlStdin)
+    {
+        return None;
+    }
+    let (_, bodies) = redact_all_heredocs(original);
+    let [heredoc] = bodies.as_slice() else {
+        return None;
+    };
+    // The heredoc must feed this psql, not another command in the pipeline.
+    let opener = split_segments(&heredoc.opener)
+        .into_iter()
+        .find(|segment| segment.contains("<<"))?;
+    if heredoc.expands || !matches!(sql_invocation(&opener)?, SqlInvocation::PsqlStdin) {
+        return None;
+    }
+    // The last stdin redirect wins in the shell: `<<` must be the only `<`.
+    let mut quote = None;
+    let mut input_operators = 0;
+    for c in opener.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if matches!(c, '\'' | '"') => quote = Some(c),
+            None if c == '<' => input_operators += 1,
+            None => {}
+        }
+    }
+    if input_operators != 2 {
+        return None;
+    }
+    let items = psql_script_items(&heredoc.body)?;
+    if items.is_empty() || !items.iter().all(|item| is_psql_item_read_only(item)) {
+        return None;
+    }
+    Some(Outcome {
+        verdict: Verdict::Allow,
+        matched: Some(Rule {
+            pattern: "<sql: a read-only psql script>".to_string(),
+            origin: Origin::BuiltIn,
+        }),
+    })
+}
+
+/// Splits a psql script into items: each backslash meta-command line, and the
+/// SQL between them (a trailing `\gset` stays with its query).
+fn psql_script_items(script: &str) -> Option<Vec<String>> {
+    let chars: Vec<char> = script.chars().collect();
+    let view = psql_code_view(script)?;
+    let mut items = Vec::new();
+    let mut sql = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if view[i] != '\\' {
+            sql.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let end = chars[i..]
+            .iter()
+            .position(|c| *c == '\n')
+            .map_or(chars.len(), |offset| i + offset);
+        let meta: String = chars[i..end].iter().collect();
+        if meta.split_whitespace().next() == Some("\\gset") && !sql.trim().is_empty() {
+            items.push(format!("{sql}{meta}"));
+            sql.clear();
+        } else {
+            if !sql.trim().is_empty() {
+                items.push(std::mem::take(&mut sql));
+            }
+            items.push(meta);
+        }
+        i = end;
+    }
+    if !sql.trim().is_empty() {
+        items.push(sql);
+    }
+    Some(items)
+}
+
+/// Text of `sql` with quoted strings, quoted identifiers, dollar quotes and
+/// comments blanked to spaces, character for character, the way psql's lexer
+/// sees them. `None` when one of them never closes.
+fn psql_code_view(sql: &str) -> Option<Vec<char>> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut view = vec![' '; chars.len()];
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\'' => {
+                let escapes = i > 0
+                    && matches!(chars[i - 1], 'e' | 'E')
+                    && (i < 2 || !(chars[i - 2].is_alphanumeric() || chars[i - 2] == '_'));
+                i += 1;
+                loop {
+                    match chars.get(i)? {
+                        '\\' if escapes => i += 2,
+                        '\'' => break,
+                        _ => i += 1,
+                    }
+                }
+                i += 1;
+            }
+            '"' => {
+                i += 1;
+                while chars.get(i)? != &'"' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            '$' => {
+                let Some((tag, body_start)) = dollar_quote_open(&chars, i) else {
+                    view[i] = c;
+                    i += 1;
+                    continue;
+                };
+                let closing: Vec<char> = format!("${tag}$").chars().collect();
+                let end = (body_start..chars.len().saturating_sub(closing.len() - 1))
+                    .find(|&j| chars[j..j + closing.len()] == closing[..])?;
+                i = end + closing.len();
+            }
+            '-' if chars.get(i + 1) == Some(&'-') => {
+                while i < chars.len() && !matches!(chars[i], '\n' | '\r') {
+                    i += 1;
+                }
+            }
+            '/' if chars.get(i + 1) == Some(&'*') => {
+                let end = (i + 2..chars.len().saturating_sub(1))
+                    .find(|&j| chars[j] == '*' && chars[j + 1] == '/')?;
+                i = end + 2;
+            }
+            _ => {
+                view[i] = c;
+                i += 1;
+            }
+        }
+    }
+    Some(view)
+}
+
+/// A `:name` outside quotes interpolates a psql variable, which `\set` can
+/// fill with arbitrary SQL; `::` casts and `:'name'` literals do not.
+fn has_psql_variable_reference(view: &[char]) -> bool {
+    let mut i = 0;
+    while i < view.len() {
+        if view[i] == ':' && view.get(i + 1) == Some(&':') {
+            i += 2;
+            continue;
+        }
+        if view[i] == ':'
+            && view
+                .get(i + 1)
+                .is_some_and(|c| c.is_alphabetic() || *c == '_')
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// `SET`/`RESET` of a plain session setting that cannot change how later
+/// text is lexed or which role runs it.
+fn is_psql_session_setting(statement: &str) -> bool {
+    let lower = statement.trim().to_ascii_lowercase();
+    let Some((verb, rest)) = lower.split_once(char::is_whitespace) else {
+        return false;
+    };
+    if !matches!(verb, "set" | "reset") {
+        return false;
+    }
+    let rest = rest.trim_start();
+    let rest = ["session ", "local "]
+        .iter()
+        .find_map(|scope| rest.strip_prefix(scope))
+        .unwrap_or(rest);
+    let name: String = rest
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.'))
+        .collect();
+    !name.is_empty() && !PSQL_GUARDED_SETTINGS.contains(&name.as_str())
+}
+
+fn is_psql_meta_command_read_only(item: &str) -> bool {
+    // A quote that never closes on this line would swallow the lines after it.
+    if item.contains(['`', '|', '>']) || item[1..].contains('\\') || psql_code_view(item).is_none()
+    {
+        return false;
+    }
+    let word = item.split_whitespace().next().unwrap_or_default();
+    if PSQL_READ_ONLY_META.contains(&word) {
+        return true;
+    }
+    // The describe family's `+` and `S` variants (`\dt+`, `\dS`).
+    let base = word.trim_end_matches(['+', 'S']);
+    (base.starts_with("\\d") || base == "\\l") && PSQL_READ_ONLY_META.contains(&base)
+}
+
+/// One psql `-c` item: a single allow-listed meta-command, or SQL whose
+/// statements are each a read or a plain session setting, optionally ending
+/// in `\gset`.
+fn is_psql_item_read_only(item: &str) -> bool {
+    let item = item.trim();
+    // `set_config` changes the guarded settings behind `is_psql_session_setting`.
+    if item.to_ascii_lowercase().contains("set_config") {
+        return false;
+    }
+    if item.starts_with('\\') {
+        return is_psql_meta_command_read_only(item);
+    }
+    let Some(view) = psql_code_view(item) else {
+        return false;
+    };
+    let sql_end = view.iter().position(|c| *c == '\\').unwrap_or(view.len());
+    let tail: String = item.chars().skip(sql_end).collect();
+    let mut tail_words = tail.split_whitespace();
+    let tail_ok = tail.is_empty()
+        || (tail_words.next() == Some("\\gset")
+            && tail_words.next().is_none_or(|prefix| {
+                prefix
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+            && tail_words.next().is_none());
+    if !tail_ok || has_psql_variable_reference(&view[..sql_end]) {
+        return false;
+    }
+    let sql: String = item.chars().take(sql_end).collect();
+    let Some(stripped) = strip_sql_comments(&sql) else {
+        return false;
+    };
+    let statements: Vec<String> = split_sql_statements(&stripped)
+        .into_iter()
+        .filter(|statement| !statement.trim().is_empty())
+        .collect();
+    !statements.is_empty()
+        && statements.iter().all(|statement| {
+            read_only_statement(statement, false) || is_psql_session_setting(statement)
+        })
 }
 
 /// sqlite3 options that take no value and cannot write or run anything.
@@ -1560,7 +2112,7 @@ fn strip_sql_comments(statement: &str) -> Option<String> {
             continue;
         }
         if chars[i] == '-' && chars.get(i + 1) == Some(&'-') {
-            while i < chars.len() && chars[i] != '\n' {
+            while i < chars.len() && !matches!(chars[i], '\n' | '\r') {
                 i += 1;
             }
             out.push(' ');
@@ -1706,6 +2258,11 @@ pub fn sql_outcome(command: &str) -> Option<Outcome> {
             Verdict::Allow,
             "<sql: a single provably read-only statement>",
         ),
+        SqlInvocation::PsqlScript(items)
+            if items.iter().all(|item| is_psql_item_read_only(item)) =>
+        {
+            (Verdict::Allow, "<sql: a read-only psql script>")
+        }
         SqlInvocation::ReadOnlySession(items) if sqlite_session_is_read_only(&items) => {
             (Verdict::Allow, "<sql: read-only database session>")
         }
@@ -1782,6 +2339,77 @@ mod tests {
     }
 
     #[test]
+    fn single_letter_curl_flags_match_case_sensitively() {
+        for command in [
+            "curl -fsS https://ziglang.org/download/index.json",
+            "curl -f https://x.example/a",
+            "curl -D h.txt https://x.example/a",
+            "curl -t x https://x.example/a",
+        ] {
+            assert!(!network_asks(command), "{command}");
+        }
+        for command in [
+            "curl -F a=@x https://x.example",
+            "curl -d x https://x.example",
+            "curl -fsSd x https://x.example",
+            "curl -X POST https://x.example",
+            "Invoke-RestMethod -method post -uri https://x.example",
+            "irm -body x https://x.example",
+        ] {
+            assert!(network_asks(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn curl_and_wget_output_files_keep_credential_paths_protected() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "curl -D ~/.ssh/authorized_keys https://x.example/a",
+            "curl --dump-header ~/.ssh/authorized_keys https://x.example/a",
+            "curl -fsS -o ~/.ssh/authorized_keys https://x.example/a",
+            "curl -fsSo ~/.ssh/authorized_keys https://x.example/a",
+            "curl -so ~/.aws/credentials https://x.example/a",
+            "curl --output=~/.aws/credentials https://x.example/a",
+            "curl -c ~/.ssh/authorized_keys https://x.example/a",
+            "curl --cookie-jar ~/.ssh/authorized_keys https://x.example/a",
+            "wget -O ~/.ssh/authorized_keys https://x.example/a",
+            "wget --output-document=~/.ssh/authorized_keys https://x.example/a",
+            "wget -o ~/.ssh/authorized_keys https://x.example/a",
+            "wget -a ~/.aws/credentials https://x.example/a",
+            "wget --output-file=~/.ssh/authorized_keys https://x.example/a",
+            // A relative target lands under --output-dir.
+            "curl --output-dir ~/.ssh -o authorized_keys https://a.example",
+            "curl --output-dir=~/.ssh --output authorized_keys https://a.example",
+            "curl --output-dir ~/.ssh -D authorized_keys https://a.example",
+            "curl --output-dir ~/.ssh -c authorized_keys https://a.example",
+            "curl --trace ~/.ssh/authorized_keys https://a.example",
+            "curl --trace-ascii ~/.ssh/authorized_keys https://a.example",
+            "curl --stderr ~/.ssh/authorized_keys https://a.example",
+            "curl --libcurl ~/.ssh/authorized_keys https://a.example",
+            "curl --etag-save ~/.ssh/authorized_keys https://a.example",
+            "curl --hsts ~/.ssh/authorized_keys https://a.example",
+            "curl --alt-svc ~/.ssh/authorized_keys https://a.example",
+            "wget --save-cookies ~/.ssh/authorized_keys https://a.example",
+            "wget --warc-file ~/.ssh/authorized_keys https://a.example",
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, Verdict::Deny, "{command}: {outcome:?}");
+        }
+        for command in [
+            "curl -fsS -o out.json https://ziglang.org/download/index.json",
+            "curl -D h.txt https://x.example/a",
+            "wget -O out.tgz https://x.example/a",
+            "curl --output-dir /tmp/dl -o out.json https://a.example",
+            "curl --trace trace.txt --stderr err.txt https://a.example",
+            "curl --hsts hsts.txt --etag-save etag.txt https://a.example",
+            "wget --save-cookies c.txt --warc-file=out https://a.example",
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, Verdict::Allow, "{command}: {outcome:?}");
+        }
+    }
+
+    #[test]
     fn uploading_a_credential_file_is_denied_before_any_prompt() {
         let policy = SafetyPolicy::default();
         for command in [
@@ -1836,6 +2464,53 @@ mod tests {
             evaluate(&policy, "cat .env", LaunchMode::Headless).verdict,
             Verdict::Ask
         );
+    }
+
+    #[test]
+    fn an_output_redirect_target_is_a_write_not_a_project_secret_read() {
+        let policy = SafetyPolicy::default();
+        let verdict = |command: &str| evaluate(&policy, command, LaunchMode::Interactive);
+        for command in [
+            "head -c 32 /dev/urandom | base64 > \"$U/master.key\"",
+            "cat seed.bin > master.key",
+            "cat seed.bin >> master.key",
+            "cat seed.bin >| master.key",
+            "cat seed.bin &> master.key",
+            "cat seed.bin 2> master.key",
+            "cat seed.bin >master.key",
+        ] {
+            let outcome = verdict(command);
+            assert_ne!(
+                outcome.matched.map(|rule| rule.pattern),
+                Some("<project secret file read>".to_string()),
+                "{command}"
+            );
+        }
+        for command in [
+            "cat .env",
+            "cat < .env",
+            "cp .env /tmp/x",
+            "cat .env > /tmp/x",
+            // A quoted operator is an operand, not a redirect.
+            "cat '>' master.key",
+            "cat \">\" .env",
+            "cat '2>' .env",
+            "cat '&>' master.key",
+            "cat '>|' master.key",
+            "cat -- '>' master.key",
+            "cat x '>' master.key",
+            "sed -n '>' .env",
+        ] {
+            assert_eq!(verdict(command).verdict, Verdict::Ask, "{command}");
+        }
+        // Writes into credential paths keep their verdict.
+        for command in [
+            "cat key.pub > ~/.ssh/authorized_keys",
+            "cat creds >> ~/.aws/credentials",
+            "echo x > ~/.ssh/authorized_keys",
+        ] {
+            assert_eq!(verdict(command).verdict, Verdict::Deny, "{command}");
+        }
     }
 
     #[test]
@@ -2389,6 +3064,44 @@ mod tests {
     }
 
     #[test]
+    fn update_ref_deletion_classifies_like_a_forced_branch_delete() {
+        let policy = SafetyPolicy::default();
+        for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
+            for command in [
+                "git branch -D x",
+                "git -C D:/repo update-ref -d refs/heads/x",
+                "git update-ref --no-deref -d refs/heads/x",
+                "git update-ref -d refs/heads/x abc123",
+                "git update-ref --stdin",
+                "git update-ref --stdin -z",
+                "git update-ref -dm x refs/heads/x",
+                "git update-ref -m x -d refs/heads/x",
+                "git update-ref refs/heads/x 0000000000000000000000000000000000000000",
+                "git update-ref -m x refs/heads/x 0000",
+                "git update-ref refs/heads/x \"\"",
+            ] {
+                let outcome = evaluate(&policy, command, mode);
+                assert_eq!(outcome.verdict, Verdict::Ask, "{mode:?}: {command}");
+                assert_eq!(
+                    outcome.matched.unwrap().pattern,
+                    "<vcs: destructive local or remote action>",
+                    "{command}"
+                );
+            }
+        }
+        for command in [
+            "git update-ref refs/heads/x abc123",
+            "git -C D:/repo update-ref refs/heads/x abc123",
+        ] {
+            assert_eq!(
+                evaluate(&policy, command, LaunchMode::Interactive).verdict,
+                Verdict::Allow,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
     fn read_only_and_dry_run_orchestrator_actions_remain_silent() {
         let policy = SafetyPolicy::default();
         for command in [
@@ -2534,6 +3247,12 @@ mod tests {
             "sqlite3 app.db",
             // Two statements on one command line.
             "psql -c 'SELECT 1' -c 'DROP TABLE t'",
+            // A `--` comment ends at the newline; what follows it runs.
+            "psql -c 'select 1 -- x\n; drop table t'",
+            "psql -c 'select 1 -- x\ndrop table t'",
+            "psql -c 'select 1 -- x\r; drop table t'",
+            "psql -c 'select 1' -c 'select 2 -- x\ndrop table t'",
+            "mysql -e \"select 1 -- x\ndrop table t\"",
             // Unbalanced quoting: the statement cannot be seen.
             "psql -c \"SELECT 1",
             // A flag with nothing after it.
@@ -2560,6 +3279,206 @@ mod tests {
                 outcome.verdict
             );
         }
+    }
+
+    /// psql's getopt-style short-option clusters (`-Atc`) carry a statement
+    /// like any `-c`, and a visible script of read-only items is a read.
+    #[test]
+    fn psql_clusters_and_visible_read_only_scripts_allow() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "psql -h 127.0.0.1 -U postgres -Atc \"select version()\"",
+            "psql -Atc \"select '{\\\"a\\\":1}'::jsonb\"",
+            "psql -At'c'\"select 1\"",
+            "psql -c \"SET plan_cache_mode = force_generic_plan\" -c \"EXPLAIN (ANALYZE, BUFFERS) SELECT 1\"",
+            "psql -c 'SELECT 1; SELECT 2'",
+            "psql -c '\\set n 5' -c '\\pset format unaligned' -c '\\timing on' -c 'SELECT 1 AS n \\gset' -c 'SET work_mem = 1' -c 'EXPLAIN (ANALYZE, BUFFERS) SELECT 1' -c '\\dt+'",
+        ] {
+            let outcome = sql_outcome(command).expect(command);
+            assert_eq!(outcome.verdict, Verdict::Allow, "{command}: {outcome:?}");
+        }
+        let docker = "docker exec zf-pg16 psql -U postgres -Atc \"SELECT count(*) FROM pg_roles WHERE rolname LIKE 'zf_prev_%'\"";
+        assert_eq!(
+            evaluate(&policy, docker, LaunchMode::Interactive).verdict,
+            Verdict::Allow,
+            "{docker}"
+        );
+    }
+
+    #[test]
+    fn a_comment_ends_at_the_newline_so_later_lines_are_still_judged() {
+        for command in [
+            "psql -c 'SELECT 1 -- note\n, 2'",
+            "psql -c 'SELECT 1 -- note\n'",
+            "psql -c 'SELECT 1; -- note\nSELECT 2'",
+        ] {
+            let outcome = sql_outcome(command).expect(command);
+            assert_eq!(outcome.verdict, Verdict::Allow, "{command}: {outcome:?}");
+        }
+    }
+
+    const PSQL_BENCH_BODY: &str = "\\set n 5\n\\pset format unaligned\n\\timing on\nSET plan_cache_mode = force_generic_plan;\nSELECT count(*) AS c\n  FROM t -- rows\n  WHERE id > 1 \\gset\nEXPLAIN (ANALYZE, BUFFERS)\nSELECT 1;\n";
+
+    #[test]
+    fn a_quoted_heredoc_psql_script_of_read_only_items_allows() {
+        let policy = SafetyPolicy::default();
+        for opener in [
+            "psql -d bench <<'SQL'",
+            "psql -h db -U app -X -q <<\"SQL\"",
+            "psql -d bench <<-'SQL'",
+        ] {
+            let command = format!("{opener}\n{PSQL_BENCH_BODY}SQL");
+            let outcome = evaluate(&policy, &command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, Verdict::Allow, "{command}: {outcome:?}");
+            assert!(
+                outcome
+                    .matched
+                    .is_some_and(|rule| rule.pattern.starts_with("<sql:")),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn heredoc_psql_scripts_ask_unless_quoted_and_every_item_is_provable() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "psql -d bench <<'SQL'\n\\! id\nSQL",
+            "psql -d bench <<'SQL'\nSELECT 1;\n\\o |sh\nSELECT 2;\nSQL",
+            "psql -d bench <<'SQL'\nSELECT 1;\nDROP TABLE t;\nSQL",
+            "psql -d bench <<'SQL'\nSELECT 1 -- x\n; DROP TABLE t;\nSQL",
+            "psql -d bench <<'SQL'\n\\set v '; DROP TABLE t'\nSELECT 1 :v;\nSQL",
+            "psql -d bench <<'SQL'\n\\echo 'x\nDROP TABLE t;\n'\nSQL",
+            "psql -d bench <<'SQL'\nSELECT 1 \\g\nSQL",
+            "psql -d bench <<SQL\nSELECT 1;\nSQL",
+            "psql -d bench <<<'SELECT 1'",
+            "psql -f x.sql <<'SQL'\nSELECT 1;\nSQL",
+            "cat x.sql | psql -d bench",
+            "cat <<'SQL' | psql -d bench\nSELECT 1;\nSQL",
+            "psql -d bench < x.sql",
+            "psql -d bench <<'SQL'\nSELECT 1;\nSQL\npsql -d bench <<'SQL'\nDROP TABLE t;\nSQL",
+            // Another stdin redirect on the opener wins in the shell.
+            "psql <<'SQL' < /tmp/evil.sql\nselect 1;\nSQL",
+            "psql <<'SQL' </tmp/evil.sql\nselect 1;\nSQL",
+            "psql <<'SQL' 0< /tmp/evil.sql\nselect 1;\nSQL",
+            "psql <<'SQL' <&3\nselect 1;\nSQL",
+            "psql <<'SQL' <>/tmp/f\nselect 1;\nSQL",
+            "psql <<'SQL' < <(echo evil)\nselect 1;\nSQL",
+            "psql <<'SQL' <<< '\\! id'\nselect 1;\nSQL",
+            "psql < /tmp/evil.sql <<'SQL'\nselect 1;\nSQL",
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn psql_long_options_resolve_by_unique_prefix_like_getopt_long() {
+        for command in [
+            "psql --fi=/tmp/evil.sql -c 'select 1'",
+            "psql --fil /tmp/evil.sql -c 'select 1'",
+            "psql -c 'select 1' --comm 'delete from t'",
+            "psql -c 'select 1' --com 'delete from t'",
+            "psql -c 'select 1' --co 'delete from t'",
+            "psql --out=/tmp/x -c 'select 1'",
+            "psql --log-f=/tmp/x -c 'select 1'",
+            "psql --o=/tmp/x -c 'select 1'",
+            "psql --f=/tmp/x -c 'select 1'",
+        ] {
+            let outcome = sql_outcome(command).expect(command);
+            assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
+        }
+        for command in [
+            "psql --no-psqlrc --tuples-only --host=x -c 'select 1'",
+            "psql --dbname db --user=x --comma 'select 1'",
+            "psql --quiet --expanded -c 'select 1'",
+        ] {
+            let outcome = sql_outcome(command).expect(command);
+            assert_eq!(outcome.verdict, Verdict::Allow, "{command}: {outcome:?}");
+        }
+        assert!(sql_outcome("psql --vers").is_none());
+    }
+
+    #[test]
+    fn a_sql_allow_never_overrides_a_protected_write_redirect() {
+        let policy = SafetyPolicy::default();
+        let verdict = |command: &str| evaluate(&policy, command, LaunchMode::Interactive).verdict;
+        for (psql, echo) in [
+            (
+                "psql -h x <<'SQL' > ~/.ssh/authorized_keys\nselect 1;\nSQL",
+                "echo hi > ~/.ssh/authorized_keys",
+            ),
+            (
+                "psql -c 'select 1' > ~/.ssh/authorized_keys",
+                "echo hi > ~/.ssh/authorized_keys",
+            ),
+            (
+                "psql -c 'select 1' >> ~/.aws/credentials",
+                "echo hi >> ~/.aws/credentials",
+            ),
+            ("psql -h x <<'SQL' > .env\nselect 1;\nSQL", "echo hi > .env"),
+            ("psql -c 'select 1' > .env", "echo hi > .env"),
+        ] {
+            assert_ne!(verdict(echo), Verdict::Allow, "{echo}");
+            assert_eq!(verdict(psql), verdict(echo), "{psql}");
+        }
+        for command in [
+            "psql -c 'select 1' > out.txt",
+            "psql -h x <<'SQL' > out.txt\nselect 1;\nSQL",
+        ] {
+            assert_eq!(verdict(command), Verdict::Allow, "{command}");
+        }
+    }
+
+    #[test]
+    fn psql_informational_flags_are_not_a_sql_invocation() {
+        for command in [
+            "psql --version",
+            "psql -V",
+            "psql --help",
+            "psql --help=commands",
+            "psql -?",
+        ] {
+            assert!(sql_outcome(command).is_none(), "{command}");
+        }
+    }
+
+    #[test]
+    fn psql_clusters_and_scripts_ask_on_anything_unprovable() {
+        for command in [
+            "psql -Atf x.sql",
+            "psql -At -c 'select 1' -c 'drop table t'",
+            "psql -Atc 'DELETE FROM t'",
+            "psql -c \"\\set q 'DROP TABLE t'\" -c ':q'",
+            "psql -c '\\set v ; DROP TABLE t' -c 'select 1 :v'",
+            "psql -c '\\echo `id`'",
+            "psql -c '\\! rm -rf /'",
+            "psql -c '\\o |sh'",
+            "psql -c '\\copy t to program x'",
+            "psql -c \"COPY t TO PROGRAM 'x'\"",
+            "psql -c 'select 1 \\! touch x'",
+            "psql -c \"select 'a\\' \\! rm -rf /'\"",
+            "psql -c '\\gexec'",
+            "psql -c '\\i x.sql'",
+            "psql -c '\\c other'",
+            "psql -c 'SET client_encoding = sjis' -c 'select 1'",
+            "psql -c 'SET standard_conforming_strings = off' -c 'select 1'",
+            "psql -Z -c 'select 1'",
+            "psql -o /tmp/out -c 'select 1'",
+            "psql -At",
+            "psql -c \"select set_config('role', 'postgres', false)\"",
+            "psql -c \"select pg_catalog.SET_CONFIG ('standard_conforming_strings', 'off', false)\"",
+        ] {
+            let outcome = sql_outcome(command).expect(command);
+            assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
+        }
+        let policy = SafetyPolicy::default();
+        let pgoptions = "PGOPTIONS='-c default_transaction_read_only=on' psql -f bench.sql";
+        assert_eq!(
+            evaluate(&policy, pgoptions, LaunchMode::Interactive).verdict,
+            Verdict::Ask,
+            "{pgoptions}"
+        );
     }
 
     /// Anything that is not a recognized DB client is not this classifier's
@@ -3079,7 +3998,6 @@ mod tests {
 
     /// Whether any executable candidate of `command` draws a network verdict,
     /// the way the policy evaluation sees it.
-    #[cfg(unix)]
     fn network_asks(command: &str) -> bool {
         let allow = Outcome {
             verdict: Verdict::Allow,

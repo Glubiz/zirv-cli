@@ -2030,16 +2030,47 @@ fn has_flag(argv: &[String], letters: &str, longs: &[&str]) -> bool {
 /// `wget -O`) or by unpacking (`tar x`, `unzip`) or downloading into the
 /// working directory. A directory target is named by a file inside it, so
 /// the repository lookup starts in that directory.
-fn output_file_targets(program: &str, argv: &[String]) -> Vec<String> {
+pub(super) fn output_file_targets(program: &str, argv: &[String]) -> Vec<String> {
     let in_dir = |dir: &str| format!("{}/__zirv_out__", dir.trim_end_matches('/'));
     let not_stdout = |value: &String| value != "-" && !value.is_empty();
     match program {
         "sort" => option_values(argv, 'o', "rnubdfghiMRsVzc", &["--output"]),
         "curl" => {
+            let output_dir = option_values(argv, '\0', "", &["--output-dir"]);
+            // A relative target lands under --output-dir.
+            let under_dir = |target: String| match output_dir.first() {
+                Some(dir)
+                    if !target.starts_with(['/', '~', '$']) && target.get(1..2) != Some(":") =>
+                {
+                    format!("{}/{target}", dir.trim_end_matches('/'))
+                }
+                _ => target,
+            };
             let mut targets: Vec<String> = option_values(argv, 'o', "sSLkfgGiIvNq", &["--output"])
                 .into_iter()
+                .chain(option_values(argv, 'D', "sSLkfgGiIvNq", &["--dump-header"]))
+                .chain(option_values(argv, 'c', "sSLkfgGiIvNq", &["--cookie-jar"]))
                 .filter(not_stdout)
+                .map(under_dir)
                 .collect();
+            targets.extend(
+                option_values(
+                    argv,
+                    '\0',
+                    "",
+                    &[
+                        "--trace",
+                        "--trace-ascii",
+                        "--stderr",
+                        "--libcurl",
+                        "--etag-save",
+                        "--hsts",
+                        "--alt-svc",
+                    ],
+                )
+                .into_iter()
+                .filter(not_stdout),
+            );
             let remote_name = argv[1..].iter().any(|t| {
                 matches!(t.as_str(), "--remote-name" | "--remote-name-all")
                     || (t.starts_with('-')
@@ -2058,18 +2089,24 @@ fn output_file_targets(program: &str, argv: &[String]) -> Vec<String> {
             if has_flag(argv, "", &["--spider"]) {
                 return Vec::new();
             }
-            let files: Vec<String> = option_values(argv, 'O', "qvcnk", &["--output-document"])
+            let mut targets: Vec<String> = option_values(argv, 'o', "qvcnk", &["--output-file"])
                 .into_iter()
+                .chain(option_values(argv, 'a', "qvcnk", &["--append-output"]))
+                .chain(option_values(
+                    argv,
+                    '\0',
+                    "",
+                    &["--save-cookies", "--warc-file"],
+                ))
                 .filter(not_stdout)
                 .collect();
-            if !files.is_empty() {
-                return files;
-            }
-            if option_values(argv, 'O', "qvcnk", &["--output-document"]).is_empty() {
+            let documents = option_values(argv, 'O', "qvcnk", &["--output-document"]);
+            if documents.is_empty() {
                 let dir = option_values(argv, 'P', "qvcnk", &["--directory-prefix"]);
-                return vec![in_dir(dir.first().map_or(".", String::as_str))];
+                targets.push(in_dir(dir.first().map_or(".", String::as_str)));
             }
-            Vec::new()
+            targets.extend(documents.into_iter().filter(not_stdout));
+            targets
         }
         "tar" => {
             let mut argv = argv.to_vec();

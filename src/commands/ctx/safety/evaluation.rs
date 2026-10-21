@@ -6,16 +6,37 @@ use super::*;
 /// preserving explicit policy precedence. Keeping this rule in one helper is
 /// what makes direct, compound, and shell-wrapped client invocations obey the
 /// same narrowing/widening contract.
-pub(super) fn apply_sql_outcome(policy: &SafetyPolicy, command: &str, base: Outcome) -> Outcome {
+pub(super) fn apply_sql_outcome(
+    policy: &SafetyPolicy,
+    command: &str,
+    original: &str,
+    base: Outcome,
+) -> Outcome {
     if policy.sql == SqlMode::Off {
         return base;
     }
-    let Some(sql) = sql_outcome(command) else {
+    let Some(sql) = psql_heredoc_outcome(command, original).or_else(|| sql_outcome(command)) else {
         return base;
     };
     match (base.verdict, sql.verdict) {
         (Verdict::Deny, _) => base,
         (Verdict::Allow, Verdict::Ask) => sql,
+        // A read-only statement says nothing about where its output is redirected.
+        (_, Verdict::Allow)
+            if base.matched.is_none()
+                && segment_redirect_targets(command)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|target| project_secret_path(target, false)) =>
+        {
+            Outcome {
+                verdict: Verdict::Ask,
+                matched: Some(Rule {
+                    pattern: "<project secret file read>".to_string(),
+                    origin: Origin::BuiltIn,
+                }),
+            }
+        }
         (_, Verdict::Allow) if base.matched.is_none() => sql,
         _ => base,
     }
@@ -25,9 +46,13 @@ pub(super) fn apply_credential_outcome(command: &str, base: Outcome) -> Outcome 
     if base.verdict == Verdict::Deny {
         return base;
     }
-    let (verdict, pattern) = if is_sensitive_credential_access(command) {
+    let writes_credential_file = segment_redirect_targets(command)
+        .unwrap_or_default()
+        .iter()
+        .any(|target| sensitive_credential_path(target));
+    let (verdict, pattern) = if writes_credential_file || is_sensitive_credential_access(command) {
         (Verdict::Deny, "<credential: sensitive-file access>")
-    } else if is_sensitive_file_access(command, |path| project_secret_path(path, false)) {
+    } else if is_project_secret_read(command) {
         (Verdict::Ask, "<project secret file read>")
     } else {
         return base;
@@ -122,6 +147,7 @@ pub(super) fn apply_recursive_delete_outcome(
     command: &str,
     original: &str,
     base: Outcome,
+    scratchpad_roots: &[String],
 ) -> Outcome {
     if !is_recursive_delete(command) {
         return base;
@@ -132,7 +158,7 @@ pub(super) fn apply_recursive_delete_outcome(
                 rule.origin == Origin::BuiltIn
                     && matches!(rule.pattern.as_str(), "rm -rf *" | "rm -fr *")
             }));
-    if overridable && recursive_delete_confined_to_temp(command, original) {
+    if overridable && recursive_delete_confined_to_temp(command, original, scratchpad_roots) {
         return Outcome {
             verdict: Verdict::Allow,
             matched: Some(Rule {
@@ -218,9 +244,26 @@ fn path_strictly_below(path: &str, root: &str) -> bool {
     }
 }
 
-/// Prove a recursive-delete target is strictly below a temp root. Dynamic
-/// paths fail; relative targets require a known leading `cd` directory.
-fn target_confined_to_temp(target: &str, cwd: Option<&str>) -> bool {
+/// True for a literal absolute target with no `..` component that lies
+/// strictly below one of the session's scratchpad roots (`/private/tmp`
+/// spellings arrive as separate roots). Dynamic targets never qualify.
+pub(super) fn target_strictly_below_scratchpad(target: &str, scratchpad_roots: &[String]) -> bool {
+    let target = strip_quotes(target);
+    if target.contains(['$', '`', '~', '*', '?']) || target.split(['/', '\\']).any(|p| p == "..") {
+        return false;
+    }
+    let normalized = target.replace('\\', "/");
+    split_absolute_root(&normalized).is_some()
+        && lexically_normalize_absolute(&normalized).is_some_and(|resolved| {
+            scratchpad_roots
+                .iter()
+                .any(|root| path_strictly_below(&resolved, root))
+        })
+}
+
+/// Prove a recursive-delete target is strictly below a temp or scratchpad
+/// root. Dynamic paths fail; relative targets require a known leading `cd`.
+fn target_confined_to_temp(target: &str, cwd: Option<&str>, scratchpad_roots: &[String]) -> bool {
     let target = strip_quotes(target);
     if target.is_empty() || target.contains(['$', '`', '~', '*', '?']) {
         return false;
@@ -240,6 +283,7 @@ fn target_confined_to_temp(target: &str, cwd: Option<&str>) -> bool {
     };
     temp_delete_roots()
         .iter()
+        .chain(scratchpad_roots)
         .any(|root| path_strictly_below(&resolved, root))
 }
 
@@ -297,7 +341,11 @@ pub(super) fn parse_leading_cd_segment(command: &str) -> Option<(String, String)
 /// One unconfined target can delete outside scratch; require every target
 /// below a temp root. Recover a leading `cd` from the original compound
 /// because normalization removed it from the delete candidate.
-fn recursive_delete_confined_to_temp(candidate: &str, original: &str) -> bool {
+fn recursive_delete_confined_to_temp(
+    candidate: &str,
+    original: &str,
+    scratchpad_roots: &[String],
+) -> bool {
     let Some(targets) = delete_targets(candidate) else {
         return false;
     };
@@ -307,7 +355,7 @@ fn recursive_delete_confined_to_temp(candidate: &str, original: &str) -> bool {
     let cwd = parse_leading_cd_segment(original).map(|(path, _)| path);
     targets
         .iter()
-        .all(|target| target_confined_to_temp(target, cwd.as_deref()))
+        .all(|target| target_confined_to_temp(target, cwd.as_deref(), scratchpad_roots))
 }
 
 pub(super) fn apply_orchestrator_outcome(command: &str, base: Outcome) -> Outcome {
@@ -540,8 +588,10 @@ const FIND_EXEC_SAFE_PROGRAMS: &[&str] = &[
 ];
 
 /// Ask for any `find -exec`/`-ok` action whose program is not proven safe;
-/// unknown executables cannot inherit an ordinary read verdict.
-fn is_risky_find_exec(command: &str) -> bool {
+/// unknown executables cannot inherit an ordinary read verdict. `rmdir` only
+/// removes empty directories, except Windows `rmdir /s`, which recurses, and
+/// only beneath a start path that is relative, temp, scratchpad or a worktree.
+fn is_risky_find_exec(command: &str, scratchpad_roots: &[String]) -> bool {
     let Some(tokens) = sql_tokens(&collapse_whitespace(command)) else {
         return false;
     };
@@ -551,14 +601,38 @@ fn is_risky_find_exec(command: &str) -> bool {
     if sql_program_name(first) != "find" {
         return false;
     }
+    let mut options = tokens[1..]
+        .iter()
+        .take_while(|token| matches!(token.as_str(), "-H" | "-L" | "-P"))
+        .count();
+    if tokens.get(1 + options).is_some_and(|token| token == "--") {
+        options += 1;
+    }
+    let start_paths = tokens[1 + options..]
+        .iter()
+        .take_while(|token| !token.starts_with(['-', '(', '!']));
+    let starts_confined = start_paths
+        .into_iter()
+        .all(|path| find_start_path_confined(path, scratchpad_roots))
+        && !tokens
+            .get(1 + options)
+            .is_some_and(|token| token.starts_with("-D") || token.starts_with("-O"));
     let mut i = 1;
     while i < tokens.len() {
         let lower = tokens[i].to_ascii_lowercase();
         if matches!(lower.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") {
-            match tokens.get(i + 1) {
-                Some(action)
-                    if FIND_EXEC_SAFE_PROGRAMS.contains(&sql_program_name(action).as_str()) => {}
-                _ => return true,
+            let Some(action) = tokens.get(i + 1) else {
+                return true;
+            };
+            let program = sql_program_name(action);
+            let recursive_rmdir = program == "rmdir"
+                && tokens[i + 2..]
+                    .iter()
+                    .take_while(|token| !matches!(token.as_str(), ";" | "\\;" | "+"))
+                    .any(|token| token.eq_ignore_ascii_case("/s"));
+            let safe_rmdir = program == "rmdir" && !recursive_rmdir && starts_confined;
+            if !(FIND_EXEC_SAFE_PROGRAMS.contains(&program.as_str()) || safe_rmdir) {
+                return true;
             }
         }
         i += 1;
@@ -566,8 +640,34 @@ fn is_risky_find_exec(command: &str) -> bool {
     false
 }
 
-pub(super) fn apply_find_exec_outcome(command: &str, base: Outcome) -> Outcome {
-    if !is_risky_find_exec(command) || base.verdict != Verdict::Allow {
+/// A `find` start path that is relative without `..`, or an absolute literal
+/// strictly below a temp root, a scratchpad root or an agent worktree root.
+fn find_start_path_confined(path: &str, scratchpad_roots: &[String]) -> bool {
+    let path = strip_quotes(path).replace('\\', "/");
+    if path.is_empty()
+        || path.contains(['$', '`', '~', '*', '?'])
+        || path.split('/').any(|p| p == "..")
+    {
+        return false;
+    }
+    if split_absolute_root(&path).is_none() {
+        return true;
+    }
+    is_agent_worktree_root(&path)
+        || target_strictly_below_scratchpad(&path, scratchpad_roots)
+        || lexically_normalize_absolute(&path).is_some_and(|resolved| {
+            temp_delete_roots()
+                .iter()
+                .any(|root| path_strictly_below(&resolved, root))
+        })
+}
+
+pub(super) fn apply_find_exec_outcome(
+    command: &str,
+    base: Outcome,
+    scratchpad_roots: &[String],
+) -> Outcome {
+    if !is_risky_find_exec(command, scratchpad_roots) || base.verdict != Verdict::Allow {
         return base;
     }
     Outcome {
@@ -633,15 +733,68 @@ pub(crate) fn evaluate_with_scratchpad_roots(
     cwd: Option<&Path>,
     now: u64,
 ) -> Outcome {
-    let canonical = canonical_shell_syntax(command);
-    let command = canonical.as_deref().unwrap_or(command);
-    let mut base = evaluate_candidates(
+    evaluate_with_facts(
         policy,
         command,
-        policy.default_verdict(mode),
         mode,
         scratchpad_roots,
-    );
+        envelope,
+        cwd,
+        now,
+        &EvalFacts::default(),
+    )
+}
+
+/// Facts gathered at the hook boundary and handed to pure evaluation:
+/// the shell environment values `$TEMP`/`$TMP`/`$TMPDIR` may resolve to, and
+/// the nested generated-directory targets `git check-ignore` confirmed.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct EvalFacts {
+    pub(crate) shell_env: Vec<(String, String)>,
+    pub(crate) ignored_generated: Vec<String>,
+}
+
+/// [`evaluate_with_scratchpad_roots`] plus boundary facts. A same-command
+/// variable is resolved once here so every classifier sees the literal it
+/// stands for; an explicit rule that matches the raw text still applies.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_with_facts(
+    policy: &SafetyPolicy,
+    command: &str,
+    mode: super::adapters::LaunchMode,
+    scratchpad_roots: &[String],
+    envelope: Option<&envelope::WorkerEnvelope>,
+    cwd: Option<&Path>,
+    now: u64,
+    facts: &EvalFacts,
+) -> Outcome {
+    let canonical = canonical_shell_syntax(command);
+    let command = canonical.as_deref().unwrap_or(command);
+    let resolved = resolve_shell_variables(command, &facts.shell_env);
+    let evaluate_text = |text: &str| {
+        evaluate_candidates(
+            policy,
+            text,
+            policy.default_verdict(mode),
+            mode,
+            scratchpad_roots,
+            &facts.ignored_generated,
+        )
+    };
+    let mut base = evaluate_text(resolved.as_deref().unwrap_or(command));
+    if resolved.is_some() {
+        let raw = evaluate_text(command);
+        let explicit = raw
+            .matched
+            .as_ref()
+            .is_some_and(|rule| rule.origin != Origin::BuiltIn);
+        if (raw.verdict == Verdict::Deny || explicit)
+            && verdict_rank(raw.verdict) > verdict_rank(base.verdict)
+        {
+            base = raw;
+        }
+    }
+    let command = resolved.as_deref().unwrap_or(command);
     // Syntax the scanners cannot model may hide a live command: never Allow it.
     if canonical.is_none() && base.verdict == Verdict::Allow {
         base = Outcome {
@@ -812,8 +965,14 @@ mod tests {
             ("some-totally-unknown-tool --flag", Verdict::Ask),
         ] {
             let direct = evaluate_candidate_outcome(&policy, command, command, Verdict::Ask, &[]);
-            let via_evaluate_candidates =
-                evaluate_candidates(&policy, command, Verdict::Ask, LaunchMode::Headless, &[]);
+            let via_evaluate_candidates = evaluate_candidates(
+                &policy,
+                command,
+                Verdict::Ask,
+                LaunchMode::Headless,
+                &[],
+                &[],
+            );
             assert_eq!(direct.verdict, expected, "{command}");
             assert_eq!(
                 direct.verdict, via_evaluate_candidates.verdict,
@@ -982,6 +1141,246 @@ mod tests {
         assert_eq!(outcome.verdict, Verdict::Ask, "got {outcome:?}");
     }
 
+    fn evaluate_with_shell_env(command: &str, env: &[(&str, &str)]) -> Outcome {
+        let facts = EvalFacts {
+            shell_env: env
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            ..EvalFacts::default()
+        };
+        evaluate_with_facts(
+            &SafetyPolicy::default(),
+            command,
+            LaunchMode::Interactive,
+            &[],
+            None,
+            None,
+            0,
+            &facts,
+        )
+    }
+
+    #[test]
+    fn a_same_command_variable_in_a_worktree_remove_gets_the_literal_verdict() {
+        let policy = SafetyPolicy::default();
+        let literal = evaluate(
+            &policy,
+            "git -C D:/repo worktree remove --force D:/repo/.claude/worktrees/x",
+            LaunchMode::Interactive,
+        );
+        assert_eq!(literal.verdict, Verdict::Allow, "got {literal:?}");
+        for command in [
+            "W=D:/repo/.claude/worktrees/x; git -C D:/repo worktree remove --force $W",
+            "export W=D:/repo/.claude/worktrees/x\ngit -C D:/repo worktree remove --force \"$W\"",
+            "W=D:/repo/.claude/worktrees/x && git -C D:/repo worktree remove --force ${W}",
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, literal.verdict, "{command}: {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn a_same_command_variable_in_a_curl_url_gets_the_literal_verdict() {
+        let policy = SafetyPolicy::default();
+        let literal = evaluate(
+            &policy,
+            "curl -sS -X POST http://localhost:18080/api/v1/workspaces -d @ws.json",
+            LaunchMode::Interactive,
+        );
+        assert_eq!(literal.verdict, Verdict::Allow, "got {literal:?}");
+        let outcome = evaluate(
+            &policy,
+            "base=http://localhost:18080/api/v1; curl -sS -X POST $base/workspaces -d @ws.json",
+            LaunchMode::Interactive,
+        );
+        assert_eq!(outcome.verdict, literal.verdict, "{outcome:?}");
+    }
+
+    #[test]
+    fn temp_variables_resolve_from_the_injected_environment_for_a_scratch_delete() {
+        let env = [("TMPDIR", "/tmp/zz"), ("TEMP", "/tmp/zz")];
+        for command in [
+            "rm -rf $TEMP/benchsmoke",
+            "rm -rf $TMPDIR/benchsmoke",
+            "rm -rf \"$TEMP/benchsmoke\"",
+        ] {
+            let outcome = evaluate_with_shell_env(command, &env);
+            assert_eq!(outcome.verdict, Verdict::Allow, "{command}: {outcome:?}");
+            assert_eq!(
+                outcome.matched.map(|rule| rule.pattern).as_deref(),
+                Some("<filesystem: temp-scratch recursive deletion>"),
+                "{command}"
+            );
+        }
+    }
+
+    fn generated_cleanup_verdict(command: &str, ignored: &[&str]) -> Outcome {
+        let facts = EvalFacts {
+            ignored_generated: ignored.iter().map(|target| target.to_string()).collect(),
+            ..EvalFacts::default()
+        };
+        evaluate_with_facts(
+            &SafetyPolicy::default(),
+            command,
+            LaunchMode::Interactive,
+            &[],
+            None,
+            None,
+            0,
+            &facts,
+        )
+    }
+
+    #[test]
+    fn nested_generated_directory_cleanup_needs_the_ignored_fact() {
+        let allowed = generated_cleanup_verdict("rm -rf web/dist", &["web/dist"]);
+        assert_eq!(allowed.verdict, Verdict::Allow, "{allowed:?}");
+        assert_eq!(
+            allowed.matched.map(|rule| rule.pattern).as_deref(),
+            Some("<filesystem: generated-directory cleanup>")
+        );
+        for (command, ignored) in [
+            ("rm -rf web/dist", vec![]),
+            ("rm -rf web/dist", vec!["web/other"]),
+            ("rm -rf scripts/build", vec![]),
+            ("rm -rf web/public", vec!["web/public"]),
+            ("rm -rf ../x/dist", vec!["../x/dist"]),
+            ("rm -rf /abs/web/dist", vec!["/abs/web/dist"]),
+            ("rm -rf web/.git/dist", vec!["web/.git/dist"]),
+            ("rm -rf web/dist web/public", vec!["web/dist"]),
+        ] {
+            let outcome = generated_cleanup_verdict(command, &ignored);
+            assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
+        }
+        let zirv = generated_cleanup_verdict("rm -rf web/.zirv/build", &["web/.zirv/build"]);
+        assert_ne!(zirv.verdict, Verdict::Allow, "{zirv:?}");
+    }
+
+    #[test]
+    fn root_level_generated_directory_cleanup_needs_no_ignored_fact() {
+        for command in [
+            "rm -rf dist",
+            "rm -rf target/debug",
+            "rm -rf ./node_modules",
+        ] {
+            let outcome = generated_cleanup_verdict(command, &[]);
+            assert_eq!(outcome.verdict, Verdict::Allow, "{command}: {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn temp_variables_stay_unresolved_without_an_injected_value_and_other_names_never_resolve() {
+        for (command, env) in [
+            ("rm -rf $TEMP/benchsmoke", vec![]),
+            ("rm -rf $SCRATCH/benchsmoke", vec![("SCRATCH", "/tmp/zz")]),
+            (
+                "TMPDIR=/home/u/x; rm -rf $TMPDIR/benchsmoke",
+                vec![("TMPDIR", "/tmp/zz")],
+            ),
+        ] {
+            let outcome = evaluate_with_shell_env(command, &env);
+            assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
+        }
+    }
+
+    /// A resolved variable must never make a command less strict than its
+    /// literal spelling: the resolved text is classified exactly as typed.
+    #[test]
+    fn a_resolved_variable_is_never_less_strict_than_the_literal_command() {
+        let policy = SafetyPolicy::default();
+        for (command, literal) in [
+            ("R=/; rm -rf $R*", "rm -rf /*"),
+            ("R=/home/u/project; rm -rf $R", "rm -rf /home/u/project"),
+            ("R=/home/u/zirv; rm -rf $R", "rm -rf /home/u/zirv"),
+        ] {
+            let resolved = evaluate(&policy, command, LaunchMode::Interactive);
+            let direct = evaluate(&policy, literal, LaunchMode::Interactive);
+            assert_ne!(direct.verdict, Verdict::Allow, "{literal}");
+            assert_eq!(resolved.verdict, direct.verdict, "{command}");
+        }
+    }
+
+    const ZIRV_SCRATCH: &str = "/tmp/claude-501/-Users-x-zirv-flow/abc/scratchpad";
+
+    fn evaluate_with_scratch_roots(command: &str, roots: &[&str]) -> Outcome {
+        let roots: Vec<String> = roots.iter().map(|root| root.to_string()).collect();
+        evaluate_with_facts(
+            &SafetyPolicy::default(),
+            command,
+            LaunchMode::Interactive,
+            &roots,
+            None,
+            None,
+            0,
+            &EvalFacts::default(),
+        )
+    }
+
+    #[test]
+    fn a_zirv_bearing_scratchpad_delete_is_allowed_literal_and_resolved() {
+        for command in [
+            format!("rm -rf {ZIRV_SCRATCH}/bench"),
+            format!("rm -rf \"{ZIRV_SCRATCH}/bench\""),
+            format!("U={ZIRV_SCRATCH}; rm -rf $U/bench"),
+        ] {
+            let outcome = evaluate_with_scratch_roots(&command, &[ZIRV_SCRATCH]);
+            assert_eq!(outcome.verdict, Verdict::Allow, "{command}: {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn a_private_tmp_scratchpad_root_reaches_the_scratch_allow() {
+        let private = "/private/tmp/claude-501/-Users-x-zirv-flow/abc/scratchpad";
+        let outcome = evaluate_with_scratch_roots(&format!("rm -rf {private}/bench"), &[private]);
+        assert_eq!(outcome.verdict, Verdict::Allow, "{outcome:?}");
+        let outside = evaluate_with_scratch_roots("rm -rf /private/tmp/other/bench", &[private]);
+        assert_eq!(outside.verdict, Verdict::Ask, "{outside:?}");
+    }
+
+    #[test]
+    fn zirv_deletes_outside_the_strict_scratchpad_interior_still_deny() {
+        for command in [
+            "rm -rf ~/.zirv".to_string(),
+            format!("rm -rf {ZIRV_SCRATCH}"),
+            format!("rm -rf {ZIRV_SCRATCH}/"),
+            format!("rm -rf {ZIRV_SCRATCH}/../../zirv-state"),
+            format!("rm -rf {ZIRV_SCRATCH}/bench /home/u/.zirv"),
+            format!("rm -rf {ZIRV_SCRATCH}/bench $HOME/zirv"),
+            format!("U={ZIRV_SCRATCH}; rm -rf $U/../../zirv-state"),
+            "rm -rf /tmp/claude-501/other-zirv/abc/scratchpad/bench".to_string(),
+        ] {
+            let outcome = evaluate_with_scratch_roots(&command, &[ZIRV_SCRATCH]);
+            assert_eq!(outcome.verdict, Verdict::Deny, "{command}: {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn a_zirv_scratchpad_delete_without_scratchpad_roots_still_denies() {
+        for command in [
+            format!("rm -rf {ZIRV_SCRATCH}/bench"),
+            format!("U={ZIRV_SCRATCH}; rm -rf $U/bench"),
+        ] {
+            let outcome = evaluate_with_scratch_roots(&command, &[]);
+            assert_eq!(outcome.verdict, Verdict::Deny, "{command}: {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn a_conditional_prefix_or_dynamic_assignment_is_not_resolved() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "test -d x || W=D:/repo/.claude/worktrees/x; git -C D:/repo worktree remove --force $W",
+            "W=D:/repo/.claude/worktrees/x; false || git -C D:/repo worktree remove --force $W",
+            "W=$(pwd); git -C D:/repo worktree remove --force $W",
+            "W=\"D:/repo/.claude/worktrees/x y\"; git -C D:/repo worktree remove --force $W",
+            "test -d x || W=/; rm -rf $W",
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
+        }
+    }
+
     /// The existing `rm -rf*zirv*` DENY still wins even for a target that
     /// also happens to be confined to a temp root: [`apply_recursive_delete_
     /// outcome`] only ever reconsiders a `base.verdict == Allow`, and a
@@ -1025,6 +1424,180 @@ mod tests {
                     "{command} ({mode:?}) must never hard-deny: {outcome:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn find_exec_rmdir_is_allowed_but_rm_and_windows_recursive_rmdir_still_ask() {
+        let policy = SafetyPolicy::default();
+        let outcome = evaluate(
+            &policy,
+            "find D:/repo/.claude/worktrees/x -depth -type d -empty -exec rmdir {} \\;",
+            LaunchMode::Interactive,
+        );
+        assert_eq!(outcome.verdict, Verdict::Allow, "{outcome:?}");
+        for command in [
+            "find . -exec rm {} \\;",
+            "find . -exec rm -f {} +",
+            "find . -type d -exec rmdir /s {} \\;",
+            "find . -type d -exec rmdir /S /Q {} \\;",
+            "find . -type d -exec rmdir {} \\; -exec rm {} \\;",
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn find_exec_rmdir_needs_every_start_path_confined() {
+        let roots = vec!["/var/scratch/claude".to_string()];
+        let verdict = |command: &str| {
+            evaluate_with_scratchpad_roots(
+                &SafetyPolicy::default(),
+                command,
+                LaunchMode::Interactive,
+                &roots,
+                None,
+                None,
+                0,
+            )
+            .verdict
+        };
+        for path in [
+            ".",
+            "sub/dir",
+            "/tmp/zz/x",
+            "/var/scratch/claude/x",
+            "D:/repo/.claude/worktrees/x",
+        ] {
+            let command = format!("find {path} -type d -empty -exec rmdir {{}} \\;");
+            assert_eq!(verdict(&command), Verdict::Allow, "{command}");
+        }
+        for path in [
+            "/",
+            "~",
+            "../x",
+            "/var/scratch/claudeX",
+            "/home/u",
+            ". /",
+            "/tmp/zz/../..",
+        ] {
+            let command = format!("find {path} -type d -empty -exec rmdir {{}} \\;");
+            assert_eq!(verdict(&command), Verdict::Ask, "{command}");
+        }
+        assert_eq!(
+            verdict("find -L / -type d -exec rmdir {} \\;"),
+            Verdict::Ask,
+            "a leading -L must not hide the start path"
+        );
+    }
+
+    #[test]
+    fn a_zsh_modifier_or_subscript_after_a_resolved_name_stays_unresolved() {
+        for command in [
+            "W=/tmp/x; rm -rf $W:h:h",
+            "W=/tmp/x; rm -rf $W[1]",
+            "W=/tmp/x; rm -rf $W:h",
+            "W=/tmp/x; rm -rf ${W}:h",
+            "W=/tmp/x; rm -rf ${W}[1]",
+        ] {
+            let outcome = evaluate(&SafetyPolicy::default(), command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
+        }
+        let env = [("TMPDIR", "/tmp/claude-501/zz")];
+        for command in [
+            "rm -rf $TMPDIR:h:h",
+            "rm -rf $TMPDIR:h",
+            "rm -rf $TMPDIR[1]",
+        ] {
+            let outcome = evaluate_with_shell_env(command, &env);
+            assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn an_ifs_assignment_disables_variable_resolution() {
+        for command in [
+            "W=/tmp/claude-501/x; IFS=/; rm -rf $W",
+            "IFS=/; W=/tmp/claude-501/x; rm -rf $W",
+        ] {
+            let outcome = evaluate(&SafetyPolicy::default(), command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn find_exec_rmdir_skips_the_double_dash_before_the_start_paths() {
+        let policy = SafetyPolicy::default();
+        for (command, expected) in [
+            ("find -- / -type d -empty -exec rmdir {} \\;", Verdict::Ask),
+            ("find -- ~ -type d -empty -exec rmdir {} \\;", Verdict::Ask),
+            (
+                "find -- /home -type d -empty -exec rmdir {} \\;",
+                Verdict::Ask,
+            ),
+            (
+                "find -L -- / -type d -empty -exec rmdir {} \\;",
+                Verdict::Ask,
+            ),
+            (
+                "find -- . -type d -empty -exec rmdir {} \\;",
+                Verdict::Allow,
+            ),
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, expected, "{command}: {outcome:?}");
+        }
+    }
+
+    /// Quoted, escaped, appended and subscripted leading assignments are still
+    /// assignments: the program is the first word after them.
+    #[test]
+    fn every_spelling_of_a_leading_assignment_leaves_the_program_visible() {
+        let policy = SafetyPolicy::default();
+        for (command, expected) in [
+            ("FOO=/x\\ y sudo ls", Verdict::Deny),
+            ("FOO=\"a b\" sudo ls", Verdict::Deny),
+            ("FOO=/x\"a b\" sudo ls", Verdict::Deny),
+            ("FOO+=/x sudo ls", Verdict::Deny),
+            ("FOO[1]=/x sudo ls", Verdict::Deny),
+            ("FOO=/x\\ y rm -rf /", Verdict::Ask),
+            ("FOO=1 sudo ls", Verdict::Deny),
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, expected, "{command}: {outcome:?}");
+        }
+        let plain = evaluate(&policy, "ls", LaunchMode::Interactive);
+        let assigned = evaluate(&policy, "FOO=/x ls", LaunchMode::Interactive);
+        assert_eq!(assigned.verdict, plain.verdict, "{assigned:?}");
+        let worktree = evaluate(
+            &policy,
+            "W=D:/repo/.claude/worktrees/x; git -C D:/repo worktree remove --force $W",
+            LaunchMode::Interactive,
+        );
+        assert_eq!(worktree.verdict, Verdict::Allow, "{worktree:?}");
+    }
+
+    /// A leading `NAME=value` whose value holds `/` must be stripped as an
+    /// assignment, not basenamed into the program position.
+    #[test]
+    fn a_leading_assignment_with_a_slash_does_not_hide_the_command() {
+        let policy = SafetyPolicy::default();
+        for (command, expected) in [
+            ("FOO=/x sudo ls", Verdict::Deny),
+            ("FOO=/x git push --force origin main", Verdict::Ask),
+            ("X=a/b rm -rf /", Verdict::Ask),
+            ("FOO=/x git reset --hard", Verdict::Ask),
+            ("FOO=/x kubectl delete ns x", Verdict::Ask),
+            ("FOO=/x rm -rf $HOME", Verdict::Ask),
+            (
+                "W=D:/repo/.claude/worktrees/x git -C D:/repo worktree remove --force $W",
+                Verdict::Ask,
+            ),
+            ("FOO=1 sudo ls", Verdict::Deny),
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, expected, "{command}: {outcome:?}");
         }
     }
 

@@ -218,7 +218,7 @@ pub use attestation::{POLICY_FINGERPRINT_ENV, POLICY_SNAPSHOT_ENV, policy_finger
 pub use classifiers::sql_outcome;
 pub(crate) use classifiers::sql_program_name;
 pub use evaluation::evaluate;
-pub(crate) use evaluation::{evaluate_with_scratchpad_roots, parse_envelope_env, pipeline_stages};
+pub(crate) use evaluation::{parse_envelope_env, pipeline_stages};
 pub use hook_core::run_check;
 #[cfg(test)]
 use hook_core::run_check_hook_mode;

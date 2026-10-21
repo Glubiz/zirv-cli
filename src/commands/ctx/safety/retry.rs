@@ -2541,6 +2541,7 @@ fn shell_text_trips_danger(screen: &RetryScreen<'_>, text: &str, dir: Option<&Pa
         Verdict::Allow,
         super::adapters::LaunchMode::Interactive,
         screen.scratchpad_roots,
+        &[],
     );
     outcome.verdict == Verdict::Deny
         || (outcome.verdict == Verdict::Ask && outcome.matched.is_some())
