@@ -387,7 +387,7 @@ fn expand_home(path: &str) -> PathBuf {
 /// Extra install roots the issue #298 liveness probe consults for
 /// `adapter_name` after `PATH` and any `agent_bin` override come up empty --
 /// codex-cli on this repo's own dev machine lives at a real, working install
-/// outside `PATH` (see CLAUDE.md's "This Windows dev machine" section),
+/// outside `PATH` (see CLAUDE.md's "Windows dev machines only" section),
 /// which [`program_is_present`]'s plain `PATH` walk alone reports as absent.
 ///
 /// A fixed Rust table, never a config read: repo-owned surfaces may only
