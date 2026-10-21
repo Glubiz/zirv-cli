@@ -601,10 +601,13 @@ fn is_risky_find_exec(command: &str, scratchpad_roots: &[String]) -> bool {
     if sql_program_name(first) != "find" {
         return false;
     }
-    let options = tokens[1..]
+    let mut options = tokens[1..]
         .iter()
         .take_while(|token| matches!(token.as_str(), "-H" | "-L" | "-P"))
         .count();
+    if tokens.get(1 + options).is_some_and(|token| token == "--") {
+        options += 1;
+    }
     let start_paths = tokens[1 + options..]
         .iter()
         .take_while(|token| !token.starts_with(['-', '(', '!']));
@@ -1521,6 +1524,58 @@ mod tests {
             let outcome = evaluate(&SafetyPolicy::default(), command, LaunchMode::Interactive);
             assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
         }
+    }
+
+    #[test]
+    fn find_exec_rmdir_skips_the_double_dash_before_the_start_paths() {
+        let policy = SafetyPolicy::default();
+        for (command, expected) in [
+            ("find -- / -type d -empty -exec rmdir {} \\;", Verdict::Ask),
+            ("find -- ~ -type d -empty -exec rmdir {} \\;", Verdict::Ask),
+            (
+                "find -- /home -type d -empty -exec rmdir {} \\;",
+                Verdict::Ask,
+            ),
+            (
+                "find -L -- / -type d -empty -exec rmdir {} \\;",
+                Verdict::Ask,
+            ),
+            (
+                "find -- . -type d -empty -exec rmdir {} \\;",
+                Verdict::Allow,
+            ),
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, expected, "{command}: {outcome:?}");
+        }
+    }
+
+    /// Quoted, escaped, appended and subscripted leading assignments are still
+    /// assignments: the program is the first word after them.
+    #[test]
+    fn every_spelling_of_a_leading_assignment_leaves_the_program_visible() {
+        let policy = SafetyPolicy::default();
+        for (command, expected) in [
+            ("FOO=/x\\ y sudo ls", Verdict::Deny),
+            ("FOO=\"a b\" sudo ls", Verdict::Deny),
+            ("FOO=/x\"a b\" sudo ls", Verdict::Deny),
+            ("FOO+=/x sudo ls", Verdict::Deny),
+            ("FOO[1]=/x sudo ls", Verdict::Deny),
+            ("FOO=/x\\ y rm -rf /", Verdict::Ask),
+            ("FOO=1 sudo ls", Verdict::Deny),
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, expected, "{command}: {outcome:?}");
+        }
+        let plain = evaluate(&policy, "ls", LaunchMode::Interactive);
+        let assigned = evaluate(&policy, "FOO=/x ls", LaunchMode::Interactive);
+        assert_eq!(assigned.verdict, plain.verdict, "{assigned:?}");
+        let worktree = evaluate(
+            &policy,
+            "W=D:/repo/.claude/worktrees/x; git -C D:/repo worktree remove --force $W",
+            LaunchMode::Interactive,
+        );
+        assert_eq!(worktree.verdict, Verdict::Allow, "{worktree:?}");
     }
 
     /// A leading `NAME=value` whose value holds `/` must be stripped as an
