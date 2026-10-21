@@ -132,6 +132,7 @@ fn matching_segment(
     mode: super::adapters::LaunchMode,
     scratchpad_roots: &[String],
     cwd: Option<&Path>,
+    env: EnvLookup<'_>,
 ) -> Option<String> {
     let segments = split_segments(command);
     // An unmatched default applies to every segment alike, so none is singled out.
@@ -139,14 +140,16 @@ fn matching_segment(
         return None;
     }
     segments.into_iter().find(|segment| {
-        let alone = evaluate_with_scratchpad_roots(
+        let segment = segment.trim();
+        let alone = evaluate_with_facts(
             policy,
-            segment.trim(),
+            segment,
             mode,
             scratchpad_roots,
             None,
             cwd,
             0,
+            &eval_facts(segment, cwd, env),
         );
         alone.verdict == outcome.verdict
             && alone.matched.as_ref().map(|rule| &rule.pattern)
@@ -897,6 +900,7 @@ fn run_check_hook_inner<W: Write>(
                 mode,
                 &scratchpad_roots,
                 cwd,
+                env,
             )
         })
         .flatten();
