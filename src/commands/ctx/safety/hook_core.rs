@@ -75,6 +75,8 @@ struct HookOutputExtras {
     /// Emit a warning even when `dontAsk` would otherwise suppress Allow
     /// output, so the repeated-failure signal reaches the agent (#313).
     additional_context: Option<String>,
+    /// The segment that produced the verdict, when one segment alone does.
+    matched_segment: Option<String>,
 }
 
 /// Build the hook reason from policy text and breaker overrides, appending
@@ -96,31 +98,89 @@ fn hook_reason_text(
         Some(note) => format!("{note} -- {base}"),
         None => base,
     };
-    match blocked_instruction_suffix(command, outcome.verdict) {
+    match blocked_instruction_suffix(
+        command,
+        extras.matched_segment.as_deref(),
+        outcome,
+        mode,
+        extras.breaker_note.is_some(),
+    ) {
         Some(suffix) => format!("{text} {suffix}"),
         None => text,
     }
 }
 
-/// Add instructions only for visible Ask/Deny decisions. Use the command
-/// family here because the full command is already shown in this reason;
-/// persisted logs use a stricter family to avoid exposing arguments.
-fn blocked_instruction_suffix(command: &str, verdict: Verdict) -> Option<String> {
-    match verdict {
-        Verdict::Deny | Verdict::Ask => {
-            let family = super::hook::command_family(command);
-            let family = if family.is_empty() {
-                "unknown".to_string()
-            } else {
-                family
-            };
-            Some(format!(
-                "BLOCKED: {family}. Do not retry this command or work around it -- report \
-                 `BLOCKED: {family}` to your caller and move on to other work."
-            ))
-        }
-        Verdict::Allow => None,
+const SEGMENT_DISPLAY_CHARS: usize = 120;
+
+/// Whitespace-collapsed, length-capped text of the segment shown in a reason.
+fn display_segment(segment: &str) -> String {
+    let collapsed = segment.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= SEGMENT_DISPLAY_CHARS {
+        return collapsed;
     }
+    let head: String = collapsed.chars().take(SEGMENT_DISPLAY_CHARS).collect();
+    format!("{head}…")
+}
+
+/// The first top-level segment that alone yields the final verdict and rule,
+/// so a prompt names what is risky rather than the command's first word.
+/// Verdicts that came from cross-segment effects match no single segment.
+fn matching_segment(
+    policy: &SafetyPolicy,
+    command: &str,
+    outcome: &Outcome,
+    mode: super::adapters::LaunchMode,
+    scratchpad_roots: &[String],
+    cwd: Option<&Path>,
+) -> Option<String> {
+    let segments = split_segments(command);
+    // An unmatched default applies to every segment alike, so none is singled out.
+    if segments.len() < 2 || outcome.matched.is_none() {
+        return None;
+    }
+    segments.into_iter().find(|segment| {
+        let alone = evaluate_with_scratchpad_roots(
+            policy,
+            segment.trim(),
+            mode,
+            scratchpad_roots,
+            None,
+            cwd,
+            0,
+        );
+        alone.verdict == outcome.verdict
+            && alone.matched.as_ref().map(|rule| &rule.pattern)
+                == outcome.matched.as_ref().map(|rule| &rule.pattern)
+    })
+}
+
+/// Name the matching segment and rule on every visible Ask/Deny. An Ask only
+/// reads as approval-needed when a human can answer it; an unanswerable Ask
+/// (headless, or after a breaker note) reaches the agent as a refusal and
+/// keeps the blocked-and-report instruction. The full command is already in
+/// the reason, so the segment exposes nothing the reason did not show.
+fn blocked_instruction_suffix(
+    command: &str,
+    segment: Option<&str>,
+    outcome: &Outcome,
+    mode: super::adapters::LaunchMode,
+    breaker_note: bool,
+) -> Option<String> {
+    if outcome.verdict == Verdict::Allow {
+        return None;
+    }
+    let shown = display_segment(segment.unwrap_or(command));
+    let why = match &outcome.matched {
+        Some(rule) => format!("matched `{}`", rule.pattern),
+        None => format!("matched no rule (default {})", outcome.verdict.label()),
+    };
+    if outcome.verdict == Verdict::Ask && mode.is_interactive() && !breaker_note {
+        return Some(format!("Approval needed: `{shown}` {why}."));
+    }
+    Some(format!(
+        "BLOCKED: `{shown}` {why}. Do not retry this command or work around it -- report it to \
+         your caller and move on to other work."
+    ))
 }
 
 /// Builds the JSON envelope [`hook_output_with_extras`] emits, with
@@ -828,10 +888,23 @@ fn run_check_hook_inner<W: Write>(
         }
     }
 
+    let matched_segment = (outcome.verdict != Verdict::Allow)
+        .then(|| {
+            matching_segment(
+                &cfg.safety,
+                &effective_command,
+                &outcome,
+                mode,
+                &scratchpad_roots,
+                cwd,
+            )
+        })
+        .flatten();
     let extras = HookOutputExtras {
         breaker_note,
         reason_override,
         additional_context,
+        matched_segment,
     };
     if let Some(output) = hook_output_with_extras(
         command,
@@ -1884,8 +1957,8 @@ mod tests {
         )
         .expect("deny produces output");
         assert!(
-            output.contains("BLOCKED: rm"),
-            "the family must be named in the reason: {output}"
+            output.contains("BLOCKED: `rm -rf` matched `rm -rf *`."),
+            "the command and rule must be named in the reason: {output}"
         );
         assert!(
             output.contains("report") && output.contains("BLOCKED:"),
@@ -1910,6 +1983,185 @@ mod tests {
             .is_none(),
             "the unsatisfiable-prompt-under-dontAsk case must stay silent, BLOCKED text or not"
         );
+    }
+
+    fn hook_reason_for(command: &str, permission_mode: &str) -> (String, String) {
+        hook_reason_with(&CtxConfig::default(), command, permission_mode)
+    }
+
+    fn hook_reason_with(cfg: &CtxConfig, command: &str, permission_mode: &str) -> (String, String) {
+        let stdin = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "permission_mode": permission_mode,
+        })
+        .to_string();
+        let mut out = Vec::new();
+        run_check_hook_mode_with_env(cfg, &mut out, &stdin, &|_| None).unwrap();
+        let output: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        (
+            output["hookSpecificOutput"]["permissionDecision"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            output["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        )
+    }
+
+    /// #927 item 7: an answerable Ask names the segment that matched and its
+    /// rule, never the first segment's program, and asks for approval
+    /// instead of telling the agent it was blocked.
+    #[test]
+    fn interactive_ask_reason_names_the_matching_segment_and_asks_for_approval() {
+        let (decision, reason) = hook_reason_for(
+            r#"export PATH="/usr/bin:$PATH"; git -C D:/repo branch -D feat/x"#,
+            "default",
+        );
+        assert_eq!(decision, "ask");
+        assert!(
+            reason.contains(
+                "Approval needed: `git -C D:/repo branch -D feat/x` matched \
+                 `<vcs: destructive local or remote action>`."
+            ),
+            "{reason}"
+        );
+        assert!(!reason.contains("BLOCKED"), "{reason}");
+        assert!(!reason.contains("Do not retry"), "{reason}");
+    }
+
+    /// An Ask nobody can answer reaches the agent as a refusal, so it must
+    /// still read as blocked-and-report while naming the matching segment.
+    #[test]
+    fn headless_ask_reason_stays_blocked_and_names_the_matching_segment() {
+        let mut cfg = CtxConfig::default();
+        cfg.safety.default = Verdict::Allow;
+        cfg.safety.ask.push(Rule {
+            pattern: "rm -rf *".to_string(),
+            origin: Origin::BuiltIn,
+        });
+        let (decision, reason) = hook_reason_with(&cfg, "export PATH=/usr/bin; rm -rf /", "");
+        assert_eq!(decision, "ask");
+        assert!(
+            reason.contains("BLOCKED: `rm -rf /` matched `rm -rf *`. Do not retry this command"),
+            "{reason}"
+        );
+        assert!(!reason.contains("Approval needed"), "{reason}");
+    }
+
+    /// When only the unmatched default applies every segment is equally
+    /// default-asked, so none is singled out and the whole command is named.
+    #[test]
+    fn default_asked_command_names_the_whole_command_not_the_first_segment() {
+        let (_, reason) = hook_reason_for("export PATH=/usr/bin; some-unknown-tool --flag", "");
+        assert!(
+            reason.contains(
+                "BLOCKED: `export PATH=/usr/bin; some-unknown-tool --flag` matched no rule \
+                 (default ask)."
+            ),
+            "{reason}"
+        );
+    }
+
+    /// The identical-command breaker tells the agent to stop, so an Ask that
+    /// carries its note must not invite approval either.
+    #[test]
+    fn ask_with_a_breaker_note_stays_blocked() {
+        let ask = Outcome {
+            verdict: Verdict::Ask,
+            matched: Some(Rule {
+                pattern: "git push*--force*".to_string(),
+                origin: Origin::BuiltIn,
+            }),
+        };
+        let extras = HookOutputExtras {
+            breaker_note: Some("3 consecutive denials this session".to_string()),
+            ..HookOutputExtras::default()
+        };
+        let output = hook_output_with_extras(
+            "git push --force x",
+            &ask,
+            "default",
+            super::super::adapters::LaunchMode::Interactive,
+            SnapshotDivergence::Unchanged,
+            "not-present",
+            &extras,
+        )
+        .expect("ask produces output");
+        assert!(
+            output.contains("BLOCKED: `git push --force x` matched `git push*--force*`."),
+            "{output}"
+        );
+        assert!(!output.contains("Approval needed"), "{output}");
+    }
+
+    #[test]
+    fn identical_command_refusal_names_the_command_and_stays_blocked() {
+        let deny = Outcome {
+            verdict: Verdict::Deny,
+            matched: Some(Rule {
+                pattern: "<guard: identical failing command>".to_string(),
+                origin: Origin::BuiltIn,
+            }),
+        };
+        let extras = HookOutputExtras {
+            reason_override: Some("zirv guard: this exact command has failed 3 times".to_string()),
+            ..HookOutputExtras::default()
+        };
+        let output = hook_output_with_extras(
+            "make test",
+            &deny,
+            "dontAsk",
+            super::super::adapters::LaunchMode::Headless,
+            SnapshotDivergence::Unchanged,
+            "not-present",
+            &extras,
+        )
+        .expect("deny produces output");
+        assert!(
+            output.contains(
+                "BLOCKED: `make test` matched `<guard: identical failing command>`. Do not retry"
+            ),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn single_segment_deny_names_the_segment_and_keeps_the_blocked_instruction() {
+        let (decision, reason) = hook_reason_for("cat ~/.ssh/id_rsa", "dontAsk");
+        assert_eq!(decision, "deny");
+        assert!(
+            reason.contains("BLOCKED: `cat ~/.ssh/id_rsa` matched `"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains(
+                "Do not retry this command or work around it -- report it to your caller"
+            ),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn windows_path_single_segment_is_not_mangled_into_a_family() {
+        let (_, reason) = hook_reason_for(r"find D:/x -exec rm {} \;", "");
+        assert!(
+            reason.contains(r"BLOCKED: `find D:/x -exec rm {} \;`"),
+            "{reason}"
+        );
+        assert!(!reason.contains("find d"), "{reason}");
+    }
+
+    #[test]
+    fn long_matching_segment_is_collapsed_and_truncated() {
+        let long = format!("git   branch -D {}", "x".repeat(300));
+        let shown = display_segment(&long);
+        assert!(shown.starts_with("git branch -D xxx"), "{shown}");
+        assert_eq!(shown.chars().count(), 121);
+        assert!(shown.ends_with('…'), "{shown}");
+        assert_eq!(display_segment("  ls   -la  "), "ls -la");
     }
 
     #[test]
