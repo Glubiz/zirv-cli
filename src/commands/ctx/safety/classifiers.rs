@@ -9,24 +9,47 @@ use super::*;
 // Path classification is lexical; the hook caller must reject symlinked
 // targets and ancestors before allowing generated cleanup.
 pub(super) fn generated_path(path: &str) -> bool {
+    let normalized = lowercase_relative_in_repo_path(path);
+    let relative = normalized.as_deref().unwrap_or_default();
+    is_generated_dir_name(relative.split('/').next().unwrap_or(relative))
+}
+
+/// A generated-directory name at any depth below the first component, for a
+/// target that [`generated_path`] does not already cover. Such a target needs
+/// the hook's `git check-ignore` fact before it may be cleaned up. `.git`,
+/// `.zirv` and secret-looking components never qualify.
+pub(super) fn nested_generated_path(path: &str) -> bool {
+    let Some(relative) = lowercase_relative_in_repo_path(path) else {
+        return false;
+    };
+    let components: Vec<&str> = relative.split('/').collect();
+    !is_generated_dir_name(components[0])
+        && components.iter().any(|part| is_generated_dir_name(part))
+        && !components
+            .iter()
+            .any(|part| matches!(*part, ".git" | ".zirv"))
+        && !sensitive_upload_path(&relative)
+}
+
+fn lowercase_relative_in_repo_path(path: &str) -> Option<String> {
     let normalized = path
         .trim_matches(['\'', '"'])
         .replace('\\', "/")
         .to_ascii_lowercase();
     let relative = normalized.strip_prefix("./").unwrap_or(normalized.as_str());
-    if relative.is_empty()
+    let in_repo = !(relative.is_empty()
         || relative == "."
         || relative.starts_with('/')
         || relative.starts_with('~')
         || relative.contains(':')
         || relative.contains("..")
-        || relative.contains(['$', '%', '`'])
-    {
-        return false;
-    }
-    let root = relative.split('/').next().unwrap_or(relative);
+        || relative.contains(['$', '%', '`']));
+    in_repo.then(|| relative.to_string())
+}
+
+fn is_generated_dir_name(name: &str) -> bool {
     matches!(
-        root,
+        name,
         "target"
             | "node_modules"
             | ".next"
@@ -77,19 +100,17 @@ pub(super) fn is_recursive_delete(command: &str) -> bool {
     }
 }
 
-pub(super) fn provably_generated_cleanup(command: &str) -> bool {
+/// The targets of a single plain recursive delete command, before any judgement
+/// about which paths are generated.
+pub(super) fn recursive_delete_targets(command: &str) -> Option<Vec<String>> {
     if split_segments(command).len() != 1
         || !command_substitutions(command).is_empty()
         || unwrap_shell_wrapper(command).is_some()
     {
-        return false;
+        return None;
     }
-    let Some(tokens) = sql_tokens(&collapse_whitespace(command)) else {
-        return false;
-    };
-    let Some(first) = tokens.first() else {
-        return false;
-    };
+    let tokens = sql_tokens(&collapse_whitespace(command))?;
+    let first = tokens.first()?;
     let program = normalized_delete_program(first);
     let mut recursive = false;
     let mut targets = Vec::new();
@@ -116,13 +137,23 @@ pub(super) fn provably_generated_cleanup(command: &str) -> bool {
                 recursive |= lower == "/s";
                 matches!(lower.as_str(), "/s" | "/q")
             }
-            _ => return false,
+            _ => return None,
         };
         if !allowed_flag {
-            targets.push(token.as_str());
+            targets.push(token.clone());
         }
     }
-    recursive && !targets.is_empty() && targets.iter().all(|target| generated_path(target))
+    (recursive && !targets.is_empty()).then_some(targets)
+}
+
+/// `ignored` holds the nested targets the hook confirmed git-ignored and
+/// untracked; a root-level generated name needs no such fact.
+pub(super) fn provably_generated_cleanup(command: &str, ignored: &[String]) -> bool {
+    recursive_delete_targets(command).is_some_and(|targets| {
+        targets.iter().all(|target| {
+            generated_path(target) || (ignored.contains(target) && nested_generated_path(target))
+        })
+    })
 }
 
 // ---------------------------------------------------------------------

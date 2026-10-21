@@ -293,6 +293,251 @@ fn expand_word(raw: &str, original: &str, depth: u8) -> Option<Vec<String>> {
     quote.is_none().then_some(results)
 }
 
+/// Variables the hook environment may supply when a command never assigns them.
+pub(super) const SHELL_ENV_NAMES: &[&str] = &["TEMP", "TMP", "TMPDIR"];
+
+const COMPOUND_KEYWORDS: &[&str] = &[
+    "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done", "case", "esac",
+    "select", "function", "coproc",
+];
+
+#[derive(Clone, Copy, PartialEq)]
+enum Separator {
+    Sequence,
+    And,
+    Or,
+    Pipe,
+    Background,
+}
+
+/// Substitute each `$NAME`/`${NAME}` outside single quotes with the literal an
+/// earlier assignment-only top-level statement gave it, so every classifier
+/// judges the command the shell will run. Only `;`, `&&` and newlines may
+/// separate that assignment from the use; any `||`, pipe, `&`, subshell, brace,
+/// loop or conditional, a prefix assignment, a dynamic value or a mutating
+/// builtin leaves the reference as written. `shell_env` supplies
+/// [`SHELL_ENV_NAMES`] only for names the command never assigns. `None` when
+/// nothing was resolved.
+pub(super) fn resolve_shell_variables(
+    command: &str,
+    shell_env: &[(String, String)],
+) -> Option<String> {
+    if !command.contains('$')
+        || command.contains("<<")
+        || command.contains("$(")
+        || command.contains('`')
+    {
+        return None;
+    }
+    for (segment, _, _) in tokenize_segments_joined(command) {
+        let words: Vec<String> = tokenize_quoted(&segment.chars().collect::<Vec<_>>())
+            .into_iter()
+            .map(|word| word.text)
+            .collect();
+        let first = words.first().map(String::as_str);
+        if words
+            .iter()
+            .any(|word| MUTATING_BUILTINS.contains(&word.as_str()))
+            || matches!(first, Some("source" | "."))
+            || first.is_some_and(|word| COMPOUND_KEYWORDS.contains(&word))
+            || (first == Some("printf") && words.iter().any(|word| word == "-v"))
+        {
+            return None;
+        }
+    }
+    let chars: Vec<char> = command.chars().collect();
+    let mut state: std::collections::HashMap<String, Option<String>> = Default::default();
+    let mut out = String::with_capacity(command.len());
+    let mut statement = String::new();
+    let mut quote: Option<char> = None;
+    let mut unconditional = true;
+    let mut last_separator = Separator::Sequence;
+    let mut changed = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if c == '\\' && quote != Some('\'') {
+            statement.push(c);
+            statement.extend(next);
+            i += 2;
+            continue;
+        }
+        let mut separator: Option<(Separator, &str)> = None;
+        let mut width = 1;
+        match (quote, c) {
+            (Some('\''), '\'') | (Some('"'), '"') => {
+                quote = None;
+                statement.push(c);
+            }
+            (Some('\''), _) => statement.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                statement.push(c);
+            }
+            (_, '$') => match dollar_reference(&chars, i) {
+                Some((name, end)) => {
+                    let value = match state.get(&name) {
+                        Some(value) => value.clone(),
+                        None => shell_env
+                            .iter()
+                            .find(|(env_name, _)| *env_name == name)
+                            .filter(|_| SHELL_ENV_NAMES.contains(&name.as_str()))
+                            .and_then(|(_, value)| absolute_literal_path(value)),
+                    };
+                    match value {
+                        Some(value) => {
+                            statement.push_str(&value);
+                            changed = true;
+                        }
+                        None => statement.extend(&chars[i..end]),
+                    }
+                    i = end;
+                    continue;
+                }
+                None => statement.push(c),
+            },
+            (None, '(' | ')' | '{' | '}') => return None,
+            (None, ';') => separator = Some((Separator::Sequence, ";")),
+            (None, '\n') => {
+                if statement.trim().is_empty()
+                    && matches!(
+                        last_separator,
+                        Separator::And | Separator::Or | Separator::Pipe
+                    )
+                {
+                    statement.push(c);
+                } else {
+                    separator = Some((Separator::Sequence, "\n"));
+                }
+            }
+            (None, '&') if next == Some('&') => {
+                separator = Some((Separator::And, "&&"));
+                width = 2;
+            }
+            (None, '&') if statement.ends_with(['>', '<']) || next == Some('>') => {
+                statement.push(c);
+            }
+            (None, '&') => separator = Some((Separator::Background, "&")),
+            (None, '|') if next == Some('|') => {
+                separator = Some((Separator::Or, "||"));
+                width = 2;
+            }
+            (None, '|') if statement.ends_with('>') => statement.push(c),
+            (None, '|') if next == Some('&') => {
+                separator = Some((Separator::Pipe, "|&"));
+                width = 2;
+            }
+            (None, '|') => separator = Some((Separator::Pipe, "|")),
+            _ => statement.push(c),
+        }
+        i += width;
+        let Some((kind, text)) = separator else {
+            continue;
+        };
+        let counts = unconditional && matches!(kind, Separator::Sequence | Separator::And);
+        let assignment_only = apply_assignment_statement(&statement, counts, &mut state);
+        out.push_str(&statement);
+        out.push_str(text);
+        statement.clear();
+        match kind {
+            Separator::Sequence => unconditional = true,
+            Separator::And => unconditional &= assignment_only,
+            Separator::Or | Separator::Pipe | Separator::Background => {
+                state.values_mut().for_each(|value| *value = None);
+                unconditional = false;
+            }
+        }
+        last_separator = kind;
+    }
+    out.push_str(&statement);
+    (quote.is_none() && changed).then_some(out)
+}
+
+/// The variable name and end index of the `$NAME`/`${NAME}` at `chars[start]`.
+fn dollar_reference(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let braced = chars.get(start + 1) == Some(&'{');
+    let begin = start + 1 + usize::from(braced);
+    let mut end = begin;
+    while chars
+        .get(end)
+        .is_some_and(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+    {
+        end += 1;
+    }
+    if end == begin || chars[begin].is_ascii_digit() {
+        return None;
+    }
+    if braced && chars.get(end) != Some(&'}') {
+        return None;
+    }
+    Some((
+        chars[begin..end].iter().collect(),
+        end + usize::from(braced),
+    ))
+}
+
+/// A value safe to splice into any shell position: no expansion, glob,
+/// quoting, separator or whitespace characters.
+fn is_resolvable_literal(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains(|ch: char| ch.is_whitespace() || "$`~*?[;|&<>()'\"\\{}!#".contains(ch))
+}
+
+/// A hook-environment path as it would appear in a Bash command: forward
+/// slashes, no trailing slash, absolute, and a resolvable literal.
+fn absolute_literal_path(value: &str) -> Option<String> {
+    let path = value.replace('\\', "/");
+    let path = path.trim_end_matches('/');
+    let bytes = path.as_bytes();
+    let absolute =
+        path.starts_with('/') || (bytes.get(1) == Some(&b':') && bytes.get(2) == Some(&b'/'));
+    (absolute && is_resolvable_literal(path)).then(|| path.to_string())
+}
+
+/// Record what one statement does to shell variables and report whether it
+/// was assignment-only. Only a lone literal assignment that is certain to run
+/// (`counts`) defines its name; anything else that touches a name makes it
+/// unresolvable.
+fn apply_assignment_statement(
+    statement: &str,
+    counts: bool,
+    state: &mut std::collections::HashMap<String, Option<String>>,
+) -> bool {
+    let words: Vec<String> = tokenize_quoted(&statement.chars().collect::<Vec<_>>())
+        .into_iter()
+        .map(|word| word.text)
+        .collect();
+    let body = match words.first().map(String::as_str) {
+        Some("export") => &words[1..],
+        _ => &words[..],
+    };
+    if body.is_empty() || !body.iter().all(|word| is_shell_identifier_assignment(word)) {
+        for word in &words {
+            let end = word
+                .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                .unwrap_or(word.len());
+            let (name, rest) = word.split_at(end);
+            if !name.is_empty() && (rest.starts_with("+=") || rest.starts_with('[')) {
+                state.insert(name.to_string(), None);
+            }
+        }
+        return false;
+    }
+    for word in body {
+        let Some((name, raw)) = word.split_once('=') else {
+            continue;
+        };
+        let value = (counts && body.len() == 1)
+            .then(|| literal_assignment_value(raw))
+            .flatten()
+            .map(|(value, _)| value)
+            .filter(|value| is_resolvable_literal(value));
+        state.insert(name.to_string(), value);
+    }
+    true
+}
+
 /// The literal value(s) a same-command variable can hold at its use.
 fn variable_values(original: &str, name: &str) -> Option<Vec<String>> {
     if let Some((value, _)) = literal_shell_assignment(original, name) {
@@ -479,22 +724,28 @@ fn literal_shell_assignment(original: &str, name: &str) -> Option<(String, bool)
             return None;
         }
         let raw = body.iter().find_map(|word| word.strip_prefix(&prefix))?;
-        let inner = |quote: char| {
-            raw.strip_prefix(quote)
-                .and_then(|rest| rest.strip_suffix(quote))
-                .filter(|inner| !inner.contains(quote))
-        };
-        found = Some(if let Some(inner) = inner('\'') {
-            (inner.to_string(), true)
-        } else {
-            let literal = inner('"').unwrap_or(raw);
-            if literal.is_empty() || literal.contains(['$', '`', '\\', '\'', '"']) {
-                return None;
-            }
-            (literal.to_string(), false)
-        });
+        found = Some(literal_assignment_value(raw)?);
     }
     found
+}
+
+/// The literal an assignment's right-hand side spells, and whether it was
+/// single-quoted; `$`, backtick, backslash and stray quotes in an unquoted or
+/// double-quoted value, or an empty one, do not qualify.
+fn literal_assignment_value(raw: &str) -> Option<(String, bool)> {
+    let inner = |quote: char| {
+        raw.strip_prefix(quote)
+            .and_then(|rest| rest.strip_suffix(quote))
+            .filter(|inner| !inner.contains(quote))
+    };
+    if let Some(inner) = inner('\'') {
+        return Some((inner.to_string(), true));
+    }
+    let literal = inner('"').unwrap_or(raw);
+    if literal.is_empty() || literal.contains(['$', '`', '\\', '\'', '"']) {
+        return None;
+    }
+    Some((literal.to_string(), false))
 }
 
 fn is_inline_query_body(flag: &str, value: &str) -> bool {
@@ -1393,6 +1644,74 @@ mod tests {
                 is_read_only_escape_safe(command, &roots),
                 "{command} should qualify"
             );
+        }
+    }
+
+    #[test]
+    fn resolve_shell_variables_substitutes_an_earlier_literal_assignment() {
+        for (command, expected) in [
+            ("W=/a/b; ls $W", "W=/a/b; ls /a/b"),
+            ("W=/a/b; ls ${W}/c", "W=/a/b; ls /a/b/c"),
+            ("W=/a/b; ls \"$W/c\"", "W=/a/b; ls \"/a/b/c\""),
+            ("export W=/a/b\nls $W", "export W=/a/b\nls /a/b"),
+            ("W='/a/b' && ls $W", "W='/a/b' && ls /a/b"),
+            ("W=/a; W=/b; ls $W", "W=/a; W=/b; ls /b"),
+            ("A=/a; B=$A/b; ls $B", "A=/a; B=/a/b; ls /a/b"),
+            ("W=/a/b; ls '$W'", "W=/a/b; ls '$W'"),
+        ] {
+            let resolved = resolve_shell_variables(command, &[]);
+            let expected = (expected != command).then(|| expected.to_string());
+            assert_eq!(resolved, expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn resolve_shell_variables_leaves_unprovable_references_alone() {
+        for command in [
+            "W=/a/b ls $W",
+            "test -d x || W=/a; ls $W",
+            "false && W=/a; ls $W",
+            "W=/a; true || ls $W",
+            "W=/a; true | ls $W",
+            "W=/a & ls $W",
+            "W=/a | cat; ls $W",
+            "W=/a; W=$(pwd); ls $W",
+            "W=$(pwd); ls $W",
+            "W=\"/a b\"; ls $W",
+            "W='/a*'; ls $W",
+            "W=~/a; ls $W",
+            "W=/a; (W=/b; ls $W)",
+            "W=/a; if true; then W=/b; fi; ls $W",
+            "W=/a; for W in /b /c; do ls $W; done",
+            "W=/a; read W; ls $W",
+            "W=/a; W+=/b; ls $W",
+            "W=/a; ls ${W:-x}",
+            "ls $UNSET",
+            "ls $1",
+        ] {
+            assert_eq!(resolve_shell_variables(command, &[]), None, "{command}");
+        }
+    }
+
+    #[test]
+    fn resolve_shell_variables_takes_temp_names_from_the_injected_environment_only() {
+        let env = vec![
+            ("TMPDIR".to_string(), "/tmp/zz/".to_string()),
+            ("TEMP".to_string(), "C:\\Users\\u\\Temp".to_string()),
+            ("TMP".to_string(), "relative".to_string()),
+            ("HOME".to_string(), "/home/u".to_string()),
+        ];
+        for (command, expected) in [
+            ("ls $TMPDIR/x", Some("ls /tmp/zz/x")),
+            ("ls \"$TEMP/x\"", Some("ls \"C:/Users/u/Temp/x\"")),
+            ("ls $TMP/x", None),
+            ("ls $HOME/x", None),
+            ("TMPDIR=/b; ls $TMPDIR/x", Some("TMPDIR=/b; ls /b/x")),
+            ("TMPDIR=$(pwd); ls $TMPDIR/x", None),
+            ("TMPDIR=/b cmd $TMPDIR/x", Some("TMPDIR=/b cmd /tmp/zz/x")),
+        ] {
+            let resolved = resolve_shell_variables(command, &env);
+            assert_eq!(resolved.as_deref(), expected, "{command}");
         }
     }
 

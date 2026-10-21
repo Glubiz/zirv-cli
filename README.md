@@ -7764,9 +7764,22 @@ recursive deletion, infrastructure/service destruction, and irreversible
 package/release operations using case-folded executable basenames, so native
 Windows and Unix wrapper spellings reach the same verdict. Quoted
 command-looking text remains data. This tripwire is bounded against hostile
-input and deliberately does not decode obfuscation, expand variables, or read
-dynamically sourced scripts; the harness sandbox is the containment boundary
-beneath it.
+input and deliberately does not decode obfuscation, expand variables beyond the
+literal-assignment case below, or read dynamically sourced scripts; the harness
+sandbox is the containment boundary beneath it.
+
+A `$NAME`, `${NAME}` or `"$NAME"` is classified as the literal it stands for
+when an earlier assignment-only statement of the same command (`NAME=v` or
+`export NAME=v`, a plain literal with no `$`, backtick, `~`, glob, whitespace
+or shell metacharacter) is separated from the use only by `;`, `&&` or a
+newline. Any `||`, pipe, `&`, subshell, brace, loop or conditional in between, a
+prefix assignment (`W=x cmd $W`), a heredoc or a mutating builtin (`read`,
+`eval`, `declare`, ...) leaves the reference unresolved and as strict as before.
+Unassigned `$TEMP`, `$TMP` and `$TMPDIR` resolve from the hook's environment
+(absolute values only); no other environment variable resolves. An explicit
+deny or ask rule matching the raw text still applies. `find -exec rmdir` (an
+empty-directory remove) is allowed; `-exec rm` and a Windows `rmdir /s` still
+ask.
 
 Each supervised Claude decision appends a privacy-preserving audit record under
 the platform state directory's `logs/safety-decisions/` UTC-day bucket. Records
@@ -7782,7 +7795,12 @@ off the conservative SQL narrowing.
 
 A recursive delete whose every target sits inside the OS temp root (or
 `/tmp`, `/var/tmp`) is allowed by the hook even under the shipped `rm -rf`
-ask rule, so an agent can clear its own scratch directory. A headless launch
+ask rule, so an agent can clear its own scratch directory. In an interactive
+launch a relative `rm -rf` of a known generated directory (`target`,
+`node_modules`, `dist`, `build`, ...) at the repo root is allowed lexically, and
+nested (`web/dist`) only when `git check-ignore` confirms the path is ignored
+and `git ls-files` shows no tracked file under it; `.git`, `.zirv`, secret paths,
+`..` and absolute paths never qualify, and a missing or slow git keeps the ask. A headless launch
 still projects the ask set into `--disallowedTools`, which Claude Code
 checks before the hook, so there the delete stays blocked.
 

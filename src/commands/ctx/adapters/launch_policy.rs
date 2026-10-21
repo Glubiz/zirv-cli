@@ -524,7 +524,7 @@ pub const SHIPPED_POSTURE_ASK: &[(&str, &str)] = &[
     // entry is still not carried over here.
     ("Bash(find*-delete*)", "find's own delete action"),
     (
-        "Bash(find*-exec rm*)",
+        "Bash(find*-exec rm *)",
         "find's exec action invoking a delete",
     ),
     (

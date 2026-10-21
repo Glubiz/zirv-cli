@@ -63,12 +63,13 @@ fn self_healed_evaluation(
     envelope: Option<&envelope::WorkerEnvelope>,
     cwd: Option<&Path>,
     now: u64,
+    facts: &EvalFacts,
 ) -> AttestedEvaluation {
     if let Some(path) = snapshot_path {
         let _ = rematerialize_policy_snapshot(path, current);
     }
     AttestedEvaluation {
-        outcome: evaluate_with_scratchpad_roots(
+        outcome: evaluate_with_facts(
             current,
             command,
             mode,
@@ -76,6 +77,7 @@ fn self_healed_evaluation(
             envelope,
             cwd,
             now,
+            facts,
         ),
         current_fingerprint,
         launch_fingerprint,
@@ -109,13 +111,14 @@ pub(super) fn evaluate_with_attestation_evidence(
     // pure and apply worker scope on every path (#262).
     let envelope = parse_envelope_env(env);
     let envelope = envelope.as_ref();
+    let facts = eval_facts(command, cwd, env);
     let current_fingerprint =
         policy_fingerprint(current).unwrap_or_else(|_| "unavailable".to_string());
     let (expected_fingerprint, snapshot_path) =
         match (env(POLICY_FINGERPRINT_ENV), env(POLICY_SNAPSHOT_ENV)) {
             (None, None) => {
                 return AttestedEvaluation {
-                    outcome: evaluate_with_scratchpad_roots(
+                    outcome: evaluate_with_facts(
                         current,
                         command,
                         mode,
@@ -123,6 +126,7 @@ pub(super) fn evaluate_with_attestation_evidence(
                         envelope,
                         cwd,
                         now,
+                        &facts,
                     ),
                     current_fingerprint,
                     launch_fingerprint: None,
@@ -143,6 +147,7 @@ pub(super) fn evaluate_with_attestation_evidence(
                     envelope,
                     cwd,
                     now,
+                    &facts,
                 );
             }
         };
@@ -162,6 +167,7 @@ pub(super) fn evaluate_with_attestation_evidence(
             envelope,
             cwd,
             now,
+            &facts,
         );
     };
     if policy_fingerprint(&launch).ok().as_deref() != Some(expected_fingerprint.as_str()) {
@@ -176,10 +182,11 @@ pub(super) fn evaluate_with_attestation_evidence(
             envelope,
             cwd,
             now,
+            &facts,
         );
     }
 
-    let current_outcome = evaluate_with_scratchpad_roots(
+    let current_outcome = evaluate_with_facts(
         current,
         command,
         mode,
@@ -187,8 +194,9 @@ pub(super) fn evaluate_with_attestation_evidence(
         envelope,
         cwd,
         now,
+        &facts,
     );
-    let launch_outcome = evaluate_with_scratchpad_roots(
+    let launch_outcome = evaluate_with_facts(
         &launch,
         command,
         mode,
@@ -196,6 +204,7 @@ pub(super) fn evaluate_with_attestation_evidence(
         envelope,
         cwd,
         now,
+        &facts,
     );
     let divergence = if verdict_rank(launch_outcome.verdict) > verdict_rank(current_outcome.verdict)
     {

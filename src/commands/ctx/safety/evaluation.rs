@@ -540,7 +540,8 @@ const FIND_EXEC_SAFE_PROGRAMS: &[&str] = &[
 ];
 
 /// Ask for any `find -exec`/`-ok` action whose program is not proven safe;
-/// unknown executables cannot inherit an ordinary read verdict.
+/// unknown executables cannot inherit an ordinary read verdict. `rmdir` only
+/// removes empty directories, except Windows `rmdir /s`, which recurses.
 fn is_risky_find_exec(command: &str) -> bool {
     let Some(tokens) = sql_tokens(&collapse_whitespace(command)) else {
         return false;
@@ -555,10 +556,19 @@ fn is_risky_find_exec(command: &str) -> bool {
     while i < tokens.len() {
         let lower = tokens[i].to_ascii_lowercase();
         if matches!(lower.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") {
-            match tokens.get(i + 1) {
-                Some(action)
-                    if FIND_EXEC_SAFE_PROGRAMS.contains(&sql_program_name(action).as_str()) => {}
-                _ => return true,
+            let Some(action) = tokens.get(i + 1) else {
+                return true;
+            };
+            let program = sql_program_name(action);
+            let recursive_rmdir = program == "rmdir"
+                && tokens[i + 2..]
+                    .iter()
+                    .take_while(|token| !matches!(token.as_str(), ";" | "\\;" | "+"))
+                    .any(|token| token.eq_ignore_ascii_case("/s"));
+            if recursive_rmdir
+                || !(FIND_EXEC_SAFE_PROGRAMS.contains(&program.as_str()) || program == "rmdir")
+            {
+                return true;
             }
         }
         i += 1;
@@ -633,15 +643,68 @@ pub(crate) fn evaluate_with_scratchpad_roots(
     cwd: Option<&Path>,
     now: u64,
 ) -> Outcome {
-    let canonical = canonical_shell_syntax(command);
-    let command = canonical.as_deref().unwrap_or(command);
-    let mut base = evaluate_candidates(
+    evaluate_with_facts(
         policy,
         command,
-        policy.default_verdict(mode),
         mode,
         scratchpad_roots,
-    );
+        envelope,
+        cwd,
+        now,
+        &EvalFacts::default(),
+    )
+}
+
+/// Facts gathered at the hook boundary and handed to pure evaluation:
+/// the shell environment values `$TEMP`/`$TMP`/`$TMPDIR` may resolve to, and
+/// the nested generated-directory targets `git check-ignore` confirmed.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct EvalFacts {
+    pub(crate) shell_env: Vec<(String, String)>,
+    pub(crate) ignored_generated: Vec<String>,
+}
+
+/// [`evaluate_with_scratchpad_roots`] plus boundary facts. A same-command
+/// variable is resolved once here so every classifier sees the literal it
+/// stands for; an explicit rule that matches the raw text still applies.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_with_facts(
+    policy: &SafetyPolicy,
+    command: &str,
+    mode: super::adapters::LaunchMode,
+    scratchpad_roots: &[String],
+    envelope: Option<&envelope::WorkerEnvelope>,
+    cwd: Option<&Path>,
+    now: u64,
+    facts: &EvalFacts,
+) -> Outcome {
+    let canonical = canonical_shell_syntax(command);
+    let command = canonical.as_deref().unwrap_or(command);
+    let resolved = resolve_shell_variables(command, &facts.shell_env);
+    let evaluate_text = |text: &str| {
+        evaluate_candidates(
+            policy,
+            text,
+            policy.default_verdict(mode),
+            mode,
+            scratchpad_roots,
+            &facts.ignored_generated,
+        )
+    };
+    let mut base = evaluate_text(resolved.as_deref().unwrap_or(command));
+    if resolved.is_some() {
+        let raw = evaluate_text(command);
+        let explicit = raw
+            .matched
+            .as_ref()
+            .is_some_and(|rule| rule.origin != Origin::BuiltIn);
+        if (raw.verdict == Verdict::Deny || explicit)
+            && verdict_rank(raw.verdict) > verdict_rank(base.verdict)
+        {
+            base = raw;
+        }
+    }
+    let command = resolved.as_deref().unwrap_or(command);
     // Syntax the scanners cannot model may hide a live command: never Allow it.
     if canonical.is_none() && base.verdict == Verdict::Allow {
         base = Outcome {
@@ -812,8 +875,14 @@ mod tests {
             ("some-totally-unknown-tool --flag", Verdict::Ask),
         ] {
             let direct = evaluate_candidate_outcome(&policy, command, command, Verdict::Ask, &[]);
-            let via_evaluate_candidates =
-                evaluate_candidates(&policy, command, Verdict::Ask, LaunchMode::Headless, &[]);
+            let via_evaluate_candidates = evaluate_candidates(
+                &policy,
+                command,
+                Verdict::Ask,
+                LaunchMode::Headless,
+                &[],
+                &[],
+            );
             assert_eq!(direct.verdict, expected, "{command}");
             assert_eq!(
                 direct.verdict, via_evaluate_candidates.verdict,
@@ -982,6 +1051,181 @@ mod tests {
         assert_eq!(outcome.verdict, Verdict::Ask, "got {outcome:?}");
     }
 
+    fn evaluate_with_shell_env(command: &str, env: &[(&str, &str)]) -> Outcome {
+        let facts = EvalFacts {
+            shell_env: env
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            ..EvalFacts::default()
+        };
+        evaluate_with_facts(
+            &SafetyPolicy::default(),
+            command,
+            LaunchMode::Interactive,
+            &[],
+            None,
+            None,
+            0,
+            &facts,
+        )
+    }
+
+    #[test]
+    fn a_same_command_variable_in_a_worktree_remove_gets_the_literal_verdict() {
+        let policy = SafetyPolicy::default();
+        let literal = evaluate(
+            &policy,
+            "git -C D:/repo worktree remove --force D:/repo/.claude/worktrees/x",
+            LaunchMode::Interactive,
+        );
+        assert_eq!(literal.verdict, Verdict::Allow, "got {literal:?}");
+        for command in [
+            "W=D:/repo/.claude/worktrees/x; git -C D:/repo worktree remove --force $W",
+            "export W=D:/repo/.claude/worktrees/x\ngit -C D:/repo worktree remove --force \"$W\"",
+            "W=D:/repo/.claude/worktrees/x && git -C D:/repo worktree remove --force ${W}",
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, literal.verdict, "{command}: {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn a_same_command_variable_in_a_curl_url_gets_the_literal_verdict() {
+        let policy = SafetyPolicy::default();
+        let literal = evaluate(
+            &policy,
+            "curl -sS -X POST http://localhost:18080/api/v1/workspaces -d @ws.json",
+            LaunchMode::Interactive,
+        );
+        assert_eq!(literal.verdict, Verdict::Allow, "got {literal:?}");
+        let outcome = evaluate(
+            &policy,
+            "base=http://localhost:18080/api/v1; curl -sS -X POST $base/workspaces -d @ws.json",
+            LaunchMode::Interactive,
+        );
+        assert_eq!(outcome.verdict, literal.verdict, "{outcome:?}");
+    }
+
+    #[test]
+    fn temp_variables_resolve_from_the_injected_environment_for_a_scratch_delete() {
+        let env = [("TMPDIR", "/tmp/zz"), ("TEMP", "/tmp/zz")];
+        for command in [
+            "rm -rf $TEMP/benchsmoke",
+            "rm -rf $TMPDIR/benchsmoke",
+            "rm -rf \"$TEMP/benchsmoke\"",
+        ] {
+            let outcome = evaluate_with_shell_env(command, &env);
+            assert_eq!(outcome.verdict, Verdict::Allow, "{command}: {outcome:?}");
+            assert_eq!(
+                outcome.matched.map(|rule| rule.pattern).as_deref(),
+                Some("<filesystem: temp-scratch recursive deletion>"),
+                "{command}"
+            );
+        }
+    }
+
+    fn generated_cleanup_verdict(command: &str, ignored: &[&str]) -> Outcome {
+        let facts = EvalFacts {
+            ignored_generated: ignored.iter().map(|target| target.to_string()).collect(),
+            ..EvalFacts::default()
+        };
+        evaluate_with_facts(
+            &SafetyPolicy::default(),
+            command,
+            LaunchMode::Interactive,
+            &[],
+            None,
+            None,
+            0,
+            &facts,
+        )
+    }
+
+    #[test]
+    fn nested_generated_directory_cleanup_needs_the_ignored_fact() {
+        let allowed = generated_cleanup_verdict("rm -rf web/dist", &["web/dist"]);
+        assert_eq!(allowed.verdict, Verdict::Allow, "{allowed:?}");
+        assert_eq!(
+            allowed.matched.map(|rule| rule.pattern).as_deref(),
+            Some("<filesystem: generated-directory cleanup>")
+        );
+        for (command, ignored) in [
+            ("rm -rf web/dist", vec![]),
+            ("rm -rf web/dist", vec!["web/other"]),
+            ("rm -rf scripts/build", vec![]),
+            ("rm -rf web/public", vec!["web/public"]),
+            ("rm -rf ../x/dist", vec!["../x/dist"]),
+            ("rm -rf /abs/web/dist", vec!["/abs/web/dist"]),
+            ("rm -rf web/.git/dist", vec!["web/.git/dist"]),
+            ("rm -rf web/dist web/public", vec!["web/dist"]),
+        ] {
+            let outcome = generated_cleanup_verdict(command, &ignored);
+            assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
+        }
+        let zirv = generated_cleanup_verdict("rm -rf web/.zirv/build", &["web/.zirv/build"]);
+        assert_ne!(zirv.verdict, Verdict::Allow, "{zirv:?}");
+    }
+
+    #[test]
+    fn root_level_generated_directory_cleanup_needs_no_ignored_fact() {
+        for command in [
+            "rm -rf dist",
+            "rm -rf target/debug",
+            "rm -rf ./node_modules",
+        ] {
+            let outcome = generated_cleanup_verdict(command, &[]);
+            assert_eq!(outcome.verdict, Verdict::Allow, "{command}: {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn temp_variables_stay_unresolved_without_an_injected_value_and_other_names_never_resolve() {
+        for (command, env) in [
+            ("rm -rf $TEMP/benchsmoke", vec![]),
+            ("rm -rf $SCRATCH/benchsmoke", vec![("SCRATCH", "/tmp/zz")]),
+            (
+                "TMPDIR=/home/u/x; rm -rf $TMPDIR/benchsmoke",
+                vec![("TMPDIR", "/tmp/zz")],
+            ),
+        ] {
+            let outcome = evaluate_with_shell_env(command, &env);
+            assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
+        }
+    }
+
+    /// A resolved variable must never make a command less strict than its
+    /// literal spelling: the resolved text is classified exactly as typed.
+    #[test]
+    fn a_resolved_variable_is_never_less_strict_than_the_literal_command() {
+        let policy = SafetyPolicy::default();
+        for (command, literal) in [
+            ("R=/; rm -rf $R*", "rm -rf /*"),
+            ("R=/home/u/project; rm -rf $R", "rm -rf /home/u/project"),
+            ("R=/home/u/zirv; rm -rf $R", "rm -rf /home/u/zirv"),
+        ] {
+            let resolved = evaluate(&policy, command, LaunchMode::Interactive);
+            let direct = evaluate(&policy, literal, LaunchMode::Interactive);
+            assert_ne!(direct.verdict, Verdict::Allow, "{literal}");
+            assert_eq!(resolved.verdict, direct.verdict, "{command}");
+        }
+    }
+
+    #[test]
+    fn a_conditional_prefix_or_dynamic_assignment_is_not_resolved() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "test -d x || W=D:/repo/.claude/worktrees/x; git -C D:/repo worktree remove --force $W",
+            "W=D:/repo/.claude/worktrees/x; false || git -C D:/repo worktree remove --force $W",
+            "W=$(pwd); git -C D:/repo worktree remove --force $W",
+            "W=\"D:/repo/.claude/worktrees/x y\"; git -C D:/repo worktree remove --force $W",
+            "test -d x || W=/; rm -rf $W",
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
+        }
+    }
+
     /// The existing `rm -rf*zirv*` DENY still wins even for a target that
     /// also happens to be confined to a temp root: [`apply_recursive_delete_
     /// outcome`] only ever reconsiders a `base.verdict == Allow`, and a
@@ -1025,6 +1269,27 @@ mod tests {
                     "{command} ({mode:?}) must never hard-deny: {outcome:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn find_exec_rmdir_is_allowed_but_rm_and_windows_recursive_rmdir_still_ask() {
+        let policy = SafetyPolicy::default();
+        let outcome = evaluate(
+            &policy,
+            "find D:/repo/.claude/worktrees/x -depth -type d -empty -exec rmdir {} \\;",
+            LaunchMode::Interactive,
+        );
+        assert_eq!(outcome.verdict, Verdict::Allow, "{outcome:?}");
+        for command in [
+            "find . -exec rm {} \\;",
+            "find . -exec rm -f {} +",
+            "find . -type d -exec rmdir /s {} \\;",
+            "find . -type d -exec rmdir /S /Q {} \\;",
+            "find . -type d -exec rmdir {} \\; -exec rm {} \\;",
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
         }
     }
 

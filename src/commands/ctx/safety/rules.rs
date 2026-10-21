@@ -435,6 +435,7 @@ pub(super) fn evaluate_candidates(
     fallback: Verdict,
     mode: super::adapters::LaunchMode,
     scratchpad_roots: &[String],
+    ignored_generated: &[String],
 ) -> Outcome {
     let candidates = normalize_segments(command);
     let explicit_match = |rules: &[Rule]| {
@@ -450,7 +451,7 @@ pub(super) fn evaluate_candidates(
         // has said, deliberately, that THIS session's unmatched commands must
         // not be silent -- this fast path must not override that choice.
         && policy.interactive_default == Verdict::Allow
-        && provably_generated_cleanup(command)
+        && provably_generated_cleanup(command, ignored_generated)
         && !explicit_match(&policy.deny)
         && !policy
             .ask

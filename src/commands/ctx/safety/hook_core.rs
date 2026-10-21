@@ -208,7 +208,7 @@ pub fn run_check<W: Write>(args: &CheckArgs, w: &mut W, env: EnvLookup<'_>) -> C
         let cwd = cwd.as_deref();
         let now = super::state::now_secs();
         let envelope = parse_envelope_env(env);
-        let outcome = evaluate_with_scratchpad_roots(
+        let outcome = evaluate_with_facts(
             &cfg.safety,
             &command,
             args.mode,
@@ -216,6 +216,7 @@ pub fn run_check<W: Write>(args: &CheckArgs, w: &mut W, env: EnvLookup<'_>) -> C
             envelope.as_ref(),
             cwd,
             now,
+            &eval_facts(&command, cwd, env),
         );
         writeln!(w, "{}", render_outcome(&command, &outcome))?;
         return Ok(outcome.verdict.exit_code());
@@ -757,7 +758,7 @@ fn run_check_hook_inner<W: Write>(
         && tokens
             .iter()
             .skip(1)
-            .filter(|target| generated_path(target))
+            .filter(|target| generated_path(target) || nested_generated_path(target))
             .any(|target| {
                 Path::new(target)
                     .ancestors()
@@ -919,6 +920,72 @@ fn audit_hook_decision(
     let _ = super::log::append_safety(&state, &decision);
 }
 
+/// Gather what pure evaluation cannot learn itself: the shell-visible temp
+/// variables, and which nested generated-directory delete targets git reports
+/// as ignored and untracked. A missing, slow or failing git yields no fact.
+pub(super) fn eval_facts(command: &str, cwd: Option<&Path>, env: EnvLookup<'_>) -> EvalFacts {
+    let shell_env = SHELL_ENV_NAMES
+        .iter()
+        .filter_map(|name| env(name).map(|value| (name.to_string(), value)))
+        .collect();
+    let ignored_generated = cwd
+        .zip(recursive_delete_targets(command))
+        .map(|(cwd, targets)| {
+            targets
+                .into_iter()
+                .filter(|target| {
+                    !generated_path(target)
+                        && nested_generated_path(target)
+                        && git_ignores_untracked(cwd, target)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    EvalFacts {
+        shell_env,
+        ignored_generated,
+    }
+}
+
+const GIT_FACT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `git check-ignore` confirms the path is ignored and `git ls-files` that it
+/// holds no tracked file, so deleting it loses nothing git can restore.
+fn git_ignores_untracked(cwd: &Path, target: &str) -> bool {
+    git_stdout(cwd, &["check-ignore", "-q", "--", target]).is_some()
+        && git_stdout(cwd, &["ls-files", "--", target]).is_some_and(|tracked| tracked.is_empty())
+}
+
+/// Stdout of a successful git run bounded by [`GIT_FACT_TIMEOUT`].
+fn git_stdout(cwd: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let mut child = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + GIT_FACT_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let mut stdout = Vec::new();
+    std::io::Read::read_to_end(&mut child.stdout.take()?, &mut stdout).ok()?;
+    status.success().then_some(stdout)
+}
+
 #[cfg(test)]
 pub(super) fn run_check_hook_mode<W: Write>(
     cfg: &CtxConfig,
@@ -932,6 +999,57 @@ pub(super) fn run_check_hook_mode<W: Write>(
 mod tests {
     use super::super::tests::*;
     use super::*;
+
+    fn git(repo: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn eval_facts_reports_only_ignored_untracked_nested_generated_targets() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path();
+        git(root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "dist/\n").expect("write");
+        for dir in ["web/dist", "scripts/build", "web/public", "kept/dist"] {
+            std::fs::create_dir_all(root.join(dir)).expect("mkdir");
+            std::fs::write(root.join(dir).join("f"), "x").expect("write");
+        }
+        git(root, &["add", "-f", "kept/dist/f"]);
+        let none = |_: &str| None;
+        let facts = |command: &str| eval_facts(command, Some(root), &none).ignored_generated;
+        assert_eq!(facts("rm -rf web/dist"), ["web/dist"]);
+        assert!(facts("rm -rf scripts/build").is_empty(), "not ignored");
+        assert!(facts("rm -rf web/public").is_empty(), "not generated");
+        assert!(facts("rm -rf kept/dist").is_empty(), "holds a tracked file");
+        assert!(facts("rm -rf ../web/dist").is_empty(), "escapes the repo");
+        assert!(facts("rm -rf dist").is_empty(), "root level needs no fact");
+        let missing = root.join("missing");
+        assert!(
+            eval_facts("rm -rf web/dist", Some(&missing), &none)
+                .ignored_generated
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn eval_facts_passes_only_the_temp_variables_from_the_given_environment() {
+        let env = |name: &str| Some(format!("/v/{name}"));
+        let mut names: Vec<String> = eval_facts("ls", None, &env)
+            .shell_env
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["TEMP", "TMP", "TMPDIR"]);
+    }
 
     // -- Issue #418: non-claude agent projection ---------------------------
 
