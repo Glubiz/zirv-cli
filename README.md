@@ -3082,7 +3082,7 @@ shell -- records one `SkillActivated` event: `skill_id`, `skill_version`,
 `skill_content_hash`, `skill_source`, and `skill_surface` (`native-tool`,
 `mcp`, or `cli`). A refusal records nothing.
 
-**Catalogue.** 30 professional-domain skills ship as portable bundles under
+**Catalogue.** 31 professional-domain skills ship as portable bundles under
 `src/commands/workflow/skills/`, parsed through the identical loader a
 custom bundle uses, alongside the original 24 flat, in-binary built-ins
 (`brainstorm`, `write-plan`, `review`, the `frontend-*` family, and so on)
@@ -3102,6 +3102,7 @@ this README's earlier paragraphs already describe.
 | Design | `brand-guide` | none | no |
 | Media | `motion-graphics` | none | no |
 | Experimentation | `fuck-around-and-find-out` | none | no |
+| Security/RE | `reverse-engineering` | none | no |
 
 Use **fuck around and find out** (`fafo`) when the goal is clear but the path
 is uncertain. The orchestrator and agents run small, bounded experiments,
@@ -3119,6 +3120,17 @@ zirv skill load fuck-around-and-find-out
 For example: "Fuck around and find out how to reduce startup time while
 keeping behavior unchanged. Compare against the current baseline and share
 what each experiment proves."
+
+Use **reverse-engineering** to analyze a named binary, package, firmware
+image, capture or running app from evidence. It follows the method of
+[REA](https://github.com/morluto/rea): route by target class, default to
+static reads, keep an evidence and residual-unknowns ledger, and report
+observed, derived and inferred claims separately. REA (MCP tools, the `rea`
+CLI, or `npx -y rea-agents@latest` when downloads are authorized) is the
+preferred engine; local tools (`otool`, `objdump`, `strings`, ...) are a
+fallback whose gaps the skill states. It is for lawful analysis only and
+declines protection circumvention. Details ship as references:
+`zirv skill read reverse-engineering references/<file>`.
 
 **Contributing a built-in skill.** The catalogue's tests and the loader's own
 parse-time checks enforce:

@@ -1698,6 +1698,10 @@ const CATALOGUE: &[(&str, &str)] = &[
         include_str!("skills/project-cycle-planning/SKILL.md"),
     ),
     (
+        "src/commands/workflow/skills/reverse-engineering/SKILL.md",
+        include_str!("skills/reverse-engineering/SKILL.md"),
+    ),
+    (
         "src/commands/workflow/skills/runbook-authoring/SKILL.md",
         include_str!("skills/runbook-authoring/SKILL.md"),
     ),
@@ -2162,6 +2166,27 @@ const EMBEDDED_RESOURCES: &[(&str, &[(&str, &str)])] = &[
             ),
         ],
     ),
+    (
+        "reverse-engineering",
+        &[
+            (
+                "references/evidence-ledger.md",
+                include_str!("skills/reverse-engineering/references/evidence-ledger.md"),
+            ),
+            (
+                "references/runtime-and-engine.md",
+                include_str!("skills/reverse-engineering/references/runtime-and-engine.md"),
+            ),
+            (
+                "references/targets.md",
+                include_str!("skills/reverse-engineering/references/targets.md"),
+            ),
+            (
+                "references/workflows.md",
+                include_str!("skills/reverse-engineering/references/workflows.md"),
+            ),
+        ],
+    ),
 ];
 
 fn embedded_bodies(id: &str) -> &'static [(&'static str, &'static str)] {
@@ -2589,7 +2614,7 @@ mod tests {
     /// original 24 never did, so this is no longer "no built-in should
     /// require an integration yet" -- see the discipline test below for the
     /// real invariant (external writes always name an integration).
-    const CATALOGUE_LEN: usize = 30;
+    const CATALOGUE_LEN: usize = 31;
     const BUILTIN_LEN: usize = 24 + CATALOGUE_LEN;
 
     #[test]
