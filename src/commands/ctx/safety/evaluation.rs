@@ -127,6 +127,7 @@ pub(super) fn apply_recursive_delete_outcome(
     command: &str,
     original: &str,
     base: Outcome,
+    scratchpad_roots: &[String],
 ) -> Outcome {
     if !is_recursive_delete(command) {
         return base;
@@ -137,7 +138,7 @@ pub(super) fn apply_recursive_delete_outcome(
                 rule.origin == Origin::BuiltIn
                     && matches!(rule.pattern.as_str(), "rm -rf *" | "rm -fr *")
             }));
-    if overridable && recursive_delete_confined_to_temp(command, original) {
+    if overridable && recursive_delete_confined_to_temp(command, original, scratchpad_roots) {
         return Outcome {
             verdict: Verdict::Allow,
             matched: Some(Rule {
@@ -223,9 +224,26 @@ fn path_strictly_below(path: &str, root: &str) -> bool {
     }
 }
 
-/// Prove a recursive-delete target is strictly below a temp root. Dynamic
-/// paths fail; relative targets require a known leading `cd` directory.
-fn target_confined_to_temp(target: &str, cwd: Option<&str>) -> bool {
+/// True for a literal absolute target with no `..` component that lies
+/// strictly below one of the session's scratchpad roots (`/private/tmp`
+/// spellings arrive as separate roots). Dynamic targets never qualify.
+pub(super) fn target_strictly_below_scratchpad(target: &str, scratchpad_roots: &[String]) -> bool {
+    let target = strip_quotes(target);
+    if target.contains(['$', '`', '~', '*', '?']) || target.split(['/', '\\']).any(|p| p == "..") {
+        return false;
+    }
+    let normalized = target.replace('\\', "/");
+    split_absolute_root(&normalized).is_some()
+        && lexically_normalize_absolute(&normalized).is_some_and(|resolved| {
+            scratchpad_roots
+                .iter()
+                .any(|root| path_strictly_below(&resolved, root))
+        })
+}
+
+/// Prove a recursive-delete target is strictly below a temp or scratchpad
+/// root. Dynamic paths fail; relative targets require a known leading `cd`.
+fn target_confined_to_temp(target: &str, cwd: Option<&str>, scratchpad_roots: &[String]) -> bool {
     let target = strip_quotes(target);
     if target.is_empty() || target.contains(['$', '`', '~', '*', '?']) {
         return false;
@@ -245,6 +263,7 @@ fn target_confined_to_temp(target: &str, cwd: Option<&str>) -> bool {
     };
     temp_delete_roots()
         .iter()
+        .chain(scratchpad_roots)
         .any(|root| path_strictly_below(&resolved, root))
 }
 
@@ -302,7 +321,11 @@ pub(super) fn parse_leading_cd_segment(command: &str) -> Option<(String, String)
 /// One unconfined target can delete outside scratch; require every target
 /// below a temp root. Recover a leading `cd` from the original compound
 /// because normalization removed it from the delete candidate.
-fn recursive_delete_confined_to_temp(candidate: &str, original: &str) -> bool {
+fn recursive_delete_confined_to_temp(
+    candidate: &str,
+    original: &str,
+    scratchpad_roots: &[String],
+) -> bool {
     let Some(targets) = delete_targets(candidate) else {
         return false;
     };
@@ -312,7 +335,7 @@ fn recursive_delete_confined_to_temp(candidate: &str, original: &str) -> bool {
     let cwd = parse_leading_cd_segment(original).map(|(path, _)| path);
     targets
         .iter()
-        .all(|target| target_confined_to_temp(target, cwd.as_deref()))
+        .all(|target| target_confined_to_temp(target, cwd.as_deref(), scratchpad_roots))
 }
 
 pub(super) fn apply_orchestrator_outcome(command: &str, base: Outcome) -> Outcome {
@@ -1213,6 +1236,71 @@ mod tests {
             let direct = evaluate(&policy, literal, LaunchMode::Interactive);
             assert_ne!(direct.verdict, Verdict::Allow, "{literal}");
             assert_eq!(resolved.verdict, direct.verdict, "{command}");
+        }
+    }
+
+    const ZIRV_SCRATCH: &str = "/tmp/claude-501/-Users-x-zirv-flow/abc/scratchpad";
+
+    fn evaluate_with_scratch_roots(command: &str, roots: &[&str]) -> Outcome {
+        let roots: Vec<String> = roots.iter().map(|root| root.to_string()).collect();
+        evaluate_with_facts(
+            &SafetyPolicy::default(),
+            command,
+            LaunchMode::Interactive,
+            &roots,
+            None,
+            None,
+            0,
+            &EvalFacts::default(),
+        )
+    }
+
+    #[test]
+    fn a_zirv_bearing_scratchpad_delete_is_allowed_literal_and_resolved() {
+        for command in [
+            format!("rm -rf {ZIRV_SCRATCH}/bench"),
+            format!("rm -rf \"{ZIRV_SCRATCH}/bench\""),
+            format!("U={ZIRV_SCRATCH}; rm -rf $U/bench"),
+        ] {
+            let outcome = evaluate_with_scratch_roots(&command, &[ZIRV_SCRATCH]);
+            assert_eq!(outcome.verdict, Verdict::Allow, "{command}: {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn a_private_tmp_scratchpad_root_reaches_the_scratch_allow() {
+        let private = "/private/tmp/claude-501/-Users-x-zirv-flow/abc/scratchpad";
+        let outcome = evaluate_with_scratch_roots(&format!("rm -rf {private}/bench"), &[private]);
+        assert_eq!(outcome.verdict, Verdict::Allow, "{outcome:?}");
+        let outside = evaluate_with_scratch_roots("rm -rf /private/tmp/other/bench", &[private]);
+        assert_eq!(outside.verdict, Verdict::Ask, "{outside:?}");
+    }
+
+    #[test]
+    fn zirv_deletes_outside_the_strict_scratchpad_interior_still_deny() {
+        for command in [
+            "rm -rf ~/.zirv".to_string(),
+            format!("rm -rf {ZIRV_SCRATCH}"),
+            format!("rm -rf {ZIRV_SCRATCH}/"),
+            format!("rm -rf {ZIRV_SCRATCH}/../../zirv-state"),
+            format!("rm -rf {ZIRV_SCRATCH}/bench /home/u/.zirv"),
+            format!("rm -rf {ZIRV_SCRATCH}/bench $HOME/zirv"),
+            format!("U={ZIRV_SCRATCH}; rm -rf $U/../../zirv-state"),
+            "rm -rf /tmp/claude-501/other-zirv/abc/scratchpad/bench".to_string(),
+        ] {
+            let outcome = evaluate_with_scratch_roots(&command, &[ZIRV_SCRATCH]);
+            assert_eq!(outcome.verdict, Verdict::Deny, "{command}: {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn a_zirv_scratchpad_delete_without_scratchpad_roots_still_denies() {
+        for command in [
+            format!("rm -rf {ZIRV_SCRATCH}/bench"),
+            format!("U={ZIRV_SCRATCH}; rm -rf $U/bench"),
+        ] {
+            let outcome = evaluate_with_scratch_roots(&command, &[]);
+            assert_eq!(outcome.verdict, Verdict::Deny, "{command}: {outcome:?}");
         }
     }
 

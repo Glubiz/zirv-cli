@@ -99,10 +99,14 @@ pub fn builtin_ask() -> Vec<Rule> {
 /// Match explicit Deny before Ask before Allow, with first match winning
 /// within each category. Reuse narrowing matches for transparent wrappers
 /// so they cannot inherit a broader allow from their outer spelling (#326).
-fn explicit_narrowing_outcome(policy: &SafetyPolicy, command: &str) -> Option<Outcome> {
+fn explicit_narrowing_outcome(
+    policy: &SafetyPolicy,
+    command: &str,
+    scratchpad_roots: &[String],
+) -> Option<Outcome> {
     for (rules, verdict) in [(&policy.deny, Verdict::Deny), (&policy.ask, Verdict::Ask)] {
         if let Some(rule) = rules.iter().find(|rule| {
-            built_in_structural_rule_matches(rule, command)
+            built_in_structural_rule_matches(rule, command, scratchpad_roots)
                 .unwrap_or_else(|| narrowing_rule_matches(&rule.pattern, command))
         }) {
             return Some(Outcome {
@@ -114,8 +118,13 @@ fn explicit_narrowing_outcome(policy: &SafetyPolicy, command: &str) -> Option<Ou
     None
 }
 
-fn evaluate_single(policy: &SafetyPolicy, command: &str, fallback: Verdict) -> Outcome {
-    if let Some(outcome) = explicit_narrowing_outcome(policy, command) {
+fn evaluate_single(
+    policy: &SafetyPolicy,
+    command: &str,
+    fallback: Verdict,
+    scratchpad_roots: &[String],
+) -> Outcome {
+    if let Some(outcome) = explicit_narrowing_outcome(policy, command, scratchpad_roots) {
         return outcome;
     }
     if let Some(rule) = reserved_zirv_auto_allow_rule(command) {
@@ -353,7 +362,11 @@ fn narrowing_rule_matches(pattern: &str, command: &str) -> bool {
 /// projection but need structural matching in the shared classifier. An
 /// operator or repository rule with the same spelling remains an ordinary
 /// glob; only the built-in rule receives this correction.
-fn built_in_structural_rule_matches(rule: &Rule, command: &str) -> Option<bool> {
+fn built_in_structural_rule_matches(
+    rule: &Rule,
+    command: &str,
+    scratchpad_roots: &[String],
+) -> Option<bool> {
     if rule.origin != Origin::BuiltIn {
         return None;
     }
@@ -374,7 +387,10 @@ fn built_in_structural_rule_matches(rule: &Rule, command: &str) -> Option<bool> 
                     && tokens
                         .get(1)
                         .is_some_and(|flag| flag.starts_with(required_flag))
-                    && tokens.iter().skip(2).any(|target| target.contains("zirv"))
+                    && tokens.iter().skip(2).any(|target| {
+                        target.contains("zirv")
+                            && !target_strictly_below_scratchpad(target, scratchpad_roots)
+                    })
             }))
         }
         "zirv ctx supervisor override*" => Some(
@@ -413,12 +429,12 @@ pub(super) fn evaluate_candidate_outcome(
     fallback: Verdict,
     scratchpad_roots: &[String],
 ) -> Outcome {
-    let base = evaluate_single(policy, candidate, fallback);
+    let base = evaluate_single(policy, candidate, fallback, scratchpad_roots);
     let outcome = apply_sql_outcome(policy, candidate, original, base);
     let outcome = apply_credential_outcome(candidate, outcome);
     let outcome = apply_operator_config_outcome(candidate, outcome);
     let outcome = apply_network_outcome(candidate, original, outcome);
-    let outcome = apply_recursive_delete_outcome(candidate, original, outcome);
+    let outcome = apply_recursive_delete_outcome(candidate, original, outcome, scratchpad_roots);
     let outcome = apply_vcs_outcome(candidate, outcome, scratchpad_roots);
     let outcome = apply_distribution_outcome(candidate, outcome);
     let outcome = apply_orchestrator_outcome(candidate, outcome);
@@ -485,7 +501,7 @@ pub(super) fn evaluate_candidates(
                 .split(' ')
                 .nth(2)
                 .is_some_and(|verb| verb.eq_ignore_ascii_case("usage"));
-            match explicit_narrowing_outcome(policy, &candidate) {
+            match explicit_narrowing_outcome(policy, &candidate, scratchpad_roots) {
                 Some(outcome) => outcome,
                 None => continue,
             }
