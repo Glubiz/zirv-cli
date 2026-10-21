@@ -21,6 +21,22 @@ pub(super) fn apply_sql_outcome(
     match (base.verdict, sql.verdict) {
         (Verdict::Deny, _) => base,
         (Verdict::Allow, Verdict::Ask) => sql,
+        // A read-only statement says nothing about where its output is redirected.
+        (_, Verdict::Allow)
+            if base.matched.is_none()
+                && segment_redirect_targets(command)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|target| project_secret_path(target, false)) =>
+        {
+            Outcome {
+                verdict: Verdict::Ask,
+                matched: Some(Rule {
+                    pattern: "<project secret file read>".to_string(),
+                    origin: Origin::BuiltIn,
+                }),
+            }
+        }
         (_, Verdict::Allow) if base.matched.is_none() => sql,
         _ => base,
     }
@@ -30,7 +46,11 @@ pub(super) fn apply_credential_outcome(command: &str, base: Outcome) -> Outcome 
     if base.verdict == Verdict::Deny {
         return base;
     }
-    let (verdict, pattern) = if is_sensitive_credential_access(command) {
+    let writes_credential_file = segment_redirect_targets(command)
+        .unwrap_or_default()
+        .iter()
+        .any(|target| sensitive_credential_path(target));
+    let (verdict, pattern) = if writes_credential_file || is_sensitive_credential_access(command) {
         (Verdict::Deny, "<credential: sensitive-file access>")
     } else if is_project_secret_read(command) {
         (Verdict::Ask, "<project secret file read>")

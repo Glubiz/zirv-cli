@@ -2036,12 +2036,41 @@ pub(super) fn output_file_targets(program: &str, argv: &[String]) -> Vec<String>
     match program {
         "sort" => option_values(argv, 'o', "rnubdfghiMRsVzc", &["--output"]),
         "curl" => {
+            let output_dir = option_values(argv, '\0', "", &["--output-dir"]);
+            // A relative target lands under --output-dir.
+            let under_dir = |target: String| match output_dir.first() {
+                Some(dir)
+                    if !target.starts_with(['/', '~', '$']) && target.get(1..2) != Some(":") =>
+                {
+                    format!("{}/{target}", dir.trim_end_matches('/'))
+                }
+                _ => target,
+            };
             let mut targets: Vec<String> = option_values(argv, 'o', "sSLkfgGiIvNq", &["--output"])
                 .into_iter()
                 .chain(option_values(argv, 'D', "sSLkfgGiIvNq", &["--dump-header"]))
                 .chain(option_values(argv, 'c', "sSLkfgGiIvNq", &["--cookie-jar"]))
                 .filter(not_stdout)
+                .map(under_dir)
                 .collect();
+            targets.extend(
+                option_values(
+                    argv,
+                    '\0',
+                    "",
+                    &[
+                        "--trace",
+                        "--trace-ascii",
+                        "--stderr",
+                        "--libcurl",
+                        "--etag-save",
+                        "--hsts",
+                        "--alt-svc",
+                    ],
+                )
+                .into_iter()
+                .filter(not_stdout),
+            );
             let remote_name = argv[1..].iter().any(|t| {
                 matches!(t.as_str(), "--remote-name" | "--remote-name-all")
                     || (t.starts_with('-')
@@ -2063,6 +2092,12 @@ pub(super) fn output_file_targets(program: &str, argv: &[String]) -> Vec<String>
             let mut targets: Vec<String> = option_values(argv, 'o', "qvcnk", &["--output-file"])
                 .into_iter()
                 .chain(option_values(argv, 'a', "qvcnk", &["--append-output"]))
+                .chain(option_values(
+                    argv,
+                    '\0',
+                    "",
+                    &["--save-cookies", "--warc-file"],
+                ))
                 .filter(not_stdout)
                 .collect();
             let documents = option_values(argv, 'O', "qvcnk", &["--output-document"]);

