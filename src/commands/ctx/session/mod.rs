@@ -638,11 +638,10 @@ pub fn chat_via_runtime<W: Write>(
     Ok(0)
 }
 
-/// Starts `zirv session serve` as a detached process. Detached in the same
-/// two ways `workflow::engine` already detaches a background worker -- its own
-/// process group off unix, `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` on
-/// Windows -- because a runtime that died with the terminal that happened to
-/// start it would defeat the entire feature.
+/// Starts `zirv session serve` as a detached process, detached the way
+/// `workflow::engine` detaches a background worker, because a runtime that
+/// died with the terminal that happened to start it would defeat the entire
+/// feature.
 fn spawn_service(state: &StateDir) -> CtxResult<()> {
     let exe = std::env::current_exe()?;
     let mut command = std::process::Command::new(exe);
@@ -656,23 +655,9 @@ fn spawn_service(state: &StateDir) -> CtxResult<()> {
         // directory, and the runtime it starts has to be the one it is about
         // to connect to.
         .env("ZIRV_CTX_STATE_DIR", state.root());
-    detach(&mut command);
+    crate::commands::workflow::engine::cli::detach(&mut command);
     command.spawn()?;
     Ok(())
-}
-
-#[cfg(unix)]
-fn detach(command: &mut std::process::Command) {
-    use std::os::unix::process::CommandExt;
-    command.process_group(0);
-}
-
-#[cfg(windows)]
-fn detach(command: &mut std::process::Command) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
 }
 
 fn wait_for_endpoint(

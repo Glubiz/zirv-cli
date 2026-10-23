@@ -685,12 +685,14 @@ pub(crate) fn detach(command: &mut std::process::Command) {
     command.process_group(0);
 }
 
+/// A hidden console of its own, not `DETACHED_PROCESS`: a child with no console makes Windows
+/// open a visible console window for every console program it starts.
 #[cfg(windows)]
 pub(crate) fn detach(command: &mut std::process::Command) {
     use std::os::windows::process::CommandExt;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
 }
 
 /// The operator explicitly enabled `auto_spawn_on_gate`, so a skip that
@@ -1514,6 +1516,22 @@ mod tests {
             .expect("phase present in this workflow's steps");
         state.status = WorkflowStatus::Running;
         state
+    }
+
+    /// A detached child with no console at all makes Windows give every console program it
+    /// starts (`claude`, `git`) a fresh visible console -- a focus-stealing Windows Terminal
+    /// window under the default-terminal handoff. Opening `CON` succeeds only with a console.
+    #[cfg(windows)]
+    #[test]
+    fn detached_child_owns_a_hidden_console() {
+        let mut command = std::process::Command::new("cmd.exe");
+        command
+            .args(["/d", "/c", "(echo.>CON) 2>nul"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        detach(&mut command);
+        assert!(command.status().expect("spawn cmd.exe").success());
     }
 
     fn production_feature_state(repo: &Path) -> WorkflowState {
