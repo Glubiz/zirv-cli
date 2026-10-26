@@ -241,10 +241,12 @@ pub(super) fn worker_pane_extra_args(
     let surface_mode = adapters::LaunchMode::Interactive;
     let mut extra = pane_model_args(req, cfg, adapter);
     extra.extend(adapters::worker_effort_args(cfg, &req.agent, &req.flags));
+    // A grant `fulfill_spawn_request` accepted is projected by the adapter's own policy args (#932).
+    let granted = super::agent::config_with_network_grant(cfg, req.network);
     // Workers skip the native skill plugin's listing cost; sub-orchestrators
     // retain it because they can dispatch workers.
     extra.extend(adapters::policy_launch_args_for_surface(
-        cfg,
+        &granted,
         adapter,
         &req.flags,
         approval_mode,
@@ -855,6 +857,13 @@ pub(super) fn fulfill_spawn_request(
         .agent
         .eq_ignore_ascii_case(super::runtime::RuntimeKind::Native.as_str())
     {
+        if req.network {
+            return Err(SpawnRefusal::policy(
+                "--network is not supported for native: zirv has no verified way to grant its \
+                 sandbox network access"
+                    .to_string(),
+            ));
+        }
         if req.work_group_id.is_some() || req.budget_tokens.is_some() || req.timeout_secs.is_some()
         {
             return Err(SpawnRefusal::policy(
@@ -997,6 +1006,16 @@ pub(super) fn fulfill_spawn_request(
     if req.mode == super::permit::WorkerMode::ReadOnly {
         adapters::require_read_only_floor(adapter.as_ref(), adapters::LaunchMode::Interactive)
             .map_err(SpawnRefusal::policy)?;
+    }
+    // The request is untrusted data: re-check the `--network` grant against this side's envelope, policy and final harness (#932).
+    if req.network {
+        super::agent::network_grant_refusal(
+            cfg,
+            adapter.as_ref(),
+            child_envelope.network,
+            &req.flags,
+        )
+        .map_err(SpawnRefusal::policy)?;
     }
     // Assess degraded capabilities against the final selected adapter, after reroute (#230).
     let mode = if req.interactive {
@@ -5430,6 +5449,78 @@ mod tests {
                 .windows(2)
                 .any(|w| w == ["--ask-for-approval", "on-request"]),
             "got {codex_extra:?}"
+        );
+    }
+
+    /// #932: a request carrying `network: true` reaches the codex pane child
+    /// as the adapter's own network override, exactly once.
+    #[test]
+    fn a_network_request_projects_codex_network_access_onto_the_pane_argv_once() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let cfg = CtxConfig::default();
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let codex = super::super::adapters::codex::CodexAdapter::new(None);
+        let mut req = spawn_request("go", tmp.path());
+        req.agent = "codex".to_string();
+        let count = |req: &spawnreq::SpawnRequest| {
+            worker_pane_extra_args(req, &cfg, &codex, Vec::new(), "sess", &state)
+                .iter()
+                .filter(|arg| *arg == "sandbox_workspace_write.network_access=true")
+                .count()
+        };
+        assert_eq!(count(&req), 0, "no grant, no override");
+        req.network = true;
+        assert_eq!(count(&req), 1);
+    }
+
+    /// #932: the dashboard re-checks the grant itself; an envelope with
+    /// network off (here `no_network`), `[policy] network = deny`, and a
+    /// harness with no verified projection each refuse before any pane.
+    #[test]
+    fn fulfill_spawn_request_refuses_a_network_grant_the_envelope_policy_or_harness_denies() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = std::env::current_dir().expect("cwd");
+        let refuse = |cfg: &CtxConfig, agent: &str, no_network: bool| {
+            let mut req = spawn_request("go", &repo);
+            req.agent = agent.to_string();
+            req.network = true;
+            req.no_network = no_network;
+            fulfill_spawn_request(
+                &req,
+                false,
+                None,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                cfg,
+                &state,
+                &repo,
+                (80, 24),
+                &tmp.path().join("requests"),
+                &mut ErrorLog::default(),
+            )
+            .expect_err("the grant must be refused")
+        };
+        let cfg = CtxConfig::default();
+        assert!(
+            refuse(&cfg, "codex", true).reason.contains("envelope"),
+            "envelope network off"
+        );
+        let mut denied = CtxConfig::default();
+        denied.policy.network = Some(crate::commands::ctx::policy::Stance::Deny);
+        assert!(
+            refuse(&denied, "codex", false)
+                .reason
+                .contains("[policy] network"),
+            "policy deny"
+        );
+        assert!(
+            refuse(&cfg, "claude", false)
+                .reason
+                .contains("no verified way"),
+            "claude has no projection"
         );
     }
 

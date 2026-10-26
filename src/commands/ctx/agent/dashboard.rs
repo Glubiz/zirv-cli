@@ -224,8 +224,23 @@ pub(super) fn try_join_dashboard<W: Write>(
     if targets.is_empty() {
         return Dispatch::Inline { no_dashboard: true };
     }
+    // Only a `--model` pin crosses this untrusted channel (#932): any other trailing flag would be
+    // silently dropped, so refuse before writing a request.
+    if !args.flags.is_empty() && super::super::adapters::model_only_flags(&args.flags).is_none() {
+        let reason = format!(
+            "a dashboard pane cannot carry the trailing flags `-- {}`: only `--model` pins cross \
+             the spawn request. The supported typed options are `--model` and `--network`",
+            args.flags.join(" ")
+        );
+        let facts = AnswerFacts {
+            launched: false,
+            short: None,
+            capability_warnings: Vec::new(),
+            reason: Some(reason.clone()),
+        };
+        return Dispatch::Answered(Err(reason.into()), facts);
+    }
     // Read the last model pin even among other flags; the dashboard revalidates it before building argv.
-    // Only the model crosses this untrusted channel; announce other dropped flags.
     let pinned_model = super::super::adapters::last_model_flag(&args.flags)
         .map(str::trim)
         .filter(|model| !model.is_empty() && !model.starts_with('-'));
@@ -275,6 +290,7 @@ pub(super) fn try_join_dashboard<W: Write>(
         envelope: envelope::canonical_json(parent_envelope).ok(),
         path_scope: args.path_scope.clone(),
         no_network: args.no_network,
+        network: args.network,
         depth: args.depth,
         // These ceilings only narrow supervision, so untrusted requests may carry them.
         max_restarts: args.max_restarts,
@@ -388,14 +404,6 @@ fn pane_ceiling_notices(args: &AgentArgs) -> Vec<String> {
              applies its own spend gate and cross-harness routing"
                 .to_string(),
         );
-    }
-    if !args.flags.is_empty() && super::super::adapters::model_only_flags(&args.flags).is_none() {
-        notices.push(format!(
-            "a dashboard pane carries only a `--model` pin out of `-- {}`; the rest is dropped \
-             because a spawn request's trailing flags would become argv on the pane's own harness \
-             child",
-            args.flags.join(" ")
-        ));
     }
     notices
 }
@@ -1170,17 +1178,8 @@ mod tests {
         let mut args = joinable_args("claude", "review this package");
         args.system_prompt =
             Some("zirv workflow agent seat: reviewer@1\nrole: reviewer".to_string());
-        // Exactly what `workflow::review::reviewer_args` puts in `flags`:
-        // the model pin never travels alone.
-        args.flags = vec![
-            "--model".to_string(),
-            "opus".to_string(),
-            "--disallowedTools=Write,Edit,Bash,NotebookEdit".to_string(),
-        ];
-        assert!(
-            super::super::adapters::model_only_flags(&args.flags).is_none(),
-            "sanity: the old extraction gives up on this exact shape"
-        );
+        // Reviewers run inline with the read-only floor in `flags` (#932); a pane only takes the model pin.
+        args.flags = vec!["--model".to_string(), "opus".to_string()];
 
         let mut out = Vec::new();
         let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
@@ -1941,11 +1940,42 @@ mod tests {
             "--verbose".to_string(),
         ];
         let notices = pane_ceiling_notices(&args);
-        assert_eq!(notices.len(), 2, "got {notices:?}");
-        assert!(
-            notices[1].contains("--verbose"),
-            "the dropped flags must be named: {notices:?}"
+        assert_eq!(
+            notices.len(),
+            1,
+            "extra flags are refused by `try_join_dashboard`, not announced: {notices:?}"
         );
+    }
+
+    /// #932: a pane never silently drops trailing flags; anything beyond a `--model` pin is refused
+    /// before a request is written, naming the flags and the supported typed options.
+    #[test]
+    fn a_pane_dispatch_with_flags_beyond_a_model_pin_is_refused_before_any_request() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let (requests_dir, env) = live_dashboard_dir(tmp.path());
+
+        let mut args = joinable_args("codex", "go");
+        args.flags = vec![
+            "--model".to_string(),
+            "gpt-5".to_string(),
+            "-c".to_string(),
+            "sandbox_workspace_write.network_access=true".to_string(),
+        ];
+        let mut out = Vec::new();
+        let err = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect_err("trailing flags beyond --model must refuse a pane dispatch");
+        let message = err.to_string();
+        assert!(message.contains("network_access=true"), "{message}");
+        assert!(
+            message.contains("`--model` and `--network`"),
+            "must name the supported options: {message}"
+        );
+        let leftover = std::fs::read_dir(&requests_dir)
+            .map(|dir| dir.count())
+            .unwrap_or(0);
+        assert_eq!(leftover, 0, "no spawn request may have been written");
     }
 
     /// R1-7: the drop channel cannot tell an operator's terminal from a

@@ -108,6 +108,9 @@ fn run_goal_bootstrap(
         .ok_or_else(|| GoalBootstrapError::before_launch("goal bootstrap called without --goal"))?;
     let adapter =
         adapters::select(Some(&args.name), &[], cfg).map_err(GoalBootstrapError::before_launch)?;
+    // The bootstrap runs after the `--network` preflight, so it shares the worker's network posture (#932).
+    let granted = config_with_network_grant(cfg, args.network);
+    let cfg = &*granted;
     let mut command = adapters::with_workload_writable_roots(
         adapters::policy_launch_args(
             cfg,
@@ -792,6 +795,20 @@ pub fn run_with<W: Write>(
     if !native && routed_args.mode == WorkerMode::ReadOnly {
         let adapter = adapters::select(Some(&routed_args.name), &[], &cfg)?;
         adapters::require_read_only_floor(adapter.as_ref(), adapters::LaunchMode::Headless)?;
+    }
+
+    // `--network` is judged against the final routed harness and the narrowed envelope, before either dispatch path (#932).
+    if routed_args.network {
+        let adapter = adapters::select(Some(&routed_args.name), &[], &cfg)?;
+        let requested = requested_envelope_from_args(
+            &routed_args,
+            &parent_envelope,
+            "network-preflight".to_string(),
+            None,
+        );
+        let narrowed = envelope::WorkerEnvelope::narrow(&parent_envelope, &requested)
+            .map_err(|error| format!("delegation envelope refused: {error}"))?;
+        network_grant_refusal(&cfg, adapter.as_ref(), narrowed.network, &routed_args.flags)?;
     }
 
     // Validate MCP requirements against the final routed adapter and materialize before either dispatch path can spawn.
@@ -2584,6 +2601,29 @@ mod tests {
             !repo.join(".zirv").join("worktrees").exists(),
             "the refusal must land before any worktree is allocated"
         );
+    }
+
+    /// #932: the run.rs preflight refuses `--network` for a harness with no verified projection before anything launches.
+    #[test]
+    fn run_with_refuses_network_for_a_claude_worker_before_launching() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let env = base_env(&tmp.path().join("state"));
+        let mut args = args_for("claude", "go");
+        args.network = true;
+        let mut out = Vec::new();
+        let err = run_with(&args, &mut out, &repo, &|k| env.get(k).cloned())
+            .expect_err("--network on claude must be refused");
+        assert!(
+            err.to_string()
+                .contains("--network is not supported for claude"),
+            "got {err}"
+        );
+        assert!(out.is_empty(), "nothing may launch or print: {out:?}");
     }
 
     /// Issue #267: allocating a fresh tree and being told to use a specific

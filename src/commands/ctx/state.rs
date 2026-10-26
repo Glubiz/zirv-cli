@@ -1163,6 +1163,7 @@ impl StateDir {
             self.intake(),
             self.frontend(),
             self.status_snapshots(),
+            self.outputs(),
         ]
     }
 

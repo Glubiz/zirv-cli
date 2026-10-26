@@ -928,13 +928,71 @@ pub(crate) fn worker_launch_flags(
     out
 }
 
+/// Issue #932: the one `--network` grant check, shared by the headless and pane paths. Refuses
+/// unless the narrowed envelope allows network, `[policy] network` is not `deny`, the harness
+/// has a verified network projection (only codex), and no operator sandbox pin suppresses it.
+pub(crate) fn network_grant_refusal(
+    cfg: &CtxConfig,
+    adapter: &dyn AgentAdapter,
+    envelope_network: bool,
+    flags: &[String],
+) -> Result<(), String> {
+    if !envelope_network {
+        return Err(
+            "--network refused: the worker's delegation envelope has network denied \
+             ([worker] deny_network, --no-network or a parent envelope)"
+                .to_string(),
+        );
+    }
+    if cfg.policy.network == Some(policy::Stance::Deny) {
+        return Err("--network refused: [policy] network = \"deny\"".to_string());
+    }
+    if !cfg.policy.network_allowlist.is_empty() {
+        return Err(
+            "--network refused: [policy] network_allowlist scopes network access, and codex's \
+             network_access=true cannot honour a scope (it would widen it to full egress)"
+                .to_string(),
+        );
+    }
+    if adapter.name() != "codex" {
+        return Err(format!(
+            "--network is not supported for {}: zirv has no verified way to grant its sandbox \
+             network access",
+            adapter.name()
+        ));
+    }
+    if adapters::flags_pin_policy(flags) {
+        return Err(
+            "--network refused: the trailing flags pin the sandbox themselves, so zirv \
+             cannot add network access; set it in those flags"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Issue #932: an accepted grant launches with `[policy] network = allow`, so the adapter's own
+/// verified projection emits the override exactly once.
+pub(crate) fn config_with_network_grant(
+    cfg: &CtxConfig,
+    network: bool,
+) -> std::borrow::Cow<'_, CtxConfig> {
+    if !network {
+        return std::borrow::Cow::Borrowed(cfg);
+    }
+    let mut granted = cfg.clone();
+    granted.policy.network = Some(policy::Stance::Allow);
+    std::borrow::Cow::Owned(granted)
+}
+
 pub(crate) fn headless_worker_flags(
     cfg: &CtxConfig,
     args: &AgentArgs,
     adapter: &dyn AgentAdapter,
 ) -> Vec<String> {
+    let cfg = config_with_network_grant(cfg, args.network);
     let mut flags = worker_launch_flags(
-        cfg,
+        &cfg,
         &args.name,
         adapter,
         &flags_with_system_prompt(args, adapter),
@@ -3374,6 +3432,63 @@ mod tests {
         .into()
     }
 
+    /// #932: an accepted `--network` reaches a codex headless worker as the adapter's own override, exactly once.
+    #[test]
+    fn headless_codex_network_grant_emits_the_override_once() {
+        let cfg = CtxConfig::default();
+        let adapter = adapters::codex::CodexAdapter::new(None);
+        let mut args = args_for("codex", "go");
+        let count = |args: &AgentArgs| {
+            headless_worker_flags(&cfg, args, &adapter)
+                .iter()
+                .filter(|arg| *arg == "sandbox_workspace_write.network_access=true")
+                .count()
+        };
+        assert_eq!(count(&args), 0);
+        args.network = true;
+        assert_eq!(count(&args), 1);
+    }
+
+    /// #932: the shared grant check refuses a harness with no verified projection, a denied envelope, a denied policy and a pinned sandbox.
+    #[test]
+    fn network_grant_refusal_checks_envelope_policy_harness_and_sandbox_pins() {
+        let cfg = CtxConfig::default();
+        let codex = adapters::codex::CodexAdapter::new(None);
+        let claude = adapters::claude::ClaudeAdapter::new(None);
+        assert!(network_grant_refusal(&cfg, &codex, true, &[]).is_ok());
+        let claude_err = network_grant_refusal(&cfg, &claude, true, &[]).expect_err("claude");
+        assert!(
+            claude_err.contains("--network is not supported for claude"),
+            "{claude_err}"
+        );
+        assert!(
+            network_grant_refusal(&cfg, &codex, false, &[])
+                .expect_err("envelope")
+                .contains("envelope")
+        );
+        let mut denied = CtxConfig::default();
+        denied.policy.network = Some(policy::Stance::Deny);
+        assert!(
+            network_grant_refusal(&denied, &codex, true, &[])
+                .expect_err("policy")
+                .contains("[policy] network")
+        );
+        let mut scoped = CtxConfig::default();
+        scoped.policy.network_allowlist =
+            vec![policy::NetworkTarget::new("https", "example.com", None).expect("target")];
+        assert!(
+            network_grant_refusal(&scoped, &codex, true, &[])
+                .expect_err("allowlist")
+                .contains("network_allowlist")
+        );
+        let pinned = vec!["--sandbox".to_string(), "danger-full-access".to_string()];
+        assert!(
+            network_grant_refusal(&cfg, &codex, true, &pinned)
+                .expect_err("pin")
+                .contains("pin the sandbox")
+        );
+    }
+
     #[test]
     fn headless_read_only_codex_worker_has_one_sandbox() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -3428,6 +3543,7 @@ mod tests {
             result_kind: None,
             path_scope: Vec::new(),
             no_network: false,
+            network: false,
             depth: None,
             task: None,
             manifest: None,

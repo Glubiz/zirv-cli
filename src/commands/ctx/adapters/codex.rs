@@ -4311,6 +4311,8 @@ mod tests {
             state.verification(),
             state.artifacts(),
             state.workflow_telemetry(),
+            // #933: `zirv ctx run` stores its logs here.
+            state.outputs(),
         ] {
             assert!(
                 joined.contains(&toml_quoted_string(&dir.display().to_string())),
