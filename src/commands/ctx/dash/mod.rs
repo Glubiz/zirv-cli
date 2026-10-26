@@ -1475,6 +1475,7 @@ fn run_dashboard_inner(
                                                     envelope: None,
                                                     path_scope: Vec::new(),
                                                     no_network: false,
+                                                    network: false,
                                                     depth: None,
                                                     // Overlay spawns carry only the chosen agent and prompt.
                                                     max_restarts: None,
@@ -4223,6 +4224,7 @@ mod tests {
             envelope: None,
             path_scope: Vec::new(),
             no_network: false,
+            network: false,
             depth: None,
             max_restarts: None,
             timeout_secs: None,

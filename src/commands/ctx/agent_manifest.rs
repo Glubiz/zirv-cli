@@ -387,6 +387,7 @@ mod tests {
             result_kind: None,
             path_scope: Vec::new(),
             no_network: false,
+            network: false,
             depth: None,
             task: None,
             json: false,

@@ -88,6 +88,10 @@ pub struct SpawnRequest {
     /// Mirror the requester's network restriction (#262).
     #[serde(default)]
     pub no_network: bool,
+    /// The requester's `--network` grant request (#932); revalidated against the
+    /// narrowed envelope, `[policy] network` and the harness before it is honoured.
+    #[serde(default)]
+    pub network: bool,
     /// Mirror the requester's delegation depth (#262).
     #[serde(default)]
     pub depth: Option<u8>,
@@ -366,6 +370,7 @@ mod tests {
             envelope: None,
             path_scope: Vec::new(),
             no_network: false,
+            network: false,
             depth: None,
             max_restarts: None,
             timeout_secs: None,

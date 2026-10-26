@@ -216,6 +216,12 @@ pub struct AgentArgs {
     /// narrows: unstated leaves the parent's own `network` value untouched.
     #[arg(long, default_value_t = false)]
     pub no_network: bool,
+    /// Issue #932: let the worker's harness sandbox reach the network
+    /// (codex `sandbox_workspace_write.network_access`). Refused unless the
+    /// narrowed envelope still allows network, `[policy] network` is not
+    /// `deny`, and the harness has a verified way to grant it.
+    #[arg(long, default_value_t = false, conflicts_with = "no_network")]
+    pub network: bool,
     /// Issue #262: how many further hops of `zirv agent` this worker's own
     /// envelope should carry. Unstated defers to `parent.delegation_depth -
     /// 1`, the automatic decrement every delegation gets; an explicit value
@@ -328,6 +334,7 @@ impl Default for AgentArgs {
             result_kind: None,
             path_scope: Vec::new(),
             no_network: false,
+            network: false,
             depth: None,
             task: None,
             manifest: None,
@@ -395,6 +402,32 @@ mod tests {
         assert_eq!(
             err.kind(),
             clap::error::ErrorKind::UnknownArgument,
+            "got {err}"
+        );
+    }
+
+    /// #932: `--network` widens and `--no-network` narrows, so both together are a usage error.
+    #[test]
+    fn network_conflicts_with_no_network() {
+        use clap::Parser;
+
+        #[derive(Debug, clap::Parser)]
+        struct OnlyAgent {
+            #[command(flatten)]
+            args: AgentArgs,
+        }
+
+        assert!(
+            OnlyAgent::try_parse_from(["zirv", "codex", "go", "--network"])
+                .expect("--network parses")
+                .args
+                .network
+        );
+        let err = OnlyAgent::try_parse_from(["zirv", "codex", "go", "--network", "--no-network"])
+            .expect_err("both flags must conflict");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
             "got {err}"
         );
     }
