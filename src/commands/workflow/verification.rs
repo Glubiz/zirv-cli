@@ -533,6 +533,19 @@ fn shell_quote(value: &str) -> String {
     }
 }
 
+/// A whole-repo final check replaying CI; not gated on changed paths.
+fn ci_check(id: String, kind: CheckKind, command: String) -> CheckSpec {
+    CheckSpec {
+        id,
+        kind,
+        command,
+        paths: Vec::new(),
+        changed: false,
+        final_check: true,
+        timeout_secs: 900,
+    }
+}
+
 fn gitlab_job_kind(name: &str) -> CheckKind {
     let name = name.to_ascii_lowercase();
     let has = |words: &[&str]| words.iter().any(|word| name.contains(word));
@@ -627,14 +640,12 @@ fn discover_gitlab_checks(repo: &Path, notes: &mut Vec<String>) -> Vec<CheckSpec
         ));
     }
     safe.into_iter()
-        .map(|name| CheckSpec {
-            id: format!("gitlab-{}", id_slug(&name)),
-            kind: gitlab_job_kind(&name),
-            command: format!("gitlab-ci-local {} --needs", shell_quote(&name)),
-            paths: Vec::new(),
-            changed: false,
-            final_check: true,
-            timeout_secs: 900,
+        .map(|name| {
+            ci_check(
+                format!("gitlab-{}", id_slug(&name)),
+                gitlab_job_kind(&name),
+                format!("gitlab-ci-local {} --needs", shell_quote(&name)),
+            )
         })
         .collect()
 }
@@ -811,27 +822,19 @@ fn discover_gha_checks(
             } else {
                 format!("set -e\n{}", commands.join("\n"))
             };
-            specs.push(CheckSpec {
-                id: format!("gha-{}", id_slug(name)),
-                kind: CheckKind::Custom,
+            specs.push(ci_check(
+                format!("gha-{}", id_slug(name)),
+                CheckKind::Custom,
                 command,
-                paths: Vec::new(),
-                changed: false,
-                final_check: true,
-                timeout_secs: 900,
-            });
+            ));
         }
     }
     if audit {
-        specs.push(CheckSpec {
-            id: "cargo-audit".into(),
-            kind: CheckKind::Lint,
-            command: "cargo audit".into(),
-            paths: Vec::new(),
-            changed: false,
-            final_check: true,
-            timeout_secs: 900,
-        });
+        specs.push(ci_check(
+            "cargo-audit".into(),
+            CheckKind::Lint,
+            "cargo audit".into(),
+        ));
     }
     for ((unit, reason), count) in skipped {
         let plural = if count == 1 { "" } else { "s" };
