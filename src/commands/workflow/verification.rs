@@ -286,12 +286,19 @@ fn load_or_discover_raw(repo: &Path) -> CtxResult<Discovered> {
     } else {
         // No root manifest: look one directory down (monorepo layouts).
         for dir in manifest_subdirs(repo) {
-            discover_manifest_checks(repo, Some(&dir), &mut checks)?;
+            // A hostile subdirectory manifest must not fail discovery for the whole repo.
+            let mut sub_checks = Vec::new();
+            match discover_manifest_checks(repo, Some(&dir), &mut sub_checks) {
+                Ok(()) => sub_checks
+                    .into_iter()
+                    .for_each(|spec| push_unique(&mut checks, spec)),
+                Err(error) => notes.push(format!("CI coverage gap: {dir}/ skipped: {error}")),
+            }
         }
     }
     // Discover zirv-owned context lint when canonical context exists; repository text cannot alter the check command. (#275)
     if repo.join(".zirv").join("context").is_dir() {
-        checks.push(CheckSpec {
+        let lint = CheckSpec {
             id: "context-lint".into(),
             kind: CheckKind::ContextLint,
             command: "zirv context lint".into(),
@@ -304,7 +311,8 @@ fn load_or_discover_raw(repo: &Path) -> CtxResult<Discovered> {
             changed: true,
             final_check: true,
             timeout_secs: 60,
-        });
+        };
+        push_unique(&mut checks, lint);
     }
     let known: std::collections::BTreeSet<String> = checks
         .iter()
@@ -361,8 +369,10 @@ fn manifest_subdirs(repo: &Path) -> Vec<String> {
                 && name
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
-            let has_manifest = entry.path().join("Cargo.toml").is_file()
-                || entry.path().join("package.json").is_file();
+            // Do not follow symlinks here; `discover_manifest_checks` reports a non-regular manifest.
+            let has_manifest = ["Cargo.toml", "package.json"]
+                .iter()
+                .any(|file| std::fs::symlink_metadata(entry.path().join(file)).is_ok());
             (is_dir && !skipped && charset && has_manifest).then_some(name)
         })
         .collect();
@@ -406,6 +416,12 @@ fn discover_manifest_checks(
     let id_prefix = sub
         .map(|dir| format!("{}-", id_slug(dir)))
         .unwrap_or_default();
+    let irregular = ["Cargo.toml", "package.json"]
+        .iter()
+        .any(|file| std::fs::symlink_metadata(base.join(file)).is_ok_and(|m| !m.is_file()));
+    if sub.is_some() && irregular {
+        return Err("a manifest is not a regular file".into());
+    }
     if base.join("Cargo.toml").is_file() {
         let rust_paths = vec![
             format!("{prefix}src/"),
@@ -525,12 +541,45 @@ fn ci_name_is_safe(name: &str) -> bool {
 }
 
 fn shell_quote(value: &str) -> String {
-    // Callers only pass strings from `ci_name_is_safe`, which contain no quote characters.
+    // Windows callers only pass strings from `ci_name_is_safe`, which contain no quote characters.
     if cfg!(windows) {
         format!("\"{value}\"")
     } else {
-        format!("'{value}'")
+        format!("'{}'", value.replace('\'', "'\\''"))
     }
+}
+
+/// Verbs that reach outside the checkout; the flag marks verbs that only count at the start of a line or segment.
+const OUTWARD_VERBS: [(&str, bool); 13] = [
+    ("docker push", false),
+    ("--push", false),
+    ("git push", false),
+    ("kubectl apply", false),
+    ("kubectl delete", false),
+    ("helm install", false),
+    ("helm upgrade", false),
+    ("terraform apply", false),
+    ("npm publish", false),
+    ("cargo publish", false),
+    ("aws ", true),
+    ("gcloud ", true),
+    ("gh ", true),
+];
+
+/// Risk reduction for CI replay, not a guarantee: true when the script text contains an outward-reaching verb.
+fn outward_command(script: &str) -> bool {
+    let lower = script.to_ascii_lowercase();
+    let segments: Vec<&str> = lower
+        .split(['\n', ';', '&', '|', '('])
+        .map(str::trim_start)
+        .collect();
+    OUTWARD_VERBS.iter().any(|&(verb, at_start)| {
+        if at_start {
+            segments.iter().any(|segment| segment.starts_with(verb))
+        } else {
+            lower.contains(verb)
+        }
+    })
 }
 
 /// A whole-repo final check replaying CI; not gated on changed paths.
@@ -567,7 +616,7 @@ fn discover_gitlab_checks(repo: &Path, notes: &mut Vec<String>) -> Vec<CheckSpec
         return Vec::new();
     }
     let cache = repo.join(".gitlab-ci-local").join("expanded-gitlab-ci.yml");
-    let mut docs = Vec::new();
+    let mut docs: Vec<(bool, serde_yaml_ng::Value)> = Vec::new();
     let root_doc = read_ci_yaml(&root, notes);
     if root_doc
         .as_ref()
@@ -580,7 +629,7 @@ fn discover_gitlab_checks(repo: &Path, notes: &mut Vec<String>) -> Vec<CheckSpec
                 .to_string(),
         );
     }
-    docs.extend(root_doc);
+    docs.extend(root_doc.map(|doc| (false, doc)));
     if cache.is_file() {
         let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
         if modified(&cache) < modified(&root) {
@@ -590,46 +639,65 @@ fn discover_gitlab_checks(repo: &Path, notes: &mut Vec<String>) -> Vec<CheckSpec
                     .to_string(),
             );
         }
-        docs.extend(read_ci_yaml(&cache, notes));
+        docs.extend(read_ci_yaml(&cache, notes).map(|doc| (true, doc)));
     }
-    let mut names: Vec<String> = Vec::new();
-    for doc in &docs {
+    // The cache is fully resolved by gitlab-ci-local, so its copy of a job wins over the root copy.
+    let mut jobs: Vec<GitlabJob> = Vec::new();
+    for (cached, doc) in &docs {
         let Some(map) = doc.as_mapping() else {
             continue;
         };
-        for (key, job) in map {
-            let Some(name) = key.as_str() else {
+        for (key, body) in map {
+            let (Some(name), Some(body)) = (key.as_str(), body.as_mapping()) else {
                 continue;
             };
-            if name.starts_with('.')
-                || GITLAB_RESERVED.contains(&name)
-                || names.contains(&name.to_string())
-            {
+            if GITLAB_RESERVED.contains(&name) {
                 continue;
             }
-            let Some(job) = job.as_mapping() else {
-                continue;
-            };
-            let get = |key: &str| job.get(key);
-            let extended_stage = || {
-                let extends = get("extends")?;
-                let parents: Vec<&serde_yaml_ng::Value> = match extends.as_sequence() {
-                    Some(list) => list.iter().collect(),
-                    None => vec![extends],
-                };
-                parents
-                    .into_iter()
-                    .find_map(|parent| map.get(parent.as_str()?)?.get("stage")?.as_str())
-            };
-            let stage = get("stage")
-                .and_then(|stage| stage.as_str())
-                .or_else(extended_stage)
-                .unwrap_or("test");
-            let when = get("when").and_then(|when| when.as_str());
-            if stage == "test" && !matches!(when, Some("manual" | "never")) {
-                names.push(name.to_string());
+            let job = (name.to_string(), body, *cached);
+            match jobs.iter_mut().find(|existing| existing.0 == name) {
+                Some(existing) => *existing = job,
+                None => jobs.push(job),
             }
         }
+    }
+    let mut names: Vec<String> = Vec::new();
+    let mut unresolved = 0;
+    for (name, _, _) in jobs.iter().filter(|job| !job.0.starts_with('.')) {
+        let Ok(stage) = gitlab_field(&jobs, name, "stage", 0) else {
+            unresolved += 1;
+            continue;
+        };
+        if stage.and_then(|stage| stage.as_str()).unwrap_or("test") != "test" {
+            continue;
+        }
+        let fields: Result<Vec<_>, ()> = ["when", "trigger", "rules"]
+            .iter()
+            .map(|key| gitlab_field(&jobs, name, key, 0))
+            .collect();
+        let Ok(fields) = fields else {
+            unresolved += 1;
+            continue;
+        };
+        let [when, trigger, rules] = fields[..] else {
+            continue;
+        };
+        let manual_rule = rules
+            .and_then(|rules| rules.as_sequence())
+            .is_some_and(|rules| {
+                rules
+                    .iter()
+                    .any(|rule| rule.get("when").and_then(|when| when.as_str()) == Some("manual"))
+            });
+        let when = when.and_then(|when| when.as_str());
+        if !matches!(when, Some("manual" | "never")) && trigger.is_none() && !manual_rule {
+            names.push(name.clone());
+        }
+    }
+    if unresolved > 0 {
+        notes.push(format!(
+            "CI coverage gap: {unresolved} GitLab job(s) skipped: stage can't be determined (unresolved extends)"
+        ));
     }
     let (safe, unsafe_names): (Vec<String>, Vec<String>) =
         names.into_iter().partition(|name| ci_name_is_safe(name));
@@ -639,15 +707,110 @@ fn discover_gitlab_checks(repo: &Path, notes: &mut Vec<String>) -> Vec<CheckSpec
             unsafe_names.len()
         ));
     }
-    safe.into_iter()
-        .map(|name| {
-            ci_check(
-                format!("gitlab-{}", id_slug(&name)),
-                gitlab_job_kind(&name),
-                format!("gitlab-ci-local {} --needs", shell_quote(&name)),
-            )
-        })
-        .collect()
+    let mut specs = Vec::new();
+    for name in safe {
+        if let Some(needed) = gitlab_risky_need(&jobs, &name) {
+            notes.push(format!(
+                "CI coverage gap: GitLab job {name:?} skipped: {needed:?} deploys, runs an outward command or is outside .pre/build/test"
+            ));
+            continue;
+        }
+        specs.push(ci_check(
+            format!("gitlab-{}", id_slug(&name)),
+            gitlab_job_kind(&name),
+            format!("gitlab-ci-local {} --needs", shell_quote(&name)),
+        ));
+    }
+    specs
+}
+
+/// A job name, its body, and whether it came from the fully resolved gitlab-ci-local cache.
+type GitlabJob<'a> = (String, &'a serde_yaml_ng::Mapping, bool);
+
+/// A job's `key`, following `extends` (string or list) recursively; Err when an extends target is missing or cyclic.
+fn gitlab_field<'a>(
+    jobs: &'a [GitlabJob<'a>],
+    name: &str,
+    key: &str,
+    depth: usize,
+) -> Result<Option<&'a serde_yaml_ng::Value>, ()> {
+    let Some((_, body, cached)) = jobs.iter().find(|job| job.0 == name) else {
+        return Err(());
+    };
+    if let Some(value) = body.get(key) {
+        return Ok(Some(value));
+    }
+    let Some(extends) = body.get("extends") else {
+        return Ok(None);
+    };
+    if *cached {
+        return Ok(None);
+    }
+    if depth > 16 {
+        return Err(());
+    }
+    let parents: Vec<&serde_yaml_ng::Value> = match extends.as_sequence() {
+        Some(list) => list.iter().collect(),
+        None => vec![extends],
+    };
+    for parent in parents {
+        let parent = parent.as_str().ok_or(())?;
+        if let Some(value) = gitlab_field(jobs, parent, key, depth + 1)? {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
+/// The first job in `name`'s transitive `needs:` chain (itself included) that deploys (`environment:`), runs an outward command, cannot be resolved, or (needed jobs) is outside `.pre`/`build`/`test`.
+fn gitlab_risky_need(jobs: &[GitlabJob], name: &str) -> Option<String> {
+    let mut pending = vec![name.to_string()];
+    let mut seen: Vec<String> = Vec::new();
+    while let Some(current) = pending.pop() {
+        if seen.contains(&current) {
+            continue;
+        }
+        seen.push(current.clone());
+        let fields: Result<Vec<_>, ()> = [
+            "needs",
+            "stage",
+            "environment",
+            "script",
+            "before_script",
+            "after_script",
+        ]
+        .iter()
+        .map(|key| gitlab_field(jobs, &current, key, 0))
+        .collect();
+        let Ok(fields) = fields else {
+            return Some(current);
+        };
+        let [needs, stage, environment, scripts @ ..] = &fields[..] else {
+            return None;
+        };
+        let stage = stage.and_then(|stage| stage.as_str()).unwrap_or("test");
+        let script: Vec<&str> = scripts
+            .iter()
+            .flatten()
+            .flat_map(|value| match value.as_str() {
+                Some(line) => vec![line],
+                None => value
+                    .as_sequence()
+                    .map(|lines| lines.iter().filter_map(|line| line.as_str()).collect())
+                    .unwrap_or_default(),
+            })
+            .collect();
+        let late_stage = current != name && !matches!(stage, ".pre" | "build" | "test");
+        if late_stage || environment.is_some() || outward_command(&script.join("\n")) {
+            return Some(current);
+        }
+        let needs = needs.and_then(|needs| needs.as_sequence());
+        pending.extend(needs.into_iter().flatten().filter_map(|need| {
+            let need = need.as_str().or_else(|| need.get("job")?.as_str());
+            need.map(str::to_string)
+        }));
+    }
+    None
 }
 
 fn gha_runs_on_host(label: &str) -> bool {
@@ -658,15 +821,13 @@ fn gha_runs_on_host(label: &str) -> bool {
     } else if cfg!(target_os = "macos") {
         // POSIX approximation: a Linux job's shell steps usually run unchanged on macOS.
         ubuntu || label.starts_with("macos-")
-    } else if cfg!(windows) {
-        label.starts_with("windows-")
     } else {
         false
     }
 }
 
-fn gha_triggers_ci(doc: &serde_yaml_ng::Value) -> bool {
-    let is_ci = |name: &str| matches!(name, "push" | "pull_request");
+fn gha_has_trigger(doc: &serde_yaml_ng::Value, trigger: &str) -> bool {
+    let is_ci = |name: &str| name == trigger;
     // YAML 1.1 parsers may read the `on:` key as boolean true.
     let on = doc
         .get("on")
@@ -683,15 +844,49 @@ fn gha_triggers_ci(doc: &serde_yaml_ng::Value) -> bool {
     }
 }
 
+/// `export KEY='value'` lines for a literal `env:` map; Err when a key is invalid or a value is not literal.
+fn gha_env_exports(env: Option<&serde_yaml_ng::Value>) -> Result<Vec<String>, ()> {
+    let Some(env) = env else {
+        return Ok(Vec::new());
+    };
+    let map = env.as_mapping().ok_or(())?;
+    let mut lines = Vec::new();
+    for (key, value) in map {
+        let key = key.as_str().ok_or(())?;
+        let value = match value {
+            serde_yaml_ng::Value::String(text) => text.clone(),
+            serde_yaml_ng::Value::Number(number) => number.to_string(),
+            serde_yaml_ng::Value::Bool(flag) => flag.to_string(),
+            _ => return Err(()),
+        };
+        let valid = key.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid || value.contains("${{") {
+            return Err(());
+        }
+        lines.push(format!("export {key}={}", shell_quote(&value)));
+    }
+    Ok(lines)
+}
+
+/// A `defaults.run.<key>` value of a workflow or job.
+fn gha_run_default<'a>(
+    scope: &'a serde_yaml_ng::Value,
+    key: &str,
+) -> Option<&'a serde_yaml_ng::Value> {
+    scope.get("defaults")?.get("run")?.get(key)
+}
+
 enum GhaStep {
     Run(String),
     Audit,
 }
 
-/// Why a step cannot be replayed locally, or its command. `known` holds commands discovery already emits.
+/// Why a step cannot be replayed locally, or its subshell block. `known` holds commands discovery already emits.
 fn gha_step(
     step: &serde_yaml_ng::Value,
     known: &std::collections::BTreeSet<String>,
+    default_dir: Option<&str>,
 ) -> Result<GhaStep, &'static str> {
     if let Some(uses) = step.get("uses").and_then(|uses| uses.as_str()) {
         return if uses.starts_with("rustsec/audit-check") {
@@ -717,10 +912,6 @@ fn gha_step(
         Err("expression ${{")
     } else if step.get("if").is_some() {
         Err("if: condition")
-    } else if step.get("working-directory").is_some() {
-        Err("working-directory")
-    } else if step.get("env").is_some() {
-        Err("step env")
     } else if shell.is_some_and(|shell| !matches!(shell, "bash" | "sh")) {
         Err("custom shell")
     } else if lower.contains("zirv verify") && !lower.contains("--builtin") {
@@ -746,12 +937,29 @@ fn gha_step(
         .any(|word| words.contains(word))
     {
         Err("setup/release step")
+    } else if outward_command(text) {
+        Err("outward command")
     } else if known.contains(text) {
         Err("duplicate of a discovered check")
-    } else if cfg!(windows) && text.contains('\n') {
-        Err("multi-line step on Windows")
     } else {
-        Ok(GhaStep::Run(text.to_string()))
+        let dir = match step.get("working-directory") {
+            Some(dir) => dir.as_str().filter(|dir| !dir.contains("${{")),
+            None => default_dir,
+        };
+        if step.get("working-directory").is_some() && dir.is_none() {
+            return Err("working-directory expression");
+        }
+        let env = gha_env_exports(step.get("env")).map_err(|()| "step env is not literal")?;
+        let mut lines: Vec<String> = dir
+            .map(|dir| format!("cd {}", shell_quote(dir)))
+            .into_iter()
+            .collect();
+        if shell == Some("bash") {
+            lines.push("set -o pipefail".to_string());
+        }
+        lines.extend(env);
+        lines.push(text.to_string());
+        Ok(GhaStep::Run(format!("(\n{}\n)", lines.join("\n"))))
     }
 }
 
@@ -764,6 +972,13 @@ fn discover_gha_checks(
     let Ok(entries) = std::fs::read_dir(repo.join(".github").join("workflows")) else {
         return Vec::new();
     };
+    if cfg!(windows) {
+        notes.push(
+            "CI coverage gap: GitHub workflows skipped: the default Windows shell is pwsh, which cannot be replayed"
+                .to_string(),
+        );
+        return Vec::new();
+    }
     let mut files: Vec<PathBuf> = entries
         .filter_map(|entry| Some(entry.ok()?.path()))
         .filter(|path| {
@@ -775,11 +990,13 @@ fn discover_gha_checks(
     let mut skipped: std::collections::BTreeMap<(&str, &str), usize> = Default::default();
     let mut specs = Vec::new();
     let mut audit = false;
+    let mut push_only = 0;
     for file in files {
         let Some(doc) = read_ci_yaml(&file, notes) else {
             continue;
         };
-        if !gha_triggers_ci(&doc) {
+        if !gha_has_trigger(&doc, "pull_request") {
+            push_only += usize::from(gha_has_trigger(&doc, "push"));
             continue;
         }
         let Some(jobs) = doc.get("jobs").and_then(|jobs| jobs.as_mapping()) else {
@@ -789,6 +1006,14 @@ fn discover_gha_checks(
             let Some(name) = name.as_str() else {
                 continue;
             };
+            let default_shell =
+                gha_run_default(job, "shell").or_else(|| gha_run_default(&doc, "shell"));
+            let default_dir = gha_run_default(job, "working-directory")
+                .or_else(|| gha_run_default(&doc, "working-directory"));
+            let env_lines = gha_env_exports(doc.get("env")).and_then(|mut lines| {
+                lines.extend(gha_env_exports(job.get("env"))?);
+                Ok(lines)
+            });
             let runs_on = job.get("runs-on").and_then(|label| label.as_str());
             let job_skip = if !runs_on
                 .is_some_and(|label| !label.contains("${{") && gha_runs_on_host(label))
@@ -798,6 +1023,16 @@ fn discover_gha_checks(
                 Some("job if: condition")
             } else if job.get("container").is_some() || job.get("services").is_some() {
                 Some("container or services job")
+            } else if default_shell
+                .is_some_and(|shell| !matches!(shell.as_str(), Some("bash" | "sh")))
+            {
+                Some("defaults.run.shell is not bash or sh")
+            } else if default_dir
+                .is_some_and(|dir| dir.as_str().is_none_or(|dir| dir.contains("${{")))
+            {
+                Some("defaults.run.working-directory is not literal")
+            } else if env_lines.is_err() {
+                Some("workflow or job env is not literal")
             } else {
                 None
             };
@@ -808,7 +1043,7 @@ fn discover_gha_checks(
             let mut commands = Vec::new();
             let steps = job.get("steps").and_then(|steps| steps.as_sequence());
             for step in steps.into_iter().flatten() {
-                match gha_step(step, known) {
+                match gha_step(step, known, default_dir.and_then(|dir| dir.as_str())) {
                     Ok(GhaStep::Run(command)) => commands.push(command),
                     Ok(GhaStep::Audit) => audit = true,
                     Err(reason) => *skipped.entry(("step", reason)).or_default() += 1,
@@ -817,15 +1052,15 @@ fn discover_gha_checks(
             if commands.is_empty() {
                 continue;
             }
-            let command = if cfg!(windows) {
-                commands.join(" && ")
-            } else {
-                format!("set -e\n{}", commands.join("\n"))
-            };
+            let script: Vec<String> = env_lines
+                .unwrap_or_default()
+                .into_iter()
+                .chain(commands)
+                .collect();
             specs.push(ci_check(
                 format!("gha-{}", id_slug(name)),
                 CheckKind::Custom,
-                command,
+                format!("bash -e -c {}", shell_quote(&script.join("\n"))),
             ));
         }
     }
@@ -834,6 +1069,11 @@ fn discover_gha_checks(
             "cargo-audit".into(),
             CheckKind::Lint,
             "cargo audit".into(),
+        ));
+    }
+    if push_only > 0 {
+        notes.push(format!(
+            "CI coverage gap: {push_only} GitHub workflow(s) ignored: triggered by push, not pull_request"
         ));
     }
     for ((unit, reason), count) in skipped {
@@ -3784,13 +4024,23 @@ mod tests {
         }
     }
 
+    // The script a composite GitHub check hands to `bash -e -c`, unquoted.
+    #[cfg(unix)]
+    fn gha_script(command: &str) -> String {
+        command
+            .strip_prefix("bash -e -c '")
+            .and_then(|rest| rest.strip_suffix('\''))
+            .unwrap()
+            .replace("'\\''", "'")
+    }
+
     fn gha_repo(job_body: &str) -> tempfile::TempDir {
         let repo = tempdir().unwrap();
         ci_write(
             repo.path(),
             ".github/workflows/ci.yml",
             &format!(
-                "on: [push]\njobs:\n  verify:\n    runs-on: {}\n{job_body}",
+                "on: [pull_request]\njobs:\n  verify:\n    runs-on: {}\n{job_body}",
                 host_label()
             ),
         );
@@ -3908,6 +4158,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn github_job_becomes_one_composite_check_dropping_unextractable_steps() {
         let repo = gha_repo(
@@ -3925,12 +4176,8 @@ mod tests {
             .find(|c| c.spec.id == "gha-verify")
             .unwrap();
         let steps = ["make build", "make verify", "cargo build --release"];
-        let expected = if cfg!(windows) {
-            steps.join(" && ")
-        } else {
-            format!("set -e\n{}", steps.join("\n"))
-        };
-        assert_eq!(gha.spec.command, expected);
+        let script: Vec<String> = steps.iter().map(|step| format!("(\n{step}\n)")).collect();
+        assert_eq!(gha_script(&gha.spec.command), script.join("\n"));
         assert!(!gha.spec.changed && gha.spec.final_check);
         assert!(
             has_note(&resolved, "1 GitHub step skipped: uses: action"),
@@ -3944,6 +4191,7 @@ mod tests {
         assert!(has_note(&resolved, "not in CI's environment"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn github_zirv_verify_builtin_is_not_a_recursion() {
         let repo =
@@ -3954,10 +4202,11 @@ mod tests {
             .iter()
             .find(|c| c.spec.id == "gha-verify")
             .unwrap();
-        assert!(gha.spec.command.ends_with("zirv verify --builtin"));
+        assert!(gha.spec.command.contains("\nzirv verify --builtin\n)"));
         assert!(!gha.spec.command.contains("zirv verify\n"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn github_matrix_runs_on_is_skipped_with_a_gap() {
         let repo = tempdir().unwrap();
@@ -3978,6 +4227,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn github_non_ci_trigger_is_ignored_and_rustsec_audit_maps_to_cargo_audit() {
         let repo = tempdir().unwrap();
@@ -3993,7 +4243,7 @@ mod tests {
             repo.path(),
             ".github/workflows/audit.yaml",
             &format!(
-                "on:\n  push:\njobs:\n  audit:\n    runs-on: {}\n    steps:\n      - uses: rustsec/audit-check@v2\n",
+                "on:\n  pull_request:\njobs:\n  audit:\n    runs-on: {}\n    steps:\n      - uses: rustsec/audit-check@v2\n",
                 host_label()
             ),
         );
@@ -4001,6 +4251,203 @@ mod tests {
         assert_eq!(ids(&resolved), ["cargo-audit"]);
         assert_eq!(resolved.checks[0].spec.command, "cargo audit");
         assert_eq!(resolved.checks[0].source, CheckSource::DiscoveredToolchain);
+    }
+
+    #[test]
+    fn gitlab_cache_copy_wins_and_root_only_extends_resolve_recursively() {
+        let repo = tempdir().unwrap();
+        ci_write(
+            repo.path(),
+            ".gitlab-ci.yml",
+            ".base:\n  stage: test\n.mid:\n  extends: .base\nchain:\n  extends: [.mid]\n  script: [x]\norphan:\n  extends: .missing\n  script: [x]\ncyc-a:\n  extends: cyc-b\n  script: [x]\ncyc-b:\n  extends: cyc-a\n  script: [x]\nshadow:\n  stage: test\n  script: [x]\n",
+        );
+        ci_write(
+            repo.path(),
+            ".gitlab-ci-local/expanded-gitlab-ci.yml",
+            "shadow:\n  stage: deploy\n  script: [x]\n",
+        );
+        let resolved = load_or_discover(repo.path()).unwrap();
+        assert_eq!(ids(&resolved), ["gitlab-chain"]);
+        assert!(
+            has_note(&resolved, "stage can't be determined"),
+            "{:?}",
+            resolved.notes
+        );
+    }
+
+    #[test]
+    fn gitlab_trigger_manual_rules_and_inherited_when_are_skipped() {
+        let repo = tempdir().unwrap();
+        ci_write(
+            repo.path(),
+            ".gitlab-ci.yml",
+            ".manual:\n  when: manual\ntrig:\n  stage: test\n  trigger:\n    project: a/b\nruled:\n  stage: test\n  rules:\n    - if: $X\n      when: manual\n  script: [x]\ninherits:\n  extends: .manual\n  stage: test\n  script: [x]\nplain:\n  stage: test\n  script: [x]\n",
+        );
+        assert_eq!(
+            ids(&load_or_discover(repo.path()).unwrap()),
+            ["gitlab-plain"]
+        );
+    }
+
+    #[test]
+    fn gitlab_test_job_needing_an_outward_or_late_stage_job_is_dropped_with_a_gap() {
+        let repo = tempdir().unwrap();
+        ci_write(
+            repo.path(),
+            ".gitlab-ci.yml",
+            "composer-install:\n  stage: build\n  script: [composer install]\nlaravel:\n  stage: build\n  script: [helm template x .]\npushy:\n  stage: build\n  script: [docker push img]\ndeployed:\n  stage: deploy\n  script: [echo]\nmid:\n  stage: build\n  needs:\n    - job: pushy\n  script: [x]\nok:\n  stage: test\n  needs: [composer-install, {job: laravel}]\n  script: [x]\nbad-script:\n  stage: test\n  needs: [pushy]\n  script: [x]\nbad-stage:\n  stage: test\n  needs: [deployed]\n  script: [x]\ntransitive:\n  stage: test\n  needs: [mid]\n  script: [x]\n",
+        );
+        let resolved = load_or_discover(repo.path()).unwrap();
+        assert_eq!(ids(&resolved), ["gitlab-ok"]);
+        assert!(has_note(&resolved, "\"pushy\""), "{:?}", resolved.notes);
+        assert!(has_note(&resolved, "\"deployed\""), "{:?}", resolved.notes);
+    }
+
+    #[test]
+    fn gitlab_remote_include_deploy_jobs_are_never_discovered() {
+        let repo = tempdir().unwrap();
+        ci_write(
+            repo.path(),
+            ".gitlab-ci.yml",
+            "include:\n  - project: grp/templates\n    file: ci.yml\ndeploy-dev:\n  extends: .deploy\ndocker-image:\n  extends: .docker-build\nphpunit:\n  stage: test\n  script: [phpunit]\n",
+        );
+        ci_write(
+            repo.path(),
+            ".gitlab-ci-local/expanded-gitlab-ci.yml",
+            "composer-install:\n  stage: build\n  script: [composer install]\ndeploy-dev:\n  stage: deploy\n  environment: dev\n  script: [./deploy.sh]\ndocker-image:\n  stage: build\n  script: [docker build .]\nphpstan:\n  stage: test\n  needs: [composer-install]\n  script: [phpstan]\nphpunit:\n  stage: test\n  needs: [composer-install]\n  script: [phpunit]\ne2e:\n  stage: test\n  environment: staging\n  script: [x]\nsmoke:\n  stage: test\n  needs: [{job: e2e}]\n  script: [x]\npushy:\n  stage: test\n  before_script: [docker push img]\n  script: [x]\n",
+        );
+        let resolved = load_or_discover(repo.path()).unwrap();
+        assert_eq!(ids(&resolved), ["gitlab-phpunit", "gitlab-phpstan"]);
+        assert!(has_note(&resolved, "\"e2e\""), "{:?}", resolved.notes);
+        assert!(has_note(&resolved, "\"pushy\""), "{:?}", resolved.notes);
+    }
+
+    #[test]
+    fn outward_denylist_matches_specific_verbs_only() {
+        for outward in [
+            "Docker Push img",
+            "docker buildx build --push .",
+            "echo hi; aws s3 ls",
+            "gh pr create",
+            "a && gcloud run deploy",
+            "kubectl apply -f x",
+            "terraform apply",
+        ] {
+            assert!(outward_command(outward), "{outward}");
+        }
+        for inward in [
+            "helm template .",
+            "composer install",
+            "echo gh",
+            "laws s3 ls",
+        ] {
+            assert!(!outward_command(inward), "{inward}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_push_only_workflow_is_ignored_with_one_gap() {
+        let repo = tempdir().unwrap();
+        ci_write(
+            repo.path(),
+            ".github/workflows/ci.yml",
+            "on: [push]\njobs:\n  verify:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make test\n",
+        );
+        let resolved = load_or_discover(repo.path()).unwrap();
+        assert!(resolved.checks.is_empty(), "{:?}", ids(&resolved));
+        assert!(has_note(&resolved, "push"), "{:?}", resolved.notes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_env_and_working_directory_are_replayed_literally_and_expressions_dropped() {
+        let repo = tempdir().unwrap();
+        ci_write(
+            repo.path(),
+            ".github/workflows/ci.yml",
+            "on: pull_request\nenv:\n  W: w\njobs:\n  verify:\n    runs-on: ubuntu-latest\n    env:\n      J: \"it's\"\n    defaults:\n      run:\n        working-directory: pkg\n    steps:\n      - run: make a\n        shell: bash\n      - run: make b\n        working-directory: other\n        env:\n          S: s\n      - run: make c\n        env:\n          S: ${{ secrets.X }}\n  bad:\n    runs-on: ubuntu-latest\n    env:\n      J: ${{ github.sha }}\n    steps:\n      - run: make d\n  pwsh:\n    runs-on: ubuntu-latest\n    defaults:\n      run:\n        shell: pwsh\n    steps:\n      - run: make e\n",
+        );
+        let resolved = load_or_discover(repo.path()).unwrap();
+        assert_eq!(ids(&resolved), ["gha-verify"]);
+        let command = &resolved.checks[0].spec.command;
+        assert!(command.starts_with("bash -e -c '"), "{command}");
+        assert_eq!(
+            gha_script(command),
+            "export W='w'\nexport J='it'\\''s'\n(\ncd 'pkg'\nset -o pipefail\nmake a\n)\n(\ncd 'other'\nexport S='s'\nmake b\n)"
+        );
+        assert!(
+            has_note(&resolved, "env is not literal"),
+            "{:?}",
+            resolved.notes
+        );
+        assert!(
+            has_note(&resolved, "defaults.run.shell"),
+            "{:?}",
+            resolved.notes
+        );
+        assert!(has_note(&resolved, "step env"), "{:?}", resolved.notes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_composite_isolates_steps_and_runs_under_bash() {
+        let repo = tempdir().unwrap();
+        ci_write(repo.path(), "sub/keep", "");
+        ci_write(repo.path(), "root-marker", "");
+        ci_write(
+            repo.path(),
+            ".github/workflows/ci.yml",
+            "on: pull_request\njobs:\n  verify:\n    runs-on: ubuntu-latest\n    env:\n      FOO: bar\n    steps:\n      - run: cd sub && export X=1\n      - run: |\n          [[ -f root-marker ]]\n          test -z \"$X\"\n          test \"$FOO\" = bar\n      - run: test -f keep && test \"$Y\" = \"it's\"\n        working-directory: sub\n        env:\n          Y: it's\n",
+        );
+        let resolved = load_or_discover(repo.path()).unwrap();
+        assert_eq!(ids(&resolved), ["gha-verify"]);
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(&resolved.checks[0].spec.command)
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "{status:?}");
+    }
+
+    #[test]
+    fn subdirectory_with_a_malformed_or_symlinked_manifest_is_skipped_with_a_gap() {
+        let repo = tempdir().unwrap();
+        ci_write(repo.path(), "bad/package.json", "{");
+        ci_write(
+            repo.path(),
+            "good/package.json",
+            "{\"scripts\":{\"lint\":\"eslint .\"}}",
+        );
+        #[cfg(unix)]
+        {
+            ci_write(repo.path(), "real/package.json", "{}");
+            std::fs::create_dir_all(repo.path().join("link")).unwrap();
+            std::os::unix::fs::symlink(
+                repo.path().join("real/package.json"),
+                repo.path().join("link/package.json"),
+            )
+            .unwrap();
+        }
+        let resolved = load_or_discover(repo.path()).unwrap();
+        assert_eq!(ids(&resolved), ["good-lint"]);
+        assert!(has_note(&resolved, "bad/"), "{:?}", resolved.notes);
+        #[cfg(unix)]
+        assert!(has_note(&resolved, "link/"), "{:?}", resolved.notes);
+    }
+
+    #[test]
+    fn context_lint_does_not_collide_with_a_context_subdirectory_script() {
+        let repo = tempdir().unwrap();
+        ci_write(
+            repo.path(),
+            "context/package.json",
+            "{\"scripts\":{\"lint\":\"eslint .\"}}",
+        );
+        std::fs::create_dir_all(repo.path().join(".zirv/context")).unwrap();
+        let resolved = load_or_discover(repo.path()).unwrap();
+        assert_eq!(ids(&resolved), ["context-lint", "context-lint-2"]);
     }
 
     #[test]
@@ -4074,6 +4521,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn ci_derived_checks_are_repo_supplied_and_refused_when_repo_checks_are_disabled() {
         let repo = git_repo();
@@ -4082,7 +4530,7 @@ mod tests {
             repo.path(),
             ".github/workflows/ci.yml",
             &format!(
-                "on: push\njobs:\n  j:\n    runs-on: {}\n    steps:\n      - run: {}\n",
+                "on: pull_request\njobs:\n  j:\n    runs-on: {}\n    steps:\n      - run: {}\n",
                 host_label(),
                 marker_command()
             ),
