@@ -860,13 +860,25 @@ fn handler_span(text: &str, value: std::ops::Range<usize>) -> Option<std::ops::R
     let line_end = text[found.end()..]
         .find('\n')
         .map_or(text.len(), |index| found.end() + index);
-    let Some(open) = text[found.start()..]
+    // The body brace follows the parameter list, so a destructured parameter's `{` is skipped.
+    let head = &text[..found.end()];
+    let after = text[found.end()..].trim_start();
+    let body_from = if head.ends_with('{') {
+        found.end() - 1
+    } else if head.ends_with('(') {
+        call_end(text, found.end()) + 1
+    } else if after.starts_with('(') {
+        call_end(text, text.len() - after.len() + 1) + 1
+    } else {
+        found.end()
+    };
+    let Some(open) = text[body_from.min(text.len())..]
         .find('{')
-        .map(|index| found.start() + index)
+        .map(|index| body_from + index)
     else {
         return Some(found.start()..line_end);
     };
-    Some(found.start()..balanced_end(text, open))
+    Some(open..balanced_end(text, open))
 }
 
 fn line_for(text: &str, offset: usize) -> usize {
@@ -2734,6 +2746,14 @@ function onPaste(event: ClipboardEvent) {
         assert_eq!(findings[0].line, 1);
         let unrelated = "el.addEventListener('paste', e => log(e))\nel.addEventListener('keydown', e => {\n  e.preventDefault()\n})\n";
         assert!(paste_findings("src/ok.ts", unrelated).is_empty());
+    }
+
+    #[test]
+    fn a_destructured_parameter_does_not_hide_the_handler_body() {
+        let method = "export default {\n  methods: {\n    onPaste({ target }) {\n      e.preventDefault()\n    },\n  },\n}\n// <input @paste=\"onPaste\" />\n";
+        assert_eq!(paste_findings("src/P.vue", method)[0].line, 4);
+        let function = "function onPaste({ clipboardData }) {\n  e.preventDefault()\n}\nel.addEventListener('paste', onPaste)\n";
+        assert_eq!(paste_findings("src/Q.ts", function)[0].line, 2);
     }
 
     #[test]
