@@ -482,6 +482,7 @@ impl Scope {
             worker.report_outcome = Some(report.outcome);
             worker.report_truncated = report.report_truncated;
         }
+        let known_ids: Vec<String> = workers.keys().cloned().collect();
         let candidates: Vec<_> = workers
             .into_values()
             .filter(|worker| {
@@ -493,7 +494,11 @@ impl Scope {
             })
             .collect();
         if args.id.is_some() && candidates.is_empty() {
-            return Err("worker not found in the selected repository".into());
+            let message = "worker not found in the selected repository";
+            let id = args.id.as_deref().unwrap_or_default();
+            return Err(
+                with_did_you_mean(message, id, known_ids.iter().map(String::as_str)).into(),
+            );
         }
         let more = candidates.len() > limit;
         let workers: Vec<_> = candidates.into_iter().take(limit).collect();
@@ -509,7 +514,14 @@ impl Scope {
         validate_id(&args.id)?;
         let bytes = bounded(args.max_bytes, 8192, 4, 8192, "max_bytes")?;
         let records = self.scoped_delegations()?;
-        let (text, _) = self.report(&args.id, &records)?;
+        let (text, _) = self.report(&args.id, &records).map_err(|e| {
+            let ids: Vec<String> = json_names(&self.state.logs().join("delegation-results"))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|id| self.report(id, &records).is_ok())
+                .collect();
+            with_did_you_mean(&e.to_string(), &args.id, ids.iter().map(String::as_str))
+        })?;
         let revision = digest(text.as_bytes());
         if args.offset > 0 && args.revision.is_none() {
             return Err("revision from the first page is required when offset is nonzero".into());
@@ -775,5 +787,93 @@ mod tests {
             serde_json::json!(["workspace_ready@1", "launched@2"]),
             "got {result}"
         );
+    }
+
+    fn launch(scope: &Scope, id: &str) {
+        use crate::commands::ctx::runtime::RuntimeKind;
+        let handle = delegation::WorkerHandle {
+            delegation: format!("job-{id}"),
+            attempt: 1,
+            runtime: RuntimeKind::Native,
+            worker_session: id.into(),
+            short: id.into(),
+            role: "worker".into(),
+            task: None,
+            group: None,
+            objective: None,
+            workdir: scope.repo.clone(),
+            manifest: None,
+            plan_override: false,
+        };
+        let record =
+            delegation::record_launch(&scope.state, &scope.repo, handle, None, 1).expect("launch");
+        delegation::save(&scope.state, &scope.repo, &record).expect("save");
+    }
+
+    fn scopes() -> (
+        tempfile::TempDir,
+        Scope,
+        Scope,
+        crate::commands::ctx::testenv::HomeGuard,
+    ) {
+        let root = tempfile::tempdir().expect("tempdir");
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let guard = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let env = BTreeMap::from([(
+            "ZIRV_CTX_STATE_DIR".into(),
+            root.path().join("state").display().to_string(),
+        )]);
+        let make = |name: &str| {
+            let repo = root.path().join(name);
+            std::fs::create_dir_all(&repo).expect("repo");
+            Scope::new(&repo, env.clone()).expect("scope")
+        };
+        let (mine, other) = (make("repo"), make("other"));
+        (root, mine, other, guard)
+    }
+
+    fn worker_miss(scope: &Scope, id: &str) -> String {
+        scope
+            .worker_status(WorkerArgs {
+                id: Some(id.into()),
+                ..Default::default()
+            })
+            .expect_err("miss")
+            .to_string()
+    }
+
+    #[test]
+    fn worker_miss_with_one_close_id_suggests_it() {
+        let (_root, mine, _other, _g) = scopes();
+        launch(&mine, "worker01");
+        launch(&mine, "zzzzzzzz");
+        let msg = worker_miss(&mine, "worker1");
+        assert!(msg.ends_with("Did you mean `worker01`?"), "{msg}");
+    }
+
+    #[test]
+    fn worker_miss_with_no_close_id_has_no_hint() {
+        let (_root, mine, _other, _g) = scopes();
+        launch(&mine, "worker01");
+        let msg = worker_miss(&mine, "completely-different");
+        assert_eq!(msg, "worker not found in the selected repository");
+    }
+
+    #[test]
+    fn worker_miss_with_ambiguous_ids_has_no_hint() {
+        let (_root, mine, _other, _g) = scopes();
+        launch(&mine, "worker01");
+        launch(&mine, "worker02");
+        let msg = worker_miss(&mine, "worker0");
+        assert_eq!(msg, "worker not found in the selected repository");
+    }
+
+    #[test]
+    fn worker_miss_never_suggests_an_id_from_another_repository() {
+        let (_root, mine, other, _g) = scopes();
+        launch(&other, "worker01");
+        let msg = worker_miss(&mine, "worker1");
+        assert_eq!(msg, "worker not found in the selected repository");
     }
 }
