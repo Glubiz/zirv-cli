@@ -1061,7 +1061,11 @@ validation/toolchain surfaces and high-signal Markdown sections. `--dry-run`
 changes nothing, `--source` accepts a Markdown file or directory (including an
 Obsidian vault), and a non-empty shared bank is refused unless `--merge` is
 passed; merge mode adds missing keys and never silently overwrites curated
-entries. `--max-entries` and `--max-bytes` cap initialization.
+entries. `--max-entries` and `--max-bytes` cap initialization. Every proposed entry goes
+through the shared-bank secret screen (dry run included): a refused entry is skipped and
+its key reported, the rest are written, and the exit code is non-zero only when nothing
+was written. `--json` prints the report with each proposed key, body and refusal reason,
+so `--dry-run --json` lets you review proposals first.
 
 Every verb defaults to the **private** (machine-local) bank; pass `--shared`
 to act on the **shared**, repository-owned bank instead — see

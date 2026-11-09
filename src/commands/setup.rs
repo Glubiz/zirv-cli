@@ -2256,7 +2256,16 @@ pub struct MemoryInitReport {
     pub proposed: usize,
     pub written: usize,
     pub skipped_existing: usize,
+    pub refused: usize,
     pub body_bytes: usize,
+    pub entries: Vec<MemoryReportEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryReportEntry {
+    pub key: String,
+    pub body: String,
+    pub refused: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2683,7 +2692,9 @@ fn initialize_memory_with(
     let proposed = proposals.len().min(options.max_entries);
     let mut written = 0;
     let mut skipped_existing = 0;
+    let mut refused = 0;
     let mut body_bytes = 0;
+    let mut entries = Vec::new();
     let timestamp = ctx::state::now_secs();
     for mut proposal in proposals.into_iter().take(options.max_entries) {
         if existing_keys.contains(&proposal.key) {
@@ -2698,20 +2709,30 @@ fn initialize_memory_with(
         if proposal.body.is_empty() {
             break;
         }
-        body_bytes += proposal.body.len();
+        let entry = ctx::memory::Entry {
+            key: proposal.key,
+            written_by: "zirv-setup".to_string(),
+            written: timestamp,
+            verified: timestamp,
+            source: "setup".to_string(),
+            body: proposal.body,
+            importance: Some("normal".to_string()),
+            confidence: Some("high".to_string()),
+            tags: proposal.tags,
+            paths: proposal.paths,
+        };
+        let refusal = ctx::memory::sensitive_shared_match(&entry);
+        entries.push(MemoryReportEntry {
+            key: entry.key.clone(),
+            body: entry.body.clone(),
+            refused: refusal.clone(),
+        });
+        if refusal.is_some() {
+            refused += 1;
+            continue;
+        }
+        body_bytes += entry.body.len();
         if !options.dry_run {
-            let entry = ctx::memory::Entry {
-                key: proposal.key,
-                written_by: "zirv-setup".to_string(),
-                written: timestamp,
-                verified: timestamp,
-                source: "setup".to_string(),
-                body: proposal.body,
-                importance: Some("normal".to_string()),
-                confidence: Some("high".to_string()),
-                tags: proposal.tags,
-                paths: proposal.paths,
-            };
             ctx::memory::upsert_scoped(
                 ctx::memory::MemoryScope::Shared,
                 repo,
@@ -2727,7 +2748,9 @@ fn initialize_memory_with(
         proposed,
         written,
         skipped_existing,
+        refused,
         body_bytes,
+        entries,
     })
 }
 
@@ -5722,6 +5745,63 @@ mod tests {
         assert_eq!(manifest["kind"], "apply");
         assert_eq!(manifest["provider"], "codex");
         assert!(run.join("files/hooks.json").is_file());
+    }
+
+    fn vault_with_refusable_page() -> (tempfile::TempDir, tempfile::TempDir, MemoryInitOptions) {
+        let repo = tempfile::tempdir().expect("repo");
+        let vault = tempfile::tempdir().expect("vault");
+        std::fs::write(
+            vault.path().join("a-claims.md"),
+            "# Claims\n\n## Architecture Decisions For Visit Claims\n\nThe claim tokens table keeps one row for every customer visit that was opened at a branch office.\n",
+        )
+        .expect("refusable page");
+        std::fs::write(
+            vault.path().join("b-release.md"),
+            "# Release\n\n## Release Checklist Before Every Deployment\n\nRun the integration suite and tag the release before every deployment to production.\n",
+        )
+        .expect("clean page");
+        let options = MemoryInitOptions {
+            source: Some(vault.path().to_path_buf()),
+            dry_run: false,
+            merge: false,
+            max_entries: 16,
+            max_bytes: 8192,
+        };
+        (repo, vault, options)
+    }
+
+    #[test]
+    fn memory_init_skips_a_refused_entry_and_writes_the_rest() {
+        let (repo, _vault, options) = vault_with_refusable_page();
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        let state = home.path().join("state");
+        let env =
+            |key: &str| (key == ctx::state::STATE_ENV).then(|| state.to_string_lossy().to_string());
+        let report = initialize_memory_with(repo.path(), &options, &env).expect("init");
+        assert_eq!(report.refused, 1, "{report:?}");
+        assert!(report.written >= 1, "{report:?}");
+        let refused: Vec<_> = report
+            .entries
+            .iter()
+            .filter(|e| e.refused.is_some())
+            .collect();
+        assert!(refused[0].key.starts_with("a-claims"), "{refused:?}");
+    }
+
+    #[test]
+    fn memory_init_dry_run_marks_entries_the_secret_screen_would_refuse() {
+        let (repo, _vault, mut options) = vault_with_refusable_page();
+        options.dry_run = true;
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        let state = home.path().join("state");
+        let env =
+            |key: &str| (key == ctx::state::STATE_ENV).then(|| state.to_string_lossy().to_string());
+        let report = initialize_memory_with(repo.path(), &options, &env).expect("dry run");
+        assert_eq!(report.refused, 1, "{report:?}");
+        assert!(report.entries.iter().all(|e| !e.body.is_empty()));
+        assert_eq!(report.written, 0);
     }
 
     #[test]

@@ -964,7 +964,7 @@ fn sensitive_shared_field(label: &str, value: &str) -> Option<String> {
 /// `upsert_shared` (a hard refusal) and `write_durable`'s harvest loop (a
 /// skip-and-log, never an abort) can call it without either owning its own
 /// copy of the rule.
-fn sensitive_shared_match(entry: &Entry) -> Option<String> {
+pub(crate) fn sensitive_shared_match(entry: &Entry) -> Option<String> {
     if let Some(m) = sensitive_shared_field("key", &entry.key) {
         return Some(m);
     }
