@@ -322,16 +322,13 @@ pub struct AdvanceArgs {
 
 impl AdvanceArgs {
     fn finding_acceptance(&self) -> CtxResult<FindingAcceptance> {
-        let introduced_reason = match self.accept_introduced_findings.as_deref().map(str::trim) {
-            Some("") => {
-                return Err("--accept-introduced-findings requires a non-empty reason".into());
-            }
-            Some(reason) => Some(reason.to_string()),
-            None => None,
-        };
+        let reason = self.accept_introduced_findings.as_deref().map(str::trim);
+        if reason == Some("") {
+            return Err("--accept-introduced-findings requires a non-empty reason".into());
+        }
         Ok(FindingAcceptance {
             preexisting: self.accept_preexisting_findings,
-            introduced_reason,
+            introduced_reason: reason.map(str::to_string),
         })
     }
 }

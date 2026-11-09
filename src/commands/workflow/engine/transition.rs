@@ -834,11 +834,10 @@ pub fn advance_with_evidence(
                 let introduced = report.introduced_blocking_count();
                 let preexisting = report.preexisting_blocking_count();
                 let preexisting_already_accepted = state.accepted_preexisting_findings.is_some();
-                let introduced_accepted =
-                    introduced > 0 && accept_findings.introduced_reason.is_some();
-                let preexisting_accepted = accept_findings.preexisting
-                    || preexisting_already_accepted
-                    || accept_findings.introduced_reason.is_some();
+                let reason_given = accept_findings.introduced_reason.is_some();
+                let introduced_accepted = introduced > 0 && reason_given;
+                let preexisting_accepted =
+                    accept_findings.preexisting || preexisting_already_accepted || reason_given;
                 if report.truncated
                     || (introduced > 0 && !introduced_accepted)
                     || (preexisting > 0 && !preexisting_accepted)
