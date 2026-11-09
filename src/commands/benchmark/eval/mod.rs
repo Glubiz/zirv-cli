@@ -5,7 +5,7 @@ mod corpus;
 mod grade;
 mod trace;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map::Entry};
 use std::io::Write;
 use std::path::Path;
 
@@ -110,7 +110,7 @@ fn lint(
     let problems = corpus::lint(
         cases,
         &|name| corpus::canned_trace(name).map(str::to_string),
-        &|surface| corpus::resolve_surface(surface, repo, env).map(|_| ()),
+        &|surface| corpus::resolve_surface(surface, corpus::DEFAULT_HARNESS, repo, env).map(|_| ()),
     );
     let text = if problems.is_empty() {
         format!("ok: {} cases lint clean\n", cases.len())
@@ -135,18 +135,23 @@ fn dry_run_report(
     context: bool,
     json: bool,
 ) -> Result<i32, String> {
-    let mut resolved: BTreeMap<&str, corpus::Resolved> = BTreeMap::new();
+    let mut resolved: BTreeMap<(&str, &str), corpus::Resolved> = BTreeMap::new();
     let mut rows = Vec::new();
     let mut text = String::new();
     for case in cases
         .iter()
         .filter(|c| wanted.is_empty() || wanted.contains(&c.id))
     {
-        if !resolved.contains_key(case.surface.as_str()) {
-            let surface = corpus::resolve_surface(&case.surface, repo, env)?;
-            resolved.insert(case.surface.as_str(), surface);
-        }
-        let surface = &resolved[case.surface.as_str()];
+        let key = (case.surface.as_str(), case.harness());
+        let surface = match resolved.entry(key) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(corpus::resolve_surface(
+                &case.surface,
+                case.harness(),
+                repo,
+                env,
+            )?),
+        };
         text.push_str(&format!(
             "== {} ({}) ==\nsurface: {}\nbundle sha256: {}\nrole: {}  harness: {}\nturns:\n",
             case.id,
@@ -289,6 +294,7 @@ mod tests {
         assert_eq!(code, Ok(0));
         let resolved = corpus::resolve_surface(
             "safety:Bash(zirv benchmark run*)",
+            "claude",
             h.tmp.path(),
             &|key: &str| h.env.get(key).cloned(),
         )

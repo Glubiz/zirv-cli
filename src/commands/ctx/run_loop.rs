@@ -1379,7 +1379,11 @@ fn evaluate_objective_after_cycle<W: Write>(
                 return Ok(ObjectiveOutcome::Continue);
             };
             if verdict == judge::Verdict::Continue {
-                log_decision("continue", "objective-judge-continue", &reason);
+                log_decision(
+                    "continue",
+                    "objective-judge-continue",
+                    &super::pace::redact_for_log(&reason),
+                );
             }
             clear_pending_note();
             match judge::next_step(
@@ -4685,6 +4689,37 @@ mod tests {
                 log.contains("\"action\":\"objective-judge-continue\""),
                 "a successful continue verdict must be logged: {log}"
             );
+        }
+
+        #[test]
+        fn a_continue_verdict_reason_is_redacted_in_the_log() {
+            let repo_dir = git_repo();
+            let repo = repo_dir.path();
+            let state_tmp = tempfile::tempdir().expect("state tempdir");
+            let state = StateDir::from_root(state_tmp.path().to_path_buf());
+            let home = state_tmp.path().join("home");
+
+            let env = objective_env(state_tmp.path(), "0");
+            store_active_objective(&state, repo);
+
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+            let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+                ("FAKE_AGENT_MODE", Some("healthy")),
+                ("FAKE_AGENT_TURNS", Some("1")),
+                ("FAKE_JUDGE_MODE", Some("continue_secret")),
+            ]);
+
+            let mut out = Vec::new();
+            let mut args = args_for(10);
+            args.simple = false;
+            let code = run_with(&args, &mut out, repo, &|k| env.get(k).cloned());
+            assert_eq!(code.expect("runs"), EXIT_OBJECTIVE_NO_PROGRESS);
+
+            let log = std::fs::read_to_string(state_tmp.path().join("logs/decisions.jsonl"))
+                .expect("log");
+            assert!(log.contains("objective-judge-continue"), "{log}");
+            assert!(!log.contains("ghp_ABCDEF1234567890"), "{log}");
+            assert!(log.contains("[redacted]"), "{log}");
         }
     }
 }

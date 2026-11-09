@@ -17,7 +17,7 @@ use crate::commands::ctx::memory::sha256_hex;
 use crate::commands::ctx::prompt::PromptRole;
 use crate::commands::workflow::skill::SkillRegistry;
 
-const DEFAULT_HARNESS: &str = "claude";
+pub const DEFAULT_HARNESS: &str = "claude";
 
 macro_rules! case_file {
     ($name:literal) => {
@@ -183,14 +183,19 @@ fn measure_row(label: &str, text: &str) -> String {
     )
 }
 
-pub fn resolve_surface(surface: &str, repo: &Path, env: EnvLookup<'_>) -> Result<Resolved, String> {
+pub fn resolve_surface(
+    surface: &str,
+    harness: &str,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> Result<Resolved, String> {
     let (scheme, name) = surface
         .split_once(':')
         .filter(|(_, name)| !name.is_empty())
         .ok_or_else(|| format!("surface '{surface}': expected <scheme>:<name>"))?;
     let (text, context) = match scheme {
         "layer" => {
-            let compiled = compile::compile_for_role(repo, env, None, Some(name))
+            let compiled = compile::compile_for_role(repo, env, Some(harness), Some(name))
                 .map_err(|e| format!("surface '{surface}': {e}"))?;
             let text = compiled
                 .compiled
@@ -497,6 +502,36 @@ pass = "p"
     }
 
     #[test]
+    fn layer_surfaces_resolve_for_the_case_harness_not_the_configured_agent() {
+        let tmp = testenv::repo();
+        let _home = testenv::HomeGuard::set(&tmp.path().join("home"));
+        let state = tmp.path().join("state").display().to_string();
+        let plain: HashMap<&str, String> =
+            [(crate::commands::ctx::state::STATE_ENV, state.clone())].into();
+        let codex_configured: HashMap<&str, String> = [
+            (crate::commands::ctx::state::STATE_ENV, state),
+            ("ZIRV_CTX_AGENT", "codex".to_string()),
+        ]
+        .into();
+        let _cwd = testenv::CwdGuard::enter(tmp.path()).unwrap();
+        let resolve = |env: &HashMap<&str, String>, harness: &str| {
+            resolve_surface("layer:worker", harness, tmp.path(), &|k: &str| {
+                env.get(k).cloned()
+            })
+            .unwrap()
+        };
+        let claude = resolve(&plain, "claude");
+        let pinned = resolve(&codex_configured, "claude");
+        assert_eq!(pinned.bundle_sha256, claude.bundle_sha256);
+        assert_eq!(pinned.text, claude.text);
+        assert_ne!(
+            resolve(&plain, "codex").bundle_sha256,
+            claude.bundle_sha256,
+            "the harness must change the compiled layer"
+        );
+    }
+
+    #[test]
     fn surfaces_resolve_from_current_source() {
         let tmp = testenv::repo();
         let _home = testenv::HomeGuard::set(&tmp.path().join("home"));
@@ -514,19 +549,19 @@ pass = "p"
             "mcp:skill_load",
             "safety:Bash(zirv benchmark run*)",
         ] {
-            let resolved = resolve_surface(surface, tmp.path(), &lookup).unwrap();
+            let resolved = resolve_surface(surface, "claude", tmp.path(), &lookup).unwrap();
             assert!(!resolved.text.is_empty(), "{surface}");
             assert_eq!(resolved.bundle_sha256.len(), 64, "{surface}");
             assert!(!resolved.context.is_empty(), "{surface}");
         }
-        assert!(resolve_surface("layer:boss", tmp.path(), &lookup).is_err());
-        assert!(resolve_surface("skill:no-such-skill", tmp.path(), &lookup).is_err());
-        assert!(resolve_surface("mcp:no_such_tool", tmp.path(), &lookup).is_err());
-        assert!(resolve_surface("safety:Bash(nope)", tmp.path(), &lookup).is_err());
-        assert!(resolve_surface("nonsense", tmp.path(), &lookup).is_err());
-        assert!(resolve_surface("web:x", tmp.path(), &lookup).is_err());
-        let a = resolve_surface("mcp:skill_load", tmp.path(), &lookup).unwrap();
-        let b = resolve_surface("mcp:skill_load", tmp.path(), &lookup).unwrap();
+        assert!(resolve_surface("layer:boss", "claude", tmp.path(), &lookup).is_err());
+        assert!(resolve_surface("skill:no-such-skill", "claude", tmp.path(), &lookup).is_err());
+        assert!(resolve_surface("mcp:no_such_tool", "claude", tmp.path(), &lookup).is_err());
+        assert!(resolve_surface("safety:Bash(nope)", "claude", tmp.path(), &lookup).is_err());
+        assert!(resolve_surface("nonsense", "claude", tmp.path(), &lookup).is_err());
+        assert!(resolve_surface("web:x", "claude", tmp.path(), &lookup).is_err());
+        let a = resolve_surface("mcp:skill_load", "claude", tmp.path(), &lookup).unwrap();
+        let b = resolve_surface("mcp:skill_load", "claude", tmp.path(), &lookup).unwrap();
         assert_eq!(a.bundle_sha256, b.bundle_sha256);
     }
 }

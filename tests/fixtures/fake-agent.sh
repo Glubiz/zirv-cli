@@ -105,6 +105,7 @@
 #   done            {"verdict":"done","reason":"objective satisfied"}
 #   blocked         {"verdict":"blocked","reason":"missing credential"}
 #   continue        {"verdict":"continue","reason":"more work remains"}
+#   continue_secret continue whose reason holds a ghp_ token
 #   wait_seconds    {"verdict":"wait","wait_on":{"seconds":1},...}
 #   wait_pid        {"verdict":"wait","wait_on":{"pid":999999999},...} (an
 #                   implausible pid, so a real liveness check sees it dead)
@@ -224,6 +225,7 @@ if [ -z "$session" ]; then
     bad) printf 'I looked things over and it seems mostly fine.\n' ;;
     blocked) printf '{"verdict":"blocked","reason":"missing credential"}\n' ;;
     continue) printf '{"verdict":"continue","reason":"more work remains"}\n' ;;
+    continue_secret) printf '{"verdict":"continue","reason":"leaked token ghp_ABCDEF1234567890 remains"}\n' ;;
     wait_seconds) printf '{"verdict":"wait","reason":"napping","wait_on":{"seconds":1}}\n' ;;
     wait_pid) printf '{"verdict":"wait","reason":"napping","wait_on":{"pid":999999999}}\n' ;;
     wait_file)
