@@ -112,10 +112,10 @@ pub(super) fn remote_host(url: &str) -> Option<String> {
         None => url.split_once(':')?.0,
     };
     let host_port = authority.rsplit('@').next()?;
-    let host = match host_port.strip_prefix('[') {
-        Some(_) => return None,
-        None => host_port.split(':').next()?,
-    };
+    if host_port.starts_with('[') {
+        return None;
+    }
+    let host = host_port.split(':').next()?;
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
