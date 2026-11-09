@@ -17,6 +17,7 @@ use crate::commands::ctx::config::{CtxConfig, EnvLookup, env_from_process};
 use crate::commands::ctx::mail::{self, Message};
 use crate::commands::ctx::sessions::short_id;
 use crate::commands::ctx::state::{StateDir, now_secs, repo_slug};
+use crate::commands::ctx::worktree;
 
 const CLI_TIMEOUT: Duration = Duration::from_secs(10);
 const SENDER: &str = "zirv-pr-watch";
@@ -94,8 +95,11 @@ pub(super) fn run_with<W: Write>(
     match &args.command {
         PrVerb::Watch(a) => {
             let Some(pr) = parse::parse_url(&a.url) else {
-                return Err(format!("zirv ctx pr watch: '{}' is not a GitHub pull request or GitLab merge request URL", a.url).into());
+                return Err(format!("zirv ctx pr watch: '{}' is not a GitHub pull request or GitLab merge request URL (https, no port, no IP address)", a.url).into());
             };
+            if let Err(allowed) = trusted_host(repo, &pr.host) {
+                return Err(format!("zirv ctx pr watch: host '{}' is not a git remote host of this repository; allowed: {allowed}", pr.host).into());
+            }
             if store::load(&state, &owner, &a.url).is_some() {
                 writeln!(w, "zirv ctx pr watch: already watching {}", a.url)?;
                 return Ok(0);
@@ -170,6 +174,25 @@ pub(super) fn run_with<W: Write>(
             Ok(0)
         }
     }
+}
+
+/// Ok when `host` equals a host of one of `repo`'s git remotes; otherwise Err with the allowed hosts.
+fn trusted_host(repo: &Path, host: &str) -> Result<(), String> {
+    let remotes = worktree::run_git(repo, &["remote", "-v"]).unwrap_or_default();
+    let mut hosts: Vec<String> = remotes
+        .lines()
+        .filter_map(|line| parse::remote_host(line.split_whitespace().nth(1)?))
+        .collect();
+    hosts.sort();
+    hosts.dedup();
+    if hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+        return Ok(());
+    }
+    Err(if hosts.is_empty() {
+        "(none; the repository has no git remotes)".into()
+    } else {
+        hosts.join(", ")
+    })
 }
 
 /// Reads one watch under its try-lock, evaluates it and delivers wakes. Read failures are recorded, not mailed.
@@ -295,7 +318,9 @@ fn must(out: Out) -> Result<String, Failure> {
 }
 
 fn fetch(env: EnvLookup<'_>, rec: &WatchRecord) -> Result<Snapshot, Failure> {
-    let pr: PrRef = parse::parse_url(&rec.url).ok_or(Failure::NotFound)?;
+    let pr: PrRef = parse::parse_url(&rec.url).ok_or(Failure::UntrustedHost)?;
+    // The store can be edited: re-check before any CLI call carries the operator's token.
+    trusted_host(&rec.repo, &pr.host).map_err(|_| Failure::UntrustedHost)?;
     let (view, checks, viewer) = match pr.forge {
         Forge::Github => fetch_github(env, rec, &pr)?,
         Forge::Gitlab => fetch_gitlab(env, rec, &pr)?,
@@ -319,11 +344,7 @@ fn fetch(env: EnvLookup<'_>, rec: &WatchRecord) -> Result<Snapshot, Failure> {
 type Fetched = (View, Vec<Check>, Option<String>);
 
 fn fetch_github(env: EnvLookup<'_>, rec: &WatchRecord, pr: &PrRef) -> Result<Fetched, Failure> {
-    let host: Vec<(&str, &str)> = if pr.host == "github.com" {
-        Vec::new()
-    } else {
-        vec![("GH_HOST", &pr.host)]
-    };
+    let host = [("GH_HOST", pr.host.as_str())];
     let gh = |args: &[&str]| cli(env, "gh", args, &host);
     let mut view = parse::gh_view(&must(gh(&[
         "pr",
@@ -451,6 +472,13 @@ mod tests {
             for dir in [&home, &bin, &repo] {
                 std::fs::create_dir_all(dir).expect("mkdir");
             }
+            worktree::tests::init_repo(&repo);
+            for (name, url) in [
+                ("origin", "https://github.com/acme/widgets.git"),
+                ("lab", "https://gitlab.example.com/group/sub/proj.git"),
+            ] {
+                assert!(worktree::tests::run(&repo, &["remote", "add", name, url]));
+            }
             let env = HashMap::from([
                 ("PATH".to_string(), bin.display().to_string()),
                 (
@@ -475,8 +503,9 @@ mod tests {
             std::fs::write(
                 &path,
                 format!(
-                    "#!/bin/sh\nPATH=\"$PATH:/usr/bin:/bin\"\nF={}\ncase \"$1 $2\" in\n{body}\nesac\n",
-                    fixtures().display()
+                    "#!/bin/sh\nPATH=\"$PATH:/usr/bin:/bin\"\nF={}\necho \"GH_HOST=${{GH_HOST-unset}}\" >> \"{}.env\"\ncase \"$1 $2\" in\n{body}\nesac\n",
+                    fixtures().display(),
+                    path.display()
                 ),
             )
             .expect("write");
@@ -699,5 +728,83 @@ mod tests {
         assert!(rig.mails().is_empty(), "the busy poller sent nothing");
         drop(held);
         rig.poll_mailed();
+    }
+
+    #[test]
+    fn watch_refuses_hosts_that_are_not_git_remotes_ip_literals_and_ports() {
+        let rig = Rig::new();
+        for (url, needle) in [
+            (
+                "https://evil.example/acme/widgets/pull/1",
+                "github.com, gitlab.example.com",
+            ),
+            ("https://127.0.0.1/acme/widgets/pull/1", "not a GitHub"),
+            ("https://[::1]/acme/widgets/pull/1", "not a GitHub"),
+            (
+                "https://github.com:8443/acme/widgets/pull/1",
+                "not a GitHub",
+            ),
+        ] {
+            let err = rig
+                .pr(PrVerb::Watch(Rig::url_args(url)))
+                .expect_err(url)
+                .to_string();
+            assert!(err.contains(needle), "{url}: {err}");
+        }
+        assert!(
+            rig.pr(PrVerb::List(Rig::session_args()))
+                .expect("list")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn watch_accepts_hosts_of_ssh_and_scp_style_remotes_case_insensitively() {
+        let rig = Rig::new();
+        for (name, url) in [
+            ("ssh", "ssh://git@ghe.corp.example:2222/acme/widgets.git"),
+            ("scp", "git@GL.corp.example:group/proj.git"),
+        ] {
+            assert!(worktree::tests::run(
+                &rig.repo,
+                &["remote", "add", name, url]
+            ));
+        }
+        for url in [
+            "https://ghe.corp.example/acme/widgets/pull/1",
+            "https://gl.corp.example/group/proj/-/merge_requests/2",
+            "https://GitHub.com/acme/widgets/pull/3",
+        ] {
+            rig.pr(PrVerb::Watch(Rig::url_args(url))).expect(url);
+        }
+    }
+
+    #[test]
+    fn poll_refuses_a_tampered_stored_url_without_spawning_a_cli() {
+        let rig = Rig::new();
+        rig.gh_shim("gh-pr-view.json");
+        rig.watch(GH_URL);
+        let evil = "https://evil.example/acme/widgets/pull/12";
+        let mut rec = store::load(&rig.state(), OWNER, GH_URL).expect("record");
+        rec.url = evil.into();
+        store::remove(&rig.state(), OWNER, GH_URL);
+        store::save(&rig.state(), &rec).expect("save");
+        assert!(rig.poll().contains("error: untrusted_host"));
+        let rec = store::load(&rig.state(), OWNER, evil).expect("record");
+        assert_eq!(rec.last_error.map(|e| e.kind), Some(Failure::UntrustedHost));
+        assert!(!rig.bin.join("gh.env").exists(), "gh must not be spawned");
+    }
+
+    #[test]
+    fn github_calls_always_pin_gh_host_even_for_github_com() {
+        let rig = Rig::new();
+        rig.gh_shim("gh-pr-view.json");
+        rig.watch(GH_URL);
+        rig.poll_mailed();
+        let log = std::fs::read_to_string(rig.bin.join("gh.env")).expect("gh was spawned");
+        assert!(
+            log.lines().all(|line| line == "GH_HOST=github.com"),
+            "{log}"
+        );
     }
 }

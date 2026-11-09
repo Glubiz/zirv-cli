@@ -27,6 +27,8 @@ const MAX_NESTED_EXCLUDES: usize = 8;
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_CAP: usize = 256 * 1024;
 const CAPTURE_CAP: usize = 4 * 1024 * 1024;
+/// Sequence numbers one capture tries when a concurrent capture claimed them first.
+const MAX_SEQ_ATTEMPTS: usize = 4;
 
 /// Why a capture did nothing. The session is never affected by any of these.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -301,6 +303,11 @@ fn select_prune(entries: &[Entry], max: usize, ttl_secs: u64, now: u64) -> Vec<u
 
 /// Snapshots the work tree around `req.repo`; see the module docs for the mechanism.
 pub fn capture(req: &Request<'_>) -> Result<Captured, Skip> {
+    capture_with(req, &|| {})
+}
+
+/// [`capture`] with `after_seq_read` run between reading the existing refs and claiming a sequence number.
+fn capture_with(req: &Request<'_>, after_seq_read: &dyn Fn()) -> Result<Captured, Skip> {
     let short = sessions::short_id(req.session);
     if short.is_empty() {
         return Err(Skip::BadSession);
@@ -351,12 +358,13 @@ pub fn capture(req: &Request<'_>) -> Result<Captured, Skip> {
 
     let existing = entries(&top, Some(&short)).map_err(|e| e.skip("for-each-ref"))?;
     let previous = existing.iter().max_by_key(|e| e.seq);
-    let seq = previous.map_or(0, |e| e.seq.saturating_add(1));
-    let kind = if previous.is_none() {
+    let mut seq = previous.map_or(0, |e| e.seq.saturating_add(1));
+    let mut kind = if previous.is_none() {
         Kind::Baseline
     } else {
         Kind::Turn
     };
+    after_seq_read();
 
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let temp = TempIndex(git_dir.join(format!("zirv-ckpt-index-{}-{n}", std::process::id())));
@@ -411,37 +419,61 @@ pub fn capture(req: &Request<'_>) -> Result<Captured, Skip> {
 
     let tree = step(git(&top, Some(&temp.0)).arg("write-tree"), "write-tree")?;
     let tree = tree.trim();
-    let trailers = [
-        ("Zirv-Session", req.session.to_string()),
-        ("Zirv-Seq", seq.to_string()),
-        ("Zirv-Turn", req.turn.unwrap_or(seq).to_string()),
-        ("Zirv-Agent", req.agent.to_string()),
-        (
-            "Zirv-Head",
-            head.clone().unwrap_or_else(|| "unborn".to_string()),
-        ),
-        ("Zirv-Kind", kind.as_str().to_string()),
-        ("Zirv-Partial", partial.to_string()),
-    ]
-    .iter()
-    .map(|(key, value)| format!("{key}: {}", one_line(value)))
-    .collect::<Vec<_>>()
-    .join("\n");
-    let mut commit_tree = git(&top, None);
-    commit_tree.args(["commit-tree", tree]);
-    commit_tree.args([
-        "-m",
-        &format!("zirv checkpoint {short}/{seq}"),
-        "-m",
-        &trailers,
-    ]);
-    let commit = step(&mut commit_tree, "commit-tree")?.trim().to_string();
+    let commit = 'claim: {
+        for _ in 0..MAX_SEQ_ATTEMPTS {
+            let trailers = [
+                ("Zirv-Session", req.session.to_string()),
+                ("Zirv-Seq", seq.to_string()),
+                ("Zirv-Turn", req.turn.unwrap_or(seq).to_string()),
+                ("Zirv-Agent", req.agent.to_string()),
+                (
+                    "Zirv-Head",
+                    head.clone().unwrap_or_else(|| "unborn".to_string()),
+                ),
+                ("Zirv-Kind", kind.as_str().to_string()),
+                ("Zirv-Partial", partial.to_string()),
+            ]
+            .iter()
+            .map(|(key, value)| format!("{key}: {}", one_line(value)))
+            .collect::<Vec<_>>()
+            .join("\n");
+            let mut commit_tree = git(&top, None);
+            commit_tree.args(["commit-tree", tree]);
+            commit_tree.args([
+                "-m",
+                &format!("zirv checkpoint {short}/{seq}"),
+                "-m",
+                &trailers,
+            ]);
+            let commit = step(&mut commit_tree, "commit-tree")?.trim().to_string();
 
-    let refname = format!("{REF_PREFIX}{short}/{seq}");
-    step(
-        git(&top, None).args(["update-ref", &refname, &commit]),
-        "update-ref",
-    )?;
+            let refname = format!("{REF_PREFIX}{short}/{seq}");
+            // Create-only (all-zero old value) so a concurrent capture's ref is never overwritten.
+            let zero = "0".repeat(commit.len());
+            let created = step(
+                git(&top, None).args(["update-ref", &refname, &commit, &zero]),
+                "update-ref",
+            );
+            let Err(failure) = created else {
+                break 'claim commit;
+            };
+            let taken = run_bounded(
+                git(&top, None).args(["rev-parse", "--verify", "-q", &refname]),
+                remaining(),
+                READ_CAP,
+            )
+            .is_ok();
+            if !taken {
+                return Err(failure);
+            }
+            seq = seq.saturating_add(1);
+            kind = Kind::Turn;
+        }
+        return Err(Skip::Git {
+            step: "update-ref".to_string(),
+            message: format!("sequence numbers up to {seq} were all taken concurrently"),
+        });
+    };
 
     let mut all = existing;
     all.push(Entry {
@@ -1268,5 +1300,107 @@ mod tests {
             .expect("load")
             .checkpoint;
         assert!(cfg.enabled, "the operator environment may enable");
+    }
+
+    #[test]
+    fn a_sequence_claimed_concurrently_is_never_overwritten_and_the_capture_takes_the_next() {
+        if !git_available() {
+            return;
+        }
+        let dir = repo();
+        let p = dir.path();
+        let first = snap(p, "sess1234abcd", &cfg()).expect("first");
+        let taken = "refs/zirv/checkpoints/sess1234/1";
+        let rival = || {
+            assert!(git_ok(p, &["update-ref", taken, &first.commit]));
+        };
+        std::fs::write(p.join("b.txt"), "b\n").expect("write");
+        let cfg = cfg();
+        let done = capture_with(
+            &Request {
+                repo: p,
+                session: "sess1234abcd",
+                agent: "claude",
+                turn: None,
+                cfg: &cfg,
+            },
+            &rival,
+        )
+        .expect("capture retries");
+        assert_eq!(done.seq, 2);
+        assert_eq!(git_out(p, &["rev-parse", taken]).trim(), first.commit);
+        assert_eq!(
+            git_out(p, &["rev-parse", "refs/zirv/checkpoints/sess1234/2"]).trim(),
+            done.commit
+        );
+        assert_eq!(done.kind, Kind::Turn);
+    }
+
+    #[test]
+    fn a_zero_capture_timeout_kills_git_and_leaves_no_temp_index_or_lock() {
+        if !git_available() {
+            return;
+        }
+        let dir = repo();
+        let p = dir.path();
+        let instant = CheckpointConfig {
+            capture_timeout_secs: 0,
+            ..cfg()
+        };
+        let result = snap(p, "sess1234abcd", &instant);
+        assert!(matches!(result, Err(Skip::Timeout(_))), "{result:?}");
+        assert!(leftovers(p).is_empty());
+        assert!(!p.join(".git/index.lock").exists());
+        assert!(git_out(p, &["for-each-ref", "refs/zirv"]).is_empty());
+    }
+
+    #[test]
+    fn checkpoint_git_commands_clear_ambient_repository_redirects() {
+        let index = Path::new("/tmp/zirv-ckpt-index-test");
+        let cmd = git(Path::new("."), Some(index));
+        let envs: Vec<_> = cmd.get_envs().collect();
+        for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"] {
+            assert!(
+                envs.iter().any(|(k, v)| *k == key && v.is_none()),
+                "{key} must be removed from the spawned command: {envs:?}"
+            );
+        }
+        let pinned = envs.iter().find(|(k, _)| *k == "GIT_INDEX_FILE");
+        assert_eq!(pinned.and_then(|(_, v)| *v), Some(index.as_os_str()));
+        let plain = git(Path::new("."), None);
+        assert!(
+            plain
+                .get_envs()
+                .any(|(k, v)| k == "GIT_INDEX_FILE" && v.is_none())
+        );
+    }
+
+    #[test]
+    fn pruning_one_session_leaves_another_sessions_refs_intact() {
+        if !git_available() {
+            return;
+        }
+        let dir = repo();
+        let p = dir.path();
+        let roomy = cfg();
+        let tight = CheckpointConfig {
+            max_per_session: 1,
+            ..cfg()
+        };
+        for _ in 0..2 {
+            snap(p, "bbbbbbbb", &roomy).expect("b capture");
+        }
+        for _ in 0..3 {
+            snap(p, "aaaaaaaa", &tight).expect("a capture");
+        }
+        let refs = git_out(p, &["for-each-ref", "--format=%(refname)", "refs/zirv"]);
+        assert_eq!(
+            refs.lines().collect::<Vec<_>>(),
+            vec![
+                "refs/zirv/checkpoints/aaaaaaaa/2",
+                "refs/zirv/checkpoints/bbbbbbbb/0",
+                "refs/zirv/checkpoints/bbbbbbbb/1"
+            ]
+        );
     }
 }

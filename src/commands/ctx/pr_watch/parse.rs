@@ -42,6 +42,7 @@ pub enum Failure {
     NotFound,
     RateLimited,
     Transient,
+    UntrustedHost,
 }
 
 impl Failure {
@@ -52,19 +53,21 @@ impl Failure {
             Self::NotFound => "not_found",
             Self::RateLimited => "rate_limited",
             Self::Transient => "transient",
+            Self::UntrustedHost => "untrusted_host",
         }
     }
 }
 
-/// `https://<host>/<repo>/pull/<n>` (GitHub) or `https://<host>/<group>/<repo>/-/merge_requests/<n>` (GitLab).
+/// `https://<host>/<repo>/pull/<n>` (GitHub; no port, no IP-literal host) or `https://<host>/<group>/<repo>/-/merge_requests/<n>` (GitLab).
 pub(super) fn parse_url(url: &str) -> Option<PrRef> {
     let rest = url.strip_prefix("https://")?;
     let (host, path) = rest.split_once('/')?;
     let host_ok = !host.is_empty()
         && host
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':')
-        && !host.starts_with('-');
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        && !host.starts_with('-')
+        && host.parse::<std::net::Ipv4Addr>().is_err();
     if !host_ok {
         return None;
     }
@@ -99,6 +102,21 @@ pub(super) fn parse_url(url: &str) -> Option<PrRef> {
         });
     }
     None
+}
+
+/// The host of one git remote URL: `https://host/..`, `ssh://[user@]host[:port]/..` or scp-style `user@host:path`.
+pub(super) fn remote_host(url: &str) -> Option<String> {
+    let url = url.trim();
+    let authority = match url.split_once("://") {
+        Some((_, rest)) => rest.split('/').next()?,
+        None => url.split_once(':')?.0,
+    };
+    let host_port = authority.rsplit('@').next()?;
+    if host_port.starts_with('[') {
+        return None;
+    }
+    let host = host_port.split(':').next()?;
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
 fn json(text: &str) -> Result<Value, String> {
@@ -343,20 +361,34 @@ pub(super) fn glab_discussions(text: &str) -> Result<Vec<Comment>, String> {
 pub(super) fn classify_failure(text: &str) -> Failure {
     let lower = text.to_lowercase();
     let has = |needles: &[&str]| needles.iter().any(|n| lower.contains(n));
-    if has(&["rate limit", "429", "too many requests", "403"]) {
+    // A bare code also matches PR numbers and URLs (`/pulls/1404/`); only the CLIs' status phrasings count.
+    let status = |code: &str| {
+        [
+            "http ",
+            "http/1.1 ",
+            "http/2 ",
+            "status ",
+            "status: ",
+            "status\":\"",
+            "status\": ",
+        ]
+        .iter()
+        .any(|prefix| lower.contains(&format!("{prefix}{code}")))
+    };
+    if has(&["rate limit", "too many requests"]) || status("429") || status("403") {
         return Failure::RateLimited;
     }
-    if has(&["404", "not found", "could not resolve"]) {
+    if has(&["not found", "could not resolve"]) || status("404") {
         return Failure::NotFound;
     }
     if has(&[
         "auth login",
-        "401",
         "bad credentials",
         "not logged",
         "authentication",
         "unauthorized",
-    ]) {
+    ]) || status("401")
+    {
         return Failure::Auth;
     }
     Failure::Transient
@@ -409,6 +441,10 @@ mod tests {
             "https://-evil/a/b/pull/1",
             "--flag",
             "https://github.com/a/b/pull/1 --extra",
+            "https://github.com:8443/a/b/pull/1",
+            "https://127.0.0.1/a/b/pull/1",
+            "https://[::1]/a/b/pull/1",
+            "https://[::1]:443/a/b/pull/1",
         ] {
             assert!(parse_url(bad).is_none(), "{bad}");
         }
@@ -586,5 +622,44 @@ mod tests {
             classify_failure("connection reset by peer"),
             Failure::Transient
         );
+    }
+
+    #[test]
+    fn a_5xx_naming_a_pull_number_with_a_status_code_inside_is_transient() {
+        assert_eq!(
+            classify_failure(
+                "HTTP 502: Bad Gateway (https://api.github.com/repos/a/b/pulls/1404/comments)"
+            ),
+            Failure::Transient
+        );
+        assert_eq!(
+            classify_failure("glab: GET https://h/api/v4/projects/g%2Fp/merge_requests/403: 500"),
+            Failure::Transient
+        );
+        assert_eq!(classify_failure("HTTP 404: Not Found"), Failure::NotFound);
+        assert_eq!(
+            classify_failure("HTTP 403: Forbidden"),
+            Failure::RateLimited
+        );
+        assert_eq!(classify_failure("HTTP 401"), Failure::Auth);
+    }
+
+    #[test]
+    fn remote_hosts_come_from_https_ssh_and_scp_style_urls() {
+        for (url, host) in [
+            ("https://GitHub.com/a/b.git", Some("github.com")),
+            (
+                "https://user:tok@gitlab.example.com/g/p.git",
+                Some("gitlab.example.com"),
+            ),
+            (
+                "ssh://git@ghe.corp.example:2222/a/b.git",
+                Some("ghe.corp.example"),
+            ),
+            ("git@gitlab.cego.dk:group/proj.git", Some("gitlab.cego.dk")),
+            ("/srv/git/local.git", None),
+        ] {
+            assert_eq!(remote_host(url).as_deref(), host, "{url}");
+        }
     }
 }

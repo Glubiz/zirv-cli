@@ -1295,10 +1295,10 @@ checks failed or passed (the required checks gate, falling back to all checks;
 a GitLab pipeline is the gate), new reviewer comments, a merge conflict, no
 checks reported after `no_checks_minutes` (only where the repo has CI config),
 and a final note when the PR is merged or closed, after which the watch is
-deleted. Reviewer text is quoted, truncated and labelled untrusted. A new head
+deleted. A PR URL is accepted only when its host equals (case-insensitively) the host of one of the repository's git remotes (https, `ssh://` or scp-style); IP-literal hosts and explicit ports are always refused, at `watch` and again at `poll` (`untrusted_host`), so the inherited `gh`/`glab` token only ever reaches a host the repo already pushes to; `GH_HOST` is always pinned to the PR host. Reviewer text is quoted, truncated and labelled untrusted. A new head
 commit resets what was already reported; your own comments are ignored;
 `max_wakes` consecutive comment-only wakes stop the watch. Read failures
-(`no_cli`, `auth`, `not_found`, `rate_limited`, `transient`) are recorded as
+(`no_cli`, `auth`, `not_found`, `rate_limited`, `transient`, `untrusted_host`) are recorded as
 `last_error` and shown by `list`, never mailed; two `not_found` in a row or
 eight failures in a row stop the watch. Records live under
 `<state>/pr-watch/<session short>/`. No background poller exists yet: `poll` is
@@ -7109,7 +7109,9 @@ byte-for-byte untouched. Metadata is carried in commit trailers
 `Zirv-Kind`, `Zirv-Partial`); there is no state file. A nested repository
 without commits is left out of the snapshot (capped at 8 per capture), and a
 repository with `assume-unchanged`/`skip-worktree` entries is marked
-`Zirv-Partial: true`.
+`Zirv-Partial: true`. The ref is created create-only: if a concurrent capture
+already claimed the sequence number, the capture retries with the next one (up
+to 4 times) and never overwrites the other's ref.
 
 ```toml
 [checkpoint]
