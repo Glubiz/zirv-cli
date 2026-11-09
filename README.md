@@ -2913,6 +2913,11 @@ Repository waivers are advisory only: they can disposition advisory craft
 findings, but only the operator-owned file can waive a blocking accessibility
 finding.
 
+`zirv workflow advance --accept-preexisting-findings` accepts pre-existing
+blocking findings; `--accept-introduced-findings <REASON>` accepts introduced
+ones judged false positives (the reason is mandatory and recorded on the
+workflow; it also accepts pre-existing findings).
+
 [Glubiz/zirv-generic-frontend](https://github.com/Glubiz/zirv-generic-frontend)
 is the reference frontend template built against this contract — it is also
 the source behind [cli.zirv.io](https://cli.zirv.io), the site rendering this
