@@ -550,8 +550,9 @@ fn shell_quote(value: &str) -> String {
 }
 
 /// Verbs that reach outside the checkout; the flag marks verbs that only count at the start of a line or segment.
-const OUTWARD_VERBS: [(&str, bool); 13] = [
+const OUTWARD_VERBS: [(&str, bool); 14] = [
     ("docker push", false),
+    ("docker image push", false),
     ("--push", false),
     ("git push", false),
     ("kubectl apply", false),
@@ -569,16 +570,26 @@ const OUTWARD_VERBS: [(&str, bool); 13] = [
 /// Risk reduction for CI replay, not a guarantee: true when the script text contains an outward-reaching verb.
 fn outward_command(script: &str) -> bool {
     let lower = script.to_ascii_lowercase();
-    let segments: Vec<&str> = lower
+    // Segments with whitespace collapsed and any leading `sudo` or `NAME=value` dropped.
+    let segments: Vec<String> = lower
         .split(['\n', ';', '&', '|', '('])
-        .map(str::trim_start)
+        .map(|segment| {
+            let mut words = segment.split_whitespace().peekable();
+            while words
+                .next_if(|word| *word == "sudo" || word.contains('='))
+                .is_some()
+            {}
+            words.collect::<Vec<_>>().join(" ")
+        })
         .collect();
     OUTWARD_VERBS.iter().any(|&(verb, at_start)| {
-        if at_start {
-            segments.iter().any(|segment| segment.starts_with(verb))
-        } else {
-            lower.contains(verb)
-        }
+        segments.iter().any(|segment| {
+            if at_start {
+                segment.starts_with(verb)
+            } else {
+                segment.contains(verb)
+            }
+        })
     })
 }
 
@@ -618,11 +629,10 @@ fn discover_gitlab_checks(repo: &Path, notes: &mut Vec<String>) -> Vec<CheckSpec
     let cache = repo.join(".gitlab-ci-local").join("expanded-gitlab-ci.yml");
     let mut docs: Vec<(bool, serde_yaml_ng::Value)> = Vec::new();
     let root_doc = read_ci_yaml(&root, notes);
-    if root_doc
+    let has_include = root_doc
         .as_ref()
-        .is_some_and(|doc| doc.get("include").is_some())
-        && !cache.is_file()
-    {
+        .is_some_and(|doc| doc.get("include").is_some());
+    if has_include && !cache.is_file() {
         notes.push(
             "CI coverage gap: .gitlab-ci.yml uses include: but no expanded cache exists; run \
              `gitlab-ci-local --list` once so zirv can see included jobs"
@@ -640,6 +650,23 @@ fn discover_gitlab_checks(repo: &Path, notes: &mut Vec<String>) -> Vec<CheckSpec
             );
         }
         docs.extend(read_ci_yaml(&cache, notes).map(|doc| (true, doc)));
+    }
+    // gitlab-ci-local runs global scripts for every job, so an outward one drops all checks.
+    let global_outward = docs.iter().any(|(_, doc)| {
+        ["before_script", "after_script"].iter().any(|key| {
+            [Some(doc), doc.get("default")]
+                .into_iter()
+                .flatten()
+                .filter_map(|scope| scope.get(key))
+                .any(|script| outward_command(&script_lines(script).join("\n")))
+        })
+    });
+    if global_outward {
+        notes.push(
+            "CI coverage gap: GitLab checks skipped: a global before_script/after_script runs an outward command"
+                .to_string(),
+        );
+        return Vec::new();
     }
     // The cache is fully resolved by gitlab-ci-local, so its copy of a job wins over the root copy.
     let mut jobs: Vec<GitlabJob> = Vec::new();
@@ -663,17 +690,23 @@ fn discover_gitlab_checks(repo: &Path, notes: &mut Vec<String>) -> Vec<CheckSpec
     }
     let mut names: Vec<String> = Vec::new();
     let mut unresolved = 0;
-    for (name, _, _) in jobs.iter().filter(|job| !job.0.starts_with('.')) {
-        let Ok(stage) = gitlab_field(&jobs, name, "stage", 0) else {
+    let mut fragments = 0;
+    for (name, _, cached) in jobs.iter().filter(|job| !job.0.starts_with('.')) {
+        let Ok(stage) = gitlab_field(&jobs, name, "stage", 0, &mut Vec::new()) else {
             unresolved += 1;
             continue;
         };
+        // A root job without a cache copy may only override an included job.
+        if has_include && !cached && stage.is_none() {
+            fragments += 1;
+            continue;
+        }
         if stage.and_then(|stage| stage.as_str()).unwrap_or("test") != "test" {
             continue;
         }
         let fields: Result<Vec<_>, ()> = ["when", "trigger", "rules"]
             .iter()
-            .map(|key| gitlab_field(&jobs, name, key, 0))
+            .map(|key| gitlab_field(&jobs, name, key, 0, &mut Vec::new()))
             .collect();
         let Ok(fields) = fields else {
             unresolved += 1;
@@ -697,6 +730,11 @@ fn discover_gitlab_checks(repo: &Path, notes: &mut Vec<String>) -> Vec<CheckSpec
     if unresolved > 0 {
         notes.push(format!(
             "CI coverage gap: {unresolved} GitLab job(s) skipped: stage can't be determined (unresolved extends)"
+        ));
+    }
+    if fragments > 0 {
+        notes.push(format!(
+            "CI coverage gap: {fragments} GitLab job(s) skipped: stage can't be determined (job may be defined by an include)"
         ));
     }
     let (safe, unsafe_names): (Vec<String>, Vec<String>) =
@@ -727,12 +765,13 @@ fn discover_gitlab_checks(repo: &Path, notes: &mut Vec<String>) -> Vec<CheckSpec
 /// A job name, its body, and whether it came from the fully resolved gitlab-ci-local cache.
 type GitlabJob<'a> = (String, &'a serde_yaml_ng::Mapping, bool);
 
-/// A job's `key`, following `extends` (string or list) recursively; Err when an extends target is missing or cyclic.
+/// A job's `key`, following `extends` (string or list; later entries win); Err when an extends target is missing or cyclic.
 fn gitlab_field<'a>(
     jobs: &'a [GitlabJob<'a>],
     name: &str,
     key: &str,
     depth: usize,
+    visited: &mut Vec<String>,
 ) -> Result<Option<&'a serde_yaml_ng::Value>, ()> {
     let Some((_, body, cached)) = jobs.iter().find(|job| job.0 == name) else {
         return Err(());
@@ -753,13 +792,27 @@ fn gitlab_field<'a>(
         Some(list) => list.iter().collect(),
         None => vec![extends],
     };
-    for parent in parents {
+    for parent in parents.into_iter().rev() {
         let parent = parent.as_str().ok_or(())?;
-        if let Some(value) = gitlab_field(jobs, parent, key, depth + 1)? {
+        // A template already fully resolved in this lookup had no value (a diamond), so skip it.
+        if visited.iter().any(|seen| seen == parent) {
+            continue;
+        }
+        if let Some(value) = gitlab_field(jobs, parent, key, depth + 1, visited)? {
             return Ok(Some(value));
         }
     }
+    visited.push(name.to_string());
     Ok(None)
+}
+
+/// The command lines of a GitLab script value: a string, or a (possibly nested) sequence of them.
+fn script_lines(value: &serde_yaml_ng::Value) -> Vec<&str> {
+    match value {
+        serde_yaml_ng::Value::String(line) => vec![line],
+        serde_yaml_ng::Value::Sequence(items) => items.iter().flat_map(script_lines).collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// The first job in `name`'s transitive `needs:` chain (itself included) that deploys (`environment:`), runs an outward command, cannot be resolved, or (needed jobs) is outside `.pre`/`build`/`test`.
@@ -780,7 +833,7 @@ fn gitlab_risky_need(jobs: &[GitlabJob], name: &str) -> Option<String> {
             "after_script",
         ]
         .iter()
-        .map(|key| gitlab_field(jobs, &current, key, 0))
+        .map(|key| gitlab_field(jobs, &current, key, 0, &mut Vec::new()))
         .collect();
         let Ok(fields) = fields else {
             return Some(current);
@@ -792,13 +845,8 @@ fn gitlab_risky_need(jobs: &[GitlabJob], name: &str) -> Option<String> {
         let script: Vec<&str> = scripts
             .iter()
             .flatten()
-            .flat_map(|value| match value.as_str() {
-                Some(line) => vec![line],
-                None => value
-                    .as_sequence()
-                    .map(|lines| lines.iter().filter_map(|line| line.as_str()).collect())
-                    .unwrap_or_default(),
-            })
+            .copied()
+            .flat_map(script_lines)
             .collect();
         let late_stage = current != name && !matches!(stage, ".pre" | "build" | "test");
         if late_stage || environment.is_some() || outward_command(&script.join("\n")) {
@@ -887,6 +935,7 @@ fn gha_step(
     step: &serde_yaml_ng::Value,
     known: &std::collections::BTreeSet<String>,
     default_dir: Option<&str>,
+    default_shell: Option<&str>,
 ) -> Result<GhaStep, &'static str> {
     if let Some(uses) = step.get("uses").and_then(|uses| uses.as_str()) {
         return if uses.starts_with("rustsec/audit-check") {
@@ -903,7 +952,10 @@ fn gha_step(
     let lower = text.to_ascii_lowercase();
     // `--release` is a build profile, not a release step.
     let words = lower.replace("--release", "");
-    let shell = step.get("shell").and_then(|shell| shell.as_str());
+    let shell = step
+        .get("shell")
+        .and_then(|shell| shell.as_str())
+        .or(default_shell);
     let piped_installer = lower.contains("curl")
         && ["| sh", "|sh", "| bash", "|bash"]
             .iter()
@@ -1044,7 +1096,12 @@ fn discover_gha_checks(
             let mut commands = Vec::new();
             let steps = job.get("steps").and_then(|steps| steps.as_sequence());
             for step in steps.into_iter().flatten() {
-                match gha_step(step, known, default_dir.and_then(|dir| dir.as_str())) {
+                match gha_step(
+                    step,
+                    known,
+                    default_dir.and_then(|dir| dir.as_str()),
+                    default_shell.and_then(|shell| shell.as_str()),
+                ) {
                     Ok(GhaStep::Run(command)) => commands.push(command),
                     Ok(GhaStep::Audit) => audit = true,
                     Err(reason) => *skipped.entry(("step", reason)).or_default() += 1,
@@ -4067,7 +4124,7 @@ mod tests {
         ci_write(
             repo.path(),
             ".gitlab-ci-local/expanded-gitlab-ci.yml",
-            "phpstan:\n  stage: test\n  script: [x]\nmanual-test:\n  stage: test\n  when: manual\n  script: [x]\nnever-test:\n  stage: test\n  when: never\n  script: [x]\ndeploy:\n  stage: deploy\n  script: [x]\n",
+            "phpunit:\n  script: [phpunit]\ndefault-stage:\n  script: [x]\nphpstan:\n  stage: test\n  script: [x]\nmanual-test:\n  stage: test\n  when: manual\n  script: [x]\nnever-test:\n  stage: test\n  when: never\n  script: [x]\ndeploy:\n  stage: deploy\n  script: [x]\n",
         );
         let resolved = load_or_discover(repo.path()).unwrap();
         assert_eq!(
@@ -4092,6 +4149,33 @@ mod tests {
             !has_note(&resolved, "gitlab-ci-local --list"),
             "{:?}",
             resolved.notes
+        );
+    }
+
+    #[test]
+    fn gitlab_include_override_fragments_without_a_stage_are_dropped() {
+        let repo = tempdir().unwrap();
+        ci_write(
+            repo.path(),
+            ".gitlab-ci.yml",
+            "include:\n  - project: grp/t\n    file: module.yml\ndocker-image:\n  variables:\n    A: b\nvitest:\n  coverage: \"/x/\"\nexplicit:\n  stage: test\n  script: [\"npm test\"]\n",
+        );
+        let resolved = load_or_discover(repo.path()).unwrap();
+        assert_eq!(ids(&resolved), ["gitlab-explicit"]);
+        assert!(
+            has_note(&resolved, "may be defined by an include"),
+            "{:?}",
+            resolved.notes
+        );
+        let control = tempdir().unwrap();
+        ci_write(
+            control.path(),
+            ".gitlab-ci.yml",
+            "lint:\n  script: [\"npm run lint\"]\n",
+        );
+        assert_eq!(
+            ids(&load_or_discover(control.path()).unwrap()),
+            ["gitlab-lint"]
         );
     }
 
@@ -4324,6 +4408,92 @@ mod tests {
     }
 
     #[test]
+    fn gitlab_later_extends_entries_override_earlier_ones() {
+        let repo = tempdir().unwrap();
+        ci_write(
+            repo.path(),
+            ".gitlab-ci.yml",
+            ".a:\n  stage: test\n.b:\n  stage: deploy\n.auto:\n  when: on_success\n.manual:\n  when: manual\njob1:\n  extends: [.a, .b]\n  script: [x]\njob2:\n  extends: [.b, .a]\n  script: [x]\njob3:\n  extends: [.auto, .manual]\n  stage: test\n  script: [x]\n",
+        );
+        assert_eq!(
+            ids(&load_or_discover(repo.path()).unwrap()),
+            ["gitlab-job2"]
+        );
+    }
+
+    #[test]
+    fn gitlab_wide_deep_extends_graph_resolves_quickly() {
+        let repo = tempdir().unwrap();
+        let mut yaml = String::new();
+        for level in 0..16 {
+            for index in 0..20 {
+                yaml.push_str(&format!(".t{level}-{index}:\n  extends: ["));
+                let next: Vec<String> = (0..20).map(|i| format!(".t{}-{i}", level + 1)).collect();
+                yaml.push_str(&if level < 15 {
+                    next.join(", ")
+                } else {
+                    String::new()
+                });
+                yaml.push_str("]\n");
+            }
+        }
+        let top: Vec<String> = (0..20).map(|i| format!(".t0-{i}")).collect();
+        yaml.push_str(&format!(
+            "job:\n  extends: [{}]\n  script: [x]\n",
+            top.join(", ")
+        ));
+        ci_write(repo.path(), ".gitlab-ci.yml", &yaml);
+        let started = std::time::Instant::now();
+        let resolved = load_or_discover(repo.path()).unwrap();
+        assert!(started.elapsed().as_secs() < 5);
+        assert_eq!(ids(&resolved), ["gitlab-job"]);
+    }
+
+    #[test]
+    fn gitlab_global_scripts_with_outward_commands_drop_all_checks() {
+        let repo = tempdir().unwrap();
+        ci_write(
+            repo.path(),
+            ".gitlab-ci.yml",
+            "default:\n  before_script: [\"docker push x\"]\nphpunit:\n  stage: test\n  script: [phpunit]\n",
+        );
+        let resolved = load_or_discover(repo.path()).unwrap();
+        assert!(resolved.checks.is_empty(), "{:?}", ids(&resolved));
+        assert!(has_note(&resolved, "global"), "{:?}", resolved.notes);
+    }
+
+    #[test]
+    fn gitlab_nested_script_sequences_are_screened() {
+        let repo = tempdir().unwrap();
+        ci_write(
+            repo.path(),
+            ".gitlab-ci.yml",
+            "pushy:\n  stage: test\n  script:\n    - [\"echo hi\", \"git push origin main\"]\nok:\n  stage: test\n  script: [x]\n",
+        );
+        assert_eq!(ids(&load_or_discover(repo.path()).unwrap()), ["gitlab-ok"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_default_shell_bash_enables_pipefail() {
+        let repo = tempdir().unwrap();
+        ci_write(
+            repo.path(),
+            ".github/workflows/ci.yml",
+            "on: pull_request\ndefaults:\n  run:\n    shell: bash\njobs:\n  verify:\n    runs-on: ubuntu-latest\n    steps:\n      - run: false | true\n",
+        );
+        let resolved = load_or_discover(repo.path()).unwrap();
+        assert_eq!(ids(&resolved), ["gha-verify"]);
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(&resolved.checks[0].spec.command)
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "{status:?}");
+    }
+
+    #[test]
     fn outward_denylist_matches_specific_verbs_only() {
         for outward in [
             "Docker Push img",
@@ -4333,6 +4503,10 @@ mod tests {
             "a && gcloud run deploy",
             "kubectl apply -f x",
             "terraform apply",
+            "docker  push x",
+            "docker image push x",
+            "FOO=1 aws s3 cp a b",
+            "sudo aws s3 ls",
         ] {
             assert!(outward_command(outward), "{outward}");
         }
@@ -4341,6 +4515,7 @@ mod tests {
             "composer install",
             "echo gh",
             "laws s3 ls",
+            "echo pushd",
         ] {
             assert!(!outward_command(inward), "{inward}");
         }

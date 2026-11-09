@@ -1570,7 +1570,8 @@ protocol and harness: [docs/benchmarks/wrapped-vs-vanilla.md](docs/benchmarks/wr
   `needs:` chain reaches a stage other than `.pre`/`build`/`test` or a script
   with an outward verb (`docker push`, `git push`, `kubectl apply`,
   `terraform apply`, `npm publish`, `aws`/`gcloud`/`gh` ...) is dropped,
-  because `--needs` runs that chain too. Each GitHub Actions job in a
+  because `--needs` runs that chain too; an outward verb in a global
+  `before_script`/`after_script` (or `default:`) drops every GitLab check. Each GitHub Actions job in a
   `pull_request` workflow (push-only workflows are ignored; skipped entirely
   on Windows, whose default shell is pwsh) whose literal `runs-on` matches this
   host (on macOS `ubuntu-*` jobs are accepted as a POSIX approximation)
