@@ -3316,6 +3316,16 @@ literals_file = "~/.zirv/obfuscate-literals.txt"
 patterns = [{ kind = "customer_id", regex = "CUST-[0-9]{8}" }]
 ```
 
+Encoded forms of secrets are masked too. For every secret in the vault (and
+every operator literal) of at least 8 characters, output containing its base64
+(standard and URL-safe, unpadded), percent-encoded (when it differs), lower- or
+upper-case hex, or reversed form is replaced with the fixed marker
+`ZIRV_REDACTED_ENCODED`. The marker is not a `ZIRV_SECRET_*` placeholder, so it
+is never rehydrated (rehydrating would put the raw value where the encoded one
+stood). Fragment or partial matching is deliberately not done: matching a
+substring of a secret (the T3 eval counts a 60% fragment) would mask ordinary
+output.
+
 `zirv ctx obfuscate list` reports kinds, counts and first-seen surfaces without
 values; `reveal <placeholder>` prints one value locally and records the audit
 action; `scan [transcript]` detects without storing; and `purge` deletes the

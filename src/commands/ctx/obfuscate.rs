@@ -30,6 +30,61 @@ pub struct VaultEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Vault {
     entries: Vec<VaultEntry>,
+    /// Encoded forms of secret values, computed once per load/insert.
+    variants: Vec<String>,
+}
+
+/// Replaces encoded forms of vault secrets. It is not a `ZIRV_SECRET_`/`ZIRV_PII_`
+/// placeholder, so `rehydrate` never turns it back into a value.
+pub const ENCODED_MARKER: &str = "ZIRV_REDACTED_ENCODED";
+
+const MIN_VARIANT_LEN: usize = 8;
+
+fn base64_nopad(bytes: &[u8], alphabet: &[u8; 64]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |acc, (i, b)| acc | (u32::from(*b) << (16 - 8 * i)));
+        for i in 0..=chunk.len() {
+            out.push(char::from(alphabet[((n >> (18 - 6 * i)) & 63) as usize]));
+        }
+    }
+    out
+}
+
+/// Base64 (standard and URL-safe, unpadded), percent, lower/upper hex and
+/// reversed forms of `value` that differ from it. Empty below the length floor.
+fn encoded_variants(value: &str) -> Vec<String> {
+    if value.chars().count() < MIN_VARIANT_LEN {
+        return Vec::new();
+    }
+    const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let bytes = value.as_bytes();
+    let mut percent = String::with_capacity(value.len() * 3);
+    let mut hex = String::with_capacity(value.len() * 2);
+    for byte in bytes {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            percent.push(char::from(*byte));
+        } else {
+            percent.push_str(&format!("%{byte:02X}"));
+        }
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    let mut variants = vec![
+        base64_nopad(bytes, STD),
+        base64_nopad(bytes, URL),
+        percent,
+        hex.to_ascii_uppercase(),
+        hex,
+        value.chars().rev().collect(),
+    ];
+    variants.retain(|variant| variant != value);
+    variants.sort();
+    variants.dedup();
+    variants
 }
 
 impl Vault {
@@ -49,7 +104,12 @@ impl Vault {
                 return Err("duplicate value or placeholder in obfuscation vault".to_string());
             }
         }
-        Ok(Self { entries })
+        let variants = entries
+            .iter()
+            .filter(|entry| entry.class == ValueClass::Secret)
+            .flat_map(|entry| encoded_variants(&entry.value))
+            .collect();
+        Ok(Self { entries, variants })
     }
 
     pub fn entries(&self) -> &[VaultEntry] {
@@ -76,6 +136,9 @@ impl Vault {
             .count()
             + 1;
         let placeholder = format!("{prefix}_{kind}_{next}");
+        if class == ValueClass::Secret {
+            self.variants.extend(encoded_variants(value));
+        }
         self.entries.push(VaultEntry {
             value: value.to_string(),
             placeholder: placeholder.clone(),
@@ -155,6 +218,8 @@ struct Candidate {
     kind: String,
     class: ValueClass,
     entropy_only: bool,
+    /// Encoded form of a vault secret: masked with `ENCODED_MARKER`, never stored.
+    encoded: bool,
 }
 
 impl Candidate {
@@ -181,6 +246,7 @@ pub fn obfuscate(
         .map(|(full, _)| (full.start(), full.end()))
         .collect();
     let mut candidates = candidates(text, options);
+    candidates.extend(encoded_candidates(text, vault, options));
     candidates.retain(|candidate| {
         !allowed
             .iter()
@@ -213,6 +279,19 @@ pub fn obfuscate(
     let mut findings = Vec::with_capacity(selected.len());
     for candidate in selected.into_values() {
         let value = &text[candidate.start..candidate.end];
+        if candidate.encoded {
+            let replace = candidate.replaces(options);
+            output.push_str(&text[cursor..candidate.start]);
+            output.push_str(if replace { ENCODED_MARKER } else { value });
+            cursor = candidate.end;
+            findings.push(Finding {
+                kind: candidate.kind,
+                class: candidate.class,
+                placeholder: ENCODED_MARKER.to_string(),
+                replaced: replace,
+            });
+            continue;
+        }
         let stem = vault.insert(value, &candidate.kind, candidate.class, surface);
         let replacement = if candidate.kind == "EMAIL" && options.email_domain == EmailDomain::Keep
         {
@@ -282,6 +361,28 @@ fn placeholders(text: &str) -> impl Iterator<Item = (regex::Match<'_>, regex::Ma
 
 pub fn contains_placeholder(text: &str) -> bool {
     text.contains("ZIRV_SECRET_") || text.contains("ZIRV_PII_")
+}
+
+fn encoded_candidates(text: &str, vault: &Vault, options: &Options) -> Vec<Candidate> {
+    let literal_variants: Vec<String> = options
+        .literals
+        .iter()
+        .flat_map(|literal| encoded_variants(literal))
+        .collect();
+    vault
+        .variants
+        .iter()
+        .chain(&literal_variants)
+        .flat_map(|variant| text.match_indices(variant.as_str()))
+        .map(|(start, matched)| Candidate {
+            start,
+            end: start + matched.len(),
+            kind: "ENCODED_SECRET".to_string(),
+            class: ValueClass::Secret,
+            entropy_only: false,
+            encoded: true,
+        })
+        .collect()
 }
 
 fn candidates(text: &str, options: &Options) -> Vec<Candidate> {
@@ -481,6 +582,7 @@ fn candidate(
         kind: normalize_kind(kind),
         class,
         entropy_only,
+        encoded: false,
     }
 }
 
@@ -639,6 +741,83 @@ fn valid_placeholder(placeholder: &str, class: ValueClass, kind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ENCODED_SECRET: &str = "pa$$w0rd/+?ok";
+
+    fn seeded_vault(value: &str, class: ValueClass) -> Vault {
+        Vault::from_entries(vec![VaultEntry {
+            value: value.to_string(),
+            placeholder: match class {
+                ValueClass::Secret => "ZIRV_SECRET_LITERAL_1",
+                ValueClass::Pii => "ZIRV_PII_LITERAL_1",
+            }
+            .to_string(),
+            kind: "LITERAL".to_string(),
+            class,
+            first_seen_surface: "test".to_string(),
+        }])
+        .expect("valid vault")
+    }
+
+    #[test]
+    fn encoded_variants_of_vault_secrets_are_masked_with_a_non_rehydrating_marker() {
+        for variant in [
+            "cGEkJHcwcmQvKz9vaw",
+            "70612424773072642f2b3f6f6b",
+            "70612424773072642F2B3F6F6B",
+            "pa%24%24w0rd%2F%2B%3Fok",
+            "ko?+/dr0w$$ap",
+        ] {
+            let mut vault = seeded_vault(ENCODED_SECRET, ValueClass::Secret);
+            let before = vault.clone();
+            let source = format!("out: {variant} end");
+            let (masked, findings) = obfuscate(&source, &mut vault, &Options::default(), "test");
+            assert_eq!(masked, format!("out: {ENCODED_MARKER} end"), "{variant}");
+            assert_eq!(findings.len(), 1);
+            assert!(findings[0].replaced);
+            assert_eq!(vault, before);
+            assert_eq!(rehydrate(&masked, &vault), masked);
+            assert!(!contains_placeholder(&masked));
+        }
+    }
+
+    #[test]
+    fn url_safe_base64_variant_is_masked() {
+        let secret = "ab?>cd~~xyz!!";
+        let mut vault = seeded_vault(secret, ValueClass::Secret);
+        let (masked, _) = obfuscate("YWI_PmNkfn54eXohIQ", &mut vault, &Options::default(), "t");
+        assert_eq!(masked, ENCODED_MARKER);
+    }
+
+    #[test]
+    fn short_and_pii_vault_values_get_no_variants() {
+        let mut vault = seeded_vault("short12", ValueClass::Secret);
+        let (masked, _) = obfuscate("c2hvcnQxMg 21trohs", &mut vault, &Options::default(), "t");
+        assert!(!masked.contains(ENCODED_MARKER));
+        let mut vault = seeded_vault(ENCODED_SECRET, ValueClass::Pii);
+        let (masked, _) = obfuscate("cGEkJHcwcmQvKz9vaw", &mut vault, &Options::default(), "t");
+        assert!(!masked.contains(ENCODED_MARKER));
+    }
+
+    #[test]
+    fn ordinary_text_is_unchanged_by_variant_matching() {
+        let mut vault = seeded_vault(ENCODED_SECRET, ValueClass::Secret);
+        let source = "cargo build finished in 2.3s with 0 warnings";
+        let (masked, findings) = obfuscate(source, &mut vault, &Options::default(), "t");
+        assert_eq!(masked, source);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn encoded_variants_of_operator_literals_are_masked() {
+        let options = Options {
+            literals: vec![ENCODED_SECRET.to_string()],
+            ..Options::default()
+        };
+        let mut vault = Vault::default();
+        let (masked, _) = obfuscate("x cGEkJHcwcmQvKz9vaw y", &mut vault, &options, "t");
+        assert_eq!(masked, format!("x {ENCODED_MARKER} y"));
+    }
 
     #[test]
     fn deterministic_identity_and_round_trip() {
