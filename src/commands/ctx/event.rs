@@ -164,6 +164,16 @@ impl TranscriptUsage {
     }
 }
 
+/// A Claude session's prompt-cache lifetime as the transcript implies it:
+/// the TTL the latest cache write chose (5 minutes or 1 hour) and the epoch
+/// second it lapses, counted from the last row that wrote or read the cache
+/// (a read refreshes the TTL). Derived data for display only; rot never sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptCache {
+    pub ttl_secs: u64,
+    pub expires_at: u64,
+}
+
 /// Keep `Transport`, `Server`, and `Auth` distinct so route health can act on the failing
 /// hop (#455).
 // Overflow belongs to rot, RateLimit to pace; Other is unattributed and changes no routing decision.
