@@ -744,13 +744,29 @@ fn bounded_manifest_contains(path: &Path, needle: &str) -> bool {
     std::fs::read_to_string(path).is_ok_and(|text| text.to_ascii_lowercase().contains(needle))
 }
 
-/// Offsets of `preventDefault()` calls inside paste handlers that never read the clipboard text back.
+/// Whether a handler reads the clipboard text back, i.e. can re-insert it after `preventDefault`.
+fn reads_clipboard(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("clipboarddata") || lower.contains("getdata(")
+}
+
+/// Offsets of paste blocks: `@paste.prevent` and `preventDefault()` calls inside paste handlers,
+/// unless the handler reads the clipboard text back.
 fn paste_blocked_offsets(text: &str) -> Vec<usize> {
-    let mut offsets: Vec<usize> = PASTE_MODIFIER_RE
-        .find_iter(text)
-        .map(|found| found.start())
-        .collect();
+    let mut offsets = Vec::new();
     let mut spans = Vec::new();
+    for found in PASTE_MODIFIER_RE.find_iter(text) {
+        let rest = &text[found.end()..];
+        let handler = rest
+            .trim_start()
+            .strip_prefix('=')
+            .map(|after| found.end() + (rest.len() - after.trim_start().len()))
+            .and_then(|start| delimited_value(text, start))
+            .and_then(|value| handler_span(text, value));
+        if !handler.is_some_and(|span| reads_clipboard(&text[span])) {
+            offsets.push(found.start());
+        }
+    }
     for found in PASTE_ATTR_RE.find_iter(text) {
         let Some(value) = delimited_value(text, found.end()) else {
             continue;
@@ -758,23 +774,17 @@ fn paste_blocked_offsets(text: &str) -> Vec<usize> {
         spans.extend(handler_span(text, value));
     }
     for found in PASTE_LISTENER_RE.find_iter(text) {
-        let rest = found.end();
-        let line_end = text[rest..]
-            .find(['\n', ')'])
-            .map_or(text.len(), |index| rest + index);
-        if HANDLER_NAME_RE.is_match(&text[rest..line_end]) {
-            spans.extend(handler_span(text, rest..line_end));
+        let end = call_end(text, found.end());
+        let handler = found.end()..end;
+        if HANDLER_NAME_RE.is_match(&text[handler.clone()]) {
+            spans.extend(handler_span(text, handler));
             continue;
         }
-        let Some(open) = text[rest..].find('{').map(|index| rest + index) else {
-            continue;
-        };
-        spans.push(rest..balanced_end(text, open));
+        spans.push(handler);
     }
     for span in spans {
         let body = &text[span.clone()];
-        let lower = body.to_ascii_lowercase();
-        if lower.contains("clipboarddata") || lower.contains("getdata(") {
+        if reads_clipboard(body) {
             continue;
         }
         offsets.extend(
@@ -786,6 +796,20 @@ fn paste_blocked_offsets(text: &str) -> Vec<usize> {
     offsets.sort_unstable();
     offsets.dedup();
     offsets
+}
+
+/// Offset of the `)` closing the call whose arguments start at `start`, or the end of text.
+fn call_end(text: &str, start: usize) -> usize {
+    let mut depth = 0usize;
+    for (index, byte) in text.bytes().enumerate().skip(start) {
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' if depth == 0 => return index,
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+    }
+    text.len()
 }
 
 /// Byte range of a quoted (`"..."`) or braced (`{...}`) attribute value starting at `start`.
@@ -829,16 +853,16 @@ fn handler_span(text: &str, value: std::ops::Range<usize>) -> Option<std::ops::R
         return Some(value);
     };
     let definition = format!(
-        r"(?:function\s+{0}\s*\(|(?:const|let|var)\s+{0}\s*=)",
+        r"(?:function\s+{0}\s*\(|(?:const|let|var)\s+{0}\s*=|\b{0}\s*\([^()]*\)\s*\{{)",
         regex::escape(&name)
     );
     let found = Regex::new(&definition).ok().and_then(|re| re.find(text))?;
     let line_end = text[found.end()..]
         .find('\n')
         .map_or(text.len(), |index| found.end() + index);
-    let Some(open) = text[found.end()..]
+    let Some(open) = text[found.start()..]
         .find('{')
-        .map(|index| found.end() + index)
+        .map(|index| found.start() + index)
     else {
         return Some(found.start()..line_end);
     };
@@ -2688,6 +2712,36 @@ function onPaste(event: ClipboardEvent) {
         let findings = paste_findings("src/Modifier.vue", modifier);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].line, 2);
+    }
+
+    #[test]
+    fn prevent_modifier_with_a_clipboard_reading_handler_is_not_blocked() {
+        let reads = "<script setup>\nfunction onPaste(e) {\n  const t = e.clipboardData.getData('text')\n  insert(t)\n}\n</script>\n<template>\n  <input @paste.prevent=\"onPaste\" />\n</template>\n";
+        assert!(paste_findings("src/A.vue", reads).is_empty());
+        let inline = "<template>\n  <input @paste.prevent=\"insert($event.clipboardData.getData('text'))\" />\n</template>\n";
+        assert!(paste_findings("src/B.vue", inline).is_empty());
+        let bare = "<template>\n  <input @paste.prevent />\n</template>\n";
+        assert_eq!(paste_findings("src/C.vue", bare)[0].line, 2);
+        let blind = "<script setup>\nfunction onPaste() {}\n</script>\n<template>\n  <input @paste.prevent=\"onPaste\" />\n</template>\n";
+        assert_eq!(paste_findings("src/D.vue", blind)[0].line, 5);
+    }
+
+    #[test]
+    fn one_line_arrow_paste_listener_is_flagged_and_a_later_keydown_is_not_attributed() {
+        let arrow = "el.addEventListener('paste', e => e.preventDefault())\n";
+        let findings = paste_findings("src/blocked.ts", arrow);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].line, 1);
+        let unrelated = "el.addEventListener('paste', e => log(e))\nel.addEventListener('keydown', e => {\n  e.preventDefault()\n})\n";
+        assert!(paste_findings("src/ok.ts", unrelated).is_empty());
+    }
+
+    #[test]
+    fn a_method_defined_paste_handler_is_resolved() {
+        let blocking = "export default {\n  methods: {\n    onPaste(e) {\n      e.preventDefault()\n    },\n  },\n}\n// <input @paste=\"onPaste\" />\n";
+        assert_eq!(paste_findings("src/M.vue", blocking)[0].line, 4);
+        let reading = "export default {\n  methods: {\n    onPaste(e) {\n      const t = e.clipboardData.getData('text')\n      e.preventDefault()\n      this.add(t)\n    },\n  },\n}\n// <input @paste=\"onPaste\" />\n";
+        assert!(paste_findings("src/N.vue", reading).is_empty());
     }
 
     #[test]

@@ -2724,7 +2724,12 @@ fn initialize_memory_with(
         let refusal = ctx::memory::sensitive_shared_match(&entry);
         entries.push(MemoryReportEntry {
             key: entry.key.clone(),
-            body: entry.body.clone(),
+            // A refused body is what the secret screen blocked; never print it back.
+            body: if refusal.is_some() {
+                String::new()
+            } else {
+                entry.body.clone()
+            },
             refused: refusal.clone(),
         });
         if refusal.is_some() {
@@ -5800,8 +5805,16 @@ mod tests {
             |key: &str| (key == ctx::state::STATE_ENV).then(|| state.to_string_lossy().to_string());
         let report = initialize_memory_with(repo.path(), &options, &env).expect("dry run");
         assert_eq!(report.refused, 1, "{report:?}");
-        assert!(report.entries.iter().all(|e| !e.body.is_empty()));
+        assert!(
+            report
+                .entries
+                .iter()
+                .all(|e| e.refused.is_some() || !e.body.is_empty())
+        );
         assert_eq!(report.written, 0);
+        let json = serde_json::to_string(&report).expect("json");
+        assert!(!json.contains("claim tokens table"), "{json}");
+        assert!(json.contains("a-claims"), "{json}");
     }
 
     #[test]

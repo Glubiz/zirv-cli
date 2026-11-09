@@ -868,17 +868,32 @@ pub fn advance_with_evidence(
                 }
                 if introduced_accepted
                     || (preexisting > 0
-                        && accept_findings.preexisting
-                        && !preexisting_already_accepted)
+                        && !preexisting_already_accepted
+                        && (accept_findings.preexisting || reason_given))
                 {
-                    state.accepted_preexisting_findings = Some(AcceptedPreexistingFindings {
-                        step: current.id.clone(),
-                        at: rfc3339_now(),
-                        blocking: preexisting,
-                        total: report.preexisting_total_count(),
-                        introduced: if introduced_accepted { introduced } else { 0 },
-                        reason: accept_findings.introduced_reason.clone(),
-                    });
+                    let reason = accept_findings.introduced_reason.clone();
+                    state.accepted_preexisting_findings =
+                        Some(match state.accepted_preexisting_findings.take() {
+                            // An earlier acceptance keeps its step, time and counts; this one adds to it.
+                            Some(mut prior) => {
+                                prior.introduced = prior.introduced.max(introduced);
+                                prior.reason = match (prior.reason.take(), reason) {
+                                    (Some(old), Some(new)) if old != new => {
+                                        Some(format!("{old}; {new}"))
+                                    }
+                                    (old, new) => new.or(old),
+                                };
+                                prior
+                            }
+                            None => AcceptedPreexistingFindings {
+                                step: current.id.clone(),
+                                at: rfc3339_now(),
+                                blocking: preexisting,
+                                total: report.preexisting_total_count(),
+                                introduced: if introduced_accepted { introduced } else { 0 },
+                                reason,
+                            },
+                        });
                     // Persisted immediately, mirroring `--frontend-root`
                     // below: a later gate in this same advance (render/
                     // visual-review, or the general test-evidence gate)
@@ -2235,6 +2250,116 @@ mod tests {
             .expect("acceptance recorded");
         assert_eq!(record.introduced, 1);
         assert_eq!(record.reason.as_deref(), Some("detector false positive"));
+    }
+
+    fn frontend_review_state(
+        base_file: (&str, &str),
+        feature_file: (&str, &str),
+    ) -> (tempfile::TempDir, tempfile::TempDir, WorkflowState) {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(repo.path().join(base_file.0), base_file.1).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        git(&["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo.path().join(feature_file.0), feature_file.1).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "feature"]);
+        let mut classification = low_classification();
+        classification.risk = RiskBand::Medium;
+        classification.work_domain.domain = WorkDomain::Frontend;
+        classification.work_domain.score = 55;
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "review a frontend component".into(),
+            WorkflowKind::Review,
+            None,
+            true,
+            classification,
+        );
+        state.status = WorkflowStatus::Running;
+        (repo, root, state)
+    }
+
+    /// #938 review: a reason that unblocks only pre-existing findings is still recorded.
+    #[test]
+    fn a_reason_that_unblocks_preexisting_findings_is_recorded() {
+        let (repo, root, state) = frontend_review_state(
+            (
+                "Old.tsx",
+                "export const Old = () => <img src={avatar} />;\n",
+            ),
+            ("style.css", ".card { color: rebeccapurple; }\n"),
+        );
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let id = state.id.clone();
+        save(&state_dir, &state, true).unwrap();
+        let accepted = FindingAcceptance {
+            preexisting: false,
+            introduced_reason: Some("old finding is fine".into()),
+        };
+        let _ = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, accepted);
+        let record = load(&state_dir, repo.path(), &id)
+            .unwrap()
+            .accepted_preexisting_findings
+            .expect("the acceptance is recorded");
+        assert_eq!((record.blocking, record.introduced), (1, 0));
+        assert_eq!(record.reason.as_deref(), Some("old finding is fine"));
+    }
+
+    /// #938 review: accepting introduced findings keeps an earlier acceptance's step and reason.
+    #[test]
+    fn accepting_introduced_findings_keeps_an_earlier_acceptance() {
+        let (repo, root, mut state) = frontend_review_state(
+            ("README.md", "base\n"),
+            (
+                "New.tsx",
+                "export const New = () => <img src={avatar} />;\n",
+            ),
+        );
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        state.accepted_preexisting_findings = Some(AcceptedPreexistingFindings {
+            step: "earlier-step".into(),
+            at: "2026-01-01T00:00:00Z".into(),
+            blocking: 2,
+            total: 3,
+            introduced: 0,
+            reason: Some("first reason".into()),
+        });
+        let id = state.id.clone();
+        save(&state_dir, &state, true).unwrap();
+        let accepted = FindingAcceptance {
+            preexisting: false,
+            introduced_reason: Some("second reason".into()),
+        };
+        let _ = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, accepted);
+        let record = load(&state_dir, repo.path(), &id)
+            .unwrap()
+            .accepted_preexisting_findings
+            .expect("record");
+        assert_eq!(record.step, "earlier-step");
+        assert_eq!((record.blocking, record.introduced), (2, 1));
+        assert_eq!(
+            record.reason.as_deref(),
+            Some("first reason; second reason")
+        );
     }
 
     #[test]
