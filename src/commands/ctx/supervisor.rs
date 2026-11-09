@@ -360,6 +360,26 @@ pub(crate) fn fire(
     unit: Option<&str>,
     spawn: &dyn Fn(&ConsultRequest) -> bool,
 ) -> bool {
+    fire_marked(state, cfg, env, request, unit, None, spawn)
+}
+
+/// What a before-done consult is recorded under, written in `fire`'s own critical section: the
+/// message-free `base` unit, the final message it saw, and whether that message changed.
+struct DoneMark<'a> {
+    base: &'a str,
+    message: &'a str,
+    changed: bool,
+}
+
+fn fire_marked(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    env: EnvLookup<'_>,
+    request: ConsultRequest,
+    unit: Option<&str>,
+    done: Option<&DoneMark<'_>>,
+    spawn: &dyn Fn(&ConsultRequest) -> bool,
+) -> bool {
     if !cfg.supervisor.enabled || in_consult(env) {
         return false;
     }
@@ -382,6 +402,21 @@ pub(crate) fn fire(
         if request.trigger == Trigger::BeforeDone {
             next.last_unit = unit.to_string();
         }
+    }
+    if let Some(mark) = done {
+        if unit != Some(mark.base) {
+            push_capped(&mut next.seen, mark.base.to_string(), SEEN_KEEP);
+        }
+        // Message-only means the previous consult judged this very evidence.
+        let message_only = mark.changed && before.msg_base == mark.base;
+        next.msg_reconsults = if message_only {
+            before.msg_reconsults + 1
+        } else {
+            0
+        };
+        next.msg_base = mark.base.to_string();
+        next.last_msg = mark.message.to_string();
+        next.last_unit = mark.base.to_string();
     }
     push_capped(
         &mut next.triggers,
@@ -600,6 +635,7 @@ pub(crate) fn on_stop(
     hook_session: &str,
     task: &dyn Fn() -> Option<(String, String)>,
     claim: &evidence::Claim<'_>,
+    spawn: &dyn Fn(&ConsultRequest) -> bool,
 ) {
     if !cfg.supervisor.enabled
         || in_consult(env)
@@ -607,7 +643,7 @@ pub(crate) fn on_stop(
     {
         return;
     }
-    let lapsed = on_stop_claimed(state, cfg, env, repo, session, task, claim, &spawn_consult);
+    let lapsed = on_stop_claimed(state, cfg, env, repo, session, task, claim, spawn);
     announce_lapsed(state, repo, &lapsed);
 }
 
@@ -704,18 +740,48 @@ fn on_stop_claimed(
     if change == MessageChange::Exhausted {
         return Vec::new();
     }
-    let unit = match change {
-        MessageChange::Changed => format!("{base}:{message}"),
-        _ => base.clone(),
+    let at = DoneEvidence {
+        beyond: &beyond,
+        base: &base,
+        message: &message,
+        change,
     };
-    let seen = state_path(state, session)
-        .map(|path| load_state(&path).seen)
-        .unwrap_or_default();
+    fire_before_done(state, cfg, env, repo, session, task, claim, &at, spawn);
+    Vec::new()
+}
+
+/// The evidence a before-done consult is about, as `on_stop_claimed` and the stop gate see it.
+struct DoneEvidence<'a> {
+    beyond: &'a evidence::Beyond,
+    base: &'a str,
+    message: &'a str,
+    change: MessageChange,
+}
+
+/// Fire the before-done consult for `at` unless that unit was already consulted on. True when a
+/// consult was spawned.
+#[allow(clippy::too_many_arguments)]
+fn fire_before_done(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    env: EnvLookup<'_>,
+    repo: &Path,
+    session: &str,
+    task: &dyn Fn() -> Option<(String, String)>,
+    claim: &evidence::Claim<'_>,
+    at: &DoneEvidence<'_>,
+    spawn: &dyn Fn(&ConsultRequest) -> bool,
+) -> bool {
+    let changed = at.change == MessageChange::Changed;
+    let unit = if changed {
+        format!("{}:{}", at.base, at.message)
+    } else {
+        at.base.to_string()
+    };
     // `fire` re-checks under its lock; this keeps a repeated stop from reading the transcript.
-    if seen.contains(&unit) {
-        return Vec::new();
+    if state_path(state, session).is_some_and(|path| load_state(&path).seen.contains(&unit)) {
+        return false;
     }
-    let message_only = change == MessageChange::Changed && seen.contains(&base);
     let task_line = task()
         .map(|(source, text)| format!("\nTask ({source}): {text}"))
         .unwrap_or_default();
@@ -725,7 +791,7 @@ fn on_stop_claimed(
     let verification_line = latest_verification(state, repo)
         .map(|(_, summary)| format!("\n{VERIFICATION_LABEL}{summary}"))
         .unwrap_or_default();
-    let block = beyond.block(repo, claim);
+    let block = at.beyond.block(repo, claim);
     let beyond_cwd_lines = if block.is_empty() {
         String::new()
     } else {
@@ -740,10 +806,12 @@ fn on_stop_claimed(
         ),
         workflow: None,
     };
-    if fire(state, cfg, env, request, Some(&unit), spawn) {
-        note_consult(state, session, &base, &message, message_only);
-    }
-    Vec::new()
+    let mark = DoneMark {
+        base: at.base,
+        message: at.message,
+        changed,
+    };
+    fire_marked(state, cfg, env, request, Some(&unit), Some(&mark), spawn)
 }
 
 /// How the agent's final message relates to the evidence a standing not_done ruling judged.
@@ -777,27 +845,6 @@ fn message_change(state: &StateDir, session: &str, base: &str, message: &str) ->
         return MessageChange::Exhausted;
     }
     MessageChange::Changed
-}
-
-/// Remember what a before-done consult was fired under: `last_unit` stays the message-free
-/// `base`, and the message-only counter restarts whenever the evidence moved.
-fn note_consult(state: &StateDir, session: &str, base: &str, message: &str, message_only: bool) {
-    let Some(path) = state_path(state, session) else {
-        return;
-    };
-    let Some(_lock) = lock_beside(&path) else {
-        return;
-    };
-    let mut current = load_state(&path);
-    current.msg_reconsults = if message_only && current.msg_base == base {
-        current.msg_reconsults + 1
-    } else {
-        u32::from(message_only)
-    };
-    current.msg_base = base.to_string();
-    current.last_msg = message.to_string();
-    current.last_unit = base.to_string();
-    save_state(&path, &current);
 }
 
 /// Before-plan trigger: the workflow engine calls this when a step succeeds. When the step
@@ -922,22 +969,37 @@ pub(crate) fn stop_block(
     session: &str,
     hook_session: &str,
 ) -> Option<String> {
-    stop_block_claimed(env, repo, session, hook_session, &evidence::Claim::none())
+    stop_block_with(
+        env,
+        repo,
+        session,
+        hook_session,
+        &evidence::Claim::none(),
+        &|| None,
+        &|_| true,
+    )
 }
 
-/// `stop_block` that also reads the agent's final message: a newly cited commit is new evidence.
-pub(crate) fn stop_block_claimed(
+/// The stop block that also reads the agent's final message (a newly cited commit is new
+/// evidence), firing the fresh before-done consult itself whenever it skips the replay
+/// because the evidence moved or the final message changed: a continuation Stop
+/// (`stop_hook_active`) never reaches `on_stop`. A changed message whose consult could not be
+/// fired replays the block as before.
+pub(crate) fn stop_block_with(
     env: EnvLookup<'_>,
     repo: &Path,
     session: &str,
     hook_session: &str,
     claim: &evidence::Claim<'_>,
+    task: &dyn Fn() -> Option<(String, String)>,
+    spawn: &dyn Fn(&ConsultRequest) -> bool,
 ) -> Option<String> {
     if in_consult(env) {
         return None;
     }
     // A repo config the loader refuses must not silence a binding ruling.
-    if !CtxConfig::load_refusal_safe(repo, env).supervisor.enabled {
+    let cfg = CtxConfig::load_refusal_safe(repo, env);
+    if !cfg.supervisor.enabled {
         return None;
     }
     let state = StateDir::resolve(env).ok()?;
@@ -946,20 +1008,31 @@ pub(crate) fn stop_block_claimed(
         return None;
     }
     let judged = load_state(&state_path(&state, session)?).last_unit;
-    let beyond = evidence::Beyond::probe(&state, repo, session);
-    let mut base = judged.clone();
+    let mut spent = false;
     if !judged.is_empty() {
+        let stat = git_diff_stat(repo);
+        let beyond = evidence::Beyond::probe(&state, repo, session);
         let fingerprint = beyond.fingerprint(&state, repo, session, claim);
-        base = done_unit(&state, repo, &git_diff_stat(repo), &fingerprint);
-        if judged != base {
-            return None;
+        let base = done_unit(&state, repo, &stat, &fingerprint);
+        let message = beyond.message_hash(&state, repo, session, claim);
+        let change = message_change(&state, session, &base, &message);
+        spent = change == MessageChange::Exhausted;
+        let moved = judged != base;
+        if moved || change == MessageChange::Changed {
+            let reviewable = !stat.is_empty() || beyond.has_worktree_commits();
+            let at = DoneEvidence {
+                beyond: &beyond,
+                base: &base,
+                message: &message,
+                change,
+            };
+            let fired = reviewable
+                && fire_before_done(&state, &cfg, env, repo, session, task, claim, &at, spawn);
+            if fired || moved {
+                return None;
+            }
         }
     }
-    let message = beyond.message_hash(&state, repo, session, claim);
-    let spent = match message_change(&state, session, &base, &message) {
-        MessageChange::Changed => return None,
-        change => change == MessageChange::Exhausted,
-    };
     let reason = rulings::take_stop_block(&state, session)?;
     Some(if spent {
         format!("{reason} {NO_RECONSULT_NOTE}")
@@ -2782,7 +2855,16 @@ mod tests {
             turn: &crate::commands::ctx::event::TurnActivity::default,
         };
         assert_eq!(
-            stop_block_claimed(&lookup, &repo, "abcd1234", "hook1", &claim),
+            // A spawn that fails leaves the unit unconsulted for the `on_stop_claimed` below.
+            stop_block_with(
+                &lookup,
+                &repo,
+                "abcd1234",
+                "hook1",
+                &claim,
+                &|| None,
+                &|_| false
+            ),
             None,
             "a newly cited commit is new evidence: consult fresh instead of replaying"
         );
@@ -3081,16 +3163,25 @@ mod tests {
         );
 
         save_verification(&state, &repo, "verify-1");
+        // The stop gate itself fires the fresh consult it skips the replay for.
+        let seen = std::cell::RefCell::new(String::new());
         assert_eq!(
-            stop_block(&lookup, &repo, "abcd1234", "hook1"),
+            stop_block_with(
+                &lookup,
+                &repo,
+                "abcd1234",
+                "hook1",
+                &evidence::Claim::none(),
+                &|| None,
+                &|request| {
+                    *seen.borrow_mut() = request.evidence.clone();
+                    true
+                }
+            ),
             None,
             "a newer verification record is new evidence: no replay"
         );
-        let seen = std::cell::RefCell::new(String::new());
-        stop(&|request| {
-            *seen.borrow_mut() = request.evidence.clone();
-            true
-        });
+        stop(&|_| panic!("already consulted by the stop gate"));
         let evidence = seen.borrow().clone();
         assert!(
             evidence.contains("Verification: final")
@@ -3910,7 +4001,15 @@ mod tests {
             }
         }
 
-        fn block(&self, message: &str) -> Option<String> {
+        /// The hook's order: the stop block first (which fires the fresh consult itself when it
+        /// skips a replay), then `on_stop`. Returns the block and the consult request that fired,
+        /// the helper having answered `reply`.
+        fn gate(&self, message: &str, reply: &str) -> (Option<String>, Option<ConsultRequest>) {
+            let fired = RefCell::new(None);
+            let spawn = |request: &ConsultRequest| {
+                *fired.borrow_mut() = Some(request.clone());
+                true
+            };
             let lookup = |k: &str| self.env.get(k).cloned();
             let read = || Some(message.to_string());
             let claim = Claim {
@@ -3918,42 +4017,49 @@ mod tests {
                 read: &read,
                 turn: &crate::commands::ctx::event::TurnActivity::default,
             };
-            stop_block_claimed(&lookup, &self.repo, "abcd1234", "hook1", &claim)
+            let block = stop_block_with(
+                &lookup,
+                &self.repo,
+                "abcd1234",
+                "hook1",
+                &claim,
+                &|| None,
+                &spawn,
+            );
+            if block.is_none() {
+                on_stop_claimed(
+                    &self.state,
+                    &enabled_cfg(),
+                    &no_env,
+                    &self.repo,
+                    "abcd1234",
+                    &|| None,
+                    &claim,
+                    &spawn,
+                );
+            }
+            let request = fired.into_inner();
+            if let Some(request) = &request {
+                consult_with(
+                    &self.state,
+                    &enabled_cfg(),
+                    request,
+                    &|_| Ok(reply.to_string()),
+                    &|body| {
+                        self.mailed.borrow_mut().push(body.to_string());
+                        Ok(())
+                    },
+                );
+            }
+            (block, request)
+        }
+
+        fn block(&self, message: &str) -> Option<String> {
+            self.gate(message, "DONE").0
         }
 
         fn stop(&self, message: &str, reply: &str) -> Option<ConsultRequest> {
-            let fired = RefCell::new(None);
-            let read = || Some(message.to_string());
-            let claim = Claim {
-                key: format!("k-{message}"),
-                read: &read,
-                turn: &crate::commands::ctx::event::TurnActivity::default,
-            };
-            on_stop_claimed(
-                &self.state,
-                &enabled_cfg(),
-                &no_env,
-                &self.repo,
-                "abcd1234",
-                &|| None,
-                &claim,
-                &|request| {
-                    *fired.borrow_mut() = Some(request.clone());
-                    true
-                },
-            );
-            let request = fired.into_inner()?;
-            consult_with(
-                &self.state,
-                &enabled_cfg(),
-                &request,
-                &|_| Ok(reply.to_string()),
-                &|body| {
-                    self.mailed.borrow_mut().push(body.to_string());
-                    Ok(())
-                },
-            );
-            Some(request)
+            self.gate(message, reply).1
         }
 
         fn open_id(&self) -> Option<String> {
@@ -3981,15 +4087,9 @@ mod tests {
                 .block("first claim")
                 .is_some_and(|r| r.contains(&first))
         );
-        assert_eq!(
-            driver.block("second claim"),
-            None,
-            "a new message is not replayed"
-        );
-        assert!(
-            driver.stop("second claim", "DONE").is_some(),
-            "a fresh consult runs"
-        );
+        let (block, fired) = driver.gate("second claim", "DONE");
+        assert_eq!(block, None, "a new message is not replayed");
+        assert!(fired.is_some(), "a fresh consult runs");
         assert_eq!(
             driver.open_id(),
             None,
@@ -4041,11 +4141,9 @@ mod tests {
         );
         git(&driver.repo, &["commit", "-qam", "more"]);
         std::fs::write(driver.repo.join("a.txt"), "three\n").expect("write");
-        assert_eq!(driver.block("m4"), None, "new evidence is not replayed");
-        assert!(
-            driver.stop("m4", "DONE").is_some(),
-            "a commit re-opens the consult"
-        );
+        let (block, fired) = driver.gate("m4", "DONE");
+        assert_eq!(block, None, "new evidence is not replayed");
+        assert!(fired.is_some(), "a commit re-opens the consult");
     }
 
     /// #944: a `done` before-done ruling is recorded but not mailed, and a message-only change
@@ -4064,6 +4162,64 @@ mod tests {
         assert!(driver.stop("read the inbox", "DONE").is_none());
         assert!(driver.stop("still fine", "DONE").is_none());
         assert_eq!(rulings::all(&driver.state).len(), 1, "no new ruling");
+    }
+
+    /// Review round: a consult fired on a commit AND a changed message together is the first
+    /// consult for that evidence, so later message-only changes count against the bound.
+    #[test]
+    fn a_commit_with_a_changed_message_starts_the_message_only_bound() {
+        let (dir, driver) = stop_driver();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        assert!(driver.stop("m1", "NOT_DONE: a").is_some());
+        git(&driver.repo, &["commit", "-qam", "more"]);
+        std::fs::write(driver.repo.join("a.txt"), "three\n").expect("write");
+        assert!(driver.stop("m2", "NOT_DONE: b").is_some(), "moved evidence");
+        assert!(driver.stop("m3", "NOT_DONE: c").is_some());
+        assert!(driver.stop("m4", "NOT_DONE: d").is_some());
+        assert!(
+            driver.stop("m5", "NOT_DONE: e").is_none(),
+            "the bound is spent after two message-only consults"
+        );
+        let reason = driver.block("m5").expect("replayed");
+        assert!(
+            reason.contains("No new supervisor consult will run"),
+            "{reason}"
+        );
+    }
+
+    /// Review round: after a `done` ruling made under commit + changed message, a message-only
+    /// stop runs no consult.
+    #[test]
+    fn a_done_ruling_under_a_moved_evidence_and_message_ends_the_consults() {
+        let (dir, driver) = stop_driver();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        assert!(driver.stop("m1", "NOT_DONE: a").is_some());
+        git(&driver.repo, &["commit", "-qam", "more"]);
+        std::fs::write(driver.repo.join("a.txt"), "three\n").expect("write");
+        assert!(driver.stop("m2", "DONE").is_some());
+        assert!(
+            driver.stop("m3", "DONE").is_none(),
+            "no consult for a message alone"
+        );
+        assert_eq!(rulings::all(&driver.state).len(), 2);
+    }
+
+    /// Review round: `last_unit` is the message-free base the moment `fire` returns, so a
+    /// concurrent Stop never reads a unit the stop gate cannot match.
+    #[test]
+    fn last_unit_is_the_message_free_base_right_after_a_fire() {
+        let (dir, driver) = stop_driver();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        assert!(driver.stop("m1", "NOT_DONE: a").is_some());
+        assert!(driver.stop("m2", "NOT_DONE: b").is_some());
+        let row = load_state(&state_path(&driver.state, "abcd1234").expect("path"));
+        assert!(!row.last_msg.is_empty());
+        assert!(
+            !row.last_unit.ends_with(&row.last_msg),
+            "last_unit carries the message: {}",
+            row.last_unit
+        );
+        assert_eq!(row.last_unit, row.msg_base);
     }
 
     /// #939/#936: tool calls with results and the operator's AskUserQuestion answers reach the

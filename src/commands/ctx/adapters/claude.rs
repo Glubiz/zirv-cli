@@ -1174,10 +1174,12 @@ fn turn_activity(jsonl: &str) -> TurnActivity {
                         continue;
                     };
                     let is_error = block.get("is_error").and_then(Value::as_bool) == Some(true);
-                    let result: String = tool_result_text(block)
-                        .chars()
-                        .take(TURN_RESULT_CHARS)
-                        .collect();
+                    // Redact before the cut: a cut through a secret leaves a fragment no detector flags.
+                    let result: String =
+                        super::super::snapshot::redact_text(&tool_result_text(block))
+                            .chars()
+                            .take(TURN_RESULT_CHARS)
+                            .collect();
                     if name == "AskUserQuestion" && !is_error {
                         out.answers.push(result);
                         continue;
@@ -6715,6 +6717,31 @@ mod tests {
         assert_eq!(
             turn.tool_lines,
             vec!["Bash cargo test -> error: 1 test failed"]
+        );
+    }
+
+    /// A secret straddling the per-result cut is redacted before the cut, never left as a prefix.
+    #[test]
+    fn turn_activity_redacts_a_tool_result_before_cutting_it() {
+        let prose: String = (0..40)
+            .map(|n| format!("compiling module {n} finished without any warning, "))
+            .collect();
+        let result = format!(
+            "{} ghp_abcdefghijklmnopqrstuvwxyz123456",
+            &prose[..TURN_RESULT_CHARS - 6]
+        );
+        let jsonl = format!(
+            "{}\n{}\n{}\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b","name":"Bash","input":{"command":"env"}}]}}"#,
+            serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b","content":result}]}}),
+            ""
+        );
+        let turn = turn_activity(&jsonl);
+        assert_eq!(turn.tool_lines.len(), 1);
+        assert!(
+            !turn.tool_lines[0].contains("ghp_a"),
+            "{}",
+            turn.tool_lines[0]
         );
     }
 
