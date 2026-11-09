@@ -67,7 +67,11 @@ fn claim_key(transcript: &str) -> String {
         .unwrap_or_default()
 }
 
-fn final_message(env: EnvLookup<'_>, transcript: &str) -> Option<String> {
+/// The transcript text and its adapter, for the Stop hook's lazy reads.
+fn read_transcript(
+    env: EnvLookup<'_>,
+    transcript: &str,
+) -> Option<(Box<dyn adapters::AgentAdapter>, String)> {
     if transcript.is_empty() {
         return None;
     }
@@ -77,7 +81,21 @@ fn final_message(env: EnvLookup<'_>, transcript: &str) -> Option<String> {
         &CtxConfig::default(),
     )
     .ok()?;
-    adapter.final_assistant_message(&std::fs::read_to_string(transcript).ok()?)
+    Some((adapter, std::fs::read_to_string(transcript).ok()?))
+}
+
+fn final_message(env: EnvLookup<'_>, transcript: &str) -> Option<String> {
+    let (adapter, jsonl) = read_transcript(env, transcript)?;
+    adapter.final_assistant_message(&jsonl)
+}
+
+fn turn_activity(
+    env: EnvLookup<'_>,
+    transcript: &str,
+) -> crate::commands::ctx::event::TurnActivity {
+    read_transcript(env, transcript)
+        .map(|(adapter, jsonl)| adapter.turn_activity(&jsonl))
+        .unwrap_or_default()
 }
 
 pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
@@ -106,6 +124,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         &crate::commands::ctx::supervisor::Claim {
             key: claim_key(&payload.transcript_path),
             read: &|| final_message(env, &payload.transcript_path),
+            turn: &|| turn_activity(env, &payload.transcript_path),
         },
     ) {
         let _ = writeln!(w, "{}", with_stop_block(None, &reason));
@@ -349,6 +368,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
             &crate::commands::ctx::supervisor::Claim {
                 key: claim_key(&payload.transcript_path),
                 read: &|| final_message(env, &payload.transcript_path),
+                turn: &|| turn_activity(env, &payload.transcript_path),
             },
         );
     }

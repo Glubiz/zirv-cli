@@ -6,10 +6,14 @@
 use std::path::{Path, PathBuf};
 
 use super::{StateDir, git_stdout};
+use crate::commands::ctx::event::TurnActivity;
 
 pub(super) const WORKTREES_LABEL: &str = "Linked worktrees: ";
 pub(super) const CLAIM_LABEL: &str = "Agent's final message (untrusted claim): ";
 pub(super) const CITED_LABEL: &str = "Cited by the agent: ";
+pub(super) const TOOLS_LABEL: &str = "Tool activity this turn (untrusted, newest last): ";
+pub(super) const ANSWERS_LABEL: &str =
+    "Operator answers to AskUserQuestion (the operator's own input): ";
 
 /// Delimiters of the one block holding every untrusted line; `clean` removes `<<<` and `>>>`
 /// from content, so content can never contain either marker.
@@ -20,6 +24,7 @@ const WORKTREES_MAX: usize = 6;
 const COMMITS_PER_WORKTREE: usize = 3;
 const CLAIM_BYTES: usize = 800;
 const CITED_MAX: usize = 5;
+const TURN_BYTES: usize = 6 * 1024;
 const SHA_CANDIDATES_MAX: usize = 20;
 
 /// The cheap, claim-free part of the evidence: commits in other linked worktrees.
@@ -33,6 +38,9 @@ pub(super) struct Beyond {
 pub(crate) struct Claim<'a> {
     pub(crate) key: String,
     pub(crate) read: &'a dyn Fn() -> Option<String>,
+    /// The current turn's tool calls and the operator's AskUserQuestion answers; read only when a
+    /// consult fires.
+    pub(crate) turn: &'a dyn Fn() -> TurnActivity,
 }
 
 #[cfg(test)]
@@ -41,6 +49,7 @@ impl Claim<'static> {
         Claim {
             key: String::new(),
             read: &|| None,
+            turn: &TurnActivity::default,
         }
     }
 }
@@ -134,6 +143,36 @@ fn worktree_lines(repo: &Path, since: u64) -> Vec<String> {
             })
         })
         .collect()
+}
+
+/// The newest tool-call lines that fit `TURN_BYTES`, oldest first, each redacted before it is
+/// cut; `None` when there are none.
+fn tool_activity(lines: &[String]) -> Option<String> {
+    let mut kept: Vec<String> = Vec::new();
+    let mut used = 0;
+    for line in lines.iter().rev() {
+        let line = clean(&crate::commands::ctx::snapshot::redact_text(line));
+        used += line.len() + 3;
+        if used > TURN_BYTES && !kept.is_empty() {
+            break;
+        }
+        kept.push(crate::utils::truncate_bytes(line, Some(TURN_BYTES)));
+    }
+    kept.reverse();
+    (!kept.is_empty()).then(|| kept.join(" | "))
+}
+
+/// The operator's AskUserQuestion answers as one evidence line, redacted and capped.
+pub(super) fn answers_line(answers: &[String]) -> Option<String> {
+    let text = clean(&crate::commands::ctx::snapshot::redact_text(
+        &answers.join(" | "),
+    ));
+    (!text.trim().is_empty()).then(|| {
+        format!(
+            "{ANSWERS_LABEL}{}",
+            crate::utils::truncate_bytes(text, Some(CLAIM_BYTES))
+        )
+    })
 }
 
 /// Lowercase hex runs that can be an abbreviated commit id: 7-40 characters with at least one
@@ -258,32 +297,55 @@ impl Beyond {
         session: &str,
         claim: &Claim<'_>,
     ) -> String {
-        let cited = self.cited_fingerprint(state, repo, session, claim);
+        let (cited, _) = self.claim_cache(state, repo, session, claim);
         crate::commands::workflow::engine::hash_bytes(
             format!("{}\n{cited}", self.worktrees.join("\n")).as_bytes(),
         )
     }
 
-    fn cited_fingerprint(
+    /// Hash of the whitespace-normalised final message; empty when there is none. Cached with
+    /// the cited fingerprint, so one transcript state reads the message once.
+    pub(super) fn message_hash(
         &self,
         state: &StateDir,
         repo: &Path,
         session: &str,
         claim: &Claim<'_>,
     ) -> String {
+        self.claim_cache(state, repo, session, claim).1
+    }
+
+    /// `(cited-commit fingerprint, message hash)` for the claim's transcript state.
+    fn claim_cache(
+        &self,
+        state: &StateDir,
+        repo: &Path,
+        session: &str,
+        claim: &Claim<'_>,
+    ) -> (String, String) {
         if claim.key.is_empty() {
-            return String::new();
+            return (String::new(), String::new());
         }
         let Some(path) = super::state_path(state, session) else {
-            return String::new();
+            return (String::new(), String::new());
         };
         let cached = super::load_state(&path);
         if cached.claim_key == claim.key {
-            return cached.claim_fp;
+            return (cached.claim_fp, cached.claim_msg);
         }
-        let mut recent: Vec<String> = (claim.read)()
-            .map(|message| verified_commits(repo, &message, self.since))
-            .unwrap_or_default()
+        let message = (claim.read)().unwrap_or_default();
+        let message_hash = if message.trim().is_empty() {
+            String::new()
+        } else {
+            crate::commands::workflow::engine::hash_bytes(
+                message
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .as_bytes(),
+            )
+        };
+        let mut recent: Vec<String> = verified_commits(repo, &message, self.since)
             .into_iter()
             .filter(|commit| commit.recent)
             .map(|commit| commit.full)
@@ -295,9 +357,10 @@ impl Beyond {
             let mut state_now = super::load_state(&path);
             state_now.claim_key = claim.key.clone();
             state_now.claim_fp = fingerprint.clone();
+            state_now.claim_msg = message_hash.clone();
             super::save_state(&path, &state_now);
         }
-        fingerprint
+        (fingerprint, message_hash)
     }
 
     /// The delimited block of untrusted lines for the consult prompt; empty when there are none.
@@ -328,6 +391,9 @@ impl Beyond {
             if !cited.is_empty() {
                 lines.push(format!("{CITED_LABEL}{}", cited.join("; ")));
             }
+        }
+        if let Some(tools) = tool_activity(&(claim.turn)().tool_lines) {
+            lines.push(format!("{TOOLS_LABEL}{tools}"));
         }
         if lines.is_empty() {
             return String::new();
