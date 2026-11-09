@@ -1199,20 +1199,78 @@ pub fn helper_answer_with_env(
             }
         }
     }
+    let mut harness = harness.to_string();
     let result = match native_text {
         Some(text) => Ok(text),
-        None => run_model(adapter, model, &protected_prompt, timeout),
+        None => {
+            let (result, routed_harness, routed_model) =
+                run_model_routed(&repo, adapter, model, &protected_prompt, timeout, env);
+            harness = routed_harness;
+            served = routed_model;
+            result
+        }
     };
     record_helper_call(
         env,
         role,
-        harness,
+        &harness,
         &served,
         &usage,
         started.elapsed(),
         result.is_ok(),
     );
     result
+}
+
+/// [`run_model`] behind the usage-window gate: an exhausted requested harness is rerouted to
+/// one with headroom, or skipped (an `Err` the caller already treats as a failed helper) when
+/// none has. Returns the result with the harness and model that actually served it.
+pub(super) fn run_model_routed(
+    repo: &Path,
+    adapter: &dyn AgentAdapter,
+    model: &str,
+    prompt: &str,
+    timeout: Duration,
+    env: EnvLookup<'_>,
+) -> (CtxResult<String>, String, String) {
+    let own = || (adapter.name().to_string(), model.to_string());
+    let direct = || {
+        let (harness, served) = own();
+        (run_model(adapter, model, prompt, timeout), harness, served)
+    };
+    let (Ok(cfg), Ok(state)) = (CtxConfig::load(repo, env), StateDir::resolve(env)) else {
+        return direct();
+    };
+    match super::fallback::route_side_call(&state, &cfg, adapter.name(), Some(model), now_secs()) {
+        super::fallback::SideCall::Proceed => direct(),
+        super::fallback::SideCall::Skip(line) => {
+            crate::output::warn(&line);
+            let (harness, served) = own();
+            (Err(line.into()), harness, served)
+        }
+        super::fallback::SideCall::Reroute(route) => {
+            let Ok(alternate) = adapters::select(Some(&route.selected), &[], &cfg) else {
+                let line = format!(
+                    "skipping side-call: fallback harness {} is not usable",
+                    route.selected
+                );
+                crate::output::warn(&line);
+                let (harness, served) = own();
+                return (Err(line.into()), harness, served);
+            };
+            crate::output::warn(format!(
+                "side-call rerouted from {} to {} ({}): usage window exhausted",
+                adapter.name(),
+                route.selected,
+                route.model
+            ));
+            (
+                run_model(alternate.as_ref(), &route.model, prompt, timeout),
+                route.selected,
+                route.model,
+            )
+        }
+    }
 }
 
 /// Meters one helper-model call as a delegation row, agent `helper` so scorecards skip it.
@@ -3870,6 +3928,135 @@ mod tests {
             answer.contains("## Task"),
             "the harness distiller's own raw answer: {answer}"
         );
+    }
+
+    fn exhausted_side_call_env(
+        tmp: &Path,
+        extra: &[(&str, &str)],
+    ) -> std::collections::HashMap<String, String> {
+        let state_root = tmp.join("state");
+        let now = now_secs();
+        crate::commands::ctx::window::store_for(
+            &StateDir::from_root(state_root.clone()),
+            "anthropic",
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 100.0,
+                    resets_at: now + 3_600,
+                    observed_at: now,
+                    overage_covered: false,
+                    limit_reached: true,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store usage");
+        let mut env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_root.display().to_string(),
+            ),
+            ("ZIRV_CTX_FALLBACK_ORDER".to_string(), "claude".to_string()),
+        ]
+        .into();
+        env.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        env
+    }
+
+    #[test]
+    fn a_side_call_on_an_exhausted_window_with_no_candidate_is_skipped_and_fails() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let _home = super::super::testenv::HomeGuard::set(&home);
+        let env = exhausted_side_call_env(tmp.path(), &[]);
+        let (result, harness, _) = run_model_routed(
+            tmp.path(),
+            &fake_model_adapter(),
+            "haiku",
+            "anything",
+            TEST_TIMEOUT,
+            &|key| env.get(key).cloned(),
+        );
+        let error = result.expect_err("no candidate has headroom, so the call is skipped");
+        assert!(error.to_string().contains("skipping side-call"), "{error}");
+        assert_eq!(harness, "claude");
+    }
+
+    fn side_call_reroute_env(
+        tmp: &Path,
+        extra: &[(&str, &str)],
+    ) -> std::collections::HashMap<String, String> {
+        let now = now_secs();
+        let state = StateDir::from_root(tmp.join("state"));
+        let mut env = exhausted_side_call_env(tmp, &[]);
+        crate::commands::ctx::window::store_for(
+            &state,
+            "openai",
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 10.0,
+                    resets_at: now + 3_600,
+                    observed_at: now,
+                    overage_covered: false,
+                    limit_reached: false,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store usage");
+        env.insert(
+            "ZIRV_CTX_FALLBACK_ORDER".to_string(),
+            "claude,codex".to_string(),
+        );
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            format!("sh {}", fixture("fake-model.sh").display()),
+        );
+        env.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        env
+    }
+
+    #[test]
+    fn a_side_call_on_an_exhausted_window_reroutes_to_the_next_harness_with_headroom() {
+        for extra in [
+            &[][..],
+            &[("ZIRV_CTX_FALLBACK_ADAPTIVE_DELEGATION", "true")][..],
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let home = tmp.path().join("home");
+            std::fs::create_dir_all(&home).expect("home");
+            let _home = super::super::testenv::HomeGuard::set(&home);
+            let env = side_call_reroute_env(tmp.path(), extra);
+            let (result, harness, _) = run_model_routed(
+                tmp.path(),
+                &fake_model_adapter(),
+                "haiku",
+                "anything",
+                TEST_TIMEOUT,
+                &|key| env.get(key).cloned(),
+            );
+            assert_eq!(harness, "codex", "{extra:?}");
+            assert!(result.is_ok(), "{extra:?}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn a_side_call_runs_unchecked_when_pace_is_disabled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let _home = super::super::testenv::HomeGuard::set(&home);
+        let env = exhausted_side_call_env(tmp.path(), &[("ZIRV_CTX_PACE", "false")]);
+        let (result, _, _) = run_model_routed(
+            tmp.path(),
+            &fake_model_adapter(),
+            "haiku",
+            "anything",
+            TEST_TIMEOUT,
+            &|key| env.get(key).cloned(),
+        );
+        assert!(result.is_ok(), "pace off means no window check: {result:?}");
     }
 
     /// `run_loop`'s objective judge hands its own injected lookup through

@@ -3348,6 +3348,18 @@ literals_file = "~/.zirv/obfuscate-literals.txt"
 patterns = [{ kind = "customer_id", regex = "CUST-[0-9]{8}" }]
 ```
 
+Encoded forms of secrets are masked too. For every secret in the vault (and
+every operator literal) of at least 8 characters, output containing its base64
+(standard and URL-safe, unpadded), percent-encoded (when it differs), lower- or
+upper-case hex, or reversed form is replaced with the fixed marker
+`ZIRV_REDACTED_ENCODED`. The marker is not a `ZIRV_SECRET_*` placeholder, so it
+is never rehydrated (rehydrating would put the raw value where the encoded one
+stood). Fragment or partial matching is deliberately not done: matching a
+substring of a secret (the T3 eval counts a 60% fragment) would mask ordinary
+output. Limits: the percent form is uppercase `%XX` (RFC 3986) only; a secret
+first seen only in encoded form is not caught until its raw form is in the
+vault; and a secret embedded inside a larger encoded blob is not caught.
+
 `zirv ctx obfuscate list` reports kinds, counts and first-seen surfaces without
 values; `reveal <placeholder>` prints one value locally and records the audit
 action; `scan [transcript]` detects without storing; and `purge` deletes the
@@ -3576,7 +3588,7 @@ Operator-only: set in `~/.zirv/ctx.toml` or as `ZIRV_CTX_ROUTING_<KEY>` (for exa
 | `zirv ctx handoff --transcript <path>` | Distills a handoff and stores it |
 | `zirv ctx resume` | Starts a clean session with the latest handoff injected |
 | `zirv ctx hook <stop\|prompt\|pre-compact\|pretool\|notify\|session-start\|install>` | Agent hook entrypoints; `install <agent>` wires zirv's own guard/compaction hooks into a non-claude agent's native hooks file (copilot, droid, gemini) |
-| `zirv ctx status [--json] [--agents]` | Shows supervised sessions, the resolved chat agent, unread mail, recent decisions, handoffs, and (issue #358) a cross-harness capacity/pool section; `--json` emits the pool view plus the orchestrator seat as structured JSON; `--agents` (issue #490) emits the native dashboard's own agent/task overview, usage-and-health provenance strip and a `limitations` list, built from the identical reducers the TUI renders through, plus (issue #723) a `delegation_conditions` map of delegation id to its typed condition list, alongside (never replacing) each agent's coarse phase |
+| `zirv ctx status [--json] [--agents]` | Shows supervised sessions, per Claude session the prompt-cache TTL and expiry (`prompt cache: 1h ttl, expires in 42m` or `expired 3m ago`; the 1h class wins when a turn wrote any 1h tokens, a cache read restarts the clock, omitted when the transcript carries no 5m/1h split), the resolved chat agent, unread mail, recent decisions, handoffs, and (issue #358) a cross-harness capacity/pool section; `--json` emits the pool view plus the orchestrator seat as structured JSON; `--agents` (issue #490) emits the native dashboard's own agent/task overview, usage-and-health provenance strip and a `limitations` list, built from the identical reducers the TUI renders through, plus (issue #723) a `delegation_conditions` map of delegation id to its typed condition list, alongside (never replacing) each agent's coarse phase |
 | `zirv ctx models [refresh] [--json]` | Lists account-discovered models, ladder placement, availability, effective price provenance, retirements and the per-model scorecard (avoid-list warnings included), then the PROMOTIONS, ROUTES and PROBES sections of [Model routing](#model-routing); `refresh` reads local Codex/Claude evidence and conditionally fetches public price catalogues |
 | `zirv ctx mcp serve [--stdio] [--repo <path>] [--session <id>]` | Serves seven read-only MCP tools for one repository/worktree; optionally binds inbox reads to a registered session. See [MCP bridge](#mcp-bridge) |
 | `zirv ctx mcp doctor [--repo <path>] [--session <id>] [--timeout-seconds <1..60>]` | Launches this executable as a stdio server, checks tool discovery and a snapshot call, and prints JSON; default deadline 10 seconds |
@@ -7002,6 +7014,19 @@ is still making progress. Either way the alternate harness must be enabled,
 ready, capacity-compatible, budget-compatible, and able to provide a verified
 equivalent model tier (`cheap`/`standard`/`deep`); zirv never guesses a tier
 translation for an operator-pinned model it cannot verify.
+
+**Side-calls.** A cheap helper call that reaches a coding harness (the judge,
+distiller, `ask` and memory helpers when no native API-key route answers; the
+native route is never window-gated, as zirv tracks no window for API keys)
+first checks that harness's 5h/7d window with the same spawn gate. An
+exhausted window reroutes the call to a harness with headroom, exactly like a
+blocked session does; with none available the call is skipped with one
+`skipping side-call` warning and fails like any failed helper, so callers keep
+their fail-open behaviour. When the allocator would keep the requested harness
+(`adaptive_delegation`), the call proceeds on it as it did before routing. A
+reroute follows the operator's cross-harness fallback order and may send the
+(already obfuscated) prompt to another vendor, as session fallback does.
+`[pace] enabled = false` or `[fallback] enabled = false` turns the check off.
 
 `zirv ctx status` reports the resolved policy and, for each harness in the
 fallback order, its readiness, capacity and current headroom:
