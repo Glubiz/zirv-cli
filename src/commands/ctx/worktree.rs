@@ -1063,10 +1063,10 @@ pub fn run<W: Write>(args: &WorktreeArgs, w: &mut W) -> CtxResult<i32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn git_available() -> bool {
+    pub(crate) fn git_available() -> bool {
         std::process::Command::new("git")
             .arg("--version")
             .output()
@@ -1074,7 +1074,7 @@ mod tests {
             .unwrap_or(false)
     }
 
-    fn run(dir: &Path, args: &[&str]) -> bool {
+    pub(crate) fn run(dir: &Path, args: &[&str]) -> bool {
         std::process::Command::new("git")
             .arg("-C")
             .arg(dir)
@@ -1084,13 +1084,13 @@ mod tests {
             .unwrap_or(false)
     }
 
-    fn init_repo(dir: &Path) {
+    pub(crate) fn init_repo(dir: &Path) {
         assert!(run(dir, &["init", "-q"]));
         assert!(run(dir, &["config", "user.email", "test@example.com"]));
         assert!(run(dir, &["config", "user.name", "test"]));
     }
 
-    fn commit(dir: &Path, file: &str, contents: &str, message: &str) -> String {
+    pub(crate) fn commit(dir: &Path, file: &str, contents: &str, message: &str) -> String {
         std::fs::write(dir.join(file), contents).expect("write");
         assert!(run(dir, &["add", file]));
         assert!(run(dir, &["commit", "-q", "-m", message]));

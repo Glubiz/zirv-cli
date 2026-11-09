@@ -99,6 +99,11 @@ pub const NARROW_ONLY_ALLOWLIST: &[&str] = &[
     // Repository values may only shrink the warm worktree pool or expire it sooner. (#718)
     "worktree.idle_pool_max",
     "worktree.idle_ttl_secs",
+    // Repository values may only shrink checkpoint retention and the capture timeout. (#946)
+    "checkpoint.enabled", // narrow-only fold: repo may only turn checkpoints OFF.
+    "checkpoint.max_per_session",
+    "checkpoint.ttl_secs",
+    "checkpoint.capture_timeout_secs",
     "wrap.debounce_ms",
     "wrap.inject_timeout_ms",
     // Repository values may disable the standing skill index, never enable it against operator policy. (#539)

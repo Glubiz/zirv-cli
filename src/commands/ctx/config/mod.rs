@@ -99,6 +99,7 @@ pub struct CtxConfig {
     pub review: ReviewConfig,
     pub worker: WorkerConfig,
     pub worktree: WorktreeConfig,
+    pub checkpoint: CheckpointConfig,
     pub handover: HandoverConfig,
     /// Operator-only seat model-tier map; see [`ModelTiersConfig`] (#699).
     pub model_tiers: ModelTiersConfig,
@@ -416,6 +417,17 @@ impl CtxConfig {
             integer_at(take_nested(&mut merged, "worktree", "idle_pool_max"));
         let home_worktree_idle_ttl_secs =
             integer_at(take_nested(&mut merged, "worktree", "idle_ttl_secs"));
+        // Lift before merge so repos can only shrink checkpoint retention and the capture timeout (#946).
+        let home_checkpoint_enabled = bool_at(take_nested(&mut merged, "checkpoint", "enabled"));
+        let home_checkpoint_max_per_session =
+            integer_at(take_nested(&mut merged, "checkpoint", "max_per_session"));
+        let home_checkpoint_ttl_secs =
+            integer_at(take_nested(&mut merged, "checkpoint", "ttl_secs"));
+        let home_checkpoint_capture_timeout_secs = integer_at(take_nested(
+            &mut merged,
+            "checkpoint",
+            "capture_timeout_secs",
+        ));
         // Lift before merge so repos can only drop gates, lower cycles or disable the judge (#314).
         let home_objective_gates = string_array_at(take_nested(&mut merged, "objective", "gates"));
         let home_objective_max_cycles = integer_at(take_nested(
@@ -580,6 +592,20 @@ impl CtxConfig {
             integer_at(take_nested(&mut repo_layer, "worktree", "idle_pool_max"));
         let repo_worktree_idle_ttl_secs =
             integer_at(take_nested(&mut repo_layer, "worktree", "idle_ttl_secs"));
+        let repo_checkpoint_enabled =
+            bool_at(take_nested(&mut repo_layer, "checkpoint", "enabled"));
+        let repo_checkpoint_max_per_session = integer_at(take_nested(
+            &mut repo_layer,
+            "checkpoint",
+            "max_per_session",
+        ));
+        let repo_checkpoint_ttl_secs =
+            integer_at(take_nested(&mut repo_layer, "checkpoint", "ttl_secs"));
+        let repo_checkpoint_capture_timeout_secs = integer_at(take_nested(
+            &mut repo_layer,
+            "checkpoint",
+            "capture_timeout_secs",
+        ));
         let repo_objective_gates =
             string_array_at(take_nested(&mut repo_layer, "objective", "gates"));
         let repo_objective_max_cycles = integer_at(take_nested(
@@ -1024,6 +1050,51 @@ impl CtxConfig {
                     u64::MAX,
                 ))
                 .unwrap_or(i64::MAX),
+            ),
+        );
+
+        let default_checkpoint = CheckpointConfig::default();
+        let narrowed_checkpoint_u64 = |home: Option<i64>, repo: Option<i64>, default: u64| {
+            let home = home.and_then(|v| u64::try_from(v).ok()).unwrap_or(default);
+            let repo = repo.and_then(|v| u64::try_from(v).ok());
+            toml::Value::Integer(
+                i64::try_from(narrow_min(home, repo, u64::MAX)).unwrap_or(i64::MAX),
+            )
+        };
+        insert_path(
+            &mut merged,
+            &["checkpoint", "enabled"],
+            toml::Value::Boolean(narrow_min(
+                home_checkpoint_enabled.unwrap_or(default_checkpoint.enabled),
+                repo_checkpoint_enabled,
+                true,
+            )),
+        );
+        insert_path(
+            &mut merged,
+            &["checkpoint", "max_per_session"],
+            narrowed_checkpoint_u64(
+                home_checkpoint_max_per_session,
+                repo_checkpoint_max_per_session,
+                u64::from(default_checkpoint.max_per_session),
+            ),
+        );
+        insert_path(
+            &mut merged,
+            &["checkpoint", "ttl_secs"],
+            narrowed_checkpoint_u64(
+                home_checkpoint_ttl_secs,
+                repo_checkpoint_ttl_secs,
+                default_checkpoint.ttl_secs,
+            ),
+        );
+        insert_path(
+            &mut merged,
+            &["checkpoint", "capture_timeout_secs"],
+            narrowed_checkpoint_u64(
+                home_checkpoint_capture_timeout_secs,
+                repo_checkpoint_capture_timeout_secs,
+                default_checkpoint.capture_timeout_secs,
             ),
         );
 
@@ -7012,6 +7083,10 @@ intake_discipline = true
         ("worker", "deny_network"),
         ("worktree", "idle_pool_max"),
         ("worktree", "idle_ttl_secs"),
+        ("checkpoint", "enabled"),
+        ("checkpoint", "max_per_session"),
+        ("checkpoint", "ttl_secs"),
+        ("checkpoint", "capture_timeout_secs"),
         ("objective", "gates"),
         ("objective", "max_cycles_without_progress"),
         ("objective", "judge"),

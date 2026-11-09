@@ -54,6 +54,28 @@ impl Default for WorktreeConfig {
     }
 }
 
+/// Per-turn git checkpoints (#946): off by default, and only the operator may turn them on.
+/// Repos may only shrink the retention and timeout bounds.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CheckpointConfig {
+    pub enabled: bool,
+    pub max_per_session: u32,
+    pub ttl_secs: u64,
+    pub capture_timeout_secs: u64,
+}
+
+impl Default for CheckpointConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_per_session: 50,
+            ttl_secs: 1_209_600,
+            capture_timeout_secs: 20,
+        }
+    }
+}
+
 /// Objective completion controls: repos may only drop gates without reordering, lower cycles, or disable the judge (#314).
 /// Enabling a model judge over untrusted transcripts is a widening reserved to the operator.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
