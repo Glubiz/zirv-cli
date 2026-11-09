@@ -1558,7 +1558,39 @@ protocol and harness: [docs/benchmarks/wrapped-vs-vanilla.md](docs/benchmarks/wr
 - **Repository check configuration** — optional, schema-versioned
   `.zirv/verify.toml` declares check id/kind/command/path patterns/phase
   eligibility/timeout; without it, Cargo commands and `npm run` scripts are
-  discovered from the manifests present, each with its own default `paths`.
+  discovered from the manifests present (the root, or, with no root
+  `Cargo.toml`/`package.json`, up to 8 immediate subdirectories via
+  `--manifest-path`/`npm --prefix`), each with its own default `paths`.
+  Discovery also mirrors CI for final verification only (`changed = false`):
+  test-stage jobs of a root `.gitlab-ci.yml` (the include-resolved
+  `.gitlab-ci-local/expanded-gitlab-ci.yml` cache that `gitlab-ci-local --list`
+  writes wins over the root copy; root-only jobs resolve `extends`) run as
+  `gitlab-ci-local '<job>' --needs` (ids `gitlab-<job>`). Jobs with `trigger:`,
+  manual rules or an unresolvable `extends` are skipped, and a job whose
+  `needs:` chain reaches a stage other than `.pre`/`build`/`test` or a script
+  with an outward verb (`docker push`, `git push`, `kubectl apply`,
+  `terraform apply`, `npm publish`, `aws`/`gcloud`/`gh` ...) is dropped,
+  because `--needs` runs that chain too; an outward verb in a global
+  `before_script`/`after_script` (or `default:`) drops every GitLab check. Each GitHub Actions job in a
+  `pull_request` workflow (push-only workflows are ignored; skipped entirely
+  on Windows, whose default shell is pwsh) whose literal `runs-on` matches this
+  host (on macOS `ubuntu-*` jobs are accepted as a POSIX approximation)
+  becomes one `gha-<job>` check replaying its eligible `run:` steps under
+  `bash -e`, each step in its own subshell, honouring literal `env:` and
+  `working-directory`/`defaults.run`. Steps using `${{`, `if:`, a non-bash
+  shell, setup/release or outward commands, an unflagged `zirv verify`, or a
+  command another check already runs are skipped; `uses:` steps are skipped
+  except `rustsec/audit-check`, which maps to `cargo audit`. The outward-verb
+  screen is risk reduction, not a guarantee. Cargo checks (root and
+  subdirectory) are zirv's own text and are not gated, yet they run the
+  repository's `build.rs`; a subdirectory with a malformed or symlinked
+  manifest is skipped. Skipped jobs/steps, a GitLab `include:` with no
+  expanded cache, a stale cache, and the fact that GitHub-derived commands run
+  on this host rather than in CI's environment are reported as `CI coverage
+  gap` notes (also in `--dry-run`). When `.gitlab-ci.yml` uses `include:` and
+  a job has no expanded-cache copy, it is replayed only if its `stage` is set
+  explicitly (own key or `extends`); otherwise it is skipped with a gap note,
+  because an included job of the same name may define it.
   Declaring `paths` narrowly lets an unrelated change elsewhere skip
   re-running that check at final verification. See [Frontend
   quality](#frontend-quality).
@@ -5452,6 +5484,7 @@ keep only your own.
 | `[models]` discovery, price refresh, pins, `avoid` and `auto_avoid` | operator home or environment only | discovery/refresh default on, `avoid` empty and `auto_avoid` off; the scorecard only reads zirv's own logs; reads account-local caches/transcripts, while network access occurs only in `zirv ctx models refresh`, run explicitly or as the detached background refresh started by `status` and dashboard startup; repositories cannot select or conceal the operator's models or prices |
 | `[routing]` promotion gate, probes, router, canary | operator home or environment only | on by default; the whole table is repo-forbidden, so a repository's `.zirv/ctx.toml` setting any `routing.*` key is a hard error and a checkout can neither disable the gate, steer a seat to a model, raise the probe spend cap nor turn on metered probing; evidence is read from zirv's own logs and benchmark rows, a pick applies only where the operator made no explicit choice, and probes spend quota only under the daily interval, the per-run `probe_max_usd` cap and the per-harness headroom floor |
 | `[policy] network_allowlist` | operator (home layer, or the same operator-owned repo layer's own narrowing) | a repository checkout may only remove hosts from the operator's own list, never name one beyond it — naming an ungranted host is a hard error; on Claude Code, a non-empty list replaces the wholesale `WebFetch`/`WebSearch` allow in the launch argv with one `WebFetch(domain:<host>)`/`WebSearch(domain:<host>)` allow rule per host (reported `degraded`, never `enforced`) — it scopes those two brokered tools only, and does nothing to `Bash` network calls (`curl`, `wget`, a raw socket, or any other network-capable program); an operator-only `[sandbox] extra_allow` entry naming bare `WebFetch` or `WebSearch` is appended afterwards and re-widens it |
+| Checks discovered from CI files (`.gitlab-ci.yml`, `.gitlab-ci-local/`, `.github/workflows/*`) and `npm` scripts | repo-owned, untrusted | job names must match a strict charset and are shell-quoted; GitHub `pull_request` `run:` text is repository-authored and replayed under `bash -e` with only literal env/working-directory, so these checks are repo-supplied: gated by `workflow.repo_checks_enabled` (on by default), timeout clamped to 900s, counted in the repo-check cap; `gitlab-ci-local --needs` also runs the needs chain, screened by an outward-verb denylist (risk reduction, not a guarantee); Cargo checks and `cargo audit` (from `rustsec/audit-check`) are zirv's own text, not gated, and run the repo's `build.rs`; `.zirv/verify.toml`, when present, replaces discovery |
 | Autoresearch campaign manifest (`zirv workflow research plan\|run`) and every file it references (corpus, fixture, evaluator, candidate patch) | operator input, like a script | a `[[candidates]]` env overlay may only use a key that is in BOTH the manifest's own `[candidate_space] allow_env` AND a compiled-in allowlist (non-safety Jev gates/floors, `ZIRV_CTX_PROXY_MIN_CONFIDENCE`/`MIN_MARGIN`, the handover ladder, `[headless]` effort, `[score]` token ratios); anything permission/sandbox/safety/credential/base_url-shaped, and the fixed Jev safety gates (approve/approve_allow/inject_screen/stop_verify/missing_tests/review/gates/admin_dispatch), are always refused regardless of what the manifest declares; repo-owned `.zirv/` files cannot widen either list, and a `requires_receipts` entry outside the compiled prefixes is refused at `plan` time |
 
 Every native instruction file inside the repository checkout — `ZIRV.md`
