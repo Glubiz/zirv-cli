@@ -1587,7 +1587,10 @@ protocol and harness: [docs/benchmarks/wrapped-vs-vanilla.md](docs/benchmarks/wr
   manifest is skipped. Skipped jobs/steps, a GitLab `include:` with no
   expanded cache, a stale cache, and the fact that GitHub-derived commands run
   on this host rather than in CI's environment are reported as `CI coverage
-  gap` notes (also in `--dry-run`).
+  gap` notes (also in `--dry-run`). When `.gitlab-ci.yml` uses `include:` and
+  a job has no expanded-cache copy, it is replayed only if its `stage` is set
+  explicitly (own key or `extends`); otherwise it is skipped with a gap note,
+  because an included job of the same name may define it.
   Declaring `paths` narrowly lets an unrelated change elsewhere skip
   re-running that check at final verification. See [Frontend
   quality](#frontend-quality).
