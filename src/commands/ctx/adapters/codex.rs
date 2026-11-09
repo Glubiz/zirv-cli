@@ -477,7 +477,26 @@ impl CodexAdapter {
             .started_at
             .saturating_mul(1_000)
             .max(handover_floor_ms);
-        let resolved = resolve_rollout(sessions_root, started_ms, &session.cwd)?;
+        // A rollout another session already pinned is that session's, never this one's.
+        let claimed: Vec<PathBuf> = std::fs::read_dir(state.rollouts())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "path") && *path != pin)
+            .filter_map(|path| std::fs::read_to_string(path).ok())
+            .map(|recorded| PathBuf::from(recorded.trim()))
+            .collect();
+        let prompt = std::fs::read_to_string(state.rollouts().join(format!("{short}.prompt")))
+            .ok()
+            .map(|digest| digest.trim().to_string());
+        let resolved = resolve_rollout(
+            sessions_root,
+            started_ms,
+            &session.cwd,
+            &claimed,
+            prompt.as_deref(),
+        )?;
         if super::super::state::create_private_dir_all(&state.rollouts()).is_ok() {
             let _ = super::super::state::write_private(&pin, &resolved.display().to_string());
         }
@@ -880,13 +899,50 @@ fn rollout_session_meta(path: &Path) -> Option<(u64, Option<String>, Option<Stri
     Some((started, cwd, id))
 }
 
+/// Hex SHA-256 of a prompt, trimmed, as `headless_cmd` records it and the rollout is matched on.
+fn prompt_digest(prompt: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(prompt.trim().as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Whether one of the rollout's early user messages is the prompt with this digest.
+fn rollout_holds_prompt(path: &Path, digest: &str) -> bool {
+    use std::io::BufRead as _;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    std::io::BufReader::new(file)
+        .lines()
+        .take(40)
+        .map_while(Result::ok)
+        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+        .filter(|row| row.pointer("/payload/role").and_then(Value::as_str) == Some("user"))
+        .filter_map(|row| row.pointer("/payload/content").cloned())
+        .filter_map(|content| content.as_array().cloned())
+        .flatten()
+        .filter_map(|part| part.get("text").and_then(Value::as_str).map(prompt_digest))
+        .any(|found| found == digest)
+}
+
 /// Choose the earliest rollout at or after session start, preferring this cwd, so concurrent runs do not swap transcripts.
-fn resolve_rollout(sessions_root: &Path, started_ms: u64, cwd: &Path) -> Option<PathBuf> {
+fn resolve_rollout(
+    sessions_root: &Path,
+    started_ms: u64,
+    cwd: &Path,
+    claimed: &[PathBuf],
+    prompt: Option<&str>,
+) -> Option<PathBuf> {
     let mut files = Vec::new();
     collect_rollouts(sessions_root, &mut files);
     let mut candidates: Vec<(u64, bool, PathBuf)> = files
         .into_iter()
         .filter_map(|path| {
+            if claimed.contains(&path) {
+                return None;
+            }
             let (started, recorded_cwd, _id) = rollout_session_meta(&path)?;
             if started < started_ms {
                 return None;
@@ -895,6 +951,17 @@ fn resolve_rollout(sessions_root: &Path, started_ms: u64, cwd: &Path) -> Option<
             Some((started, same_cwd, path))
         })
         .collect();
+    // The rollout that holds this run's own prompt is exact; start order only breaks ties.
+    if let Some(digest) = prompt {
+        let own: Vec<_> = candidates
+            .iter()
+            .filter(|(_, _, path)| rollout_holds_prompt(path, digest))
+            .cloned()
+            .collect();
+        if !own.is_empty() {
+            candidates = own;
+        }
+    }
     if candidates.iter().any(|(_, same_cwd, _)| *same_cwd) {
         candidates.retain(|(_, same_cwd, _)| *same_cwd);
     }
@@ -1108,6 +1175,16 @@ impl AgentAdapter for CodexAdapter {
     /// `codex exec` has no `--session-id` flag (verified): codex always mints
     /// its own session id, so `session` cannot appear in the built command.
     fn headless_cmd(&self, prompt: &str, _session: &SessionId, extra: &[String]) -> Command {
+        // Codex mints its own id, so the prompt's digest is what later finds this run's rollout.
+        if let Some(state) = self.state_dir()
+            && super::super::state::create_private_dir_all(&state.rollouts()).is_ok()
+        {
+            let short = super::super::sessions::short_id(_session.as_str());
+            let _ = super::super::state::write_private(
+                &state.rollouts().join(format!("{short}.prompt")),
+                &prompt_digest(prompt),
+            );
+        }
         let mut cmd = self.base();
         cmd.arg("exec").arg(prompt).args(extra);
         cmd
@@ -4645,6 +4722,104 @@ mod tests {
         };
 
         assert_eq!(adapter.resume_target(&session), None);
+    }
+
+    /// #931: two concurrent helpers in one cwd, both registered before either rollout started.
+    /// Whichever finishes first, each must resolve to the rollout that holds its own prompt.
+    fn resolve_two_concurrent_helpers(b_first: bool) {
+        let home = tempfile::tempdir().expect("home");
+        let state_root = tempfile::tempdir().expect("state");
+        let day_dir = home.path().join(".codex/sessions/2026/09/06");
+        std::fs::create_dir_all(&day_dir).expect("mkdir");
+        let rollout = |name: &str, started: &str, prompt: &str| -> PathBuf {
+            let path = day_dir.join(name);
+            let meta = serde_json::json!({
+                "timestamp": started,
+                "type": "session_meta",
+                "payload": {"id": "x", "timestamp": started, "cwd": "/work/repo"},
+            });
+            let developer = serde_json::json!({
+                "type": "response_item",
+                "payload": {"type": "message", "role": "developer",
+                    "content": [{"type": "input_text", "text": "standard"}]},
+            });
+            let user = serde_json::json!({
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": prompt}]},
+            });
+            std::fs::write(&path, format!("{meta}\n{developer}\n{user}\n")).expect("write rollout");
+            path
+        };
+        let rollout_a = rollout(
+            "rollout-2026-09-06T06-00-10-bbbbbbbb-2222-7222-8222-222222222222.jsonl",
+            "2026-09-06T06:00:10.000Z",
+            "question A",
+        );
+        let rollout_b = rollout(
+            "rollout-2026-09-06T06-00-12-cccccccc-3333-7333-8333-333333333333.jsonl",
+            "2026-09-06T06:00:12.000Z",
+            "question B",
+        );
+        let state =
+            crate::commands::ctx::state::StateDir::from_root(state_root.path().to_path_buf());
+        std::fs::create_dir_all(state.sessions()).expect("mkdir sessions");
+        let adapter = CodexAdapter::new(None)
+            .with_home(home.path().to_path_buf())
+            .with_state_root(state_root.path().to_path_buf());
+        let launch = |id: &str, started_at: u64, prompt: &str| {
+            let mut record = crate::commands::ctx::sessions::Record::new(
+                id,
+                "codex",
+                std::path::Path::new("/work/repo"),
+                crate::commands::ctx::sessions::Verb::Dash,
+            );
+            record.started_at = started_at;
+            let short = crate::commands::ctx::sessions::short_id(id);
+            std::fs::write(
+                state.sessions().join(format!("{short}.json")),
+                serde_json::to_string(&record).expect("record json"),
+            )
+            .expect("write record");
+            let _ = adapter.headless_cmd(prompt, &SessionId::parse(id), &[]);
+            SessionRef {
+                id: SessionId::parse(id),
+                cwd: std::path::PathBuf::from("/work/repo"),
+            }
+        };
+        let a = launch(
+            "11111111-2222-4333-8444-555555555555",
+            1_788_674_400,
+            "question A",
+        );
+        let b = launch(
+            "22222222-2222-4333-8444-555555555555",
+            1_788_674_405,
+            "question B",
+        );
+        let (first, second) = if b_first { (&b, &a) } else { (&a, &b) };
+        let _ = adapter.transcript_path(first);
+        let _ = adapter.transcript_path(second);
+        assert_eq!(
+            adapter.transcript_path(&a),
+            rollout_a,
+            "helper A's own rollout"
+        );
+        assert_eq!(
+            adapter.transcript_path(&b),
+            rollout_b,
+            "helper B's own rollout"
+        );
+    }
+
+    #[test]
+    fn concurrent_helpers_resolve_their_own_rollouts_when_the_first_finishes_first() {
+        resolve_two_concurrent_helpers(false);
+    }
+
+    #[test]
+    fn concurrent_helpers_resolve_their_own_rollouts_when_the_second_finishes_first() {
+        resolve_two_concurrent_helpers(true);
     }
 
     /// Review round 1 (R6): a handover keeps the SAME zirv session id, so the
