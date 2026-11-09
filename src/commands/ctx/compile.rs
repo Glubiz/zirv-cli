@@ -1356,7 +1356,11 @@ fn measure_row(layer: &str, bytes: usize, note: &str) -> String {
 
 /// Use compiler provenance and the same selected prompt constants as composition, never a second size calculation.
 /// Keep emission order and name the exact budget to raise for any truncated surface (#427).
-fn render_measure_table(compiled: &CompiledContext, cfg: &CtxConfig, role: PromptRole) -> String {
+pub(crate) fn render_measure_table(
+    compiled: &CompiledContext,
+    cfg: &CtxConfig,
+    role: PromptRole,
+) -> String {
     let mut rows: Vec<String> = Vec::new();
     // Bytes in listed layers, so the unlabelled remainder of the prompt can be reported too.
     let mut listed = 0usize;
@@ -1491,19 +1495,26 @@ fn render_measure_table(compiled: &CompiledContext, cfg: &CtxConfig, role: Promp
     out
 }
 
-pub fn run_with<W: std::io::Write>(
-    args: &CompileArgs,
-    w: &mut W,
+/// One compiled seat prompt with the config and role it was compiled under.
+pub(crate) struct RoleCompile {
+    pub(crate) compiled: CompiledContext,
+    pub(crate) cfg: CtxConfig,
+    pub(crate) role: PromptRole,
+}
+
+/// Compile the prompt a launch would send for `role` (default orchestrator). Spawns nothing.
+pub(crate) fn compile_for_role(
     repo: &Path,
     env: super::config::EnvLookup<'_>,
-) -> CtxResult<i32> {
+    agent: Option<&str>,
+    role: Option<&str>,
+) -> CtxResult<RoleCompile> {
     let cfg = CtxConfig::load(repo, env)?;
     let home = crate::utils::home_dir().ok();
     let state = StateDir::resolve(env)?;
     // Rendering spawns nothing and must work without an installed harness binary (#690).
-    let adapter =
-        adapters::select_for_identity(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
-    let role = match args.role.as_deref() {
+    let adapter = adapters::select_for_identity(agent.or(cfg.agent.as_deref()), &[], &cfg)?;
+    let role = match role {
         None => PromptRole::Orchestrator,
         Some(label) => PromptRole::from_label(label).ok_or_else(|| {
             format!(
@@ -1535,7 +1546,24 @@ pub fn run_with<W: std::io::Write>(
         &cfg.prompt,
     )
     .1;
+    Ok(RoleCompile {
+        compiled,
+        cfg,
+        role,
+    })
+}
 
+pub fn run_with<W: std::io::Write>(
+    args: &CompileArgs,
+    w: &mut W,
+    repo: &Path,
+    env: super::config::EnvLookup<'_>,
+) -> CtxResult<i32> {
+    let RoleCompile {
+        compiled,
+        cfg,
+        role,
+    } = compile_for_role(repo, env, args.agent.as_deref(), args.role.as_deref())?;
     if args.measure {
         writeln!(w, "{}", render_measure_table(&compiled, &cfg, role))?;
     } else {

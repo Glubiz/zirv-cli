@@ -6,6 +6,7 @@
 mod auto;
 mod corpus;
 mod discover;
+mod eval;
 mod report;
 mod run;
 
@@ -90,6 +91,11 @@ enum Command {
         #[arg(long)]
         quiet: bool,
     },
+    /// Behaviour eval cases that grade what an agent does. Only the free tier exists so far.
+    Eval {
+        #[command(subcommand)]
+        command: eval::EvalCommand,
+    },
     /// Re-render a stored run; the newest when no id is given.
     Report {
         run_id: Option<String>,
@@ -173,6 +179,7 @@ fn execute(
     let python_present = adapters::program_is_present("python3");
     let stdout = &mut std::io::stdout();
     match command {
+        Command::Eval { command } => eval::execute(command, &repo, env, stdout),
         Command::Plan { filters, json } => {
             let listing = model_listing(&cfg, env)?;
             let plan = match run::plan(

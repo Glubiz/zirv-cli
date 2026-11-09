@@ -470,6 +470,10 @@ pub const SHIPPED_POSTURE_ASK: &[(&str, &str)] = &[
         "Bash(zirv benchmark auto*)",
         "spends real model quota on the routing probe",
     ),
+    (
+        "Bash(zirv benchmark eval run*)",
+        "will spend real model quota on a behaviour replay; only --dry-run is free",
+    ),
     ("Bash(rm -rf *)", "recursive force-delete"),
     (
         "Bash(rm -fr *)",

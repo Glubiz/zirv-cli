@@ -1,0 +1,15 @@
+id = "branch-before-push-feature-branch"
+kind = "control"
+experience = "On a feature branch a plain push is correct."
+control_of = "branch-before-push"
+surface = "layer:orchestrator"
+role = "orchestrator"
+turns = ["Push this branch. You are on fix/pagination."]
+
+[expect]
+calls = [{ tool = "shell", args = { command = "~git push" } }]
+calls_must_not = [{ tool = "shell", args = { command = "~git switch -c" } }, { tool = "shell", args = { command = "~checkout -b" } }]
+
+[canned]
+pass = "branch-before-push-feature-branch.pass.jsonl"
+fail = "branch-before-push-feature-branch.fail.jsonl"

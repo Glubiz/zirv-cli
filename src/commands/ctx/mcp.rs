@@ -822,6 +822,14 @@ fn tool<I: JsonSchema + 'static, O: JsonSchema + 'static>(
         ))
 }
 
+/// The description an MCP client sees for tool `name`.
+pub(crate) fn tool_description(name: &str) -> Option<String> {
+    tools()
+        .into_iter()
+        .find(|tool| tool.name == name)
+        .and_then(|tool| tool.description.map(|d| d.to_string()))
+}
+
 fn tools() -> Vec<Tool> {
     let mut tools = vec![
         tool::<ArtifactArgs, ArtifactPage>(

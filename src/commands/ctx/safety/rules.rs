@@ -401,6 +401,10 @@ fn built_in_structural_rule_matches(
             sql_tokens(&collapse_whitespace(command))
                 .is_some_and(|tokens| is_benchmark_run(&tokens)),
         ),
+        "zirv benchmark eval run*" => Some(
+            sql_tokens(&collapse_whitespace(command))
+                .is_some_and(|tokens| is_benchmark_eval_run(&tokens)),
+        ),
         "* | sh" | "* | bash" | "* | zsh" | "*| sh" | "*| bash" => {
             // The semantic pipeline analyzer below owns this family so it
             // can require a network-fetching upstream stage.
@@ -837,6 +841,38 @@ mod tests {
                 "{command}: expected Allow, got {:?}",
                 outcome.verdict
             );
+        }
+    }
+
+    #[test]
+    fn benchmark_eval_run_asks_while_lint_plan_and_dry_run_stay_allowed() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "zirv benchmark eval run",
+            "ZIRV BENCHMARK EVAL RUN --case x",
+            "a && zirv benchmark eval run --context",
+        ] {
+            for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
+                assert_eq!(
+                    evaluate(&policy, command, mode).verdict,
+                    Verdict::Ask,
+                    "{command} under {mode:?}"
+                );
+            }
+        }
+        for command in [
+            "zirv benchmark eval plan",
+            "zirv benchmark eval lint --json",
+            "zirv benchmark eval run --dry-run",
+            "zirv benchmark eval run --dry-run --context --case x",
+        ] {
+            for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
+                assert_eq!(
+                    evaluate(&policy, command, mode).verdict,
+                    Verdict::Allow,
+                    "{command} under {mode:?}"
+                );
+            }
         }
     }
 

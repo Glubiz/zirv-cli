@@ -59,6 +59,7 @@ criterion).
 | `artifact show` | shared |  |
 | `benchmark` | shared |  |
 | `benchmark auto` | shared | unattended routing probe; launches installed harnesses through the same `ctx exec` path as `benchmark run`; owns no model-calling call site of its own |
+| `benchmark eval` | shared | behaviour evals (`lint`, `plan`, `run --dry-run`); paid replay not implemented; makes no model call |
 | `benchmark plan` | shared | read-only; makes no model call |
 | `benchmark report` | shared | re-renders a stored run; makes no model call |
 | `benchmark run` | shared | launches installed harnesses solo through `ctx exec`; owns no model-calling call site of its own |

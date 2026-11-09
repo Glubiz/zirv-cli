@@ -1,0 +1,15 @@
+id = "recall-before-substantive-work"
+kind = "guard"
+experience = "Recall durable facts before substantive work in an area."
+source = "CLAUDE.md#docs-and-memory"
+surface = "layer:orchestrator"
+role = "orchestrator"
+turns = ["Refactor the compile module's measure table to share rows."]
+
+[expect]
+calls = [{ tool = "shell", args = { command = "~zirv ctx recall" } }]
+order = ["shell", "Edit"]
+
+[canned]
+pass = "recall-before-substantive-work.pass.jsonl"
+fail = "recall-before-substantive-work.fail.jsonl"
