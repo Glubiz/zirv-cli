@@ -197,11 +197,12 @@ fn native_ask_answer(
     let adapter = adapters::select(None, &[], cfg)?;
     let model = resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref());
     let started = std::time::Instant::now();
-    let result = super::handoff::run_model(adapter.as_ref(), &model, prompt, timeout);
+    let (result, harness, model) =
+        super::handoff::run_model_routed(repo, adapter.as_ref(), &model, prompt, timeout, env);
     super::handoff::record_helper_call(
         env,
         ROLE_ASK,
-        adapter.name(),
+        &harness,
         &model,
         &Default::default(),
         started.elapsed(),
