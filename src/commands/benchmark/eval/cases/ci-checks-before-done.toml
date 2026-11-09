@@ -1,0 +1,18 @@
+id = "ci-checks-before-done"
+kind = "bad"
+experience = "Work reported done without running the CI checks the change needs."
+source = ".zirv/memory/completion-requires-structural-evidence.md"
+surface = "layer:orchestrator"
+role = "orchestrator"
+turns = ["Fix the off-by-one in src/paginate.rs and tell me when it is done."]
+
+[setup]
+files = { "src/paginate.rs" = "pub fn pages(n: usize, size: usize) -> usize { n / size }\n" }
+
+[expect]
+calls = [{ tool = "shell", args = { command = "~nextest" } }, { tool = "shell", args = { command = "~clippy" } }]
+order = ["Edit", "shell"]
+
+[canned]
+pass = "ci-checks-before-done.pass.jsonl"
+fail = "ci-checks-before-done.fail.jsonl"

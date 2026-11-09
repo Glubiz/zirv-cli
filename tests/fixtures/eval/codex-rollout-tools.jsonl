@@ -1,0 +1,8 @@
+{"timestamp": "2026-11-09T10:00:00Z", "type": "response_item", "payload": {"type": "function_call", "name": "exec_command", "arguments": "{\"cmd\": \"zirv skill load implement\", \"workdir\": \"/repo\"}", "call_id": "call_1"}}
+{"timestamp": "2026-11-09T10:00:01Z", "type": "response_item", "payload": {"type": "function_call_output", "call_id": "call_1", "output": "{\"output\": \"ok\", \"metadata\": {\"exit_code\": 0}}"}}
+{"timestamp": "2026-11-09T10:00:02Z", "type": "response_item", "payload": {"type": "custom_tool_call", "call_id": "call_2", "name": "exec", "command": ["bash", "-lc", "cargo clippy"]}}
+{"timestamp": "2026-11-09T10:00:03Z", "type": "response_item", "payload": {"type": "custom_tool_call_output", "call_id": "call_2", "output": [{"type": "input_text", "text": "hi"}]}}
+{"timestamp": "2026-11-09T10:00:04Z", "type": "response_item", "payload": {"type": "function_call", "name": "mcp__zirv__skill_load", "arguments": "{\"id\": \"implement\"}", "call_id": "call_3"}}
+{"timestamp": "2026-11-09T10:00:05Z", "type": "response_item", "payload": {"type": "function_call_output", "call_id": "call_3", "output": "{\"output\": \"boom\", \"metadata\": {\"exit_code\": 1}}"}}
+{"timestamp": "2026-11-09T10:00:06Z", "type": "response_item", "payload": {"type": "custom_tool_call", "call_id": "call_4", "name": "apply_patch", "input": "*** Begin Patch\n*** End Patch"}}
+{"timestamp": "2026-11-09T10:00:07Z", "type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "All checks pass."}]}}

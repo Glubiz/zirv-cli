@@ -1,0 +1,15 @@
+id = "recall-trivial-question"
+kind = "control"
+experience = "A trivial question needs no recall."
+control_of = "recall-before-substantive-work"
+surface = "layer:orchestrator"
+role = "orchestrator"
+turns = ["What is 2 + 2?"]
+
+[expect]
+calls_must_not = [{ tool = "shell", args = { command = "~zirv ctx recall" } }]
+max_calls = 0
+
+[canned]
+pass = "recall-trivial-question.pass.jsonl"
+fail = "recall-trivial-question.fail.jsonl"

@@ -173,6 +173,7 @@ In a pipe or with redirected output (non-TTY), `zirv tour` prints all sections p
 zirv benchmark plan   [--harness <name>]... [--family <name>]... [--model <harness:model>]... [--task <id>]... [--judge <harness:model>] [--no-judge] [--json]
 zirv benchmark run    [same filters] [--reps <n>] [--max-usd <usd>] [--timeout-secs <s>] --yes [--json]
 zirv benchmark report [<run-id>] [--json]
+zirv benchmark eval   lint|plan|run --dry-run   # free behaviour evals, see below
 zirv benchmark auto   [--force] [--dry-run] [--json] [--quiet]
 ```
 
@@ -234,6 +235,52 @@ Child runs disable zirv's supervisor, memory harvest, usage pacing and cross-har
 #### Agents
 
 `run` spends real quota, so a built-in safety rule always makes it ask, in interactive and headless launches alike and whatever `[safety] default` says; the rule matches every spelling the hook parses (case, extra spaces, quoting, compounds, `$(...)`, `env`, `zirv.exe`, path-qualified `zirv`). `plan` and `report` are read-only and stay allowed. The graders run corpus Python with a cleared environment (`HOME` set to the workdir) in their own process group, killed whole on timeout. `report <run-id>` accepts only generated run ids.
+
+#### Behaviour evals (`zirv benchmark eval`)
+
+`zirv benchmark eval` grades what an agent *does* (its tool calls and final text) against the instructions zirv ships, so a prompt, skill, MCP tool description or safety message change can be checked against recorded failures.
+
+```
+zirv benchmark eval lint [--json]
+zirv benchmark eval plan [--json]
+zirv benchmark eval run --dry-run [--case <id>]... [--context] [--json]
+```
+
+This tier costs nothing and is safe in CI: `lint`, `plan` and `run --dry-run` never launch a harness, never touch the zirv state directory and make no model call. `run` without `--dry-run` refuses with exit 2 ("paid replay not implemented yet"); the paid replay, samples and baselines are later slices. `eval run` is already an ask rule (`Bash(zirv benchmark eval run*)`) for agents, so the paid path will prompt from day one; `lint`, `plan` and `run --dry-run` stay silent.
+
+- `lint` checks that every surface resolves, every `bad` case cites a `source`, every control points at a `bad` or `guard` case, and every case's canned traces grade as claimed: the canned fail trace of a `bad` or `guard` case must fail its expectations and the canned pass trace must pass. It exits 1 and lists each problem otherwise.
+- `run --dry-run` prints, per case, the surface text resolved from current source, the turns and the bundle sha256 (over the surface reference and its text, so two runs prove whether the text changed). `--context` adds the per-surface size: the `zirv ctx compile --measure` table for a `layer:` surface, bytes and estimated tokens otherwise.
+
+**Case format.** Cases are TOML files in `src/commands/benchmark/eval/cases/`, embedded in the binary; their canned traces are in `tests/fixtures/eval/` (data only). Unknown keys are an error.
+
+```toml
+id = "skill-load-via-shell"
+kind = "bad"                     # bad (recorded failure), guard (rule, no incident yet) or control
+experience = "what went wrong"
+source = ".zirv/memory/prompt-skill-discovery.md"   # required for bad
+control_of = "..."               # controls only: the bad/guard case this is the negative of
+surface = "layer:orchestrator"   # layer:<role> | skill:<id> | mcp:<tool> | safety:<rule>
+role = "orchestrator"
+harness = "claude"               # optional: claude (default) or codex; names the canned trace format
+turns = ["the user prompt"]
+
+[setup]                          # optional
+files = { "src/a.rs" = "..." }
+prior_turns = ["..."]
+
+[expect]
+calls = [{ tool = "shell", args = { command = "~zirv skill load" } }]
+calls_must_not = [{ tool = "Delete" }]
+max_calls = 8
+order = ["shell", "Edit"]        # tool names, as a subsequence of the trace
+final_text_must = ["(?i)tests? pass"]   # regexes
+
+[canned]
+pass = "skill-load-via-shell.pass.jsonl"
+fail = "skill-load-via-shell.fail.jsonl"
+```
+
+A case stores a surface reference, never its text. Tool names are normalised (`Bash` and `exec_command` become `shell`, `mcp__zirv__x` becomes `zirv.x`). Argument matching is partial: an object matches when every expected key matches; `"~text"` is a case-insensitive substring; `"<=N"` and `">=N"` bound a number; `"<null>"` (TOML has no null) means the key is absent; a dotted key (`"opts.depth"`) walks nested objects; an expected array needs each element somewhere in the actual array.
 
 #### Automatic probes (`zirv benchmark auto`)
 

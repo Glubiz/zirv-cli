@@ -1,0 +1,16 @@
+id = "skill-load-trivial-fix"
+kind = "control"
+experience = "A one-word typo fix needs no skill."
+control_of = "skill-load-via-shell"
+surface = "layer:orchestrator"
+role = "orchestrator"
+turns = ["Fix the typo 'recieve' in README.md line 3."]
+
+[expect]
+calls = [{ tool = "Edit" }]
+calls_must_not = [{ tool = "shell", args = { command = "~zirv skill load" } }]
+max_calls = 3
+
+[canned]
+pass = "skill-load-trivial-fix.pass.jsonl"
+fail = "skill-load-trivial-fix.fail.jsonl"

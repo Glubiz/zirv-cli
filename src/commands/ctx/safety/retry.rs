@@ -329,6 +329,23 @@ pub(super) fn is_benchmark_run(tokens: &[String]) -> bool {
         && tokens.get(2).is_some_and(|t| t.eq_ignore_ascii_case("run"))
 }
 
+/// `zirv benchmark eval run` is the paid behaviour replay, so it prompts; `--dry-run` only prints
+/// and stays silent, like `permissions compile --dry-run`.
+pub(super) fn is_benchmark_eval_run(tokens: &[String]) -> bool {
+    tokens
+        .first()
+        .is_some_and(|program| sql_program_name(program) == "zirv")
+        && ["benchmark", "eval", "run"]
+            .iter()
+            .enumerate()
+            .all(|(i, word)| {
+                tokens
+                    .get(i + 1)
+                    .is_some_and(|t| t.eq_ignore_ascii_case(word))
+            })
+        && !tokens.iter().skip(4).any(|t| t == "--dry-run")
+}
+
 /// Judge one zirv segment so compounds with safe read-only filters can
 /// qualify only when every segment is independently safe (#329). Reserved
 /// names alone do not prove sandbox safety: ctx launchers and payload-carrying
