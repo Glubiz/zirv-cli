@@ -88,6 +88,18 @@ fn cadence_phrase(reason: super::memory::CadenceReason, z: f64) -> &'static str 
     }
 }
 
+/// `1h ttl, expires in 42m` / `5m ttl, expired 3m ago`.
+fn prompt_cache_text(cache: super::event::PromptCache, now: u64) -> String {
+    let ttl = if cache.ttl_secs >= 3600 { "1h" } else { "5m" };
+    if cache.expires_at > now {
+        let left = crate::style::format_age(cache.expires_at - now);
+        format!("prompt cache: {ttl} ttl, expires in {left}")
+    } else {
+        let ago = crate::style::format_age(now - cache.expires_at);
+        format!("prompt cache: {ttl} ttl, expired {ago} ago")
+    }
+}
+
 fn model_change_status_text(change: &super::event::ModelChange) -> String {
     format!(
         "model changed mid-session {} turns ago: `{}` -> `{}`",
@@ -284,6 +296,23 @@ fn sessions_lines(
                 line.push_str(&format!(
                     "  {}",
                     style::paint(&model_change_status_text(&change), Tone::Warn, colour)
+                ));
+            }
+            if let Some(cache) = super::score::prompt_cache_for_session(
+                state,
+                &record.agent,
+                &record.session,
+                &record.repo,
+                env,
+            ) {
+                let tone = if cache.expires_at > now {
+                    Tone::Muted
+                } else {
+                    Tone::Warn
+                };
+                line.push_str(&format!(
+                    "  {}",
+                    style::paint(&prompt_cache_text(cache, now), tone, colour)
                 ));
             }
             // Issue #349: the composed attention projection, shown for every
@@ -2800,6 +2829,23 @@ mod tests {
     #[cfg(unix)]
     use crate::commands::ctx::signal;
     use crate::commands::ctx::state::{STATE_ENV, StateDir};
+
+    #[test]
+    fn prompt_cache_text_names_ttl_and_time_to_expiry() {
+        use crate::commands::ctx::event::PromptCache;
+        let cache = |ttl_secs, expires_at| PromptCache {
+            ttl_secs,
+            expires_at,
+        };
+        assert_eq!(
+            prompt_cache_text(cache(3600, 1000 + 42 * 60), 1000),
+            "prompt cache: 1h ttl, expires in 42m"
+        );
+        assert_eq!(
+            prompt_cache_text(cache(300, 1000 - 3 * 60), 1000),
+            "prompt cache: 5m ttl, expired 3m ago"
+        );
+    }
 
     fn env_for(state: &std::path::Path) -> std::collections::HashMap<String, String> {
         [(STATE_ENV.to_string(), state.display().to_string())].into()

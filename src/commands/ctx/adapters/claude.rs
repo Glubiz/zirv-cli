@@ -12,8 +12,8 @@ use super::super::CtxResult;
 use super::super::catalogue;
 use super::super::event::input_hash;
 use super::super::event::{
-    Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext, ToolInvocation,
-    TranscriptUsage, UNRESOLVED_TOOL_CALL_CAP, UnresolvedToolCall, error_text_hash,
+    Capabilities, NormalizedEvent, PromptCache, SessionId, SessionRef, StructuralContext,
+    ToolInvocation, TranscriptUsage, UNRESOLVED_TOOL_CALL_CAP, UnresolvedToolCall, error_text_hash,
     last_verification_run,
 };
 use super::super::window::parse_iso8601_utc_ms;
@@ -615,6 +615,65 @@ fn fold_usage_rows(jsonl: &str, keep: impl Fn(&Value) -> bool) -> Option<Transcr
 
 pub fn transcript_usage(jsonl: &str) -> Option<TranscriptUsage> {
     fold_assistant_usage(jsonl, false)
+}
+
+/// Prompt-cache TTL and expiry from the main thread's assistant rows. The TTL is
+/// the 1h class when a row wrote any 1h tokens, else 5m when it wrote 5m tokens
+/// (mirrors t3code's `claudePromptCacheTtlMs`); a row with no
+/// `cache_creation` split leaves the TTL as it was. A row that wrote or read
+/// cache restarts the clock from its own timestamp. `None` when no TTL or
+/// timestamp is known: never a guess.
+pub fn prompt_cache(jsonl: &str) -> Option<PromptCache> {
+    let mut ttl_secs: Option<u64> = None;
+    let mut touched_ms: Option<u64> = None;
+    for line in jsonl.lines() {
+        let Ok(row) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if row.get("type").and_then(Value::as_str) != Some("assistant")
+            || row.get("isSidechain").and_then(Value::as_bool) == Some(true)
+        {
+            continue;
+        }
+        let Some(usage) = row.get("message").and_then(|message| message.get("usage")) else {
+            continue;
+        };
+        let split = |key: &str| {
+            usage
+                .get("cache_creation")
+                .and_then(|split| split.get(key))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        };
+        let row_ttl = if split("ephemeral_1h_input_tokens") > 0 {
+            Some(60 * 60)
+        } else if split("ephemeral_5m_input_tokens") > 0 {
+            Some(5 * 60)
+        } else {
+            None
+        };
+        let categories = usage_categories(usage);
+        let touches_cache =
+            categories.cache_creation_input_tokens > 0 || categories.cache_read_input_tokens > 0;
+        if row_ttl.is_some() {
+            ttl_secs = row_ttl;
+        }
+        if !touches_cache {
+            continue;
+        }
+        let at_ms = row
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_iso8601_utc_ms);
+        if at_ms.is_some() {
+            touched_ms = at_ms;
+        }
+    }
+    let ttl_secs = ttl_secs?;
+    Some(PromptCache {
+        ttl_secs,
+        expires_at: touched_ms? / 1000 + ttl_secs,
+    })
 }
 
 /// The same fold as [`transcript_usage`], over the rows it deliberately
@@ -3152,6 +3211,63 @@ impl AgentAdapter for ClaudeAdapter {
 mod tests {
     use super::super::super::config::OrchestratorWrites;
     use super::*;
+
+    fn cache_row(ts: &str, create: Option<(u64, u64)>, read: u64) -> String {
+        let split = create.map_or(String::new(), |(m5, h1)| {
+            format!(
+                r#","cache_creation":{{"ephemeral_5m_input_tokens":{m5},"ephemeral_1h_input_tokens":{h1}}}"#
+            )
+        });
+        let created = create.map_or(0, |(m5, h1)| m5 + h1);
+        format!(
+            r#"{{"type":"assistant","timestamp":"{ts}","message":{{"usage":{{"input_tokens":1,"cache_creation_input_tokens":{created},"cache_read_input_tokens":{read},"output_tokens":1{split}}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn prompt_cache_prefers_1h_over_5m_and_detects_5m() {
+        let base = parse_iso8601_utc_ms("2026-01-01T00:00:00.000Z").unwrap() / 1000;
+        let one_hour = cache_row("2026-01-01T00:00:00.000Z", Some((10, 20)), 0);
+        let five_min = cache_row("2026-01-01T00:00:00.000Z", Some((10, 0)), 0);
+        assert_eq!(
+            prompt_cache(&one_hour),
+            Some(PromptCache {
+                ttl_secs: 3600,
+                expires_at: base + 3600
+            })
+        );
+        assert_eq!(
+            prompt_cache(&five_min),
+            Some(PromptCache {
+                ttl_secs: 300,
+                expires_at: base + 300
+            })
+        );
+    }
+
+    #[test]
+    fn prompt_cache_expiry_follows_the_latest_cache_touching_row() {
+        let base = parse_iso8601_utc_ms("2026-01-01T00:00:00.000Z").unwrap() / 1000;
+        let jsonl = [
+            cache_row("2026-01-01T00:00:00.000Z", Some((10, 0)), 0),
+            cache_row("2026-01-01T00:02:00.000Z", None, 500),
+            // no cache tokens at all: must not move the clock
+            cache_row("2026-01-01T00:09:00.000Z", None, 0),
+        ]
+        .join("\n");
+        let cache = prompt_cache(&jsonl).expect("known ttl");
+        assert_eq!(cache.ttl_secs, 300);
+        assert_eq!(cache.expires_at, base + 120 + 300);
+    }
+
+    #[test]
+    fn prompt_cache_is_unknown_without_the_split_or_a_timestamp() {
+        let legacy = cache_row("2026-01-01T00:00:00.000Z", None, 900);
+        assert_eq!(prompt_cache(&legacy), None);
+        let no_ts = r#"{"type":"assistant","message":{"usage":{"cache_creation_input_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":0}}}}"#;
+        assert_eq!(prompt_cache(no_ts), None);
+        assert_eq!(prompt_cache(""), None);
+    }
     use crate::commands::ctx::event::{NormalizedEvent, input_hash};
 
     fn credential_names(env: &[(&str, &str)]) -> Vec<String> {

@@ -445,6 +445,33 @@ pub fn model_change_for_session(
         .model_change
 }
 
+/// Best-effort prompt-cache TTL/expiry for one registered Claude session; `None`
+/// for any other harness or when the transcript does not state it. Same I/O
+/// layer as [`model_change_for_session`], so `rot.rs` stays pure.
+pub fn prompt_cache_for_session(
+    state: &StateDir,
+    agent: &str,
+    session_id: &str,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> Option<super::event::PromptCache> {
+    if agent != "claude" {
+        return None;
+    }
+    let cfg = CtxConfig::load(repo, env).ok()?;
+    let adapter = adapters::select(Some(agent), &[], &cfg).ok()?;
+    let transcript = super::adapters::claude::session_transcript(
+        adapter.as_ref(),
+        state,
+        &SessionRef {
+            id: SessionId::parse(session_id),
+            cwd: repo.to_path_buf(),
+        },
+    );
+    let jsonl = std::fs::read_to_string(transcript).ok()?;
+    super::adapters::claude::prompt_cache(&jsonl)
+}
+
 /// Issue #312: the window-attribution summary for one registered session,
 /// plus the model's resolved context window (for a percentage-of-window
 /// render) when either the operator or the adapter states one. `status.rs`'s
