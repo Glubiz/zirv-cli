@@ -299,7 +299,7 @@ fn sessions_lines(
                 ));
             }
             // A dead session's cache is long gone: skip the transcript read.
-            if is_live
+            if matches!(liveness, Liveness::Live)
                 && let Some(cache) = super::score::prompt_cache_for_session(
                     state,
                     &record.agent,
@@ -2881,7 +2881,7 @@ mod tests {
             compact_min_bytes: 1024,
             decision_sessions: &decision_sessions,
         };
-        let render = |liveness| {
+        let render = |record: &crate::commands::ctx::sessions::Record, liveness| {
             sessions_lines(
                 &[(record.clone(), liveness)],
                 &state,
@@ -2892,8 +2892,10 @@ mod tests {
             )
             .join("\n")
         };
-        assert!(render(Liveness::Live).contains("prompt cache:"));
-        assert!(!render(Liveness::Stale).contains("prompt cache:"));
+        assert!(render(&record, Liveness::Live).contains("prompt cache:"));
+        assert!(!render(&record, Liveness::Stale).contains("prompt cache:"));
+        record.reachable = false;
+        assert!(render(&record, Liveness::Live).contains("prompt cache:"));
     }
 
     fn env_for(state: &std::path::Path) -> std::collections::HashMap<String, String> {

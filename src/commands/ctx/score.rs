@@ -468,7 +468,20 @@ pub fn prompt_cache_for_session(
             cwd: repo.to_path_buf(),
         },
     );
-    let jsonl = read_transcript_tail(&transcript, PROMPT_CACHE_TAIL_BYTES)?;
+    prompt_cache_from_transcript(&transcript)
+}
+
+/// A cache row hidden behind one huge row misses the normal tail, so a file
+/// longer than the tail gets one retry with a wider one.
+fn prompt_cache_from_transcript(path: &Path) -> Option<super::event::PromptCache> {
+    let jsonl = read_transcript_tail(path, PROMPT_CACHE_TAIL_BYTES)?;
+    if let Some(cache) = super::adapters::claude::prompt_cache(&jsonl) {
+        return Some(cache);
+    }
+    if std::fs::metadata(path).ok()?.len() <= PROMPT_CACHE_TAIL_BYTES {
+        return None;
+    }
+    let jsonl = read_transcript_tail(path, PROMPT_CACHE_RETRY_TAIL_BYTES)?;
     super::adapters::claude::prompt_cache(&jsonl)
 }
 
@@ -476,6 +489,7 @@ pub fn prompt_cache_for_session(
 /// reads a bounded tail instead of parsing a multi-megabyte transcript per
 /// session. A cut first line fails JSON parsing and is skipped.
 const PROMPT_CACHE_TAIL_BYTES: u64 = 256 * 1024;
+const PROMPT_CACHE_RETRY_TAIL_BYTES: u64 = 4 * 1024 * 1024;
 
 fn read_transcript_tail(path: &Path, cap: u64) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
@@ -1568,6 +1582,20 @@ mod tests {
         let tail = read_transcript_tail(&path, 4096).expect("tail");
         assert!(tail.len() <= 4096);
         let cache = crate::commands::ctx::adapters::claude::prompt_cache(&tail).expect("cache");
+        assert_eq!(cache.ttl_secs, 300);
+    }
+
+    #[test]
+    fn prompt_cache_is_found_behind_a_row_larger_than_the_tail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let row = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00.000Z","message":{"usage":{"cache_creation_input_tokens":5,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":0}}}}"#;
+        let huge = format!(
+            "{{\"type\":\"user\",\"message\":{{\"content\":\"{}\"}}}}\n",
+            "x".repeat(300 * 1024)
+        );
+        std::fs::write(&path, format!("{row}\n{huge}")).expect("write");
+        let cache = prompt_cache_from_transcript(&path).expect("cache");
         assert_eq!(cache.ttl_secs, 300);
     }
 

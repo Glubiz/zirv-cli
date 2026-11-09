@@ -255,19 +255,57 @@ pub fn obfuscate(
                 .iter()
                 .any(|(start, end)| candidate.start >= *start && candidate.end <= *end)
     });
-    // An encoded variant must never lose to an overlapping regular candidate:
-    // that one would mint a rehydratable placeholder for an encoded secret.
-    let encoded_spans: Vec<(usize, usize)> = candidates
-        .iter()
-        .filter(|candidate| candidate.encoded)
-        .map(|candidate| (candidate.start, candidate.end))
-        .collect();
-    candidates.retain(|candidate| {
-        candidate.encoded
-            || !encoded_spans
-                .iter()
-                .any(|(start, end)| candidate.start < *end && candidate.end > *start)
-    });
+    // Encoded variants must never mint a rehydratable placeholder: a regular
+    // span inside one is dropped; one containing it keeps the whole-token mask;
+    // a partial overlap masks the union with the non-rehydrating marker.
+    let replacing = options.mode == Mode::Obfuscate;
+    let (encoded, regular): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|c| c.encoded);
+    let mut consumed = vec![false; encoded.len()];
+    let mut candidates = Vec::with_capacity(regular.len() + encoded.len());
+    let mut reported_only = Vec::new();
+    for regular in regular {
+        // A bare entropy guess is no detected token: any overlap loses to the marker.
+        if encoded.iter().any(|e| {
+            let overlaps = e.start < regular.end && e.end > regular.start;
+            let inside = e.start <= regular.start && regular.end <= e.end;
+            inside || (regular.entropy_only && overlaps)
+        }) {
+            continue;
+        }
+        let (mut start, mut end) = (regular.start, regular.end);
+        let mut partial = false;
+        for (index, e) in encoded.iter().enumerate() {
+            if e.start >= regular.end || e.end <= regular.start {
+                continue;
+            }
+            consumed[index] = true;
+            if !replacing {
+                reported_only.push(e.clone());
+            } else if e.start < regular.start || e.end > regular.end {
+                partial = true;
+                start = start.min(e.start);
+                end = end.max(e.end);
+            }
+        }
+        if !partial {
+            candidates.push(regular);
+            continue;
+        }
+        candidates.push(Candidate {
+            start,
+            end,
+            kind: "ENCODED_SECRET".to_string(),
+            class: ValueClass::Secret,
+            entropy_only: false,
+            encoded: true,
+        });
+    }
+    candidates.extend(
+        encoded
+            .into_iter()
+            .zip(consumed)
+            .filter_map(|(e, used)| (!used).then_some(e)),
+    );
     // Issue #466: flag-only spans must never suppress a replacing detector.
     candidates.sort_by(|a, b| {
         b.replaces(options)
@@ -327,6 +365,12 @@ pub fn obfuscate(
         });
     }
     output.push_str(&text[cursor..]);
+    findings.extend(reported_only.into_iter().map(|e| Finding {
+        kind: e.kind,
+        class: e.class,
+        placeholder: ENCODED_MARKER.to_string(),
+        replaced: false,
+    }));
     (output, findings)
 }
 
@@ -818,6 +862,53 @@ mod tests {
             assert!(!contains_placeholder(&masked), "{masked}");
             assert_eq!(vault, before, "{source}");
         }
+    }
+
+    const JWT_PREFIX: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.";
+
+    #[test]
+    fn a_long_token_containing_an_encoded_variant_keeps_its_full_rehydratable_mask() {
+        let encoded = base64_of(LONG_SECRET);
+        let token = format!("{JWT_PREFIX}{encoded}Zm9vYmFy");
+        let mut vault = seeded_vault(LONG_SECRET, ValueClass::Secret);
+        let (masked, findings) = obfuscate(
+            &format!("t={token} end"),
+            &mut vault,
+            &Options::default(),
+            "test",
+        );
+        assert!(!masked.contains(&encoded), "{masked}");
+        assert!(!masked.contains("Zm9vYmFy"), "{masked}");
+        assert!(!masked.contains(ENCODED_MARKER), "{masked}");
+        assert!(contains_placeholder(&masked), "{masked}");
+        assert_eq!(rehydrate(&masked, &vault), format!("t={token} end"));
+        assert!(findings.iter().all(|f| f.kind != "ENCODED_SECRET"));
+    }
+
+    #[test]
+    fn a_partial_overlap_masks_the_union_with_the_non_rehydrating_marker() {
+        let mut vault = seeded_vault(LONG_SECRET, ValueClass::Secret);
+        let before = vault.clone();
+        // The JWT ends at the first `%`, inside the encoded variant.
+        let source = "a eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sigZq8%21vR3%23kT9%40mW5%24xL2%25nB7%26 b".to_string();
+        let (masked, _) = obfuscate(&source, &mut vault, &Options::default(), "test");
+        assert_eq!(masked, format!("a {ENCODED_MARKER} b"));
+        assert_eq!(vault, before);
+    }
+
+    #[test]
+    fn a_contained_encoded_variant_is_still_reported_in_flag_mode() {
+        let encoded = base64_of(LONG_SECRET);
+        let token = format!("{JWT_PREFIX}{encoded}Zm9vYmFy");
+        let mut vault = seeded_vault(LONG_SECRET, ValueClass::Secret);
+        let options = Options {
+            mode: Mode::Flag,
+            ..Options::default()
+        };
+        let (masked, findings) = obfuscate(&token, &mut vault, &options, "test");
+        assert_eq!(masked, token);
+        assert!(findings.iter().any(|f| f.kind == "ENCODED_SECRET"));
+        assert!(findings.iter().any(|f| f.kind != "ENCODED_SECRET"));
     }
 
     #[test]
