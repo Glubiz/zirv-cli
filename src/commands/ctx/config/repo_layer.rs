@@ -741,6 +741,26 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Int,
     ),
     (
+        "ZIRV_CTX_CHECKPOINT",
+        &["checkpoint", "enabled"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_CHECKPOINT_MAX_PER_SESSION",
+        &["checkpoint", "max_per_session"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_CHECKPOINT_TTL_SECS",
+        &["checkpoint", "ttl_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_CHECKPOINT_CAPTURE_TIMEOUT_SECS",
+        &["checkpoint", "capture_timeout_secs"],
+        EnvKind::Int,
+    ),
+    (
         "ZIRV_CTX_HANDOVER_CLAUDE_CHEAP",
         &["handover", "claude", "cheap"],
         EnvKind::Str,

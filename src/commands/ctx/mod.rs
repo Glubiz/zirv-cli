@@ -15,6 +15,7 @@ pub mod capabilities_cmd;
 pub mod catalogue;
 pub mod chain;
 pub mod chat;
+pub mod checkpoint;
 pub mod chrome;
 pub mod compile;
 pub mod config;
@@ -705,6 +706,10 @@ pub enum CtxVerb {
     /// worktrees (issue #319): proof-required reclaim, so nothing is ever
     /// removed without affirmative evidence it carries no unrecoverable work.
     Worktree(worktree::WorktreeArgs),
+    /// Per-turn git checkpoints under `refs/zirv/checkpoints/` (issue #946):
+    /// `capture` snapshots the working tree without touching HEAD, the index
+    /// or any file; `list` and `diff` read them back.
+    Checkpoint(checkpoint::CheckpointArgs),
     /// One level-triggered pass over every opportunistic sweep this crate
     /// already runs (stuck task claims, dead-owner permits/reservations,
     /// worktree GC) plus the one resource with no automatic reclaim at all,
@@ -907,6 +912,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Snapshot(a) => snapshot::run(a, &mut out),
         CtxVerb::Search(a) => search::run(a, &mut out),
         CtxVerb::Worktree(a) => worktree::run(a, &mut out),
+        CtxVerb::Checkpoint(a) => checkpoint::run(a, &mut out),
         CtxVerb::Reconcile(a) => reconcile::run(a, &mut out),
         CtxVerb::Task(a) => task::run(a, &mut out),
         CtxVerb::Swarm(a) => task::run_swarm(a, &mut out),

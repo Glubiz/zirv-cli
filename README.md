@@ -3566,6 +3566,9 @@ Operator-only: set in `~/.zirv/ctx.toml` or as `ZIRV_CTX_ROUTING_<KEY>` (for exa
 | `zirv ctx doctor [--role <role>] [--live] [--json]` | Diagnoses native readiness: the resolved backend and route per role, and every problem classified as missing auth material, inaccessible model, missing tool, unsupported isolation, service failure or upstream entitlement limit — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
 | `zirv ctx config get <key> [--json]` / `show [key] [--json]` | Prints one key's effective value, built-in default, winning source and reload timing exactly as `/settings get` does, or the stored `~/.zirv/ctx.toml` (optionally one key) as TOML or JSON |
 | `zirv ctx config migrate [--to harness\|native] [--downgrade] [--dry-run]` | Versions `~/.zirv/ctx.toml` with a backup and a documented way back; idempotent in both directions — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
+| `zirv ctx checkpoint capture [--session <id>] [--turn <n>]` | Issue #946, off by default: snapshots the work tree (tracked, staged, unstaged and untracked-but-not-ignored files) as a commit under `refs/zirv/checkpoints/<session-short>/<seq>`, with no parent (order comes from `Zirv-Seq`), without touching HEAD, the real index or any file; refused unless the operator sets `[checkpoint] enabled`. Retention (`max_per_session`, `ttl_secs`) is applied after each capture. A skipped capture (mid-merge/rebase, hung git, unreadable file) prints the reason and exits 1. See [Per-turn git checkpoints](#per-turn-git-checkpoints) |
+| `zirv ctx checkpoint list [--session <id>] [--json]` | Lists checkpoints newest first: session, seq, turn, time, kind, files, `+/-` lines, and the HEAD they were taken on; read-only |
+| `zirv ctx checkpoint diff <seq\|a..b> [--session <id>] [--stat\|--name-status]` | Shows what one checkpoint changed against its previous checkpoint (or the HEAD it started from), or between two; output is capped and says so when cut |
 | `zirv ctx reconcile [--dry-run] [--json]` | One level-triggered pass over every opportunistic sweep (stuck task claims, dead-owner permits/reservations, worktree GC) plus the one resource with no automatic reclaim at all, an abandoned **machine-wide** work group (issue #720 -- `<state>/groups` carries no repo dimension, unlike task/worktree state); a group closes on coordinator liveness alone, since no on-disk record attributes a live session to its work group, so a still-running child of a dead coordinator can no longer admit nested children once its group is closed; `--dry-run` mutates nothing (it never reaches the sweeping `sessions::list`, even for the group check); `--json` prints one object per resource kind. A resource failing does not abort the others -- every id already healed is still reported alongside the error; exits non-zero if any did |
 
 #### Declarative worker workspaces
@@ -5436,6 +5439,7 @@ keep only your own.
 | `[jev]` token-savings gates | operator home or environment only | off by default; each site also needs the named nonempty TypeSafe credential, or a live relay to the supervisor that holds it (scrubbed `exec` and dashboard Worker sessions; the relay forwards only the binary's own compiled questions), before reading cached advice or writing Jev records; repository/model-authored material may only remove optional context or prevent a permitted launch, never grant or waive a required check |
 | Native `/settings` writes | operator, by keyboard in the pane | the same validation and atomic write as `zirv ctx config`; session scope is an in-memory, journaled override of live-reload keys only and never touches a file; project scope refuses every `REPO_FORBIDDEN` key and any value that would not narrow before writing, credential-like keys are never rendered, journaled or accepted |
 | `[sandbox] scrub_worker_secrets` | operator home or environment only | on by default; a delegated worker (`zirv agent`, `zirv ctx exec`/`loop`) launches without secret-shaped environment variables, never a repository's call to turn off; its hook-side `[jev]` gates reach Jev through the supervisor's relay (`exec`, dashboard Worker panes), and a `loop` cycle with a gate on keeps `credential_env` |
+| `[checkpoint] enabled` | operator home or environment; repository may narrow | off by default; a repository may only turn it off, never on (a repo `true` is ignored), because a snapshot writes the work tree, including an untracked non-ignored `.env`, into the repository's own git objects; `max_per_session`, `ttl_secs` and `capture_timeout_secs` are narrow-only (a repository may only lower them) |
 | `[headless]` cost levers | operator home or environment only | a headless (`-p`) Claude Code launch only -- prompt-cache TTL, per-complexity effort (defaults to `low`) and a lean/`--disallowedTools` tool surface (lean on by default) -- with every key unset the launch differs from before this table existed only by `CLAUDE_CODE_EFFORT_LEVEL=low`, `CLAUDE_CODE_PROMPT_CACHE_TTL=5m` and the lean settings layer and unused-tool (`Workflow`, `ScheduleWakeup`, `ShareOnboardingGuide`, `ListAgents`, `ReportFindings`, `Agent` for worker/single) deny; an interactive `wrap`/`chat`/dash session is never narrowed by it |
 | `[models]` discovery, price refresh, pins, `avoid` and `auto_avoid` | operator home or environment only | discovery/refresh default on, `avoid` empty and `auto_avoid` off; the scorecard only reads zirv's own logs; reads account-local caches/transcripts, while network access occurs only in `zirv ctx models refresh`, run explicitly or as the detached background refresh started by `status` and dashboard startup; repositories cannot select or conceal the operator's models or prices |
 | `[routing]` promotion gate, probes, router, canary | operator home or environment only | on by default; the whole table is repo-forbidden, so a repository's `.zirv/ctx.toml` setting any `routing.*` key is a hard error and a checkout can neither disable the gate, steer a seat to a model, raise the probe spend cap nor turn on metered probing; evidence is read from zirv's own logs and benchmark rows, a pick applies only where the operator made no explicit choice, and probes spend quota only under the daily interval, the per-run `probe_max_usd` cap and the per-harness headroom floor |
@@ -6955,6 +6959,39 @@ the per-window bound entirely and is unset by default.
 A pause is announced once, not once per check, and appears in the decision log as
 a single `pace-wait` entry. Parks and relaunches are logged too. Check the
 current picture, including how fresh each reading is, with `zirv ctx usage`.
+
+### Per-turn git checkpoints
+
+Issue #946 (capture core; supervisor auto-capture, `restore` and handoff
+integration are later slices). `zirv ctx checkpoint capture` records the work
+tree as a git commit under `refs/zirv/checkpoints/<session-short>/<seq>`. It
+copies the real index to a temp file inside the git dir, stages everything
+(`git add -A -- .`) into that copy, writes a tree and commits it with no
+parent (order comes from `Zirv-Seq`), so HEAD, the real index and every file stay
+byte-for-byte untouched. Metadata is carried in commit trailers
+(`Zirv-Session`, `Zirv-Seq`, `Zirv-Turn`, `Zirv-Agent`, `Zirv-Head`,
+`Zirv-Kind`, `Zirv-Partial`); there is no state file. A nested repository
+without commits is left out of the snapshot (capped at 8 per capture), and a
+repository with `assume-unchanged`/`skip-worktree` entries is marked
+`Zirv-Partial: true`.
+
+```toml
+[checkpoint]
+enabled = false              # operator turns it on (ZIRV_CTX_CHECKPOINT); a repository may only turn it off
+max_per_session = 50         # newest N kept per session; a repository may only lower it
+ttl_secs = 1209600           # older checkpoints are dropped (14 days); a repository may only lower it
+capture_timeout_secs = 20    # a hung git is killed and the capture skipped; a repository may only lower it
+```
+
+Environment overrides: `ZIRV_CTX_CHECKPOINT`, `ZIRV_CTX_CHECKPOINT_MAX_PER_SESSION`,
+`ZIRV_CTX_CHECKPOINT_TTL_SECS`, `ZIRV_CTX_CHECKPOINT_CAPTURE_TIMEOUT_SECS`.
+
+**Secrets note.** Snapshots honour `.gitignore` only. An untracked,
+non-ignored file such as `.env` is committed into the repository's local git
+objects (refs are never pushed by zirv, but they show in `git log --all`).
+Ignore secret files before enabling checkpoints. Retention drops refs; the
+objects of a pruned checkpoint become unreachable and a normal `git gc`
+reclaims them (zirv itself never runs `git gc`).
 
 ### Cross-harness fallback and handover
 
