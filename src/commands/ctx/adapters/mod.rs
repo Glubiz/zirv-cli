@@ -641,8 +641,7 @@ pub trait AgentAdapter: std::fmt::Debug {
 
     /// Tool calls and AskUserQuestion answers since the last operator prompt; empty for an
     /// adapter whose transcript shape this does not parse.
-    fn turn_activity(&self, jsonl: &str) -> super::event::TurnActivity {
-        let _ = jsonl;
+    fn turn_activity(&self, _jsonl: &str) -> super::event::TurnActivity {
         super::event::TurnActivity::default()
     }
 

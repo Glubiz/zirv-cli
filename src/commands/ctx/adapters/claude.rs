@@ -13,8 +13,8 @@ use super::super::catalogue;
 use super::super::event::input_hash;
 use super::super::event::{
     Capabilities, NormalizedEvent, PromptCache, SessionId, SessionRef, StructuralContext,
-    ToolInvocation, TranscriptUsage, UNRESOLVED_TOOL_CALL_CAP, UnresolvedToolCall, error_text_hash,
-    last_verification_run,
+    ToolInvocation, TranscriptUsage, TurnActivity, UNRESOLVED_TOOL_CALL_CAP, UnresolvedToolCall,
+    error_text_hash, last_verification_run,
 };
 use super::super::window::parse_iso8601_utc_ms;
 use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
@@ -1140,8 +1140,8 @@ const TURN_RESULT_CHARS: usize = 600;
 
 /// Tool calls with their results, and AskUserQuestion answers, after the last real operator
 /// prompt (the same "real" test `done_task` uses: not injected text).
-fn turn_activity(jsonl: &str) -> super::super::event::TurnActivity {
-    let mut out = super::super::event::TurnActivity::default();
+fn turn_activity(jsonl: &str) -> TurnActivity {
+    let mut out = TurnActivity::default();
     let mut pending: HashMap<String, (String, String)> = HashMap::new();
     for row in jsonl
         .lines()
@@ -1156,7 +1156,7 @@ fn turn_activity(jsonl: &str) -> super::super::event::TurnActivity {
                 }
                 let prompt = user_message_text(message.get("content"));
                 if !prompt.trim().is_empty() && !super::is_injected_user_text(&prompt) {
-                    out = super::super::event::TurnActivity::default();
+                    out = TurnActivity::default();
                     pending.clear();
                     continue;
                 }
@@ -3135,7 +3135,7 @@ impl AgentAdapter for ClaudeAdapter {
         structural_context(jsonl, last_n)
     }
 
-    fn turn_activity(&self, jsonl: &str) -> super::super::event::TurnActivity {
+    fn turn_activity(&self, jsonl: &str) -> TurnActivity {
         turn_activity(jsonl)
     }
 

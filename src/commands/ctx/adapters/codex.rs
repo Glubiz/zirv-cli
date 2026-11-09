@@ -901,11 +901,7 @@ fn rollout_session_meta(path: &Path) -> Option<(u64, Option<String>, Option<Stri
 
 /// Hex SHA-256 of a prompt, trimmed, as `headless_cmd` records it and the rollout is matched on.
 fn prompt_digest(prompt: &str) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(prompt.trim().as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    crate::commands::workflow::engine::hash_bytes(prompt.trim().as_bytes())
 }
 
 /// Whether one of the rollout's early user messages is the prompt with this digest.
@@ -1174,12 +1170,12 @@ impl AgentAdapter for CodexAdapter {
 
     /// `codex exec` has no `--session-id` flag (verified): codex always mints
     /// its own session id, so `session` cannot appear in the built command.
-    fn headless_cmd(&self, prompt: &str, _session: &SessionId, extra: &[String]) -> Command {
+    fn headless_cmd(&self, prompt: &str, session: &SessionId, extra: &[String]) -> Command {
         // Codex mints its own id, so the prompt's digest is what later finds this run's rollout.
         if let Some(state) = self.state_dir()
             && super::super::state::create_private_dir_all(&state.rollouts()).is_ok()
         {
-            let short = super::super::sessions::short_id(_session.as_str());
+            let short = super::super::sessions::short_id(session.as_str());
             let _ = super::super::state::write_private(
                 &state.rollouts().join(format!("{short}.prompt")),
                 &prompt_digest(prompt),
