@@ -30,6 +30,23 @@ const MAX_WAIVER_BYTES: u64 = 64 * 1024;
 const MAX_WAIVER_REASON_BYTES: usize = 512;
 const MAX_EVIDENCE_BYTES: usize = 256;
 
+static PASTE_ATTR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:\bon:?paste|@paste|\bv-on:paste)(?:\.[\w.]+)?\s*=\s*")
+        .expect("valid paste attribute regex")
+});
+static PASTE_MODIFIER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:@paste|\bv-on:paste)\.(?:\w+\.)*prevent\b")
+        .expect("valid paste modifier regex")
+});
+static PASTE_LISTENER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)addEventListener\(\s*['"]paste['"]\s*,\s*"#)
+        .expect("valid paste listener regex")
+});
+static PREVENT_DEFAULT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bpreventDefault\s*\(").expect("valid preventDefault regex"));
+static HANDLER_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*([A-Za-z_$][\w$]*)\s*(?:\([^()]*\))?\s*$").expect("valid handler name regex")
+});
 static IMAGE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?is)<img\b[^>]*>").expect("valid image regex"));
 static DIOXUS_IMAGE_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -727,6 +744,107 @@ fn bounded_manifest_contains(path: &Path, needle: &str) -> bool {
     std::fs::read_to_string(path).is_ok_and(|text| text.to_ascii_lowercase().contains(needle))
 }
 
+/// Offsets of `preventDefault()` calls inside paste handlers that never read the clipboard text back.
+fn paste_blocked_offsets(text: &str) -> Vec<usize> {
+    let mut offsets: Vec<usize> = PASTE_MODIFIER_RE
+        .find_iter(text)
+        .map(|found| found.start())
+        .collect();
+    let mut spans = Vec::new();
+    for found in PASTE_ATTR_RE.find_iter(text) {
+        let Some(value) = delimited_value(text, found.end()) else {
+            continue;
+        };
+        spans.extend(handler_span(text, value));
+    }
+    for found in PASTE_LISTENER_RE.find_iter(text) {
+        let rest = found.end();
+        let line_end = text[rest..]
+            .find(['\n', ')'])
+            .map_or(text.len(), |index| rest + index);
+        if HANDLER_NAME_RE.is_match(&text[rest..line_end]) {
+            spans.extend(handler_span(text, rest..line_end));
+            continue;
+        }
+        let Some(open) = text[rest..].find('{').map(|index| rest + index) else {
+            continue;
+        };
+        spans.push(rest..balanced_end(text, open));
+    }
+    for span in spans {
+        let body = &text[span.clone()];
+        let lower = body.to_ascii_lowercase();
+        if lower.contains("clipboarddata") || lower.contains("getdata(") {
+            continue;
+        }
+        offsets.extend(
+            PREVENT_DEFAULT_RE
+                .find_iter(body)
+                .map(|found| span.start + found.start()),
+        );
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+    offsets
+}
+
+/// Byte range of a quoted (`"..."`) or braced (`{...}`) attribute value starting at `start`.
+fn delimited_value(text: &str, start: usize) -> Option<std::ops::Range<usize>> {
+    let quote = text[start..].chars().next()?;
+    if quote == '{' {
+        let end = balanced_end(text, start);
+        return Some(start + 1..end.saturating_sub(1).max(start + 1));
+    }
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let close = text[start + 1..].find(quote)?;
+    Some(start + 1..start + 1 + close)
+}
+
+/// End offset (exclusive) of the brace block opening at `open`, or the end of text when unbalanced.
+fn balanced_end(text: &str, open: usize) -> usize {
+    let mut depth = 0usize;
+    for (index, byte) in text.bytes().enumerate().skip(open) {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return index + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    text.len()
+}
+
+/// The handler value itself, or, when it names a function, that function's definition.
+fn handler_span(text: &str, value: std::ops::Range<usize>) -> Option<std::ops::Range<usize>> {
+    let Some(name) = HANDLER_NAME_RE
+        .captures(&text[value.clone()])
+        .map(|caps| caps[1].to_string())
+    else {
+        return Some(value);
+    };
+    let definition = format!(
+        r"(?:function\s+{0}\s*\(|(?:const|let|var)\s+{0}\s*=)",
+        regex::escape(&name)
+    );
+    let found = Regex::new(&definition).ok().and_then(|re| re.find(text))?;
+    let line_end = text[found.end()..]
+        .find('\n')
+        .map_or(text.len(), |index| found.end() + index);
+    let Some(open) = text[found.end()..]
+        .find('{')
+        .map(|index| found.end() + index)
+    else {
+        return Some(found.start()..line_end);
+    };
+    Some(found.start()..balanced_end(text, open))
+}
+
 fn line_for(text: &str, offset: usize) -> usize {
     text[..offset.min(text.len())]
         .bytes()
@@ -928,14 +1046,13 @@ fn analyze(path: &Path, text: &str, findings: &mut Vec<DetectorFinding>) {
             "Allow pinch zoom and browser text scaling.",
         );
     }
-    if (lower.contains("onpaste") || lower.contains("on:paste")) && lower.contains("preventdefault")
-    {
+    for offset in paste_blocked_offsets(text) {
         finding(
             findings,
             "a11y/paste-blocked",
             FindingSeverity::Blocking,
             path,
-            1,
+            line_for(text, offset),
             "Paste appears to be blocked on an input path.",
             "Allow paste, including password-manager and assistive-technology input.",
         );
@@ -2489,6 +2606,88 @@ reason = "Operator accepted this generated decorative surface temporarily."
         assert_eq!(apply_waivers(&mut findings, &waivers), 0);
         assert!(!findings[0].blocks());
         assert_eq!(findings[0].disposition, FindingDisposition::Waived);
+    }
+
+    fn paste_findings(path: &str, text: &str) -> Vec<DetectorFinding> {
+        let mut findings = Vec::new();
+        analyze(Path::new(path), text, &mut findings);
+        findings
+            .into_iter()
+            .filter(|finding| finding.rule_id == "a11y/paste-blocked")
+            .collect()
+    }
+
+    #[test]
+    fn paste_handler_that_reinserts_transformed_clipboard_text_is_not_blocked() {
+        let sfc = r#"<script setup lang="ts">
+import { ref } from 'vue'
+const model = defineModel<string>({ default: '' })
+const input = ref<HTMLInputElement | null>(null)
+
+function onPaste(event: ClipboardEvent) {
+  const clip = event.clipboardData?.getData('text') ?? ''
+  if (!/[;,]/.test(clip)) return
+  event.preventDefault()
+  const normalised = clip.replace(/;/g, ',')
+  const el = input.value
+  if (!el) return
+  const start = el.selectionStart ?? 0
+  model.value = model.value.slice(0, start) + normalised + model.value.slice(el.selectionEnd ?? start)
+  el.setSelectionRange(start + normalised.length, start + normalised.length)
+}
+</script>
+
+<template>
+  <input ref="input" v-model="model" @paste="onPaste" />
+</template>
+"#;
+        assert!(paste_findings("src/PredicateValueInput.vue", sfc).is_empty());
+    }
+
+    #[test]
+    fn preventdefault_in_a_keydown_handler_is_not_attributed_to_paste() {
+        let sfc = r#"<script setup lang="ts">
+const draft = ref('')
+function onPaste(event: ClipboardEvent) {
+  const text = event.clipboardData?.getData('text') ?? ''
+  draft.value += text.trim()
+}
+function onKeydown(event: KeyboardEvent) {
+  if (event.key === ',') {
+    event.preventDefault()
+    commit()
+  }
+}
+</script>
+
+<template>
+  <input v-model="draft" @paste="onPaste" @keydown="onKeydown" />
+</template>
+"#;
+        assert!(paste_findings("src/RecipientChipsInput.vue", sfc).is_empty());
+    }
+
+    #[test]
+    fn paste_handler_that_blocks_without_reading_the_clipboard_is_anchored_at_its_line() {
+        let sfc = r#"<script setup lang="ts">
+const code = ref('')
+function onPaste(event: ClipboardEvent) {
+  event.preventDefault()
+}
+</script>
+
+<template>
+  <input v-model="code" @paste="onPaste" />
+</template>
+"#;
+        let findings = paste_findings("src/OneTimeCode.vue", sfc);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].line, 4);
+        assert_eq!(findings[0].evidence, "event.preventDefault()");
+        let modifier = "<template>\n  <input @paste.prevent />\n</template>\n";
+        let findings = paste_findings("src/Modifier.vue", modifier);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].line, 2);
     }
 
     #[test]
