@@ -2405,4 +2405,107 @@ mod tests {
         assert!(!denied.status.success());
         assert!(String::from_utf8_lossy(&denied.stderr).contains("tool_access"));
     }
+
+    fn miss(scope: &Scope, tool: &str, args: Value) -> String {
+        scope.call(tool, args).expect_err("miss").to_string()
+    }
+
+    #[test]
+    fn did_you_mean_prefers_a_unique_prefix_over_edit_distance() {
+        let hinted = with_did_you_mean("gone.", "abc", ["abcdefgh", "abd"]);
+        assert_eq!(hinted, "gone. Did you mean `abcdefgh`?");
+    }
+
+    #[test]
+    fn did_you_mean_falls_back_to_a_unique_close_edit() {
+        let hinted = with_did_you_mean("gone.", "worker1", ["worker01", "zzzzzzzz"]);
+        assert_eq!(hinted, "gone. Did you mean `worker01`?");
+    }
+
+    #[test]
+    fn did_you_mean_stays_silent_when_ambiguous_exact_or_distant() {
+        for (id, candidates) in [
+            ("abc", vec!["abcd", "abce"]),
+            ("abc", vec!["abc"]),
+            ("abc", vec!["zzzzzzzz"]),
+            ("", vec!["abc"]),
+        ] {
+            assert_eq!(with_did_you_mean("gone.", id, candidates), "gone.", "{id}");
+        }
+    }
+
+    #[test]
+    fn artifact_read_miss_hints_only_artifacts_under_the_selected_repo() {
+        let f = Fixture::new();
+        let record = f.artifact(b"report");
+        let dir = f
+            .scope
+            .state
+            .artifacts()
+            .join(repo_slug_read_only(&f.scope.repo));
+        let foreign = artifact::ArtifactRecord {
+            id: "zzforeign1".into(),
+            path: f.root.path().join("elsewhere.txt"),
+            ..record.clone()
+        };
+        std::fs::write(
+            dir.join("zzforeign1.json"),
+            serde_json::to_vec(&foreign).unwrap(),
+        )
+        .unwrap();
+
+        let truncated = &record.id[..record.id.len() - 1];
+        let msg = miss(&f.scope, "artifact_read", json!({"id": truncated}));
+        assert!(
+            msg.ends_with(&format!("Did you mean `{}`?", record.id)),
+            "{msg}"
+        );
+        let msg = miss(&f.scope, "artifact_read", json!({"id": "zzforeign"}));
+        assert!(!msg.contains("zzforeign1"), "{msg}");
+        assert!(!msg.contains("Did you mean"), "{msg}");
+    }
+
+    #[test]
+    fn result_read_miss_hints_only_reports_from_the_selected_repo() {
+        let f = Fixture::new();
+        f.report("worker01", &f.scope.repo, "mine");
+        f.report("worker02", &f.root.path().join("home"), "foreign");
+        // Unfiltered, `worker0` would match both ids and the hint would vanish.
+        let msg = miss(&f.scope, "result_read", json!({"id": "worker0"}));
+        assert!(msg.ends_with("Did you mean `worker01`?"), "{msg}");
+        let msg = miss(&f.scope, "result_read", json!({"id": "worker02x"}));
+        assert!(!msg.contains("worker02`"), "{msg}");
+    }
+
+    #[test]
+    fn skill_miss_hints_through_host_prefix_and_version_suffix() {
+        let f = Fixture::new();
+        let registry = f.scope.skill_registry().unwrap();
+        for requested in ["implemen", "zirv:implemen", "implemen@1", "zirv:implemen@1"] {
+            let message = registry.get(requested).expect_err("unknown").to_string();
+            let hinted = skill_miss(&registry, requested, &message);
+            assert!(
+                hinted.ends_with("Did you mean `implement`?"),
+                "{requested}: {hinted}"
+            );
+        }
+        let message = registry
+            .get("implement@999")
+            .expect_err("version")
+            .to_string();
+        assert_eq!(skill_miss(&registry, "implement@999", &message), message);
+    }
+
+    #[test]
+    fn skill_load_and_read_resource_misses_carry_the_hint() {
+        let f = Fixture::new();
+        let msg = miss(&f.scope, "skill_load", json!({"id": "zirv:implemen"}));
+        assert!(msg.ends_with("Did you mean `implement`?"), "{msg}");
+        let msg = miss(
+            &f.scope,
+            "skill_read_resource",
+            json!({"id": "implemen", "path": "x.md"}),
+        );
+        assert!(msg.ends_with("Did you mean `implement`?"), "{msg}");
+    }
 }

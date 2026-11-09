@@ -5718,6 +5718,7 @@ mod tests {
                 "interactive must let '{rule}' reach a prompt, not die: {deny_arg}"
             );
         }
+        assert!(!deny_arg.contains("Bash(zirv benchmark eval run*)"));
         for (rule, _) in super::super::SHIPPED_POSTURE_DENY {
             assert!(
                 deny_arg.contains(rule),
@@ -5759,6 +5760,10 @@ mod tests {
                 "headless has nobody to prompt, so ask folds into deny: {deny_arg}"
             );
         }
+        assert!(
+            deny_arg.contains("Bash(zirv benchmark eval run*)"),
+            "headless refuses eval run, --dry-run included: {deny_arg}"
+        );
     }
 
     /// Issue #504: an operator's `chat.claude_permission_mode` override
