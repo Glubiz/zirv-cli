@@ -3261,6 +3261,22 @@ mod tests {
     }
 
     #[test]
+    fn prompt_cache_ignores_sidechain_rows() {
+        let base = parse_iso8601_utc_ms("2026-01-01T00:00:00.000Z").unwrap() / 1000;
+        let main = cache_row("2026-01-01T00:00:00.000Z", Some((10, 0)), 0);
+        let sidechain = cache_row("2026-01-01T00:30:00.000Z", Some((0, 10)), 900).replacen(
+            r#""type":"assistant""#,
+            r#""type":"assistant","isSidechain":true"#,
+            1,
+        );
+        assert!(sidechain.contains("isSidechain"));
+        let cache = prompt_cache(&[main.clone(), sidechain.clone()].join("\n")).expect("ttl");
+        assert_eq!(cache.ttl_secs, 300);
+        assert_eq!(cache.expires_at, base + 300);
+        assert_eq!(prompt_cache(&sidechain), None);
+    }
+
+    #[test]
     fn prompt_cache_is_unknown_without_the_split_or_a_timestamp() {
         let legacy = cache_row("2026-01-01T00:00:00.000Z", None, 900);
         assert_eq!(prompt_cache(&legacy), None);

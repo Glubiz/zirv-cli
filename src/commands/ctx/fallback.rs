@@ -1262,8 +1262,25 @@ pub fn route_blocked_session(
     request: RouteRequest<'_>,
     excluded: &[String],
 ) -> Option<Route> {
+    route_or_reason(state, cfg, request, excluded).ok()
+}
+
+/// Why [`route_or_reason`] chose no reroute.
+enum NoRoute {
+    /// The allocator judged the requested harness still the best place to run.
+    KeepRequested,
+    /// Routing is off, or no other candidate is admissible.
+    NoCandidate,
+}
+
+fn route_or_reason(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    request: RouteRequest<'_>,
+    excluded: &[String],
+) -> Result<Route, NoRoute> {
     if !cfg.fallback.enabled {
-        return None;
+        return Err(NoRoute::NoCandidate);
     }
     let requested_reading = requested_reading(
         state,
@@ -1286,9 +1303,12 @@ pub fn route_blocked_session(
         exclude.extend(request.exclude.iter().copied());
         let models = |name: &str| translated_model_for(request, name, cfg);
         let placement = super::allocator::place(&snapshot, cfg, &unit, &exclude, &models);
-        let candidate = placement.selected.filter(|_| !placement.keep_requested)?;
+        if placement.keep_requested {
+            return Err(NoRoute::KeepRequested);
+        }
+        let candidate = placement.selected.ok_or(NoRoute::NoCandidate)?;
         let requested_headroom_pct = requested_reading.map(|reading| reading.headroom_pct);
-        return Some(route_from_candidate(
+        return Ok(route_from_candidate(
             request,
             RouteReason::Exhausted,
             requested_headroom_pct,
@@ -1301,8 +1321,9 @@ pub fn route_blocked_session(
         ));
     }
 
-    let (selected, model, headroom) = best_alternate(state, cfg, request, excluded)?;
-    Some(Route {
+    let (selected, model, headroom) =
+        best_alternate(state, cfg, request, excluded).ok_or(NoRoute::NoCandidate)?;
+    Ok(Route {
         requested: request.requested.to_string(),
         selected,
         model,
@@ -1362,9 +1383,16 @@ pub fn route_side_call(
         exclude: &[],
         requester: None,
     };
-    match route_blocked_session(state, cfg, request, &[]) {
-        Some(route) => SideCall::Reroute(route),
-        None => SideCall::Skip(format!(
+    match route_or_reason(state, cfg, request, &[]) {
+        Ok(route) => SideCall::Reroute(route),
+        // The allocator prefers the requested harness: the call worked before routing existed.
+        Err(NoRoute::KeepRequested) => {
+            crate::output::warn(format!(
+                "side-call stays on {requested}: {window} window at {percent:.0}% but no fallback harness is better"
+            ));
+            SideCall::Proceed
+        }
+        Err(NoRoute::NoCandidate) => SideCall::Skip(format!(
             "skipping side-call: {requested} {window} window at {percent:.0}% and no fallback harness has headroom"
         )),
     }
@@ -3131,6 +3159,31 @@ mod tests {
         assert!(
             line.contains("claude") && line.contains("five_hour"),
             "{line}"
+        );
+    }
+
+    #[test]
+    fn adaptive_side_call_proceeds_when_the_allocator_keeps_the_requested_harness() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = test_cfg_with_ready_adapters();
+        cfg.fallback.adaptive_delegation = true;
+        cfg.fallback.order = vec!["opencode".to_string(), "codex".to_string()];
+        let now = 1_700_000_000;
+        // The gate reads the model's vendor window; the allocator reads the harness's own pool.
+        store_usage(&state, "anthropic", 100.0, now + 3_600, now);
+        store_usage(&state, "opencode", 10.0, now + 3_600, now);
+        store_usage(&state, "openai", 10.0, now + 3_600, now);
+        assert_eq!(
+            route_side_call(
+                &state,
+                &cfg,
+                "opencode",
+                Some("anthropic/claude-sonnet-5"),
+                now
+            ),
+            SideCall::Proceed,
+            "the allocator keeps the requested harness: the call must run as before"
         );
     }
 

@@ -3983,6 +3983,64 @@ mod tests {
         assert_eq!(harness, "claude");
     }
 
+    fn side_call_reroute_env(
+        tmp: &Path,
+        extra: &[(&str, &str)],
+    ) -> std::collections::HashMap<String, String> {
+        let now = now_secs();
+        let state = StateDir::from_root(tmp.join("state"));
+        let mut env = exhausted_side_call_env(tmp, &[]);
+        crate::commands::ctx::window::store_for(
+            &state,
+            "openai",
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 10.0,
+                    resets_at: now + 3_600,
+                    observed_at: now,
+                    overage_covered: false,
+                    limit_reached: false,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store usage");
+        env.insert(
+            "ZIRV_CTX_FALLBACK_ORDER".to_string(),
+            "claude,codex".to_string(),
+        );
+        env.insert(
+            "ZIRV_CTX_AGENT_BIN".to_string(),
+            format!("sh {}", fixture("fake-model.sh").display()),
+        );
+        env.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        env
+    }
+
+    #[test]
+    fn a_side_call_on_an_exhausted_window_reroutes_to_the_next_harness_with_headroom() {
+        for extra in [
+            &[][..],
+            &[("ZIRV_CTX_FALLBACK_ADAPTIVE_DELEGATION", "true")][..],
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let home = tmp.path().join("home");
+            std::fs::create_dir_all(&home).expect("home");
+            let _home = super::super::testenv::HomeGuard::set(&home);
+            let env = side_call_reroute_env(tmp.path(), extra);
+            let (result, harness, _) = run_model_routed(
+                tmp.path(),
+                &fake_model_adapter(),
+                "haiku",
+                "anything",
+                TEST_TIMEOUT,
+                &|key| env.get(key).cloned(),
+            );
+            assert_eq!(harness, "codex", "{extra:?}");
+            assert!(result.is_ok(), "{extra:?}: {result:?}");
+        }
+    }
+
     #[test]
     fn a_side_call_runs_unchecked_when_pace_is_disabled() {
         let tmp = tempfile::tempdir().expect("tempdir");

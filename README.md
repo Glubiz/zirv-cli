@@ -3324,7 +3324,9 @@ upper-case hex, or reversed form is replaced with the fixed marker
 is never rehydrated (rehydrating would put the raw value where the encoded one
 stood). Fragment or partial matching is deliberately not done: matching a
 substring of a secret (the T3 eval counts a 60% fragment) would mask ordinary
-output.
+output. Limits: the percent form is uppercase `%XX` (RFC 3986) only; a secret
+first seen only in encoded form is not caught until its raw form is in the
+vault; and a secret embedded inside a larger encoded blob is not caught.
 
 `zirv ctx obfuscate list` reports kinds, counts and first-seen surfaces without
 values; `reveal <placeholder>` prints one value locally and records the audit
@@ -6987,8 +6989,11 @@ first checks that harness's 5h/7d window with the same spawn gate. An
 exhausted window reroutes the call to a harness with headroom, exactly like a
 blocked session does; with none available the call is skipped with one
 `skipping side-call` warning and fails like any failed helper, so callers keep
-their fail-open behaviour. `[pace] enabled = false` or `[fallback] enabled =
-false` turns the check off.
+their fail-open behaviour. When the allocator would keep the requested harness
+(`adaptive_delegation`), the call proceeds on it as it did before routing. A
+reroute follows the operator's cross-harness fallback order and may send the
+(already obfuscated) prompt to another vendor, as session fallback does.
+`[pace] enabled = false` or `[fallback] enabled = false` turns the check off.
 
 `zirv ctx status` reports the resolved policy and, for each harness in the
 fallback order, its readiness, capacity and current headroom:

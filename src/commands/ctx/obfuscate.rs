@@ -255,6 +255,19 @@ pub fn obfuscate(
                 .iter()
                 .any(|(start, end)| candidate.start >= *start && candidate.end <= *end)
     });
+    // An encoded variant must never lose to an overlapping regular candidate:
+    // that one would mint a rehydratable placeholder for an encoded secret.
+    let encoded_spans: Vec<(usize, usize)> = candidates
+        .iter()
+        .filter(|candidate| candidate.encoded)
+        .map(|candidate| (candidate.start, candidate.end))
+        .collect();
+    candidates.retain(|candidate| {
+        candidate.encoded
+            || !encoded_spans
+                .iter()
+                .any(|(start, end)| candidate.start < *end && candidate.end > *start)
+    });
     // Issue #466: flag-only spans must never suppress a replacing detector.
     candidates.sort_by(|a, b| {
         b.replaces(options)
@@ -779,6 +792,50 @@ mod tests {
             assert_eq!(rehydrate(&masked, &vault), masked);
             assert!(!contains_placeholder(&masked));
         }
+    }
+
+    const LONG_SECRET: &str = "Zq8!vR3#kT9@mW5$xL2%nB7&";
+
+    fn base64_of(value: &str) -> String {
+        base64_nopad(
+            value.as_bytes(),
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
+        )
+    }
+
+    #[test]
+    fn encoded_variant_wins_over_an_overlapping_entropy_candidate() {
+        let encoded = base64_of(LONG_SECRET);
+        for source in [encoded.clone(), format!("token={encoded}")] {
+            let mut vault = seeded_vault(LONG_SECRET, ValueClass::Secret);
+            let before = vault.clone();
+            let options = Options {
+                entropy: EntropyMode::Obfuscate,
+                ..Options::default()
+            };
+            let (masked, _) = obfuscate(&source, &mut vault, &options, "test");
+            assert!(masked.contains(ENCODED_MARKER), "{source} -> {masked}");
+            assert!(!contains_placeholder(&masked), "{masked}");
+            assert_eq!(vault, before, "{source}");
+        }
+    }
+
+    #[test]
+    fn encoded_variant_is_reported_in_flag_mode_without_touching_the_vault() {
+        let encoded = base64_of(LONG_SECRET);
+        let mut vault = seeded_vault(LONG_SECRET, ValueClass::Secret);
+        let before = vault.clone();
+        let options = Options {
+            mode: Mode::Flag,
+            entropy: EntropyMode::Obfuscate,
+            ..Options::default()
+        };
+        let source = format!("token={encoded}");
+        let (masked, findings) = obfuscate(&source, &mut vault, &options, "test");
+        assert_eq!(masked, source);
+        assert!(findings.iter().any(|f| f.kind == "ENCODED_SECRET"));
+        assert!(findings.iter().all(|f| !f.replaced));
+        assert_eq!(vault, before);
     }
 
     #[test]

@@ -298,13 +298,16 @@ fn sessions_lines(
                     style::paint(&model_change_status_text(&change), Tone::Warn, colour)
                 ));
             }
-            if let Some(cache) = super::score::prompt_cache_for_session(
-                state,
-                &record.agent,
-                &record.session,
-                &record.repo,
-                env,
-            ) {
+            // A dead session's cache is long gone: skip the transcript read.
+            if is_live
+                && let Some(cache) = super::score::prompt_cache_for_session(
+                    state,
+                    &record.agent,
+                    &record.session,
+                    &record.repo,
+                    env,
+                )
+            {
                 let tone = if cache.expires_at > now {
                     Tone::Muted
                 } else {
@@ -2845,6 +2848,52 @@ mod tests {
             prompt_cache_text(cache(300, 1000 - 3 * 60), 1000),
             "prompt cache: 5m ttl, expired 3m ago"
         );
+    }
+
+    #[test]
+    fn a_dead_session_shows_no_prompt_cache_line_but_a_live_one_does() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let env = env_for(state.root());
+        let session = "dddd4444-2222-4333-8444-555555555555";
+        let projects = home.path().join(".claude/projects/slug");
+        std::fs::create_dir_all(&projects).expect("mkdir projects");
+        std::fs::write(
+            projects.join(format!("{session}.jsonl")),
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00.000Z","message":{"usage":{"cache_creation_input_tokens":5,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":0}}}}"#,
+        )
+        .expect("write transcript");
+        let mut record = crate::commands::ctx::sessions::Record::new(
+            session,
+            "claude",
+            &repo,
+            crate::commands::ctx::sessions::Verb::Wrap,
+        );
+        record.reachable = true;
+        let decision_sessions = std::collections::BTreeSet::new();
+        let ctx = SessionLineContext {
+            compact_stall_secs: 600,
+            compact_min_bytes: 1024,
+            decision_sessions: &decision_sessions,
+        };
+        let render = |liveness| {
+            sessions_lines(
+                &[(record.clone(), liveness)],
+                &state,
+                crate::commands::ctx::state::now_secs(),
+                &|k| env.get(k).cloned(),
+                false,
+                &ctx,
+            )
+            .join("\n")
+        };
+        assert!(render(Liveness::Live).contains("prompt cache:"));
+        assert!(!render(Liveness::Stale).contains("prompt cache:"));
     }
 
     fn env_for(state: &std::path::Path) -> std::collections::HashMap<String, String> {

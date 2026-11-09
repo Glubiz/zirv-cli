@@ -468,8 +468,23 @@ pub fn prompt_cache_for_session(
             cwd: repo.to_path_buf(),
         },
     );
-    let jsonl = std::fs::read_to_string(transcript).ok()?;
+    let jsonl = read_transcript_tail(&transcript, PROMPT_CACHE_TAIL_BYTES)?;
     super::adapters::claude::prompt_cache(&jsonl)
+}
+
+/// The last cache-touching row is all the prompt-cache line needs, so status
+/// reads a bounded tail instead of parsing a multi-megabyte transcript per
+/// session. A cut first line fails JSON parsing and is skipped.
+const PROMPT_CACHE_TAIL_BYTES: u64 = 256 * 1024;
+
+fn read_transcript_tail(path: &Path, cap: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(cap))).ok()?;
+    let mut buf = Vec::new();
+    file.take(cap).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Issue #312: the window-attribution summary for one registered session,
@@ -1539,6 +1554,22 @@ pub fn run<W: Write>(args: &ScoreArgs, w: &mut W) -> CtxResult<i32> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn transcript_tail_is_bounded_and_still_finds_the_last_cache_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.jsonl");
+        let filler = format!(
+            "{{\"type\":\"user\",\"message\":{{\"content\":\"{}\"}}}}\n",
+            "x".repeat(1000)
+        );
+        let row = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00.000Z","message":{"usage":{"cache_creation_input_tokens":5,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":0}}}}"#;
+        std::fs::write(&path, format!("{}{row}\n", filler.repeat(500))).expect("write");
+        let tail = read_transcript_tail(&path, 4096).expect("tail");
+        assert!(tail.len() <= 4096);
+        let cache = crate::commands::ctx::adapters::claude::prompt_cache(&tail).expect("cache");
+        assert_eq!(cache.ttl_secs, 300);
+    }
 
     fn write_transcript(dir: &std::path::Path, turns: usize, marker: bool, tokens: u64) -> PathBuf {
         let mut text = String::new();
