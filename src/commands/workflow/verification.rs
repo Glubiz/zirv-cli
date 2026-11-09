@@ -827,18 +827,18 @@ fn gha_runs_on_host(label: &str) -> bool {
 }
 
 fn gha_has_trigger(doc: &serde_yaml_ng::Value, trigger: &str) -> bool {
-    let is_ci = |name: &str| name == trigger;
+    let is_trigger = |name: &str| name == trigger;
     // YAML 1.1 parsers may read the `on:` key as boolean true.
     let on = doc
         .get("on")
         .or_else(|| doc.get(serde_yaml_ng::Value::Bool(true)));
     match on {
-        Some(serde_yaml_ng::Value::String(name)) => is_ci(name),
-        Some(serde_yaml_ng::Value::Sequence(list)) => {
-            list.iter().any(|name| name.as_str().is_some_and(is_ci))
-        }
+        Some(serde_yaml_ng::Value::String(name)) => is_trigger(name),
+        Some(serde_yaml_ng::Value::Sequence(list)) => list
+            .iter()
+            .any(|name| name.as_str().is_some_and(is_trigger)),
         Some(serde_yaml_ng::Value::Mapping(map)) => {
-            map.keys().any(|name| name.as_str().is_some_and(is_ci))
+            map.keys().any(|name| name.as_str().is_some_and(is_trigger))
         }
         _ => false,
     }
@@ -942,11 +942,12 @@ fn gha_step(
     } else if known.contains(text) {
         Err("duplicate of a discovered check")
     } else {
-        let dir = match step.get("working-directory") {
+        let step_dir = step.get("working-directory");
+        let dir = match step_dir {
             Some(dir) => dir.as_str().filter(|dir| !dir.contains("${{")),
             None => default_dir,
         };
-        if step.get("working-directory").is_some() && dir.is_none() {
+        if step_dir.is_some() && dir.is_none() {
             return Err("working-directory expression");
         }
         let env = gha_env_exports(step.get("env")).map_err(|()| "step env is not literal")?;
