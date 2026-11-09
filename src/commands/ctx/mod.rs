@@ -87,6 +87,7 @@ pub mod permit;
 pub mod policy;
 pub mod poll;
 pub mod pool;
+pub mod pr_watch;
 pub mod price;
 pub mod priority;
 pub mod prompt;
@@ -653,6 +654,9 @@ pub enum CtxVerb {
     Forget(memory::ForgetArgs),
     /// Interrupt a live session with a message: durable mail plus a wake-up.
     Nudge(sessions::NudgeArgs),
+    /// Watch a pull/merge request and mail this session when checks, comments
+    /// or mergeability change (issue #949).
+    Pr(pr_watch::PrArgs),
     /// Distill a read-only answer to a question from a LIVE worker
     /// session's own transcript (issue #310, 3c). Never sends input to that
     /// session -- no pty/stdin write, no nudge, no mail -- and never
@@ -895,6 +899,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Recall(a) => memory::run_recall(a, &mut out),
         CtxVerb::Forget(a) => memory::run_forget(a, &mut out),
         CtxVerb::Nudge(a) => sessions::run_nudge(a, &mut out),
+        CtxVerb::Pr(a) => pr_watch::run(a, &mut out),
         CtxVerb::Ask(a) => ask::run(a, &mut out),
         CtxVerb::Kill(a) => sessions::run_kill(a, &mut out),
         CtxVerb::Safety(a) => safety::run(a, &mut out),

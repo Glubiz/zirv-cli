@@ -1,0 +1,17 @@
+[
+  {
+    "id": "d1",
+    "individual_note": false,
+    "notes": [
+      {"id": 501, "type": "DiffNote", "body": "Please add a test.", "author": {"username": "reviewer-a"}, "system": false, "created_at": "2026-11-09T09:00:00.000Z", "updated_at": "2026-11-09T09:30:00.000Z", "position": {"new_path": "src/a.rs"}},
+      {"id": 502, "type": "DiffNote", "body": "approved", "author": {"username": "josj"}, "system": true, "created_at": "2026-11-09T09:40:00.000Z", "updated_at": "2026-11-09T09:40:00.000Z"}
+    ]
+  },
+  {
+    "id": "d2",
+    "individual_note": true,
+    "notes": [
+      {"id": 503, "type": null, "body": "General remark", "author": {"username": "reviewer-b"}, "system": false, "created_at": "2026-11-09T10:00:00.000Z", "updated_at": "2026-11-09T10:00:00.000Z"}
+    ]
+  }
+]

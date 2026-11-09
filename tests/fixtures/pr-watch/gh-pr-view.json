@@ -1,0 +1,43 @@
+{
+  "headRefOid": "0123456789abcdef0123456789abcdef01234567",
+  "state": "OPEN",
+  "mergeable": "CONFLICTING",
+  "mergeStateStatus": "DIRTY",
+  "url": "https://github.com/acme/widgets/pull/12",
+  "author": {"id": "U_1", "is_bot": false, "login": "Glubiz", "name": "G"},
+  "comments": [
+    {
+      "id": "IC_kwDOAAA1",
+      "author": {"login": "reviewer-a"},
+      "authorAssociation": "MEMBER",
+      "body": "Looks fine overall, but rename `foo`.",
+      "createdAt": "2026-11-09T10:00:00Z",
+      "url": "https://github.com/acme/widgets/pull/12#issuecomment-1",
+      "viewerDidAuthor": false
+    }
+  ],
+  "reviews": [
+    {
+      "id": "PRR_kwDOAAA2",
+      "author": {"login": "reviewer-b"},
+      "body": "",
+      "state": "CHANGES_REQUESTED",
+      "submittedAt": "2026-11-09T11:30:00Z"
+    },
+    {
+      "id": "PRR_kwDOAAA3",
+      "author": {"login": "reviewer-c"},
+      "body": "",
+      "state": "COMMENTED",
+      "submittedAt": "2026-11-09T11:31:00Z"
+    },
+    {
+      "id": "PRR_kwDOAAA4",
+      "author": {"login": "reviewer-d"},
+      "body": "pending draft",
+      "state": "PENDING",
+      "submittedAt": null
+    }
+  ],
+  "someFutureField": {"nested": [1, 2, 3]}
+}

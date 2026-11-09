@@ -1,0 +1,12 @@
+{
+  "id": 88,
+  "iid": 7,
+  "state": "opened",
+  "sha": "fedcba9876543210fedcba9876543210fedcba98",
+  "has_conflicts": false,
+  "detailed_merge_status": "checking",
+  "web_url": "https://gitlab.example.com/group/sub/proj/-/merge_requests/7",
+  "author": {"id": 3, "username": "josj", "name": "J"},
+  "head_pipeline": {"id": 4242, "status": "running", "web_url": "https://gitlab.example.com/group/sub/proj/-/pipelines/4242"},
+  "future_field": ["x"]
+}
