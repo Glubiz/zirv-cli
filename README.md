@@ -6980,6 +6980,16 @@ ready, capacity-compatible, budget-compatible, and able to provide a verified
 equivalent model tier (`cheap`/`standard`/`deep`); zirv never guesses a tier
 translation for an operator-pinned model it cannot verify.
 
+**Side-calls.** A cheap helper call that reaches a coding harness (the judge,
+distiller, `ask` and memory helpers when no native API-key route answers; the
+native route is never window-gated, as zirv tracks no window for API keys)
+first checks that harness's 5h/7d window with the same spawn gate. An
+exhausted window reroutes the call to a harness with headroom, exactly like a
+blocked session does; with none available the call is skipped with one
+`skipping side-call` warning and fails like any failed helper, so callers keep
+their fail-open behaviour. `[pace] enabled = false` or `[fallback] enabled =
+false` turns the check off.
+
 `zirv ctx status` reports the resolved policy and, for each harness in the
 fallback order, its readiness, capacity and current headroom:
 

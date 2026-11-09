@@ -1318,6 +1318,58 @@ pub fn route_blocked_session(
     })
 }
 
+/// What a cheap harness side-call (judge, helper, ask) should do before it spends the
+/// requested harness's usage window.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SideCall {
+    Proceed,
+    /// The requested window is exhausted; use this non-exhausted harness and model.
+    Reroute(Route),
+    /// The requested window is exhausted and no candidate has headroom; carries the log line.
+    Skip(String),
+}
+
+/// Gates one side-call on the requested harness's usage window, reusing the delegation
+/// gate (`pace::spawn_gate`) and the blocked-session reroute. Off when pace or fallback is.
+pub fn route_side_call(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    requested: &str,
+    model: Option<&str>,
+    now: u64,
+) -> SideCall {
+    if !cfg.fallback.enabled || !cfg.pace.enabled {
+        return SideCall::Proceed;
+    }
+    let provider = adapters::provider_for_agent_and_model(Some(requested), model);
+    let (collector, estimator) = pace::current_windows(state, &cfg.pace, now, provider);
+    let SpawnGate::Refuse {
+        window, percent, ..
+    } = pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace)
+    else {
+        return SideCall::Proceed;
+    };
+    let request = RouteRequest {
+        requested,
+        source_model: model,
+        source_model_explicit: false,
+        delegation: true,
+        bounds: TaskBounds {
+            tokens: None,
+            tool_calls: None,
+        },
+        now,
+        exclude: &[],
+        requester: None,
+    };
+    match route_blocked_session(state, cfg, request, &[]) {
+        Some(route) => SideCall::Reroute(route),
+        None => SideCall::Skip(format!(
+            "skipping side-call: {requested} {window} window at {percent:.0}% and no fallback harness has headroom"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3045,6 +3097,71 @@ mod tests {
             relaxed.harness("claude").expect("claude").state,
             allocator::HarnessState::Ready,
             "a disabled policy excludes nothing"
+        );
+    }
+
+    #[test]
+    fn side_call_on_an_exhausted_window_reroutes_to_a_candidate_with_headroom() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = test_cfg_with_ready_adapters();
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 100.0, now + 3_600, now);
+        store_usage(&state, "openai", 10.0, now + 3_600, now);
+        let SideCall::Reroute(route) = route_side_call(&state, &cfg, "claude", Some("haiku"), now)
+        else {
+            panic!("an exhausted window with a free candidate must reroute");
+        };
+        assert_eq!(route.selected, "codex");
+        assert_eq!(route.reason, RouteReason::Exhausted);
+    }
+
+    #[test]
+    fn side_call_with_no_candidate_is_skipped_with_a_log_line() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = test_cfg_with_ready_adapters();
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 100.0, now + 3_600, now);
+        store_usage(&state, "openai", 100.0, now + 3_600, now);
+        let SideCall::Skip(line) = route_side_call(&state, &cfg, "claude", Some("haiku"), now)
+        else {
+            panic!("every window exhausted must skip");
+        };
+        assert!(
+            line.contains("claude") && line.contains("five_hour"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn side_call_proceeds_when_pace_or_fallback_is_off_or_the_window_has_room() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 100.0, now + 3_600, now);
+        let mut pace_off = test_cfg_with_ready_adapters();
+        pace_off.pace.enabled = false;
+        assert_eq!(
+            route_side_call(&state, &pace_off, "claude", Some("haiku"), now),
+            SideCall::Proceed
+        );
+        let mut fallback_off = test_cfg_with_ready_adapters();
+        fallback_off.fallback.enabled = false;
+        assert_eq!(
+            route_side_call(&state, &fallback_off, "claude", Some("haiku"), now),
+            SideCall::Proceed
+        );
+        store_usage(&state, "anthropic", 10.0, now + 3_600, now);
+        assert_eq!(
+            route_side_call(
+                &state,
+                &test_cfg_with_ready_adapters(),
+                "claude",
+                Some("haiku"),
+                now
+            ),
+            SideCall::Proceed
         );
     }
 }
