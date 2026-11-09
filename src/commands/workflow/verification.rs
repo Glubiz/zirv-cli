@@ -4074,6 +4074,7 @@ mod tests {
         std::fs::write(path, text).unwrap();
     }
 
+    #[cfg(unix)]
     fn host_label() -> &'static str {
         if cfg!(windows) {
             "windows-latest"
@@ -4092,6 +4093,7 @@ mod tests {
             .replace("'\\''", "'")
     }
 
+    #[cfg(unix)]
     fn gha_repo(job_body: &str) -> tempfile::TempDir {
         let repo = tempdir().unwrap();
         ci_write(
