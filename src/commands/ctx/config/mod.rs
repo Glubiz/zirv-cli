@@ -87,6 +87,7 @@ pub struct CtxConfig {
     pub prompt: PromptConfig,
     pub context: ContextConfig,
     pub mail: MailConfig,
+    pub pr_watch: PrWatchConfig,
     pub workflow: WorkflowConfig,
     pub report: ReportConfig,
     pub search: SearchConfig,
@@ -366,6 +367,7 @@ impl CtxConfig {
         // Union denials so repo arrays cannot erase operator entries; extra-allow is operator-only and needs no lift.
         let home_extra_deny = string_array(take_nested(&mut merged, "sandbox", "extra_deny"));
         // Lift before merge so stricter pacing wins: enabled=true and lower percentages.
+        let home_pr_watch_enabled = bool_at(take_nested(&mut merged, "pr_watch", "enabled"));
         let home_pace_enabled = bool_at(take_nested(&mut merged, "pace", "enabled"));
         let home_pace_max_percent = float_at(take_nested(&mut merged, "pace", "max_percent"));
         let home_pace_soft_percent = float_at(take_nested(&mut merged, "pace", "soft_percent"));
@@ -527,6 +529,7 @@ impl CtxConfig {
         let repo_safety = repo_layer.remove(SAFETY_SECTION);
         let repo_workspaces = repo_layer.remove("workspace");
         let repo_extra_deny = string_array(take_nested(&mut repo_layer, "sandbox", "extra_deny"));
+        let repo_pr_watch_enabled = bool_at(take_nested(&mut repo_layer, "pr_watch", "enabled"));
         let repo_pace_enabled = bool_at(take_nested(&mut repo_layer, "pace", "enabled"));
         let repo_pace_max_percent = float_at(take_nested(&mut repo_layer, "pace", "max_percent"));
         let repo_pace_soft_percent = float_at(take_nested(&mut repo_layer, "pace", "soft_percent"));
@@ -777,6 +780,15 @@ impl CtxConfig {
         );
 
         // Reinsert after merge but before env so the operator can still override the result outright.
+        insert_path(
+            &mut merged,
+            &["pr_watch", "enabled"],
+            toml::Value::Boolean(narrow_min(
+                home_pr_watch_enabled.unwrap_or(PrWatchConfig::default().enabled),
+                repo_pr_watch_enabled,
+                true,
+            )),
+        );
         let default_pace = PaceConfig::default();
         insert_path(
             &mut merged,
@@ -1514,6 +1526,7 @@ impl CtxConfig {
             ));
         }
 
+        cfg.pr_watch.interval_secs = cfg.pr_watch.interval_secs.max(60);
         cfg.approvals.validate().map_err(add_config_error_prefix)?;
 
         // TTL reaches Claude's environment verbatim; reject unsupported values at load time (#788).
@@ -4783,6 +4796,58 @@ intake_discipline = true
                 err.contains("ZIRV_CTX_MAIL"),
                 "names the operator escape hatch: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn pr_watch_is_off_by_default_and_the_operator_env_turns_it_on() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(home.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(!cfg.pr_watch.enabled);
+        let env = env_map(&[
+            ("ZIRV_CTX_PR_WATCH", "true"),
+            ("ZIRV_CTX_PR_WATCH_MAX_WAKES", "3"),
+        ]);
+        let cfg = CtxConfig::load(home.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(cfg.pr_watch.enabled);
+        assert_eq!(cfg.pr_watch.max_wakes, 3);
+    }
+
+    #[test]
+    fn a_repo_may_switch_pr_watch_off_but_never_on_or_tune_it() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[pr_watch]\nenabled = true\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let load_with = |repo_toml: &str| {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), repo_toml).expect("write");
+            CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+        };
+        let off = load_with("[pr_watch]\nenabled = false\n").expect("repo may disable");
+        assert!(!off.pr_watch.enabled, "a repo may narrow enabled to false");
+        let kept = load_with("[pr_watch]\nenabled = true\n").expect("load");
+        assert!(kept.pr_watch.enabled, "home true stays true");
+        for key in [
+            "auto_register = false",
+            "interval_secs = 60",
+            "no_checks_minutes = 1",
+            "max_wakes = 99",
+        ] {
+            let err = load_with(&format!("[pr_watch]\n{key}\n"))
+                .expect_err("a repo may not tune pr_watch")
+                .to_string();
+            let name = key.split(' ').next().expect("key");
+            assert!(err.contains(&format!("pr_watch.{name}")), "got {err}");
+            assert!(err.contains("ZIRV_CTX_PR_WATCH"), "got {err}");
         }
     }
 

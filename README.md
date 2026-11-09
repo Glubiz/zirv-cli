@@ -1228,6 +1228,44 @@ so an advisory delivery never looks like a nudge that silently did nothing. Eith
 already runs on, since a nudge just claims a marker file that same tick
 checks for.
 
+### PR/MR watch
+
+Off by default (`[pr_watch] enabled = false`): every read shells out to `gh` or
+`glab` on the operator's own login. `watch`/`poll` refuse with a message while
+disabled.
+
+| Command | Does |
+| --- | --- |
+| `zirv ctx pr watch <url>` | Register a GitHub pull request or GitLab merge request for this session (`--session <short>` to act for another). |
+| `zirv ctx pr unwatch <url>` | Stop watching it. |
+| `zirv ctx pr list` | One line per watch: head, wakes sent, last poll, last error, stopped reason. |
+| `zirv ctx pr poll` | One manual sweep: read every watch of this session, evaluate, mail what changed. |
+
+`poll` calls `gh pr view/checks`, `gh api` (GitHub) or `glab mr view`, `glab api`
+(GitLab) with argv arrays and a 10 s timeout; token files are never read. Each
+change becomes one mail from `zirv-pr-watch` addressed to the owning session:
+checks failed or passed (the required checks gate, falling back to all checks;
+a GitLab pipeline is the gate), new reviewer comments, a merge conflict, no
+checks reported after `no_checks_minutes` (only where the repo has CI config),
+and a final note when the PR is merged or closed, after which the watch is
+deleted. Reviewer text is quoted, truncated and labelled untrusted. A new head
+commit resets what was already reported; your own comments are ignored;
+`max_wakes` consecutive comment-only wakes stop the watch. Read failures
+(`no_cli`, `auth`, `not_found`, `rate_limited`, `transient`) are recorded as
+`last_error` and shown by `list`, never mailed; two `not_found` in a row or
+eight failures in a row stop the watch. Records live under
+`<state>/pr-watch/<session short>/`. No background poller exists yet: `poll` is
+the only trigger.
+
+```toml
+[pr_watch]
+enabled = false          # ZIRV_CTX_PR_WATCH; operator-only to turn on, a repo may only set false
+auto_register = true     # ZIRV_CTX_PR_WATCH_AUTO_REGISTER; operator-only
+interval_secs = 120      # ZIRV_CTX_PR_WATCH_INTERVAL_SECS; operator-only, floor 60
+no_checks_minutes = 15   # ZIRV_CTX_PR_WATCH_NO_CHECKS_MINUTES; operator-only
+max_wakes = 10           # ZIRV_CTX_PR_WATCH_MAX_WAKES; operator-only
+```
+
 ### Banner, status bar and events
 
 A `zirv ctx chat` session (bare `zirv` included) with a real, large-enough
@@ -5458,7 +5496,7 @@ enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `agent`, `agent_bin`, `supervise.on_failure`, `handoff.model`,
 `optimize.model`, `sandbox.enabled`, `prompt.enabled`, `prompt.repo_layer`,
 `prompt.max_repo_bytes`, `prompt.harnesses`, `prompt.codex_orchestrator`, `prompt.skill_index_repo_filter`, `prompt.verbosity`, `chat.claude_permission_mode`, `mail.enabled`,
-`mail.max_delivered_bytes`, `mail.mid_turn`, any `supervisor.*` key, `chrome.events`, any `memory.*` key, any
+`mail.max_delivered_bytes`, `mail.mid_turn`, `pr_watch.auto_register`, `pr_watch.interval_secs`, `pr_watch.no_checks_minutes`, `pr_watch.max_wakes` (a repo may set `pr_watch.enabled = false`, never true), any `supervisor.*` key, `chrome.events`, any `memory.*` key, any
 `dash.*` key, any `pace.*` key, any `price.*` key, any `models.*` key, any `proxy.*` key, any `jev.*` key, any `headless.*` key, `review`, `worker.claude`,
 `worker.codex`, `worker.codex_effort`, `worker.default_depth`, `worker.default_read_only`,
 `worker.bootstrap_timeout_secs`,
@@ -5569,6 +5607,11 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `mail.enabled` | `ZIRV_CTX_MAIL` |
 | `mail.max_delivered_bytes` | `ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES` |
 | `mail.mid_turn` | `ZIRV_CTX_MAIL_MID_TURN` |
+| `pr_watch.enabled` | `ZIRV_CTX_PR_WATCH` |
+| `pr_watch.auto_register` | `ZIRV_CTX_PR_WATCH_AUTO_REGISTER` |
+| `pr_watch.interval_secs` | `ZIRV_CTX_PR_WATCH_INTERVAL_SECS` |
+| `pr_watch.no_checks_minutes` | `ZIRV_CTX_PR_WATCH_NO_CHECKS_MINUTES` |
+| `pr_watch.max_wakes` | `ZIRV_CTX_PR_WATCH_MAX_WAKES` |
 | `supervisor.enabled` | `ZIRV_CTX_SUPERVISOR_ENABLED` |
 | `supervisor.harness` | `ZIRV_CTX_SUPERVISOR_HARNESS` |
 | `supervisor.model` | `ZIRV_CTX_SUPERVISOR_MODEL` |

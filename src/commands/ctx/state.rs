@@ -1142,6 +1142,11 @@ impl StateDir {
         self.0.join("mail")
     }
 
+    /// PR/MR watches: `<state>/pr-watch/<session short>/<hash(url)>.json`.
+    pub fn pr_watch(&self) -> PathBuf {
+        self.0.join("pr-watch")
+    }
+
     /// The state subdirectories a sandboxed worker's own `zirv` calls persist
     /// to (#845): mail, memory, sessions, logs, tasks/groups, workflow,
     /// verification, artifact and telemetry state. Deliberately NOT the bare

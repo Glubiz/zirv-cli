@@ -121,6 +121,33 @@ impl Default for MailConfig {
     }
 }
 
+/// PR/MR watch (#949). Off by default: every poll shells out to `gh`/`glab` on the operator's account.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrWatchConfig {
+    pub enabled: bool,
+    /// Register a watch automatically when a session creates a PR/MR.
+    pub auto_register: bool,
+    /// Seconds between polls of one watch; values below 60 are raised to 60.
+    pub interval_secs: u64,
+    /// Minutes a head may report no checks before the session is told, in repos with CI config.
+    pub no_checks_minutes: u64,
+    /// Consecutive comment-only wakes before the watch stops itself.
+    pub max_wakes: u32,
+}
+
+impl Default for PrWatchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_register: true,
+            interval_secs: 120,
+            no_checks_minutes: 15,
+            max_wakes: 10,
+        }
+    }
+}
+
 /// Operator-only deploy tier; the repo-controlled minimum may only increase strictness.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
