@@ -12,8 +12,7 @@ pub(super) const WORKTREES_LABEL: &str = "Linked worktrees: ";
 pub(super) const CLAIM_LABEL: &str = "Agent's final message (untrusted claim): ";
 pub(super) const CITED_LABEL: &str = "Cited by the agent: ";
 pub(super) const TOOLS_LABEL: &str = "Tool activity this turn (untrusted, newest last): ";
-pub(super) const ANSWERS_LABEL: &str =
-    "Operator answers to AskUserQuestion (the operator's own input): ";
+pub(super) const ANSWERS_LABEL: &str = "AskUserQuestion result (untrusted: the selection is the operator's answer, the question and option wording is agent-authored): ";
 
 /// Delimiters of the one block holding every untrusted line; `clean` removes `<<<` and `>>>`
 /// from content, so content can never contain either marker.
@@ -163,7 +162,7 @@ fn tool_activity(lines: &[String]) -> Option<String> {
 }
 
 /// The operator's AskUserQuestion answers as one evidence line, redacted and capped.
-pub(super) fn answers_line(answers: &[String]) -> Option<String> {
+fn answers_line(answers: &[String]) -> Option<String> {
     let text = clean(&crate::commands::ctx::snapshot::redact_text(
         &answers.join(" | "),
     ));
@@ -392,9 +391,11 @@ impl Beyond {
                 lines.push(format!("{CITED_LABEL}{}", cited.join("; ")));
             }
         }
-        if let Some(tools) = tool_activity(&(claim.turn)().tool_lines) {
+        let turn = (claim.turn)();
+        if let Some(tools) = tool_activity(&turn.tool_lines) {
             lines.push(format!("{TOOLS_LABEL}{tools}"));
         }
+        lines.extend(answers_line(&turn.answers));
         if lines.is_empty() {
             return String::new();
         }

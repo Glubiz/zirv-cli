@@ -731,15 +731,12 @@ fn on_stop_claimed(
     } else {
         format!("\n{block}")
     };
-    let answers_line = evidence::answers_line(&(claim.turn)().answers)
-        .map(|line| format!("\n{line}"))
-        .unwrap_or_default();
     let request = ConsultRequest {
         trigger: Trigger::BeforeDone,
         session: session.to_string(),
         repo: repo.to_path_buf(),
         evidence: format!(
-            "The agent is about to declare the task done.{task_line}{answers_line}{journal_line}{verification_line}{beyond_cwd_lines}"
+            "The agent is about to declare the task done.{task_line}{journal_line}{verification_line}{beyond_cwd_lines}"
         ),
         workflow: None,
     };
@@ -4123,14 +4120,12 @@ mod tests {
             evidence.contains("NEWEST") && !evidence.contains("OLDEST"),
             "{evidence}"
         );
-        assert!(end - tools < 7 * 1024, "capped: {}", end - tools);
-        let answers = evidence
-            .find("Operator answers to AskUserQuestion")
-            .expect("answers");
+        let answers = evidence.find("AskUserQuestion result").expect("answers");
         assert!(
-            answers < begin,
-            "operator input is outside the untrusted block"
+            begin < answers && answers < end,
+            "agent-authored question text must sit inside the untrusted block: {evidence}"
         );
+        assert!(answers - tools < 7 * 1024, "capped: {}", answers - tools);
         assert!(evidence.contains("Ship it?"), "{evidence}");
     }
 }
