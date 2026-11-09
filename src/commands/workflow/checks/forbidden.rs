@@ -104,6 +104,7 @@ pub const NARROW_ONLY_ALLOWLIST: &[&str] = &[
     "checkpoint.max_per_session",
     "checkpoint.ttl_secs",
     "checkpoint.capture_timeout_secs",
+    "pr_watch.enabled", // narrow-only fold: repo may only turn PR watch OFF.
     "wrap.debounce_ms",
     "wrap.inject_timeout_ms",
     // Repository values may disable the standing skill index, never enable it against operator policy. (#539)
