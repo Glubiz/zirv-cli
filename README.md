@@ -1462,6 +1462,10 @@ to the section that documents it in depth.
   input or touching its transcript or registry record. See
   [Verbs](#verbs) and [Cross-harness fallback and
   handover](#cross-harness-fallback-and-handover).
+- **Per-turn checkpoints** — `checkpoint` (`zirv ctx checkpoint`; capture, list, diff) records a
+  git checkpoint each turn. See [Per-turn git checkpoints](#per-turn-git-checkpoints).
+- **PR/MR watch** — `pr` (`zirv ctx pr`; `watch`, `unwatch`, `list`, `poll`) watches a PR or MR's
+  CI and review state. See [PR/MR watch](#prmr-watch).
 - **Status and attention** — `status`, `explain-status`, and `wait` report
   or block on a session's composed attention projection; `watch <session-or-
   delegation> [--json] [--since <revision>]` blocks on a session OR a
@@ -1706,6 +1710,8 @@ protocol and harness: [docs/benchmarks/wrapped-vs-vanilla.md](docs/benchmarks/wr
   (`zirv benchmark auto`) is the unattended, budget-capped probe that keeps
   routing evidence fresh. See [Benchmarking agents and
   models](#benchmarking-agents-and-models-zirv-benchmark).
+- **Behaviour evals** — `eval` (`zirv benchmark eval`; `lint`, `plan`, `run --dry-run`)
+  checks a behaviour eval corpus. See [Behaviour evals](#behaviour-evals-zirv-benchmark-eval).
 - **Model routing** — new model versions are held on probation until
   probe and recorded-work evidence shows they are not worse, and an
   unpinned seat, worker or reviewer gets the cheapest model within
