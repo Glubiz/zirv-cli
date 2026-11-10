@@ -1,0 +1,4 @@
+# codex app-server handshake. '>' client sends, '<' server emits.
+> {"id":1,"method":"initialize","params":{"clientInfo":{"name":"zirv","version":"0.0.0"},"capabilities":{"experimentalApi":false}}}
+< {"id":1,"result":{"userAgent":"fake/0","codexHome":"/tmp/codex","platformFamily":"unix","platformOs":"linux"}}
+> {"method":"initialized"}

@@ -784,6 +784,17 @@ fn detect_top_level_help_marker(program: &str, bin_args: &[String], marker: &str
 /// checks so their resolution, cmd-shim guard, timeout and failure polarity
 /// cannot drift.
 fn detect_top_level_help_markers(program: &str, bin_args: &[String], markers: &[&str]) -> bool {
+    detect_help_markers(program, bin_args, &[], markers)
+}
+
+/// `detect_top_level_help_markers` for `<program> [bin_args] <subcommand..>
+/// --help`; the app-server transport probe (#950) reuses it for `app-server`.
+pub(crate) fn detect_help_markers(
+    program: &str,
+    bin_args: &[String],
+    subcommand: &[&str],
+    markers: &[&str],
+) -> bool {
     // The same resolution the real launch uses, exactly like
     // `detect_ignore_flags` -- otherwise the probe and the spawn could
     // disagree on Windows about whether this is a `.cmd` shim.
@@ -794,9 +805,10 @@ fn detect_top_level_help_markers(program: &str, bin_args: &[String], markers: &[
     // fail-closed reparse guard against the exact probe argv before spawning,
     // since `bin_args` can carry repo-controlled text on some launch shapes.
     let mut probe_args: Vec<String> =
-        Vec::with_capacity(resolved.prefix.len() + bin_args.len() + 1);
+        Vec::with_capacity(resolved.prefix.len() + bin_args.len() + subcommand.len() + 1);
     probe_args.extend(resolved.prefix.iter().cloned());
     probe_args.extend(bin_args.iter().cloned());
+    probe_args.extend(subcommand.iter().map(|s| (*s).to_string()));
     probe_args.push("--help".to_string());
     if super::guard_cmd_shim_reparse(&resolved.program, &probe_args).is_err() {
         return false;
@@ -805,6 +817,7 @@ fn detect_top_level_help_markers(program: &str, bin_args: &[String], markers: &[
     let Ok(mut child) = Command::new(&resolved.program)
         .args(&resolved.prefix)
         .args(bin_args)
+        .args(subcommand)
         .arg("--help")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

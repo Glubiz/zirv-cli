@@ -1,0 +1,2 @@
+> {"id":1,"method":"initialize","params":{}}
+< {"id":1,"error":{"code":-32600,"message":"Invalid request"}}

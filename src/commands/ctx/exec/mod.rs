@@ -26,6 +26,9 @@ use super::{
 use crate::commands::workflow::classify::Complexity;
 
 mod accounting;
+#[cfg(unix)]
+#[allow(dead_code)] // unwired until #950 slice 4
+mod app_server;
 mod argv;
 mod command;
 mod compact;
