@@ -1061,6 +1061,7 @@ mod tests {
             cost_micros: Some(1000),
             model: None,
             answer: String::new(),
+            transcript: String::new(),
         }
     }
 

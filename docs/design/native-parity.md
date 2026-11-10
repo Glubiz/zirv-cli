@@ -98,7 +98,7 @@ means it runs on any supported OS with no provider configured at all.
 | `artifact show` | `workflow::artifact` | same zirv code | none | `artifact::tests::static_output_is_preferred_without_an_interaction_requirement` | `unit` |
 | `benchmark` | `commands::benchmark` | same zirv code | none | `benchmark::tests::a_bare_benchmark_prints_help_and_a_subcommand_is_required` | `unit` |
 | `benchmark auto` | `commands::benchmark::auto` | same zirv code | installed vendor harnesses | `benchmark::auto::tests::the_run_stamp_is_written_before_the_first_launch` | `integration` |
-| `benchmark eval` | `commands::benchmark::eval` | same zirv code | none | `benchmark::eval::corpus::tests::the_embedded_corpus_lints_clean_with_its_canned_traces` | `unit` |
+| `benchmark eval` | `commands::benchmark::eval` | same zirv code | installed vendor harnesses | `benchmark::eval::tests::the_spend_cap_stops_the_run_and_records_the_skipped_samples` | `integration` |
 | `benchmark plan` | `commands::benchmark::run` | same zirv code | none | `benchmark::run::tests::plan_counts_runs_and_skips_python_only_tasks_without_python` | `unit` |
 | `benchmark report` | `commands::benchmark::report` | same zirv code | none | `benchmark::report::tests::the_text_report_carries_the_caveat_and_none_for_empty_roles` | `unit` |
 | `benchmark run` | `commands::benchmark::run` | same zirv code | installed vendor harnesses | `benchmark::run::tests::an_end_to_end_run_records_a_row_and_removes_the_workdir` | `integration` |

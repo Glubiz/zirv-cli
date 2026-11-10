@@ -91,7 +91,7 @@ enum Command {
         #[arg(long)]
         quiet: bool,
     },
-    /// Behaviour eval cases that grade what an agent does. Only the free tier exists so far.
+    /// Behaviour eval cases that grade what an agent does (`run --yes` spends real model quota).
     Eval {
         #[command(subcommand)]
         command: eval::EvalCommand,
@@ -284,13 +284,7 @@ fn run_benchmark_with(
     injected: Option<&mut Launcher<'_>>,
 ) -> Result<(report::Report, u64), String> {
     if injected.is_none() {
-        // SAFETY: nothing else is running yet; the CLI is single-threaded until the first launch.
-        // Child zirv hooks read their own process env, so the knobs must be set there too.
-        unsafe {
-            for (key, value) in run::CHILD_KNOBS {
-                std::env::set_var(key, value);
-            }
-        }
+        run::export_child_knobs();
     }
     let started = chrono::Utc::now();
     let id = run::run_id(started);

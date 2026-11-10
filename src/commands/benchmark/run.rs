@@ -24,7 +24,7 @@ use crate::commands::ctx::state;
 
 const ROW_SCHEMA: u32 = 1;
 const DIFF_LIMIT: usize = 20 * 1024;
-const SPEND_CAP_REASON: &str = "spend cap";
+pub(super) const SPEND_CAP_REASON: &str = "spend cap";
 
 const NOTICE: &str = "You are running non-interactively: nobody will answer questions or approve plans. Make reasonable decisions yourself and complete the task end to end.\n\n";
 
@@ -384,6 +384,8 @@ pub struct LaunchSpec<'a> {
     pub model: &'a str,
     pub prompt: String,
     pub read_only: bool,
+    /// Headless, with every tool call denied: the transcript records the attempt and nothing runs.
+    pub deny_all: bool,
 }
 
 pub struct Launch {
@@ -394,6 +396,8 @@ pub struct Launch {
     /// The model the transcript names, when it does.
     pub model: Option<String>,
     pub answer: String,
+    /// The raw transcript of the last segment, empty when it cannot be read.
+    pub transcript: String,
 }
 
 pub struct Runner<'a> {
@@ -468,6 +472,7 @@ impl Runner<'_> {
             model: &candidate.model,
             prompt: format!("{NOTICE}{}", task.prompt),
             read_only: false,
+            deny_all: false,
         };
         let launched = match (self.launch)(&spec) {
             Ok(launched) => launched,
@@ -510,6 +515,7 @@ impl Runner<'_> {
             model: &judge.model,
             prompt: judge_prompt(&task.prompt, answer, &diff),
             read_only: true,
+            deny_all: false,
         };
         match (self.launch)(&spec) {
             Err(error) => row.judge_error = Some(error),
@@ -534,21 +540,28 @@ impl Runner<'_> {
         Some(relative)
     }
 
-    /// Every run starts from the same pristine fixture at the same path.
     fn reset_workdir(&self) -> Result<(), String> {
-        match std::fs::remove_dir_all(self.work) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("could not reset the workdir: {error}")),
-        }
-        std::fs::create_dir_all(self.work)
-            .map_err(|e| format!("could not create the workdir: {e}"))?;
-        corpus::materialize(self.work).map_err(|e| format!("could not write the fixture: {e}"))?;
-        if self.git_present {
-            init_git(self.work)?;
-        }
-        Ok(())
+        reset_dir(self.work, self.git_present, &corpus::materialize)
     }
+}
+
+/// Every run starts from the same pristine fixture at the same path.
+pub(super) fn reset_dir(
+    work: &Path,
+    git_present: bool,
+    fill: &dyn Fn(&Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    match std::fs::remove_dir_all(work) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("could not reset the workdir: {error}")),
+    }
+    std::fs::create_dir_all(work).map_err(|e| format!("could not create the workdir: {e}"))?;
+    fill(work).map_err(|e| format!("could not write the fixture: {e}"))?;
+    if git_present {
+        init_git(work)?;
+    }
+    Ok(())
 }
 
 /// Workers and orchestrators alternate (corpus order within each role), so a spend cap that
@@ -686,6 +699,16 @@ pub fn strip_markers(text: &str) -> String {
         .join("\n")
 }
 
+/// Child zirv hooks read their own process env, so the knobs must be set there too.
+pub(super) fn export_child_knobs() {
+    // SAFETY: nothing else is running yet; the CLI is single-threaded until the first launch.
+    unsafe {
+        for (key, value) in CHILD_KNOBS {
+            std::env::set_var(key, value);
+        }
+    }
+}
+
 /// The environment handed to the supervised child: no inherited supervision identity, no extra zirv model calls.
 pub fn child_env(base: EnvLookup<'_>, key: &str) -> Option<String> {
     if SUPERVISION_ENV.contains(&key) {
@@ -697,7 +720,7 @@ pub fn child_env(base: EnvLookup<'_>, key: &str) -> Option<String> {
     }
 }
 
-fn append_row(dir: &Path, row: &Row) -> Result<(), String> {
+pub(super) fn append_row(dir: &Path, row: &impl Serialize) -> Result<(), String> {
     let line = serde_json::to_string(row).map_err(|e| e.to_string())?;
     let mut file = state::open_private_append(&dir.join("results.jsonl"))
         .map_err(|e| format!("results.jsonl: {e}"))?;
@@ -705,7 +728,7 @@ fn append_row(dir: &Path, row: &Row) -> Result<(), String> {
 }
 
 /// Create the run directory and `run.json` before the first run starts.
-pub fn start_store(dir: &Path, meta: &RunMeta) -> Result<(), String> {
+pub fn start_store(dir: &Path, meta: &impl Serialize) -> Result<(), String> {
     state::create_private_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let json = serde_json::to_string_pretty(meta).map_err(|e| e.to_string())?;
     state::write_private(&dir.join("run.json"), &json).map_err(|e| format!("run.json: {e}"))
@@ -767,9 +790,24 @@ impl ExecLauncher<'_> {
         } else {
             adapter.model_args(spec.model)
         };
+        let mut pinned = model_flags;
+        if spec.deny_all && adapter.name() == "claude" {
+            // Pinning the mode drops zirv's allow list; `dontAsk` denies whatever is not allowed,
+            // and a denied call still lands in the transcript. Project-only settings keep the
+            // user's own allow rules out of the measurement.
+            pinned.extend(
+                [
+                    "--permission-mode",
+                    "dontAsk",
+                    "--setting-sources",
+                    "project",
+                ]
+                .map(String::from),
+            );
+        }
         let mut command =
-            agent::worker_launch_flags(self.cfg, spec.harness, adapter.as_ref(), &model_flags);
-        if spec.read_only {
+            agent::worker_launch_flags(self.cfg, spec.harness, adapter.as_ref(), &pinned);
+        if spec.read_only || (spec.deny_all && adapter.name() != "claude") {
             adapters::extend_read_only_args(
                 adapter.as_ref(),
                 &mut command,
@@ -804,7 +842,7 @@ impl ExecLauncher<'_> {
             self.table,
         );
         let model = report.segments.last().and_then(|s| s.model.clone());
-        let answer = report
+        let transcript = report
             .segments
             .last()
             .and_then(|segment| {
@@ -812,9 +850,11 @@ impl ExecLauncher<'_> {
                     id: SessionId::parse(&segment.session),
                     cwd: self.work.to_path_buf(),
                 };
-                let transcript = std::fs::read_to_string(adapter.transcript_path(&session)).ok()?;
-                adapter.final_assistant_message(&transcript)
+                std::fs::read_to_string(adapter.transcript_path(&session)).ok()
             })
+            .unwrap_or_default();
+        let answer = adapter
+            .final_assistant_message(&transcript)
             .map(|text| strip_markers(&text))
             .unwrap_or_default();
         Ok(Launch {
@@ -824,6 +864,7 @@ impl ExecLauncher<'_> {
             cost_micros,
             model,
             answer,
+            transcript,
         })
     }
 }
@@ -890,6 +931,7 @@ mod tests {
             cost_micros: cost,
             model: None,
             answer: "reserve InsufficientStock".to_string(),
+            transcript: String::new(),
         }
     }
 
@@ -1509,6 +1551,7 @@ mod tests {
             model: DEFAULT_MODEL,
             prompt: "p".to_string(),
             read_only: false,
+            deny_all: false,
         };
         let launched = launcher.launch(&spec);
         unsafe {

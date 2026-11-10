@@ -173,7 +173,7 @@ In a pipe or with redirected output (non-TTY), `zirv tour` prints all sections p
 zirv benchmark plan   [--harness <name>]... [--family <name>]... [--model <harness:model>]... [--task <id>]... [--judge <harness:model>] [--no-judge] [--json]
 zirv benchmark run    [same filters] [--reps <n>] [--max-usd <usd>] [--timeout-secs <s>] --yes [--json]
 zirv benchmark report [<run-id>] [--json]
-zirv benchmark eval   lint|plan|run --dry-run   # free behaviour evals, see below
+zirv benchmark eval   lint|plan|report|run   # behaviour evals; `run --yes` spends quota, see below
 zirv benchmark auto   [--force] [--dry-run] [--json] [--quiet]
 ```
 
@@ -244,12 +244,18 @@ Child runs disable zirv's supervisor, memory harvest, usage pacing and cross-har
 zirv benchmark eval lint [--json]
 zirv benchmark eval plan [--json]
 zirv benchmark eval run --dry-run [--case <id>]... [--context] [--json]
+zirv benchmark eval run [--case <id>]... [--samples <n>] [--max-usd <usd>] [--timeout-secs <n>] [--baseline <run-id> [--stop-on-regression]] [--json] --yes
+zirv benchmark eval report [<run-id>] [--json]
 ```
 
-This tier costs nothing and is safe in CI: `lint`, `plan` and `run --dry-run` never launch a harness, never touch the zirv state directory and make no model call. `run` without `--dry-run` refuses with exit 2 ("paid replay not implemented yet"); the paid replay, samples and baselines are later slices. `eval run` is already an ask rule (`Bash(zirv benchmark eval run*)`) for agents, so the paid path will prompt from day one; interactively `lint`, `plan` and `run --dry-run` stay silent. In headless launches zirv turns every ask rule into a native deny, so `eval run --dry-run` is refused there, as `benchmark run` already is; headless agents use `eval plan` / `eval lint`.
+`lint`, `plan`, `report` and `run --dry-run` cost nothing and are safe in CI: they never launch a harness and make no model call (`run --dry-run` and `lint` touch no state; `report` only reads `<state>/eval/`). `run` without `--dry-run` is the paid replay and spends real model quota: without `--yes` it prints the plan and exits 2 and launches nothing, exactly as `benchmark run` does. `eval run` is an ask rule (`Bash(zirv benchmark eval run*)`) for agents, so the paid path prompts; interactively `lint`, `plan`, `report` and `run --dry-run` stay silent. `--dry-run` cannot be combined with `--yes` or the baseline flags. In headless launches zirv turns every ask rule into a native deny, so `eval run --dry-run` is refused there, as `benchmark run` already is; headless agents use `eval plan` / `eval lint` / `eval report`.
 
 - `lint` checks that every surface resolves, every `bad` case cites a `source`, every control points at a `bad` or `guard` case, and every case's canned traces grade as claimed: the canned fail trace of a `bad` or `guard` case must fail its expectations and the canned pass trace must pass. It exits 1 and lists each problem otherwise.
 - `run --dry-run` prints, per case, the surface text resolved from current source, the turns and the bundle sha256 (over the surface reference and its text, so two runs prove whether the text changed). `--context` adds the per-surface size: the `zirv ctx compile --measure` table for a `layer:` surface, bytes and estimated tokens otherwise.
+
+- `run --yes` replays each selected case through the real headless harness of the case, one prompt (prior turns, then the turns) in a fresh workdir holding the case's `setup` files. Every tool call is denied (claude runs in `dontAsk` mode with project-only settings; codex gets its read-only sandbox), so the transcript records the attempt and nothing is executed. The transcript is graded by the deterministic trace grader. A case runs `--samples` times (default 2); when an even count ties (for the default, the first two disagree) one more sample breaks the tie. A case fails when at least half of its counted samples fail. A harness that exits non-zero, errors, or leaves no transcript counts as a failed sample. `--max-usd` (default 10) stops launching new samples once measured spend reaches it, as `benchmark run` does; the remaining samples are recorded as skipped, and a sample with no reported cost counts as zero toward the cap.
+- Results go to `<state>/eval/<run-id>/`: `run.json`, `results.jsonl` (one row per sample: case id, harness, sample index, pass/fail for every expectation, the resolved bundle sha256, cost) and `traces/` (the raw transcripts). Bundle hashes come from the surface resolved from current source, not from the transcript.
+- `--baseline <run-id>` compares each case against an earlier eval run: a case that passed there and fails now is a **regression** (`run` then exits 1); `--stop-on-regression` stops before the next case. A case whose bundle sha256 differs from the baseline's is flagged **surface changed**: the instructions under test are not the ones the baseline ran, which is expected when you are testing a prompt edit, so the comparison is shown but labelled instead of passed off as like for like. `eval report [<run-id>]` re-renders a stored run (the newest by default) with its baseline comparison; `--json` prints one document.
 
 **Case format.** Cases are TOML files in `src/commands/benchmark/eval/cases/`, embedded in the binary; their canned traces are in `tests/fixtures/eval/` (data only). Unknown keys are an error.
 
@@ -1710,7 +1716,7 @@ protocol and harness: [docs/benchmarks/wrapped-vs-vanilla.md](docs/benchmarks/wr
   (`zirv benchmark auto`) is the unattended, budget-capped probe that keeps
   routing evidence fresh. See [Benchmarking agents and
   models](#benchmarking-agents-and-models-zirv-benchmark).
-- **Behaviour evals** — `eval` (`zirv benchmark eval`; `lint`, `plan`, `run --dry-run`)
+- **Behaviour evals** — `eval` (`zirv benchmark eval`; `lint`, `plan`, `report`, `run`)
   checks a behaviour eval corpus. See [Behaviour evals](#behaviour-evals-zirv-benchmark-eval).
 - **Model routing** — new model versions are held on probation until
   probe and recorded-work evidence shows they are not worse, and an

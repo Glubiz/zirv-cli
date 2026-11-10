@@ -227,6 +227,7 @@ const READ_ONLY: &[&str] = &[
     "zirv benchmark report",
     "zirv benchmark eval lint",
     "zirv benchmark eval plan",
+    "zirv benchmark eval report",
     "zirv setup status",
     "zirv skill list",
     "zirv skill show",
@@ -406,9 +407,8 @@ const MUTATING: &[&str] = &[
     // Spends real model quota like `run`, but unattended and bounded by `[routing]`;
     // writes the same benchmark store plus `<state>/probe-*` stamps, evidence and promotions.
     "zirv benchmark auto",
-    // Not yet implemented (exits 2); the future paid replay spends model quota and writes
-    // `<state>/eval/<run-id>/`. Its `--dry-run` form is read-only and is let through by the
-    // safety rules, like `permissions compile --dry-run`.
+    // The paid replay spends model quota and writes `<state>/eval/<run-id>/`. Its `--dry-run`
+    // form is read-only and is let through by the safety rules, like `permissions compile --dry-run`.
     "zirv benchmark eval run",
 ];
 
