@@ -344,7 +344,7 @@ fn sample(
     dir: &Path,
     launch: &mut Launcher<'_>,
 ) -> Row {
-    let row = Row::new(case, bundle, index, Status::Ok);
+    let mut row = Row::new(case, bundle, index, Status::Ok);
     let reset = run::reset_dir(opts.work, false, &|work| write_setup(work, case));
     if let Err(error) = reset {
         return row.failed(error);
@@ -360,7 +360,6 @@ fn sample(
         Ok(launched) => launched,
         Err(error) => return row.failed(error),
     };
-    let mut row = row;
     row.exit_code = Some(launched.exit_code);
     row.wall_ms = Some(launched.wall_ms);
     row.cost_micros = launched.cost_micros;

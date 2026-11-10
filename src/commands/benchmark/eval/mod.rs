@@ -181,8 +181,9 @@ fn execute_with(
                 return Ok(2);
             }
             let root = eval_root(env)?;
-            let work_root = std::fs::canonicalize(std::env::temp_dir())
-                .unwrap_or_else(|_| std::env::temp_dir())
+            let temp = std::env::temp_dir();
+            let work_root = std::fs::canonicalize(&temp)
+                .unwrap_or(temp)
                 .join("zirv-eval")
                 .join(uuid::Uuid::new_v4().simple().to_string());
             state::create_private_dir_all(&work_root)

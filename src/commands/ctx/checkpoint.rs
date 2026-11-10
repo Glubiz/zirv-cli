@@ -544,6 +544,16 @@ fn base_of(found: &[Entry], short: &str, seq: u64, head: &str) -> Option<String>
     }
 }
 
+/// The full commit message of `commit`, for its `Zirv-*` trailers.
+fn commit_message(repo: &Path, commit: &str) -> Result<String, RunErr> {
+    run_bounded(
+        git(repo, None).args(["log", "-1", "--format=%B", commit]),
+        READ_TIMEOUT,
+        READ_CAP,
+    )
+    .map(|(out, _)| out)
+}
+
 fn trailer(message: &str, key: &str) -> String {
     let prefix = format!("{key}: ");
     message
@@ -559,12 +569,7 @@ pub fn list(repo: &Path, short: Option<&str>) -> Result<Vec<Info>, String> {
     found.sort_by(|a, b| b.ts.cmp(&a.ts).then(b.seq.cmp(&a.seq)));
     let mut infos = Vec::new();
     for entry in found.clone() {
-        let (message, _) = run_bounded(
-            git(repo, None).args(["log", "-1", "--format=%B", &entry.commit]),
-            READ_TIMEOUT,
-            READ_CAP,
-        )
-        .map_err(|e| e.skip("log").to_string())?;
+        let message = commit_message(repo, &entry.commit).map_err(|e| e.skip("log").to_string())?;
         let head = trailer(&message, "Zirv-Head");
         let base = base_of(&found, &entry.short, entry.seq, &head);
         let mut numstat = git(repo, None);
@@ -646,12 +651,7 @@ pub fn diff(
         }
         None => {
             let commit = commit_of(spec)?;
-            let (message, _) = run_bounded(
-                git(repo, None).args(["log", "-1", "--format=%B", &commit]),
-                READ_TIMEOUT,
-                READ_CAP,
-            )
-            .map_err(|e| e.skip("log").to_string())?;
+            let message = commit_message(repo, &commit).map_err(|e| e.skip("log").to_string())?;
             let head = trailer(&message, "Zirv-Head");
             let seq: u64 = spec.trim().parse().unwrap_or_default();
             if let Some(base) = base_of(&found, short, seq, &head) {
@@ -677,6 +677,7 @@ pub struct Checkpointer {
     wait: Duration,
 }
 
+#[derive(Clone)]
 struct Worker {
     cfg: CheckpointConfig,
     repo: PathBuf,
@@ -761,6 +762,7 @@ impl Checkpointer {
             failures: 0,
             disabled: false,
         };
+        let on_spawn_failure = worker.clone();
         let wants_final = Arc::clone(&finish);
         let spawned = std::thread::Builder::new()
             .name("zirv-checkpoint".to_string())
@@ -780,17 +782,7 @@ impl Checkpointer {
                 wait: Duration::from_secs(cfg.capture_timeout_secs),
             }),
             Err(e) => {
-                let skipped = Worker {
-                    cfg: cfg.clone(),
-                    repo: repo.to_path_buf(),
-                    session: session.to_string(),
-                    agent: agent.to_string(),
-                    verb,
-                    state: state.clone(),
-                    failures: 0,
-                    disabled: false,
-                };
-                skipped.log("checkpoint-skipped", &format!("worker thread: {e}"));
+                on_spawn_failure.log("checkpoint-skipped", &format!("worker thread: {e}"));
                 None
             }
         }
@@ -1040,15 +1032,14 @@ pub fn run_restore<W: Write>(
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_default();
-    let record =
-        worktree::latest_for_path(ctx.state, &super::state::repo_slug(&main), &canonical(&top));
+    let record = worktree::latest_for_path(ctx.state, &super::state::repo_slug(&main), &top);
     let owner = record
         .as_ref()
         .and_then(|r| r.owner_session.clone())
         .unwrap_or_else(|| "-".to_string());
     let short = sessions::short_id(args.session.as_deref().unwrap_or(&owner));
     if restore_refusal(
-        &canonical(&top),
+        &top,
         &main,
         record.as_ref(),
         &short,
@@ -1113,14 +1104,10 @@ pub fn run_restore<W: Write>(
             return Ok(1);
         }
     }
-    let message = run_bounded(
-        git(&top, None).args(["log", "-1", "--format=%B", &commit]),
-        READ_TIMEOUT,
-        READ_CAP,
-    )
-    .map(|(out, _)| out)
-    .unwrap_or_default();
-    let taken_on = trailer(&message, "Zirv-Head");
+    let taken_on = trailer(
+        &commit_message(&top, &commit).unwrap_or_default(),
+        "Zirv-Head",
+    );
     let head = run_bounded(
         git(&top, None).args(["rev-parse", "--verify", "-q", "HEAD"]),
         READ_TIMEOUT,

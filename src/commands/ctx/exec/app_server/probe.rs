@@ -8,10 +8,10 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use super::super::super::adapters::{ResolvedProgram, codex, resolve_program};
 use super::codec::{
     ClientRequest, CodecError, Correlator, RpcError, ServerFrame, decode_line, encode_initialized,
 };
+use crate::commands::ctx::adapters::{ResolvedProgram, codex, resolve_program};
 
 /// Whole handshake budget: spawn to `initialize` response.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
