@@ -264,12 +264,11 @@ pub fn obfuscate(
     let mut candidates = Vec::with_capacity(regular.len() + encoded.len());
     let mut reported_only = Vec::new();
     for regular in regular {
-        // A bare entropy guess is no detected token: any overlap loses to the marker.
-        if encoded.iter().any(|e| {
-            let overlaps = e.start < regular.end && e.end > regular.start;
-            let inside = e.start <= regular.start && regular.end <= e.end;
-            inside || (regular.entropy_only && overlaps)
-        }) {
+        if !regular.entropy_only
+            && encoded
+                .iter()
+                .any(|e| e.start <= regular.start && regular.end <= e.end)
+        {
             continue;
         }
         let (mut start, mut end) = (regular.start, regular.end);
@@ -279,12 +278,15 @@ pub fn obfuscate(
                 continue;
             }
             consumed[index] = true;
-            if !replacing {
-                reported_only.push(e.clone());
-            } else if e.start < regular.start || e.end > regular.end {
+            // A bare entropy guess is no detected token: any overlap masks the union.
+            if regular.entropy_only
+                || (replacing && (e.start < regular.start || e.end > regular.end))
+            {
                 partial = true;
                 start = start.min(e.start);
                 end = end.max(e.end);
+            } else if !replacing {
+                reported_only.push(e.clone());
             }
         }
         if !partial {
@@ -893,6 +895,27 @@ mod tests {
         let source = "a eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sigZq8%21vR3%23kT9%40mW5%24xL2%25nB7%26 b".to_string();
         let (masked, _) = obfuscate(&source, &mut vault, &Options::default(), "test");
         assert_eq!(masked, format!("a {ENCODED_MARKER} b"));
+        assert_eq!(vault, before);
+    }
+
+    #[test]
+    fn an_entropy_span_extending_past_an_encoded_variant_is_masked_whole() {
+        let encoded = base64_of(LONG_SECRET);
+        let mut vault = seeded_vault(LONG_SECRET, ValueClass::Secret);
+        let before = vault.clone();
+        let options = Options {
+            entropy: EntropyMode::Obfuscate,
+            ..Options::default()
+        };
+        let (masked, _) = obfuscate(
+            &format!("x {encoded}Q9xZ7mK2pL y"),
+            &mut vault,
+            &options,
+            "test",
+        );
+        assert!(!masked.contains(&encoded), "{masked}");
+        assert!(!masked.contains("Q9xZ7mK2pL"), "{masked}");
+        assert!(masked.contains(ENCODED_MARKER), "{masked}");
         assert_eq!(vault, before);
     }
 
