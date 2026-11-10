@@ -27,6 +27,7 @@ pub(super) fn supervise_run(
     health_policy: &super::health::HealthPolicy,
     state: &StateDir,
     server: Option<&signal::SignalServer>,
+    checkpointer: Option<&super::super::checkpoint::Checkpointer>,
     session: &str,
     // Use the stable registry address for nudges across session remints.
     registry_short: &str,
@@ -127,6 +128,9 @@ pub(super) fn supervise_run(
                 // its in-flight marker. (#281, #310)
                 stall_signals.last_turn = Some(Instant::now());
                 session_guard.clear_in_flight();
+                if let Some(checkpointer) = checkpointer {
+                    checkpointer.request(Some(received.turn));
+                }
             }
             match action_for_signal(adapter, &received, session) {
                 action @ (SignalAction::SuggestRestart | SignalAction::SuggestCompact) => {

@@ -431,6 +431,23 @@ pub fn run_with(
     // posture here without raising the child process class. (#330)
     super::priority::apply_process(super::priority::posture_for(role));
 
+    // Baseline before the child starts; capture runs on its own thread, never here.
+    let checkpointer = if args.no_supervise {
+        None
+    } else {
+        super::checkpoint::Checkpointer::start(
+            &cfg.checkpoint,
+            repo,
+            &state_dir,
+            session.as_str(),
+            adapter.name(),
+            "wrap",
+        )
+    };
+    if let Some(checkpointer) = &checkpointer {
+        checkpointer.request(None);
+    }
+
     let mut child = pair.slave.spawn_command(command).map_err(|error| {
         format!(
             "adapter '{}': program '{}' failed to start: {}",
@@ -587,6 +604,7 @@ pub fn run_with(
         &mut pair,
         &mut supervision,
         server.as_ref(),
+        checkpointer.as_ref(),
         &mut adapter,
         &writer,
         &mut transcript,
@@ -619,6 +637,8 @@ pub fn run_with(
     // Release the child job explicitly after exit; panic = "abort" means
     // Drop cannot be relied on for cleanup.
     child_guard.release();
+    // Final capture; waits at most `capture_timeout_secs` and never fails the exit.
+    drop(checkpointer);
     if native_successor.is_some() {
         session_guard.disown();
     } else {

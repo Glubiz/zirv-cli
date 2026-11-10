@@ -76,7 +76,7 @@ criterion).
 | `ctx supervisor` | shared | off-by-default supervisor: binding rulings that only narrow, from one read-only consult through `agent::run_with`; mail delivery; runtime-neutral |
 | `ctx ask` | N15 (#484) |  |
 | `ctx capabilities` | N14 (#483) | the available/unavailable/unverified integration report the native tool service and workflow admission both read; `--probe` verifies each configured MCP server, `--require` gates a script on the engine's own admission rule |
-| `ctx checkpoint` | shared | off-by-default per-turn git snapshots under `refs/zirv/checkpoints/`; makes no model call |
+| `ctx checkpoint` | shared | off-by-default per-turn git snapshots (`capture`/`list`/`diff`/`restore`) under `refs/zirv/checkpoints/`, taken off the supervision loop by `wrap` and `exec`; makes no model call |
 | `ctx chat` | N11 (#480) |  |
 | `ctx compile` | N06 (#475) | legacy composition stays unchanged; `runtime::context` separately compiles typed native instruction/data messages with provenance and hard-budget retention |
 | `ctx config` | shared |  |
