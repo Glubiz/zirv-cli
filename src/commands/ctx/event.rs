@@ -456,6 +456,15 @@ pub struct Capabilities {
     pub post_tool_hook: bool,
 }
 
+/// What happened since the last operator prompt: one `name input -> result` line per tool call
+/// that has a result, and the operator's AskUserQuestion answers. Unredacted; the consumer
+/// redacts and caps.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TurnActivity {
+    pub tool_lines: Vec<String>,
+    pub answers: Vec<String>,
+}
+
 /// Raw material for handoffs, extracted per-agent because it needs fields the
 /// normalized stream deliberately drops (message text, tool inputs).
 #[derive(Debug, Clone, PartialEq, Default)]

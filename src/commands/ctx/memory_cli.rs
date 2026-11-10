@@ -121,6 +121,10 @@ pub struct InitArgs {
     /// Maximum total bytes across generated entry bodies.
     #[arg(long, default_value_t = 8192)]
     pub max_bytes: usize,
+    /// Print the report as JSON, including each proposed key and body and whether the secret
+    /// screen refuses it; with `--dry-run`, review proposals before writing.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -371,16 +375,38 @@ pub fn run_init_with<W: Write>(args: &InitArgs, w: &mut W, repo: &Path) -> CtxRe
             max_bytes: args.max_bytes,
         },
     )?;
+    let nothing_written = !args.dry_run && report.written == 0 && report.refused > 0;
+    if args.json {
+        writeln!(w, "{}", serde_json::to_string(&report)?)?;
+        return Ok(i32::from(nothing_written));
+    }
     writeln!(
         w,
-        "zirv memory init: {} proposed, {} written, {} existing skipped, {} body bytes{}",
+        "zirv memory init: {} proposed, {} written, {} existing skipped, {} refused by the secret screen, {} body bytes{}",
         report.proposed,
         report.written,
         report.skipped_existing,
+        report.refused,
         report.body_bytes,
         if args.dry_run { " (dry run)" } else { "" }
     )?;
-    Ok(0)
+    for entry in &report.entries {
+        if let Some(reason) = &entry.refused {
+            let verb = if args.dry_run {
+                "would refuse"
+            } else {
+                "refused"
+            };
+            writeln!(w, "  {verb} '{}': {reason}", entry.key)?;
+        }
+    }
+    if nothing_written {
+        writeln!(
+            w,
+            "zirv memory init: nothing was written; every proposed entry was refused by the secret screen"
+        )?;
+    }
+    Ok(i32::from(nothing_written))
 }
 
 pub fn run_init<W: Write>(args: &InitArgs, w: &mut W) -> CtxResult<i32> {

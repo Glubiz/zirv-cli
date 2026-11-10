@@ -1230,6 +1230,7 @@ mod tests {
                     workers: 0,
                     frontend_root: None,
                     accept_preexisting_findings: false,
+                    accept_introduced_findings: None,
                 }),
             };
             let mut out = Vec::new();

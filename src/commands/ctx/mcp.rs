@@ -12,7 +12,7 @@ use cap_std::fs::Dir;
 use clap::{Args, Subcommand};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, Implementation, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
+    PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
 };
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::service::{RequestContext, RoleServer};
@@ -834,8 +834,8 @@ fn tools() -> Vec<Tool> {
 struct Bridge(Arc<Scope>);
 
 impl ServerHandler for Bridge {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("zirv", env!("CARGO_PKG_VERSION")))
             .with_instructions(INSTRUCTIONS)
     }

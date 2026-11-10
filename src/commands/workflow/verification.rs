@@ -1354,7 +1354,11 @@ fn changed_paths_at_root(root: &Path) -> CtxResult<Vec<PathBuf>> {
         paths.extend(
             git_paths(&output.stdout)
                 // Exclude workflow bookkeeping under `.zirv/work` from change fingerprints so concurrent artifact edits cannot stale review evidence. (#229, #232)
-                .filter(|path: &PathBuf| !super::classify::is_workflow_work_path(path)),
+                .filter(|path: &PathBuf| !super::classify::is_workflow_work_path(path))
+                // An untracked nested repo or linked worktree lists as a directory, which `hash-object` cannot hash. (#945)
+                .filter(|path: &PathBuf| {
+                    !std::fs::symlink_metadata(root.join(path)).is_ok_and(|m| m.is_dir())
+                }),
         );
     }
     paths.sort();
@@ -6176,6 +6180,39 @@ mod tests {
         std::fs::write(&path, "one\n").unwrap();
         let before = change_fingerprint(repo.path()).unwrap();
         std::fs::write(&path, "two\n").unwrap();
+        assert_ne!(change_fingerprint(repo.path()).unwrap(), before);
+    }
+
+    /// #945: an untracked nested repo or linked worktree lists as a directory entry that
+    /// `hash-object` cannot hash; the fingerprint must skip it and still track real edits.
+    #[test]
+    fn change_fingerprint_survives_untracked_nested_repo_and_worktree() {
+        let repo = git_repo();
+        let run = |dir: &Path, args: &[&str]| {
+            let status = Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        let nested = repo.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        run(&nested, &["init", "-q"]);
+        std::fs::write(nested.join("n.txt"), "n\n").unwrap();
+        run(&nested, &["add", "."]);
+        run(&nested, &["commit", "-q", "-m", "n"]);
+        run(repo.path(), &["worktree", "add", "-q", "wt2", "-b", "w2"]);
+        let before = change_fingerprint(repo.path()).expect("nested repo must not error");
+        std::fs::write(repo.path().join("tracked.txt"), "two\n").unwrap();
         assert_ne!(change_fingerprint(repo.path()).unwrap(), before);
     }
 
