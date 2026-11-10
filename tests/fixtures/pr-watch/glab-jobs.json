@@ -1,0 +1,8 @@
+[
+  {"id": 1, "name": "build", "status": "success", "allow_failure": false, "web_url": "https://gitlab.example.com/j/1"},
+  {"id": 2, "name": "test", "status": "failed", "allow_failure": false, "web_url": "https://gitlab.example.com/j/2"},
+  {"id": 3, "name": "e2e", "status": "failed", "allow_failure": true, "web_url": "https://gitlab.example.com/j/3"},
+  {"id": 4, "name": "deploy", "status": "manual", "allow_failure": true, "web_url": ""},
+  {"id": 5, "name": "package", "status": "running", "allow_failure": false, "web_url": ""},
+  {"id": 6, "name": "scan", "status": "canceled", "allow_failure": false, "web_url": ""}
+]

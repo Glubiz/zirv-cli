@@ -458,6 +458,27 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["mail", "mid_turn"],
         EnvKind::Bool,
     ),
+    ("ZIRV_CTX_PR_WATCH", &["pr_watch", "enabled"], EnvKind::Bool),
+    (
+        "ZIRV_CTX_PR_WATCH_AUTO_REGISTER",
+        &["pr_watch", "auto_register"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_PR_WATCH_INTERVAL_SECS",
+        &["pr_watch", "interval_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_PR_WATCH_NO_CHECKS_MINUTES",
+        &["pr_watch", "no_checks_minutes"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_PR_WATCH_MAX_WAKES",
+        &["pr_watch", "max_wakes"],
+        EnvKind::Int,
+    ),
     (
         "ZIRV_CTX_WORKFLOW_REPO_CHECKS",
         &["workflow", "repo_checks_enabled"],
@@ -738,6 +759,26 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     (
         "ZIRV_CTX_WORKTREE_IDLE_TTL_SECS",
         &["worktree", "idle_ttl_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_CHECKPOINT",
+        &["checkpoint", "enabled"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_CHECKPOINT_MAX_PER_SESSION",
+        &["checkpoint", "max_per_session"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_CHECKPOINT_TTL_SECS",
+        &["checkpoint", "ttl_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_CHECKPOINT_CAPTURE_TIMEOUT_SECS",
+        &["checkpoint", "capture_timeout_secs"],
         EnvKind::Int,
     ),
     (
@@ -1606,6 +1647,20 @@ pub(super) const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (&["mail", "mid_turn"], "ZIRV_CTX_MAIL_MID_TURN"),
     // Repos cannot re-enable mail the operator disabled.
     (&["mail", "enabled"], "ZIRV_CTX_MAIL"),
+    // Repos may only switch PR watching off (folded with narrow_min); every other key spends the operator's account.
+    (
+        &["pr_watch", "auto_register"],
+        "ZIRV_CTX_PR_WATCH_AUTO_REGISTER",
+    ),
+    (
+        &["pr_watch", "interval_secs"],
+        "ZIRV_CTX_PR_WATCH_INTERVAL_SECS",
+    ),
+    (
+        &["pr_watch", "no_checks_minutes"],
+        "ZIRV_CTX_PR_WATCH_NO_CHECKS_MINUTES",
+    ),
+    (&["pr_watch", "max_wakes"], "ZIRV_CTX_PR_WATCH_MAX_WAKES"),
     // Repos must not silence announcements, including notices that supervision degraded.
     (&["chrome", "events"], "ZIRV_CTX_QUIET"),
     // Repos cannot re-enable execution or untrusted skill injection, control telemetry, or extend retention.

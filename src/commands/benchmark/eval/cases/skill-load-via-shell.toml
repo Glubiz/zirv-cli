@@ -1,0 +1,15 @@
+id = "skill-load-via-shell"
+kind = "bad"
+experience = "Small models missed deferred, namespaced skill tools on wrapped hosts; loading a skill through the shell stayed reliable."
+source = ".zirv/memory/prompt-skill-discovery.md"
+surface = "layer:orchestrator"
+role = "orchestrator"
+turns = ["Add a --json flag to the report command, following the repo's usual method."]
+
+[expect]
+calls = [{ tool = "shell", args = { command = "~zirv skill load" } }]
+order = ["shell", "Edit"]
+
+[canned]
+pass = "skill-load-via-shell.pass.jsonl"
+fail = "skill-load-via-shell.fail.jsonl"

@@ -59,6 +59,7 @@ criterion).
 | `artifact show` | shared |  |
 | `benchmark` | shared |  |
 | `benchmark auto` | shared | unattended routing probe; launches installed harnesses through the same `ctx exec` path as `benchmark run`; owns no model-calling call site of its own |
+| `benchmark eval` | shared | behaviour evals (`lint`, `plan`, `run --dry-run`); paid replay not implemented; makes no model call |
 | `benchmark plan` | shared | read-only; makes no model call |
 | `benchmark report` | shared | re-renders a stored run; makes no model call |
 | `benchmark run` | shared | launches installed harnesses solo through `ctx exec`; owns no model-calling call site of its own |
@@ -75,6 +76,7 @@ criterion).
 | `ctx supervisor` | shared | off-by-default supervisor: binding rulings that only narrow, from one read-only consult through `agent::run_with`; mail delivery; runtime-neutral |
 | `ctx ask` | N15 (#484) |  |
 | `ctx capabilities` | N14 (#483) | the available/unavailable/unverified integration report the native tool service and workflow admission both read; `--probe` verifies each configured MCP server, `--require` gates a script on the engine's own admission rule |
+| `ctx checkpoint` | shared | off-by-default per-turn git snapshots under `refs/zirv/checkpoints/`; makes no model call |
 | `ctx chat` | N11 (#480) |  |
 | `ctx compile` | N06 (#475) | legacy composition stays unchanged; `runtime::context` separately compiles typed native instruction/data messages with provenance and hard-budget retention |
 | `ctx config` | shared |  |
@@ -102,6 +104,7 @@ criterion).
 | `ctx optimize` | N15 (#484) |  |
 | `ctx output` | N05 (#474) | the native tool service streams raw process/file evidence into the existing store and retrieves it only by opaque id; the CLI remains the operator surface |
 | `ctx permissions` | N04 (#473) | canonical policy and approval audit remain shared; native effects consume them through `runtime::enforcement` |
+| `ctx pr` | shared | off-by-default PR/MR watch over `gh`/`glab`; mails changes to the owning session; makes no model call |
 | `ctx provider` | N02 (#471) | `init`, `list`, `check`, official execution `login`/`status`, and nested `credential set`; inventory tracks depth 1/2, so this is the owning depth-2 row |
 | `ctx proxy` | shared | decide-and-print CRUD (`--json` prints the `ProxyDecision`, never launches; `stats` is a read-only fold over stored profiles, delegations and transcripts) is runtime-neutral; its two model-calling deciders (TypeSafe HTTP, the helper-model chokepoint) are tracked as entry points below |
 | `ctx recall` | N06 (#475) | native `memory_recall` preserves session/private/global/shared precedence |

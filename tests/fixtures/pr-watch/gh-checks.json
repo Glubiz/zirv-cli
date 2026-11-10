@@ -1,0 +1,7 @@
+[
+  {"name": "build", "state": "SUCCESS", "bucket": "pass", "link": "https://github.com/acme/widgets/actions/runs/1", "extra": 1},
+  {"name": "test", "state": "FAILURE", "bucket": "fail", "link": "https://github.com/acme/widgets/actions/runs/2"},
+  {"name": "lint", "state": "IN_PROGRESS", "bucket": "pending", "link": ""},
+  {"name": "docs", "state": "SKIPPED", "bucket": "skipping", "link": ""},
+  {"name": "deploy", "state": "CANCELLED", "bucket": "cancel", "link": "https://github.com/acme/widgets/actions/runs/5"}
+]

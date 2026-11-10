@@ -1351,18 +1351,40 @@ fn evaluate_objective_after_cycle<W: Write>(
             effect.baseline_count = Some(1);
             effect.actual_count = Some(1);
             jev::record_effect(cfg, state, cfg.jev.supervisor, &effect);
-            let parsed = answer.ok().and_then(|text| judge::parse_verdict(&text));
-            let Some((verdict, reason)) = parsed else {
-                // Fails open: an unavailable or non-conforming judge is
-                // never grounds to stop, block, or (least of all) close.
+            // Fails open: an unavailable or non-conforming judge is never
+            // grounds to stop, block, or (least of all) close.
+            let text = match answer {
+                Ok(text) => text,
+                Err(error) => {
+                    log_decision(
+                        "n/a",
+                        "objective-judge-helper-failed",
+                        &super::pace::redact_for_log(&error.to_string()),
+                    );
+                    clear_pending_note();
+                    return Ok(ObjectiveOutcome::Continue);
+                }
+            };
+            let Some((verdict, reason)) = judge::parse_verdict(&text) else {
                 log_decision(
                     "n/a",
-                    "objective-judge-unavailable",
-                    "judge call failed or its answer did not parse",
+                    "objective-judge-unparsed",
+                    &format!(
+                        "len={} head={}",
+                        text.len(),
+                        super::pace::redact_for_log(&text)
+                    ),
                 );
                 clear_pending_note();
                 return Ok(ObjectiveOutcome::Continue);
             };
+            if verdict == judge::Verdict::Continue {
+                log_decision(
+                    "continue",
+                    "objective-judge-continue",
+                    &super::pace::redact_for_log(&reason),
+                );
+            }
             clear_pending_note();
             match judge::next_step(
                 GateOutcome::Green,
@@ -4394,11 +4416,16 @@ mod tests {
             let log = std::fs::read_to_string(state_tmp.path().join("logs/decisions.jsonl"))
                 .expect("log");
             assert!(
-                log.matches("\"action\":\"objective-judge-unavailable\"")
-                    .count()
-                    >= 2,
-                "both a non-conforming answer and a spawn failure must log the same fail-open \
-                 path: {log}"
+                log.contains("\"action\":\"objective-judge-unparsed\""),
+                "a non-conforming answer must log its own decision: {log}"
+            );
+            assert!(
+                log.contains("\"action\":\"objective-judge-helper-failed\""),
+                "a helper failure must log its own decision: {log}"
+            );
+            assert!(
+                !log.contains("objective-judge-unavailable"),
+                "the collapsed decision is gone: {log}"
             );
             assert!(
                 !log.contains("\"action\":\"objective-done\"")
@@ -4630,6 +4657,69 @@ mod tests {
                 log.contains("\"action\":\"objective-no-progress\""),
                 "{log}"
             );
+        }
+
+        #[test]
+        fn a_continue_verdict_logs_its_own_decision_and_still_continues() {
+            let repo_dir = git_repo();
+            let repo = repo_dir.path();
+            let state_tmp = tempfile::tempdir().expect("state tempdir");
+            let state = StateDir::from_root(state_tmp.path().to_path_buf());
+            let home = state_tmp.path().join("home");
+
+            let env = objective_env(state_tmp.path(), "0");
+            store_active_objective(&state, repo);
+
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+            let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+                ("FAKE_AGENT_MODE", Some("healthy")),
+                ("FAKE_AGENT_TURNS", Some("1")),
+                ("FAKE_JUDGE_MODE", Some("continue")),
+            ]);
+
+            let mut out = Vec::new();
+            let mut args = args_for(10);
+            args.simple = false;
+            let code = run_with(&args, &mut out, repo, &|k| env.get(k).cloned());
+            assert_eq!(code.expect("runs"), EXIT_OBJECTIVE_NO_PROGRESS);
+
+            let log = std::fs::read_to_string(state_tmp.path().join("logs/decisions.jsonl"))
+                .expect("log");
+            assert!(
+                log.contains("\"action\":\"objective-judge-continue\""),
+                "a successful continue verdict must be logged: {log}"
+            );
+        }
+
+        #[test]
+        fn a_continue_verdict_reason_is_redacted_in_the_log() {
+            let repo_dir = git_repo();
+            let repo = repo_dir.path();
+            let state_tmp = tempfile::tempdir().expect("state tempdir");
+            let state = StateDir::from_root(state_tmp.path().to_path_buf());
+            let home = state_tmp.path().join("home");
+
+            let env = objective_env(state_tmp.path(), "0");
+            store_active_objective(&state, repo);
+
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+            let _fake_agent = crate::commands::ctx::testenv::VarGuard::set(&[
+                ("FAKE_AGENT_MODE", Some("healthy")),
+                ("FAKE_AGENT_TURNS", Some("1")),
+                ("FAKE_JUDGE_MODE", Some("continue_secret")),
+            ]);
+
+            let mut out = Vec::new();
+            let mut args = args_for(10);
+            args.simple = false;
+            let code = run_with(&args, &mut out, repo, &|k| env.get(k).cloned());
+            assert_eq!(code.expect("runs"), EXIT_OBJECTIVE_NO_PROGRESS);
+
+            let log = std::fs::read_to_string(state_tmp.path().join("logs/decisions.jsonl"))
+                .expect("log");
+            assert!(log.contains("objective-judge-continue"), "{log}");
+            assert!(!log.contains("ghp_ABCDEF1234567890"), "{log}");
+            assert!(log.contains("[redacted]"), "{log}");
         }
     }
 }

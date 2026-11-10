@@ -168,6 +168,9 @@ const READ_ONLY: &[&str] = &[
     "zirv ctx watch",
     "zirv ctx worktree list",
     "zirv ctx worktree finalize",
+    "zirv ctx checkpoint list",
+    "zirv ctx pr list",
+    "zirv ctx checkpoint diff",
     "zirv ctx task list",
     "zirv ctx task show",
     // Issue #466: `list`/`reveal` only load the vault (`with_vault_readonly`,
@@ -222,6 +225,8 @@ const READ_ONLY: &[&str] = &[
     "zirv frontend benchmark",
     "zirv benchmark plan",
     "zirv benchmark report",
+    "zirv benchmark eval lint",
+    "zirv benchmark eval plan",
     "zirv setup status",
     "zirv skill list",
     "zirv skill show",
@@ -336,6 +341,10 @@ const MUTATING: &[&str] = &[
     "zirv ctx provider credential set",
     "zirv ctx usage tee",
     "zirv ctx worktree prune",
+    "zirv ctx checkpoint capture",
+    "zirv ctx pr watch",
+    "zirv ctx pr unwatch",
+    "zirv ctx pr poll",
     "zirv ctx reconcile",
     "zirv ctx task create",
     "zirv ctx task claim",
@@ -397,6 +406,10 @@ const MUTATING: &[&str] = &[
     // Spends real model quota like `run`, but unattended and bounded by `[routing]`;
     // writes the same benchmark store plus `<state>/probe-*` stamps, evidence and promotions.
     "zirv benchmark auto",
+    // Not yet implemented (exits 2); the future paid replay spends model quota and writes
+    // `<state>/eval/<run-id>/`. Its `--dry-run` form is read-only and is let through by the
+    // safety rules, like `permissions compile --dry-run`.
+    "zirv benchmark eval run",
 ];
 
 fn classify(path: &str) -> Option<bool> {

@@ -150,6 +150,7 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
         SlugEntry::Directory,
         &[
             "commands/ctx/mail.rs",
+            "commands/ctx/pr_watch/run.rs",
             "commands/ctx/sessions/bookkeeping.rs",
             "commands/ctx/sessions/mod.rs",
             "commands/ctx/sessions/ops.rs",
@@ -1140,6 +1141,11 @@ impl StateDir {
     /// `super::mail` for the storage layout and message format.
     pub fn mail(&self) -> PathBuf {
         self.0.join("mail")
+    }
+
+    /// PR/MR watches: `<state>/pr-watch/<session short>/<hash(url)>.json`.
+    pub fn pr_watch(&self) -> PathBuf {
+        self.0.join("pr-watch")
     }
 
     /// The state subdirectories a sandboxed worker's own `zirv` calls persist

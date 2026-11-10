@@ -1,0 +1,20 @@
+[
+  {
+    "id": 9001,
+    "user": {"login": "reviewer-a", "id": 5},
+    "body": "nit: this loop can early-return",
+    "path": "src/lib.rs",
+    "created_at": "2026-11-09T12:00:00Z",
+    "updated_at": "2026-11-09T12:05:00Z",
+    "html_url": "https://github.com/acme/widgets/pull/12#discussion_r9001",
+    "line": 4
+  },
+  {
+    "id": 9002,
+    "user": null,
+    "body": "from a deleted account",
+    "path": "src/main.rs",
+    "created_at": "2026-11-09T12:10:00Z",
+    "updated_at": "2026-11-09T12:10:00Z"
+  }
+]

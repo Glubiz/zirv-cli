@@ -1,0 +1,16 @@
+id = "ci-checks-doc-only"
+kind = "control"
+experience = "A doc-only change needs no code checks."
+control_of = "ci-checks-before-done"
+surface = "layer:orchestrator"
+role = "orchestrator"
+turns = ["Fix the typo 'recieve' in README.md line 3."]
+
+[expect]
+calls = [{ tool = "Edit" }]
+calls_must_not = [{ tool = "shell", args = { command = "~clippy" } }, { tool = "shell", args = { command = "~nextest" } }]
+max_calls = 3
+
+[canned]
+pass = "ci-checks-doc-only.pass.jsonl"
+fail = "ci-checks-doc-only.fail.jsonl"

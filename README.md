@@ -173,6 +173,7 @@ In a pipe or with redirected output (non-TTY), `zirv tour` prints all sections p
 zirv benchmark plan   [--harness <name>]... [--family <name>]... [--model <harness:model>]... [--task <id>]... [--judge <harness:model>] [--no-judge] [--json]
 zirv benchmark run    [same filters] [--reps <n>] [--max-usd <usd>] [--timeout-secs <s>] --yes [--json]
 zirv benchmark report [<run-id>] [--json]
+zirv benchmark eval   lint|plan|run --dry-run   # free behaviour evals, see below
 zirv benchmark auto   [--force] [--dry-run] [--json] [--quiet]
 ```
 
@@ -234,6 +235,52 @@ Child runs disable zirv's supervisor, memory harvest, usage pacing and cross-har
 #### Agents
 
 `run` spends real quota, so a built-in safety rule always makes it ask, in interactive and headless launches alike and whatever `[safety] default` says; the rule matches every spelling the hook parses (case, extra spaces, quoting, compounds, `$(...)`, `env`, `zirv.exe`, path-qualified `zirv`). `plan` and `report` are read-only and stay allowed. The graders run corpus Python with a cleared environment (`HOME` set to the workdir) in their own process group, killed whole on timeout. `report <run-id>` accepts only generated run ids.
+
+#### Behaviour evals (`zirv benchmark eval`)
+
+`zirv benchmark eval` grades what an agent *does* (its tool calls and final text) against the instructions zirv ships, so a prompt, skill, MCP tool description or safety message change can be checked against recorded failures.
+
+```
+zirv benchmark eval lint [--json]
+zirv benchmark eval plan [--json]
+zirv benchmark eval run --dry-run [--case <id>]... [--context] [--json]
+```
+
+This tier costs nothing and is safe in CI: `lint`, `plan` and `run --dry-run` never launch a harness, never touch the zirv state directory and make no model call. `run` without `--dry-run` refuses with exit 2 ("paid replay not implemented yet"); the paid replay, samples and baselines are later slices. `eval run` is already an ask rule (`Bash(zirv benchmark eval run*)`) for agents, so the paid path will prompt from day one; interactively `lint`, `plan` and `run --dry-run` stay silent. In headless launches zirv turns every ask rule into a native deny, so `eval run --dry-run` is refused there, as `benchmark run` already is; headless agents use `eval plan` / `eval lint`.
+
+- `lint` checks that every surface resolves, every `bad` case cites a `source`, every control points at a `bad` or `guard` case, and every case's canned traces grade as claimed: the canned fail trace of a `bad` or `guard` case must fail its expectations and the canned pass trace must pass. It exits 1 and lists each problem otherwise.
+- `run --dry-run` prints, per case, the surface text resolved from current source, the turns and the bundle sha256 (over the surface reference and its text, so two runs prove whether the text changed). `--context` adds the per-surface size: the `zirv ctx compile --measure` table for a `layer:` surface, bytes and estimated tokens otherwise.
+
+**Case format.** Cases are TOML files in `src/commands/benchmark/eval/cases/`, embedded in the binary; their canned traces are in `tests/fixtures/eval/` (data only). Unknown keys are an error.
+
+```toml
+id = "skill-load-via-shell"
+kind = "bad"                     # bad (recorded failure), guard (rule, no incident yet) or control
+experience = "what went wrong"
+source = ".zirv/memory/prompt-skill-discovery.md"   # required for bad
+control_of = "..."               # controls only: the bad/guard case this is the negative of
+surface = "layer:orchestrator"   # layer:<role> | skill:<id> | mcp:<tool> | safety:<rule>
+role = "orchestrator"
+harness = "claude"               # optional: claude (default) or codex; names the canned trace format
+turns = ["the user prompt"]
+
+[setup]                          # optional
+files = { "src/a.rs" = "..." }
+prior_turns = ["..."]
+
+[expect]
+calls = [{ tool = "shell", args = { command = "~zirv skill load" } }]
+calls_must_not = [{ tool = "Delete" }]
+max_calls = 8
+order = ["shell", "Edit"]        # tool names, as a subsequence of the trace
+final_text_must = ["(?i)tests? pass"]   # regexes
+
+[canned]
+pass = "skill-load-via-shell.pass.jsonl"
+fail = "skill-load-via-shell.fail.jsonl"
+```
+
+A case stores a surface reference, never its text. Tool names are normalised (`Bash` and `exec_command` become `shell`, `mcp__zirv__x` becomes `zirv.x`). Argument matching is partial: an object matches when every expected key matches; `"~text"` is a case-insensitive substring; `"<=N"` and `">=N"` bound a number; `"<null>"` (TOML has no null) means the key is absent; a dotted key (`"opts.depth"`) walks nested objects; an expected array needs each element somewhere in the actual array.
 
 #### Automatic probes (`zirv benchmark auto`)
 
@@ -1232,6 +1279,44 @@ so an advisory delivery never looks like a nudge that silently did nothing. Eith
 already runs on, since a nudge just claims a marker file that same tick
 checks for.
 
+### PR/MR watch
+
+Off by default (`[pr_watch] enabled = false`): every read shells out to `gh` or
+`glab` on the operator's own login. `watch`/`poll` refuse with a message while
+disabled.
+
+| Command | Does |
+| --- | --- |
+| `zirv ctx pr watch <url>` | Register a GitHub pull request or GitLab merge request for this session (`--session <short>` to act for another). |
+| `zirv ctx pr unwatch <url>` | Stop watching it. |
+| `zirv ctx pr list` | One line per watch: head, wakes sent, last poll, last error, stopped reason. |
+| `zirv ctx pr poll` | One manual sweep: read every watch of this session, evaluate, mail what changed. |
+
+`poll` calls `gh pr view/checks`, `gh api` (GitHub) or `glab mr view`, `glab api`
+(GitLab) with argv arrays and a 10 s timeout; token files are never read. Each
+change becomes one mail from `zirv-pr-watch` addressed to the owning session:
+checks failed or passed (the required checks gate, falling back to all checks;
+a GitLab pipeline is the gate), new reviewer comments, a merge conflict, no
+checks reported after `no_checks_minutes` (only where the repo has CI config),
+and a final note when the PR is merged or closed, after which the watch is
+deleted. A PR URL is accepted only when its host equals (case-insensitively) the host of one of the repository's git remotes (https, `ssh://` or scp-style); IP-literal hosts and explicit ports are always refused, at `watch` and again at `poll` (`untrusted_host`), so the inherited `gh`/`glab` token only ever reaches a host the repo already pushes to; `GH_HOST` is always pinned to the PR host. Reviewer text is quoted, truncated and labelled untrusted. A new head
+commit resets what was already reported; your own comments are ignored;
+`max_wakes` consecutive comment-only wakes stop the watch. Read failures
+(`no_cli`, `auth`, `not_found`, `rate_limited`, `transient`, `untrusted_host`) are recorded as
+`last_error` and shown by `list`, never mailed; two `not_found` in a row or
+eight failures in a row stop the watch. Records live under
+`<state>/pr-watch/<session short>/`. No background poller exists yet: `poll` is
+the only trigger.
+
+```toml
+[pr_watch]
+enabled = false          # ZIRV_CTX_PR_WATCH; operator-only to turn on, a repo may only set false
+auto_register = true     # ZIRV_CTX_PR_WATCH_AUTO_REGISTER; operator-only
+interval_secs = 120      # ZIRV_CTX_PR_WATCH_INTERVAL_SECS; operator-only, floor 60
+no_checks_minutes = 15   # ZIRV_CTX_PR_WATCH_NO_CHECKS_MINUTES; operator-only
+max_wakes = 10           # ZIRV_CTX_PR_WATCH_MAX_WAKES; operator-only
+```
+
 ### Banner, status bar and events
 
 A `zirv ctx chat` session (bare `zirv` included) with a real, large-enough
@@ -1377,6 +1462,10 @@ to the section that documents it in depth.
   input or touching its transcript or registry record. See
   [Verbs](#verbs) and [Cross-harness fallback and
   handover](#cross-harness-fallback-and-handover).
+- **Per-turn checkpoints** — `checkpoint` (`zirv ctx checkpoint`; capture, list, diff) records a
+  git checkpoint each turn. See [Per-turn git checkpoints](#per-turn-git-checkpoints).
+- **PR/MR watch** — `pr` (`zirv ctx pr`; `watch`, `unwatch`, `list`, `poll`) watches a PR or MR's
+  CI and review state. See [PR/MR watch](#prmr-watch).
 - **Status and attention** — `status`, `explain-status`, and `wait` report
   or block on a session's composed attention projection; `watch <session-or-
   delegation> [--json] [--since <revision>]` blocks on a session OR a
@@ -1621,6 +1710,8 @@ protocol and harness: [docs/benchmarks/wrapped-vs-vanilla.md](docs/benchmarks/wr
   (`zirv benchmark auto`) is the unattended, budget-capped probe that keeps
   routing evidence fresh. See [Benchmarking agents and
   models](#benchmarking-agents-and-models-zirv-benchmark).
+- **Behaviour evals** — `eval` (`zirv benchmark eval`; `lint`, `plan`, `run --dry-run`)
+  checks a behaviour eval corpus. See [Behaviour evals](#behaviour-evals-zirv-benchmark-eval).
 - **Model routing** — new model versions are held on probation until
   probe and recorded-work evidence shows they are not worse, and an
   unpinned seat, worker or reviewer gets the cheapest model within
@@ -3619,6 +3710,9 @@ Operator-only: set in `~/.zirv/ctx.toml` or as `ZIRV_CTX_ROUTING_<KEY>` (for exa
 | `zirv ctx doctor [--role <role>] [--live] [--json]` | Diagnoses native readiness: the resolved backend and route per role, and every problem classified as missing auth material, inaccessible model, missing tool, unsupported isolation, service failure or upstream entitlement limit — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
 | `zirv ctx config get <key> [--json]` / `show [key] [--json]` | Prints one key's effective value, built-in default, winning source and reload timing exactly as `/settings get` does, or the stored `~/.zirv/ctx.toml` (optionally one key) as TOML or JSON |
 | `zirv ctx config migrate [--to harness\|native] [--downgrade] [--dry-run]` | Versions `~/.zirv/ctx.toml` with a backup and a documented way back; idempotent in both directions — see [Native setup, diagnosis and rollback](#native-setup-diagnosis-and-rollback) below |
+| `zirv ctx checkpoint capture [--session <id>] [--turn <n>]` | Issue #946, off by default: snapshots the work tree (tracked, staged, unstaged and untracked-but-not-ignored files) as a commit under `refs/zirv/checkpoints/<session-short>/<seq>`, with no parent (order comes from `Zirv-Seq`), without touching HEAD, the real index or any file; refused unless the operator sets `[checkpoint] enabled`. Retention (`max_per_session`, `ttl_secs`) is applied after each capture. A skipped capture (mid-merge/rebase, hung git, unreadable file) prints the reason and exits 1. See [Per-turn git checkpoints](#per-turn-git-checkpoints) |
+| `zirv ctx checkpoint list [--session <id>] [--json]` | Lists checkpoints newest first: session, seq, turn, time, kind, files, `+/-` lines, and the HEAD they were taken on; read-only |
+| `zirv ctx checkpoint diff <seq\|a..b> [--session <id>] [--stat\|--name-status]` | Shows what one checkpoint changed against its previous checkpoint (or the HEAD it started from), or between two; output is capped and says so when cut |
 | `zirv ctx reconcile [--dry-run] [--json]` | One level-triggered pass over every opportunistic sweep (stuck task claims, dead-owner permits/reservations, worktree GC) plus the one resource with no automatic reclaim at all, an abandoned **machine-wide** work group (issue #720 -- `<state>/groups` carries no repo dimension, unlike task/worktree state); a group closes on coordinator liveness alone, since no on-disk record attributes a live session to its work group, so a still-running child of a dead coordinator can no longer admit nested children once its group is closed; `--dry-run` mutates nothing (it never reaches the sweeping `sessions::list`, even for the group check); `--json` prints one object per resource kind. A resource failing does not abort the others -- every id already healed is still reported alongside the error; exits non-zero if any did |
 
 #### Declarative worker workspaces
@@ -5489,6 +5583,8 @@ keep only your own.
 | `[jev]` token-savings gates | operator home or environment only | off by default; each site also needs the named nonempty TypeSafe credential, or a live relay to the supervisor that holds it (scrubbed `exec` and dashboard Worker sessions; the relay forwards only the binary's own compiled questions), before reading cached advice or writing Jev records; repository/model-authored material may only remove optional context or prevent a permitted launch, never grant or waive a required check |
 | Native `/settings` writes | operator, by keyboard in the pane | the same validation and atomic write as `zirv ctx config`; session scope is an in-memory, journaled override of live-reload keys only and never touches a file; project scope refuses every `REPO_FORBIDDEN` key and any value that would not narrow before writing, credential-like keys are never rendered, journaled or accepted |
 | `[sandbox] scrub_worker_secrets` | operator home or environment only | on by default; a delegated worker (`zirv agent`, `zirv ctx exec`/`loop`) launches without secret-shaped environment variables, never a repository's call to turn off; its hook-side `[jev]` gates reach Jev through the supervisor's relay (`exec`, dashboard Worker panes), and a `loop` cycle with a gate on keeps `credential_env` |
+| `[checkpoint] enabled` | operator home or environment; repository may narrow | off by default; a repository may only turn it off, never on (a repo `true` is ignored), because a snapshot writes the work tree, including an untracked non-ignored `.env`, into the repository's own git objects; `max_per_session`, `ttl_secs` and `capture_timeout_secs` are narrow-only (a repository may only lower them) |
+| `[pr_watch] enabled` | operator home or environment; repository may narrow | off by default; a repository may only turn it off, never on, because every poll shells out to `gh`/`glab` on the operator's own login; `auto_register`, `interval_secs`, `no_checks_minutes` and `max_wakes` are operator-only (repo-forbidden); reviewer text is quoted, truncated and labelled untrusted |
 | `[headless]` cost levers | operator home or environment only | a headless (`-p`) Claude Code launch only -- prompt-cache TTL, per-complexity effort (defaults to `low`) and a lean/`--disallowedTools` tool surface (lean on by default) -- with every key unset the launch differs from before this table existed only by `CLAUDE_CODE_EFFORT_LEVEL=low`, `CLAUDE_CODE_PROMPT_CACHE_TTL=5m` and the lean settings layer and unused-tool (`Workflow`, `ScheduleWakeup`, `ShareOnboardingGuide`, `ListAgents`, `ReportFindings`, `Agent` for worker/single) deny; an interactive `wrap`/`chat`/dash session is never narrowed by it |
 | `[models]` discovery, price refresh, pins, `avoid` and `auto_avoid` | operator home or environment only | discovery/refresh default on, `avoid` empty and `auto_avoid` off; the scorecard only reads zirv's own logs; reads account-local caches/transcripts, while network access occurs only in `zirv ctx models refresh`, run explicitly or as the detached background refresh started by `status` and dashboard startup; repositories cannot select or conceal the operator's models or prices |
 | `[routing]` promotion gate, probes, router, canary | operator home or environment only | on by default; the whole table is repo-forbidden, so a repository's `.zirv/ctx.toml` setting any `routing.*` key is a hard error and a checkout can neither disable the gate, steer a seat to a model, raise the probe spend cap nor turn on metered probing; evidence is read from zirv's own logs and benchmark rows, a pick applies only where the operator made no explicit choice, and probes spend quota only under the daily interval, the per-run `probe_max_usd` cap and the per-harness headroom floor |
@@ -5512,7 +5608,7 @@ enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 `agent`, `agent_bin`, `supervise.on_failure`, `handoff.model`,
 `optimize.model`, `sandbox.enabled`, `prompt.enabled`, `prompt.repo_layer`,
 `prompt.max_repo_bytes`, `prompt.harnesses`, `prompt.codex_orchestrator`, `prompt.skill_index_repo_filter`, `prompt.verbosity`, `chat.claude_permission_mode`, `mail.enabled`,
-`mail.max_delivered_bytes`, `mail.mid_turn`, any `supervisor.*` key, `chrome.events`, any `memory.*` key, any
+`mail.max_delivered_bytes`, `mail.mid_turn`, `pr_watch.auto_register`, `pr_watch.interval_secs`, `pr_watch.no_checks_minutes`, `pr_watch.max_wakes` (a repo may set `pr_watch.enabled = false`, never true), any `supervisor.*` key, `chrome.events`, any `memory.*` key, any
 `dash.*` key, any `pace.*` key, any `price.*` key, any `models.*` key, any `proxy.*` key, any `jev.*` key, any `headless.*` key, `review`, `worker.claude`,
 `worker.codex`, `worker.codex_effort`, `worker.default_depth`, `worker.default_read_only`,
 `worker.bootstrap_timeout_secs`,
@@ -5623,6 +5719,11 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `mail.enabled` | `ZIRV_CTX_MAIL` |
 | `mail.max_delivered_bytes` | `ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES` |
 | `mail.mid_turn` | `ZIRV_CTX_MAIL_MID_TURN` |
+| `pr_watch.enabled` | `ZIRV_CTX_PR_WATCH` |
+| `pr_watch.auto_register` | `ZIRV_CTX_PR_WATCH_AUTO_REGISTER` |
+| `pr_watch.interval_secs` | `ZIRV_CTX_PR_WATCH_INTERVAL_SECS` |
+| `pr_watch.no_checks_minutes` | `ZIRV_CTX_PR_WATCH_NO_CHECKS_MINUTES` |
+| `pr_watch.max_wakes` | `ZIRV_CTX_PR_WATCH_MAX_WAKES` |
 | `supervisor.enabled` | `ZIRV_CTX_SUPERVISOR_ENABLED` |
 | `supervisor.harness` | `ZIRV_CTX_SUPERVISOR_HARNESS` |
 | `supervisor.model` | `ZIRV_CTX_SUPERVISOR_MODEL` |
@@ -7009,6 +7110,41 @@ the per-window bound entirely and is unset by default.
 A pause is announced once, not once per check, and appears in the decision log as
 a single `pace-wait` entry. Parks and relaunches are logged too. Check the
 current picture, including how fresh each reading is, with `zirv ctx usage`.
+
+### Per-turn git checkpoints
+
+Issue #946 (capture core; supervisor auto-capture, `restore` and handoff
+integration are later slices). `zirv ctx checkpoint capture` records the work
+tree as a git commit under `refs/zirv/checkpoints/<session-short>/<seq>`. It
+copies the real index to a temp file inside the git dir, stages everything
+(`git add -A -- .`) into that copy, writes a tree and commits it with no
+parent (order comes from `Zirv-Seq`), so HEAD, the real index and every file stay
+byte-for-byte untouched. Metadata is carried in commit trailers
+(`Zirv-Session`, `Zirv-Seq`, `Zirv-Turn`, `Zirv-Agent`, `Zirv-Head`,
+`Zirv-Kind`, `Zirv-Partial`); there is no state file. A nested repository
+without commits is left out of the snapshot (capped at 8 per capture), and a
+repository with `assume-unchanged`/`skip-worktree` entries is marked
+`Zirv-Partial: true`. The ref is created create-only: if a concurrent capture
+already claimed the sequence number, the capture retries with the next one (up
+to 4 times) and never overwrites the other's ref.
+
+```toml
+[checkpoint]
+enabled = false              # operator turns it on (ZIRV_CTX_CHECKPOINT); a repository may only turn it off
+max_per_session = 50         # newest N kept per session; a repository may only lower it
+ttl_secs = 1209600           # older checkpoints are dropped (14 days); a repository may only lower it
+capture_timeout_secs = 20    # a hung git is killed and the capture skipped; a repository may only lower it
+```
+
+Environment overrides: `ZIRV_CTX_CHECKPOINT`, `ZIRV_CTX_CHECKPOINT_MAX_PER_SESSION`,
+`ZIRV_CTX_CHECKPOINT_TTL_SECS`, `ZIRV_CTX_CHECKPOINT_CAPTURE_TIMEOUT_SECS`.
+
+**Secrets note.** Snapshots honour `.gitignore` only. An untracked,
+non-ignored file such as `.env` is committed into the repository's local git
+objects (refs are never pushed by zirv, but they show in `git log --all`).
+Ignore secret files before enabling checkpoints. Retention drops refs; the
+objects of a pruned checkpoint become unreachable and a normal `git gc`
+reclaims them (zirv itself never runs `git gc`).
 
 ### Cross-harness fallback and handover
 

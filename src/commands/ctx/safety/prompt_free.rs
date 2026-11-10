@@ -500,6 +500,7 @@ fn segment_is_prompt_free(
         return env_ok
             && env_scope_ok
             && !is_permissions_compile_write(&tokens[env_count..])
+            && !is_benchmark_eval_run(&tokens[env_count..])
             && !is_supervisor_override(&[&["zirv".to_string()][..], args].concat());
     }
     if env_count > 0 {
@@ -622,6 +623,15 @@ mod tests {
         assert_eq!(split_segments(command).len(), 1);
         assert!(free(command));
         assert!(free("zirv ctx send abc 'one\ntwo && three'"));
+    }
+
+    #[test]
+    fn benchmark_eval_run_is_prompt_free_only_as_a_dry_run() {
+        assert!(free("zirv benchmark eval run --dry-run"));
+        assert!(free("zirv benchmark eval lint"));
+        assert!(free("zirv benchmark eval plan"));
+        assert!(!free("zirv benchmark eval run"));
+        assert!(!free("zirv benchmark eval run --case x"));
     }
 
     #[test]

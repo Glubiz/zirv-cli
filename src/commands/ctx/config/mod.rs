@@ -87,6 +87,7 @@ pub struct CtxConfig {
     pub prompt: PromptConfig,
     pub context: ContextConfig,
     pub mail: MailConfig,
+    pub pr_watch: PrWatchConfig,
     pub workflow: WorkflowConfig,
     pub report: ReportConfig,
     pub search: SearchConfig,
@@ -99,6 +100,7 @@ pub struct CtxConfig {
     pub review: ReviewConfig,
     pub worker: WorkerConfig,
     pub worktree: WorktreeConfig,
+    pub checkpoint: CheckpointConfig,
     pub handover: HandoverConfig,
     /// Operator-only seat model-tier map; see [`ModelTiersConfig`] (#699).
     pub model_tiers: ModelTiersConfig,
@@ -366,6 +368,7 @@ impl CtxConfig {
         // Union denials so repo arrays cannot erase operator entries; extra-allow is operator-only and needs no lift.
         let home_extra_deny = string_array(take_nested(&mut merged, "sandbox", "extra_deny"));
         // Lift before merge so stricter pacing wins: enabled=true and lower percentages.
+        let home_pr_watch_enabled = bool_at(take_nested(&mut merged, "pr_watch", "enabled"));
         let home_pace_enabled = bool_at(take_nested(&mut merged, "pace", "enabled"));
         let home_pace_max_percent = float_at(take_nested(&mut merged, "pace", "max_percent"));
         let home_pace_soft_percent = float_at(take_nested(&mut merged, "pace", "soft_percent"));
@@ -416,6 +419,17 @@ impl CtxConfig {
             integer_at(take_nested(&mut merged, "worktree", "idle_pool_max"));
         let home_worktree_idle_ttl_secs =
             integer_at(take_nested(&mut merged, "worktree", "idle_ttl_secs"));
+        // Lift before merge so repos can only shrink checkpoint retention and the capture timeout (#946).
+        let home_checkpoint_enabled = bool_at(take_nested(&mut merged, "checkpoint", "enabled"));
+        let home_checkpoint_max_per_session =
+            integer_at(take_nested(&mut merged, "checkpoint", "max_per_session"));
+        let home_checkpoint_ttl_secs =
+            integer_at(take_nested(&mut merged, "checkpoint", "ttl_secs"));
+        let home_checkpoint_capture_timeout_secs = integer_at(take_nested(
+            &mut merged,
+            "checkpoint",
+            "capture_timeout_secs",
+        ));
         // Lift before merge so repos can only drop gates, lower cycles or disable the judge (#314).
         let home_objective_gates = string_array_at(take_nested(&mut merged, "objective", "gates"));
         let home_objective_max_cycles = integer_at(take_nested(
@@ -527,6 +541,7 @@ impl CtxConfig {
         let repo_safety = repo_layer.remove(SAFETY_SECTION);
         let repo_workspaces = repo_layer.remove("workspace");
         let repo_extra_deny = string_array(take_nested(&mut repo_layer, "sandbox", "extra_deny"));
+        let repo_pr_watch_enabled = bool_at(take_nested(&mut repo_layer, "pr_watch", "enabled"));
         let repo_pace_enabled = bool_at(take_nested(&mut repo_layer, "pace", "enabled"));
         let repo_pace_max_percent = float_at(take_nested(&mut repo_layer, "pace", "max_percent"));
         let repo_pace_soft_percent = float_at(take_nested(&mut repo_layer, "pace", "soft_percent"));
@@ -580,6 +595,20 @@ impl CtxConfig {
             integer_at(take_nested(&mut repo_layer, "worktree", "idle_pool_max"));
         let repo_worktree_idle_ttl_secs =
             integer_at(take_nested(&mut repo_layer, "worktree", "idle_ttl_secs"));
+        let repo_checkpoint_enabled =
+            bool_at(take_nested(&mut repo_layer, "checkpoint", "enabled"));
+        let repo_checkpoint_max_per_session = integer_at(take_nested(
+            &mut repo_layer,
+            "checkpoint",
+            "max_per_session",
+        ));
+        let repo_checkpoint_ttl_secs =
+            integer_at(take_nested(&mut repo_layer, "checkpoint", "ttl_secs"));
+        let repo_checkpoint_capture_timeout_secs = integer_at(take_nested(
+            &mut repo_layer,
+            "checkpoint",
+            "capture_timeout_secs",
+        ));
         let repo_objective_gates =
             string_array_at(take_nested(&mut repo_layer, "objective", "gates"));
         let repo_objective_max_cycles = integer_at(take_nested(
@@ -777,6 +806,15 @@ impl CtxConfig {
         );
 
         // Reinsert after merge but before env so the operator can still override the result outright.
+        insert_path(
+            &mut merged,
+            &["pr_watch", "enabled"],
+            toml::Value::Boolean(narrow_min(
+                home_pr_watch_enabled.unwrap_or(PrWatchConfig::default().enabled),
+                repo_pr_watch_enabled,
+                true,
+            )),
+        );
         let default_pace = PaceConfig::default();
         insert_path(
             &mut merged,
@@ -1024,6 +1062,51 @@ impl CtxConfig {
                     u64::MAX,
                 ))
                 .unwrap_or(i64::MAX),
+            ),
+        );
+
+        let default_checkpoint = CheckpointConfig::default();
+        let narrowed_checkpoint_u64 = |home: Option<i64>, repo: Option<i64>, default: u64| {
+            let home = home.and_then(|v| u64::try_from(v).ok()).unwrap_or(default);
+            let repo = repo.and_then(|v| u64::try_from(v).ok());
+            toml::Value::Integer(
+                i64::try_from(narrow_min(home, repo, u64::MAX)).unwrap_or(i64::MAX),
+            )
+        };
+        insert_path(
+            &mut merged,
+            &["checkpoint", "enabled"],
+            toml::Value::Boolean(narrow_min(
+                home_checkpoint_enabled.unwrap_or(default_checkpoint.enabled),
+                repo_checkpoint_enabled,
+                true,
+            )),
+        );
+        insert_path(
+            &mut merged,
+            &["checkpoint", "max_per_session"],
+            narrowed_checkpoint_u64(
+                home_checkpoint_max_per_session,
+                repo_checkpoint_max_per_session,
+                u64::from(default_checkpoint.max_per_session),
+            ),
+        );
+        insert_path(
+            &mut merged,
+            &["checkpoint", "ttl_secs"],
+            narrowed_checkpoint_u64(
+                home_checkpoint_ttl_secs,
+                repo_checkpoint_ttl_secs,
+                default_checkpoint.ttl_secs,
+            ),
+        );
+        insert_path(
+            &mut merged,
+            &["checkpoint", "capture_timeout_secs"],
+            narrowed_checkpoint_u64(
+                home_checkpoint_capture_timeout_secs,
+                repo_checkpoint_capture_timeout_secs,
+                default_checkpoint.capture_timeout_secs,
             ),
         );
 
@@ -1514,6 +1597,7 @@ impl CtxConfig {
             ));
         }
 
+        cfg.pr_watch.interval_secs = cfg.pr_watch.interval_secs.max(60);
         cfg.approvals.validate().map_err(add_config_error_prefix)?;
 
         // TTL reaches Claude's environment verbatim; reject unsupported values at load time (#788).
@@ -4786,6 +4870,58 @@ intake_discipline = true
         }
     }
 
+    #[test]
+    fn pr_watch_is_off_by_default_and_the_operator_env_turns_it_on() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(home.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(!cfg.pr_watch.enabled);
+        let env = env_map(&[
+            ("ZIRV_CTX_PR_WATCH", "true"),
+            ("ZIRV_CTX_PR_WATCH_MAX_WAKES", "3"),
+        ]);
+        let cfg = CtxConfig::load(home.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(cfg.pr_watch.enabled);
+        assert_eq!(cfg.pr_watch.max_wakes, 3);
+    }
+
+    #[test]
+    fn a_repo_may_switch_pr_watch_off_but_never_on_or_tune_it() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[pr_watch]\nenabled = true\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let load_with = |repo_toml: &str| {
+            let repo = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), repo_toml).expect("write");
+            CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+        };
+        let off = load_with("[pr_watch]\nenabled = false\n").expect("repo may disable");
+        assert!(!off.pr_watch.enabled, "a repo may narrow enabled to false");
+        let kept = load_with("[pr_watch]\nenabled = true\n").expect("load");
+        assert!(kept.pr_watch.enabled, "home true stays true");
+        for key in [
+            "auto_register = false",
+            "interval_secs = 60",
+            "no_checks_minutes = 1",
+            "max_wakes = 99",
+        ] {
+            let err = load_with(&format!("[pr_watch]\n{key}\n"))
+                .expect_err("a repo may not tune pr_watch")
+                .to_string();
+            let name = key.split(' ').next().expect("key");
+            assert!(err.contains(&format!("pr_watch.{name}")), "got {err}");
+            assert!(err.contains("ZIRV_CTX_PR_WATCH"), "got {err}");
+        }
+    }
+
     /// S1: a repo could otherwise silence the `zirv \u{25b8}` announcement
     /// channel -- including its own degradation notices -- for anyone
     /// running zirv there, with no operator-visible sign that it happened.
@@ -7012,6 +7148,10 @@ intake_discipline = true
         ("worker", "deny_network"),
         ("worktree", "idle_pool_max"),
         ("worktree", "idle_ttl_secs"),
+        ("checkpoint", "enabled"),
+        ("checkpoint", "max_per_session"),
+        ("checkpoint", "ttl_secs"),
+        ("checkpoint", "capture_timeout_secs"),
         ("objective", "gates"),
         ("objective", "max_cycles_without_progress"),
         ("objective", "judge"),

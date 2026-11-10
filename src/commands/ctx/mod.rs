@@ -15,6 +15,7 @@ pub mod capabilities_cmd;
 pub mod catalogue;
 pub mod chain;
 pub mod chat;
+pub mod checkpoint;
 pub mod chrome;
 pub mod compile;
 pub mod config;
@@ -86,6 +87,7 @@ pub mod permit;
 pub mod policy;
 pub mod poll;
 pub mod pool;
+pub mod pr_watch;
 pub mod price;
 pub mod priority;
 pub mod prompt;
@@ -652,6 +654,9 @@ pub enum CtxVerb {
     Forget(memory::ForgetArgs),
     /// Interrupt a live session with a message: durable mail plus a wake-up.
     Nudge(sessions::NudgeArgs),
+    /// Watch a pull/merge request and mail this session when checks, comments
+    /// or mergeability change (issue #949).
+    Pr(pr_watch::PrArgs),
     /// Distill a read-only answer to a question from a LIVE worker
     /// session's own transcript (issue #310, 3c). Never sends input to that
     /// session -- no pty/stdin write, no nudge, no mail -- and never
@@ -705,6 +710,10 @@ pub enum CtxVerb {
     /// worktrees (issue #319): proof-required reclaim, so nothing is ever
     /// removed without affirmative evidence it carries no unrecoverable work.
     Worktree(worktree::WorktreeArgs),
+    /// Per-turn git checkpoints under `refs/zirv/checkpoints/` (issue #946):
+    /// `capture` snapshots the working tree without touching HEAD, the index
+    /// or any file; `list` and `diff` read them back.
+    Checkpoint(checkpoint::CheckpointArgs),
     /// One level-triggered pass over every opportunistic sweep this crate
     /// already runs (stuck task claims, dead-owner permits/reservations,
     /// worktree GC) plus the one resource with no automatic reclaim at all,
@@ -890,6 +899,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Recall(a) => memory::run_recall(a, &mut out),
         CtxVerb::Forget(a) => memory::run_forget(a, &mut out),
         CtxVerb::Nudge(a) => sessions::run_nudge(a, &mut out),
+        CtxVerb::Pr(a) => pr_watch::run(a, &mut out),
         CtxVerb::Ask(a) => ask::run(a, &mut out),
         CtxVerb::Kill(a) => sessions::run_kill(a, &mut out),
         CtxVerb::Safety(a) => safety::run(a, &mut out),
@@ -907,6 +917,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Snapshot(a) => snapshot::run(a, &mut out),
         CtxVerb::Search(a) => search::run(a, &mut out),
         CtxVerb::Worktree(a) => worktree::run(a, &mut out),
+        CtxVerb::Checkpoint(a) => checkpoint::run(a, &mut out),
         CtxVerb::Reconcile(a) => reconcile::run(a, &mut out),
         CtxVerb::Task(a) => task::run(a, &mut out),
         CtxVerb::Swarm(a) => task::run_swarm(a, &mut out),
