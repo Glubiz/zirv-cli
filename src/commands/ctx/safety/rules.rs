@@ -851,6 +851,7 @@ mod tests {
             "zirv benchmark eval run",
             "ZIRV BENCHMARK EVAL RUN --case x",
             "a && zirv benchmark eval run --context",
+            "zirv benchmark eval run --yes --max-usd 1 --samples 3 --baseline abc --stop-on-regression",
         ] {
             for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
                 assert_eq!(
@@ -863,6 +864,7 @@ mod tests {
         for command in [
             "zirv benchmark eval plan",
             "zirv benchmark eval lint --json",
+            "zirv benchmark eval report --json",
             "zirv benchmark eval run --dry-run",
             "zirv benchmark eval run --dry-run --context --case x",
         ] {
