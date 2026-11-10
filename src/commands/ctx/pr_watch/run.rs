@@ -438,7 +438,8 @@ fn fetch_gitlab(env: EnvLookup<'_>, rec: &WatchRecord, pr: &PrRef) -> Result<Fet
     Ok((view, checks, viewer))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
