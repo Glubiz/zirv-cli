@@ -253,7 +253,7 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
     (
         "worktrees",
         SlugEntry::File("", ".jsonl"),
-        &["commands/ctx/worktree.rs"],
+        &["commands/ctx/worktree.rs", "commands/ctx/checkpoint.rs"],
     ),
     // Issue #717: completed workspace setup steps are grouped beneath the
     // source repository slug, alongside the existing worktree ownership
