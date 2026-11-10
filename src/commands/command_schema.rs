@@ -342,6 +342,7 @@ const MUTATING: &[&str] = &[
     "zirv ctx usage tee",
     "zirv ctx worktree prune",
     "zirv ctx checkpoint capture",
+    "zirv ctx checkpoint restore",
     "zirv ctx pr watch",
     "zirv ctx pr unwatch",
     "zirv ctx pr poll",

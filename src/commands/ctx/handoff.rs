@@ -169,6 +169,9 @@ pub struct WorkingSet {
     /// changed". `Some(vec![])` is a real, verified answer: the branch
     /// genuinely has no changed paths.
     pub branch_changed_paths: Option<Vec<String>>,
+    /// Per-turn files-changed lines from the newest other session's git
+    /// checkpoints (`checkpoint::recent_turn_changes`); empty when there are none.
+    pub checkpoint_changes: Vec<String>,
 }
 
 /// The three workflow artifact files [`working_set`] looks for in a fixed
@@ -319,10 +322,16 @@ fn collect_branch_changed_paths(repo: &Path) -> Option<Vec<String>> {
 /// `(state, repo, session)` shape -- reserved for a future caller that needs
 /// to scope this per session, but nothing here reads it today; every entry
 /// is scoped by `repo` alone.
-pub fn working_set(state: &StateDir, repo: &Path, _session: &str) -> WorkingSet {
+pub fn working_set(state: &StateDir, repo: &Path, session: &str) -> WorkingSet {
     WorkingSet {
         workflow_artifacts: collect_workflow_artifacts(state, repo),
         branch_changed_paths: collect_branch_changed_paths(repo),
+        checkpoint_changes: super::checkpoint::recent_turn_changes(
+            repo,
+            &super::sessions::short_id(session),
+            CHECKPOINT_TURN_CAP,
+            CHECKPOINT_FILES_PER_TURN_CAP,
+        ),
     }
 }
 
@@ -331,6 +340,9 @@ pub fn working_set(state: &StateDir, repo: &Path, _session: &str) -> WorkingSet 
 /// path (a 5 KB filename, say) must never make the manifest arbitrarily
 /// large.
 const WORKING_SET_PATH_CHAR_CAP: usize = 120;
+/// Turns, and files per turn, the checkpoint section lists.
+const CHECKPOINT_TURN_CAP: usize = 8;
+const CHECKPOINT_FILES_PER_TURN_CAP: usize = 5;
 /// Lines shown per section (`Workflow artifacts`, `Branch changed paths`)
 /// before a `+N more` line takes over.
 const WORKING_SET_SECTION_LINE_CAP: usize = 20;
@@ -441,6 +453,17 @@ pub fn render_working_set(working_set: &WorkingSet) -> String {
         }
     }
     out.push('\n');
+
+    if !working_set.checkpoint_changes.is_empty() {
+        out.push_str("### Files changed per turn (git checkpoints)\n");
+        let lines: Vec<String> = working_set
+            .checkpoint_changes
+            .iter()
+            .map(|l| truncate_working_set_path(l))
+            .collect();
+        render_capped_section(&mut out, &lines, &mut remaining_total);
+        out.push('\n');
+    }
 
     out.push_str(
         "What did not survive: the previous session's own reasoning, its unsaved intermediate \
@@ -5317,6 +5340,7 @@ mod tests {
                 files: vec![".zirv/work/abc123/intent.md".to_string()],
             }],
             branch_changed_paths: Some(vec!["src/lib.rs".to_string()]),
+            checkpoint_changes: Vec::new(),
         };
         assert_eq!(render_working_set(&ws), render_working_set(&ws));
     }
@@ -5401,6 +5425,26 @@ mod tests {
         assert!(rendered.contains(&expected_status), "got {rendered}");
     }
 
+    #[test]
+    fn the_working_set_lists_per_turn_checkpoint_changes_and_omits_the_section_when_empty() {
+        let none = render_working_set(&WorkingSet::default());
+        assert!(!none.contains("git checkpoints"), "got {none}");
+
+        let ws = WorkingSet {
+            checkpoint_changes: vec!["checkpoint 2: M src/a.rs, A src/b.rs".to_string()],
+            ..WorkingSet::default()
+        };
+        let rendered = render_working_set(&ws);
+        assert!(
+            rendered.contains("### Files changed per turn (git checkpoints)"),
+            "got {rendered}"
+        );
+        assert!(
+            rendered.contains("- checkpoint 2: M src/a.rs, A src/b.rs"),
+            "got {rendered}"
+        );
+    }
+
     /// Bounds: at most `WORKING_SET_SECTION_LINE_CAP` lines per section, a
     /// `+N more` line when truncated, and the section caps never together
     /// exceed `WORKING_SET_TOTAL_LINE_CAP`.
@@ -5410,6 +5454,7 @@ mod tests {
         let ws = WorkingSet {
             workflow_artifacts: Vec::new(),
             branch_changed_paths: Some(paths),
+            checkpoint_changes: Vec::new(),
         };
         let rendered = render_working_set(&ws);
         let shown = rendered
@@ -5440,6 +5485,7 @@ mod tests {
         let ws = WorkingSet {
             workflow_artifacts,
             branch_changed_paths,
+            checkpoint_changes: Vec::new(),
         };
         let rendered = render_working_set(&ws);
         let bullet_lines = rendered
@@ -5477,6 +5523,7 @@ mod tests {
         let ws = WorkingSet {
             workflow_artifacts: Vec::new(),
             branch_changed_paths: Some(vec!["src/lib.rs".to_string()]),
+            checkpoint_changes: Vec::new(),
         };
         let out = labeled_for_injection_with_working_set(
             &handoff,

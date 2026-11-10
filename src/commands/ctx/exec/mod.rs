@@ -443,6 +443,19 @@ fn run_with_clock_inner<W: Write>(
             None
         }
     };
+    // Baseline before the first child; capture runs on its own thread. Dropped
+    // on every exit path, which takes the final capture.
+    let checkpointer = super::checkpoint::Checkpointer::start(
+        &cfg.checkpoint,
+        repo,
+        &state,
+        &registry_short,
+        adapter.name(),
+        "exec",
+    );
+    if let Some(checkpointer) = &checkpointer {
+        checkpointer.request(None);
+    }
     // Rebuild session identity for every child; export harness identity even
     // without a turn-signal socket.
     let turn_env_for = |session: &SessionId| {
@@ -750,6 +763,7 @@ fn run_with_clock_inner<W: Write>(
             &cfg.fallback.effective_health(),
             &state,
             server.as_ref(),
+            checkpointer.as_ref(),
             session.as_str(),
             &registry_short,
             &mut session_guard,

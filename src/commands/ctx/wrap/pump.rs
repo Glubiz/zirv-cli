@@ -13,6 +13,7 @@ pub(super) fn pump(
     pair: &mut portable_pty::PtyPair,
     supervision: &mut InjectionState,
     server: Option<&super::signal::SignalServer>,
+    checkpointer: Option<&super::checkpoint::Checkpointer>,
     // `&mut Box<dyn AgentAdapter>`, not `&dyn AgentAdapter`: a handover swap
     // replaces the boxed adapter in place, so every later pump tick must see
     // the new one.
@@ -136,6 +137,9 @@ pub(super) fn pump(
             transcript.adopt(signal.transcript_path.as_deref());
             let previous_verdict = supervision.verdict;
             supervision.on_turn(&signal);
+            if let Some(checkpointer) = checkpointer {
+                checkpointer.request(Some(signal.turn));
+            }
             // Clear in-flight state at the turn boundary so a later crash
             // between turns is not marked as interrupted. (#281)
             session_guard.clear_in_flight();
