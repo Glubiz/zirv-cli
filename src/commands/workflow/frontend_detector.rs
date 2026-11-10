@@ -30,6 +30,23 @@ const MAX_WAIVER_BYTES: u64 = 64 * 1024;
 const MAX_WAIVER_REASON_BYTES: usize = 512;
 const MAX_EVIDENCE_BYTES: usize = 256;
 
+static PASTE_ATTR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:\bon:?paste|@paste|\bv-on:paste)(?:\.[\w.]+)?\s*=\s*")
+        .expect("valid paste attribute regex")
+});
+static PASTE_MODIFIER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:@paste|\bv-on:paste)\.(?:\w+\.)*prevent\b")
+        .expect("valid paste modifier regex")
+});
+static PASTE_LISTENER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)addEventListener\(\s*['"]paste['"]\s*,\s*"#)
+        .expect("valid paste listener regex")
+});
+static PREVENT_DEFAULT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bpreventDefault\s*\(").expect("valid preventDefault regex"));
+static HANDLER_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*([A-Za-z_$][\w$]*)\s*(?:\([^()]*\))?\s*$").expect("valid handler name regex")
+});
 static IMAGE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?is)<img\b[^>]*>").expect("valid image regex"));
 static DIOXUS_IMAGE_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -727,6 +744,143 @@ fn bounded_manifest_contains(path: &Path, needle: &str) -> bool {
     std::fs::read_to_string(path).is_ok_and(|text| text.to_ascii_lowercase().contains(needle))
 }
 
+/// Whether a handler reads the clipboard text back, i.e. can re-insert it after `preventDefault`.
+fn reads_clipboard(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("clipboarddata") || lower.contains("getdata(")
+}
+
+/// Offsets of paste blocks: `@paste.prevent` and `preventDefault()` calls inside paste handlers,
+/// unless the handler reads the clipboard text back.
+fn paste_blocked_offsets(text: &str) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    let mut spans = Vec::new();
+    for found in PASTE_MODIFIER_RE.find_iter(text) {
+        let rest = &text[found.end()..];
+        let handler = rest
+            .trim_start()
+            .strip_prefix('=')
+            .map(|after| found.end() + (rest.len() - after.trim_start().len()))
+            .and_then(|start| delimited_value(text, start))
+            .and_then(|value| handler_span(text, value));
+        if !handler.is_some_and(|span| reads_clipboard(&text[span])) {
+            offsets.push(found.start());
+        }
+    }
+    for found in PASTE_ATTR_RE.find_iter(text) {
+        let Some(value) = delimited_value(text, found.end()) else {
+            continue;
+        };
+        spans.extend(handler_span(text, value));
+    }
+    for found in PASTE_LISTENER_RE.find_iter(text) {
+        let end = call_end(text, found.end());
+        let handler = found.end()..end;
+        if HANDLER_NAME_RE.is_match(&text[handler.clone()]) {
+            spans.extend(handler_span(text, handler));
+            continue;
+        }
+        spans.push(handler);
+    }
+    for span in spans {
+        let body = &text[span.clone()];
+        if reads_clipboard(body) {
+            continue;
+        }
+        offsets.extend(
+            PREVENT_DEFAULT_RE
+                .find_iter(body)
+                .map(|found| span.start + found.start()),
+        );
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+    offsets
+}
+
+/// Offset of the `)` closing the call whose arguments start at `start`, or the end of text.
+fn call_end(text: &str, start: usize) -> usize {
+    let mut depth = 0usize;
+    for (index, byte) in text.bytes().enumerate().skip(start) {
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' if depth == 0 => return index,
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+    }
+    text.len()
+}
+
+/// Byte range of a quoted (`"..."`) or braced (`{...}`) attribute value starting at `start`.
+fn delimited_value(text: &str, start: usize) -> Option<std::ops::Range<usize>> {
+    let quote = text[start..].chars().next()?;
+    if quote == '{' {
+        let end = balanced_end(text, start);
+        return Some(start + 1..end.saturating_sub(1).max(start + 1));
+    }
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let close = text[start + 1..].find(quote)?;
+    Some(start + 1..start + 1 + close)
+}
+
+/// End offset (exclusive) of the brace block opening at `open`, or the end of text when unbalanced.
+fn balanced_end(text: &str, open: usize) -> usize {
+    let mut depth = 0usize;
+    for (index, byte) in text.bytes().enumerate().skip(open) {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return index + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    text.len()
+}
+
+/// The handler value itself, or, when it names a function, that function's definition.
+fn handler_span(text: &str, value: std::ops::Range<usize>) -> Option<std::ops::Range<usize>> {
+    let Some(name) = HANDLER_NAME_RE
+        .captures(&text[value.clone()])
+        .map(|caps| caps[1].to_string())
+    else {
+        return Some(value);
+    };
+    let definition = format!(
+        r"(?:function\s+{0}\s*\(|(?:const|let|var)\s+{0}\s*=|\b{0}\s*\([^()]*\)\s*\{{)",
+        regex::escape(&name)
+    );
+    let found = Regex::new(&definition).ok().and_then(|re| re.find(text))?;
+    let line_end = text[found.end()..]
+        .find('\n')
+        .map_or(text.len(), |index| found.end() + index);
+    // The body brace follows the parameter list, so a destructured parameter's `{` is skipped.
+    let head = &text[..found.end()];
+    let after = text[found.end()..].trim_start();
+    let body_from = if head.ends_with('{') {
+        found.end() - 1
+    } else if head.ends_with('(') {
+        call_end(text, found.end()) + 1
+    } else if after.starts_with('(') {
+        call_end(text, text.len() - after.len() + 1) + 1
+    } else {
+        found.end()
+    };
+    let Some(open) = text[body_from.min(text.len())..]
+        .find('{')
+        .map(|index| body_from + index)
+    else {
+        return Some(found.start()..line_end);
+    };
+    Some(open..balanced_end(text, open))
+}
+
 fn line_for(text: &str, offset: usize) -> usize {
     text[..offset.min(text.len())]
         .bytes()
@@ -928,14 +1082,13 @@ fn analyze(path: &Path, text: &str, findings: &mut Vec<DetectorFinding>) {
             "Allow pinch zoom and browser text scaling.",
         );
     }
-    if (lower.contains("onpaste") || lower.contains("on:paste")) && lower.contains("preventdefault")
-    {
+    for offset in paste_blocked_offsets(text) {
         finding(
             findings,
             "a11y/paste-blocked",
             FindingSeverity::Blocking,
             path,
-            1,
+            line_for(text, offset),
             "Paste appears to be blocked on an input path.",
             "Allow paste, including password-manager and assistive-technology input.",
         );
@@ -2489,6 +2642,126 @@ reason = "Operator accepted this generated decorative surface temporarily."
         assert_eq!(apply_waivers(&mut findings, &waivers), 0);
         assert!(!findings[0].blocks());
         assert_eq!(findings[0].disposition, FindingDisposition::Waived);
+    }
+
+    fn paste_findings(path: &str, text: &str) -> Vec<DetectorFinding> {
+        let mut findings = Vec::new();
+        analyze(Path::new(path), text, &mut findings);
+        findings
+            .into_iter()
+            .filter(|finding| finding.rule_id == "a11y/paste-blocked")
+            .collect()
+    }
+
+    #[test]
+    fn paste_handler_that_reinserts_transformed_clipboard_text_is_not_blocked() {
+        let sfc = r#"<script setup lang="ts">
+import { ref } from 'vue'
+const model = defineModel<string>({ default: '' })
+const input = ref<HTMLInputElement | null>(null)
+
+function onPaste(event: ClipboardEvent) {
+  const clip = event.clipboardData?.getData('text') ?? ''
+  if (!/[;,]/.test(clip)) return
+  event.preventDefault()
+  const normalised = clip.replace(/;/g, ',')
+  const el = input.value
+  if (!el) return
+  const start = el.selectionStart ?? 0
+  model.value = model.value.slice(0, start) + normalised + model.value.slice(el.selectionEnd ?? start)
+  el.setSelectionRange(start + normalised.length, start + normalised.length)
+}
+</script>
+
+<template>
+  <input ref="input" v-model="model" @paste="onPaste" />
+</template>
+"#;
+        assert!(paste_findings("src/PredicateValueInput.vue", sfc).is_empty());
+    }
+
+    #[test]
+    fn preventdefault_in_a_keydown_handler_is_not_attributed_to_paste() {
+        let sfc = r#"<script setup lang="ts">
+const draft = ref('')
+function onPaste(event: ClipboardEvent) {
+  const text = event.clipboardData?.getData('text') ?? ''
+  draft.value += text.trim()
+}
+function onKeydown(event: KeyboardEvent) {
+  if (event.key === ',') {
+    event.preventDefault()
+    commit()
+  }
+}
+</script>
+
+<template>
+  <input v-model="draft" @paste="onPaste" @keydown="onKeydown" />
+</template>
+"#;
+        assert!(paste_findings("src/RecipientChipsInput.vue", sfc).is_empty());
+    }
+
+    #[test]
+    fn paste_handler_that_blocks_without_reading_the_clipboard_is_anchored_at_its_line() {
+        let sfc = r#"<script setup lang="ts">
+const code = ref('')
+function onPaste(event: ClipboardEvent) {
+  event.preventDefault()
+}
+</script>
+
+<template>
+  <input v-model="code" @paste="onPaste" />
+</template>
+"#;
+        let findings = paste_findings("src/OneTimeCode.vue", sfc);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].line, 4);
+        assert_eq!(findings[0].evidence, "event.preventDefault()");
+        let modifier = "<template>\n  <input @paste.prevent />\n</template>\n";
+        let findings = paste_findings("src/Modifier.vue", modifier);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].line, 2);
+    }
+
+    #[test]
+    fn prevent_modifier_with_a_clipboard_reading_handler_is_not_blocked() {
+        let reads = "<script setup>\nfunction onPaste(e) {\n  const t = e.clipboardData.getData('text')\n  insert(t)\n}\n</script>\n<template>\n  <input @paste.prevent=\"onPaste\" />\n</template>\n";
+        assert!(paste_findings("src/A.vue", reads).is_empty());
+        let inline = "<template>\n  <input @paste.prevent=\"insert($event.clipboardData.getData('text'))\" />\n</template>\n";
+        assert!(paste_findings("src/B.vue", inline).is_empty());
+        let bare = "<template>\n  <input @paste.prevent />\n</template>\n";
+        assert_eq!(paste_findings("src/C.vue", bare)[0].line, 2);
+        let blind = "<script setup>\nfunction onPaste() {}\n</script>\n<template>\n  <input @paste.prevent=\"onPaste\" />\n</template>\n";
+        assert_eq!(paste_findings("src/D.vue", blind)[0].line, 5);
+    }
+
+    #[test]
+    fn one_line_arrow_paste_listener_is_flagged_and_a_later_keydown_is_not_attributed() {
+        let arrow = "el.addEventListener('paste', e => e.preventDefault())\n";
+        let findings = paste_findings("src/blocked.ts", arrow);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].line, 1);
+        let unrelated = "el.addEventListener('paste', e => log(e))\nel.addEventListener('keydown', e => {\n  e.preventDefault()\n})\n";
+        assert!(paste_findings("src/ok.ts", unrelated).is_empty());
+    }
+
+    #[test]
+    fn a_destructured_parameter_does_not_hide_the_handler_body() {
+        let method = "export default {\n  methods: {\n    onPaste({ target }) {\n      e.preventDefault()\n    },\n  },\n}\n// <input @paste=\"onPaste\" />\n";
+        assert_eq!(paste_findings("src/P.vue", method)[0].line, 4);
+        let function = "function onPaste({ clipboardData }) {\n  e.preventDefault()\n}\nel.addEventListener('paste', onPaste)\n";
+        assert_eq!(paste_findings("src/Q.ts", function)[0].line, 2);
+    }
+
+    #[test]
+    fn a_method_defined_paste_handler_is_resolved() {
+        let blocking = "export default {\n  methods: {\n    onPaste(e) {\n      e.preventDefault()\n    },\n  },\n}\n// <input @paste=\"onPaste\" />\n";
+        assert_eq!(paste_findings("src/M.vue", blocking)[0].line, 4);
+        let reading = "export default {\n  methods: {\n    onPaste(e) {\n      const t = e.clipboardData.getData('text')\n      e.preventDefault()\n      this.add(t)\n    },\n  },\n}\n// <input @paste=\"onPaste\" />\n";
+        assert!(paste_findings("src/N.vue", reading).is_empty());
     }
 
     #[test]

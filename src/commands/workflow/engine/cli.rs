@@ -313,6 +313,24 @@ pub struct AdvanceArgs {
     /// the rest of it once accepted.
     #[arg(long)]
     pub accept_preexisting_findings: bool,
+    /// Accept the frontend detector's introduced blocking findings as false
+    /// positives so this advance can proceed. The reason is mandatory and is
+    /// recorded on the workflow; it also accepts pre-existing findings.
+    #[arg(long, value_name = "REASON")]
+    pub accept_introduced_findings: Option<String>,
+}
+
+impl AdvanceArgs {
+    fn finding_acceptance(&self) -> CtxResult<FindingAcceptance> {
+        let reason = self.accept_introduced_findings.as_deref().map(str::trim);
+        if reason == Some("") {
+            return Err("--accept-introduced-findings requires a non-empty reason".into());
+        }
+        Ok(FindingAcceptance {
+            preexisting: self.accept_preexisting_findings,
+            introduced_reason: reason.map(str::to_string),
+        })
+    }
 }
 
 pub(crate) fn resolve_repo(repo: Option<&Path>) -> CtxResult<PathBuf> {
@@ -872,6 +890,13 @@ pub(crate) fn write_state(
                 "accepted pre-existing frontend findings: {} blocking / {} total at {} ({})",
                 accepted.blocking, accepted.total, accepted.step, accepted.at
             )?;
+            if let Some(reason) = &accepted.reason {
+                writeln!(
+                    writer,
+                    "accepted {} introduced frontend finding(s): {reason}",
+                    accepted.introduced
+                )?;
+            }
         }
         writeln!(writer, "deploy tier: {}", state.deploy_tier)?;
         if !state.jev_tags.is_empty() {
@@ -1413,7 +1438,7 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                             state,
                             StepOutcome::Failure,
                             Some(&evidence),
-                            args.accept_preexisting_findings,
+                            args.finding_acceptance()?,
                         )?;
                         write_state(writer, &state, args.json)?;
                         return Ok(1);
@@ -1453,7 +1478,7 @@ pub fn run(args: &WorkflowArgs, writer: &mut impl Write) -> CtxResult<i32> {
                 state,
                 outcome,
                 Some(&evidence),
-                args.accept_preexisting_findings,
+                args.finding_acceptance()?,
             )?;
             write_state(writer, &state, args.json)?;
         }
@@ -1829,6 +1854,7 @@ mod tests {
                 workers: 0,
                 frontend_root: None,
                 accept_preexisting_findings: false,
+                accept_introduced_findings: None,
             }),
         };
         let mut out = Vec::new();
@@ -1967,6 +1993,7 @@ mod tests {
                 workers: 0,
                 frontend_root: None,
                 accept_preexisting_findings: false,
+                accept_introduced_findings: None,
             }),
         };
 
@@ -2162,6 +2189,7 @@ mod tests {
                 workers: 0,
                 frontend_root: None,
                 accept_preexisting_findings: false,
+                accept_introduced_findings: None,
             }),
         };
         let mut out = Vec::new();
@@ -2288,6 +2316,7 @@ mod tests {
                 workers: 0,
                 frontend_root: None,
                 accept_preexisting_findings: false,
+                accept_introduced_findings: None,
             }),
         };
         let mut out = Vec::new();
@@ -2468,6 +2497,7 @@ mod tests {
                 workers: 0,
                 frontend_root: None,
                 accept_preexisting_findings: false,
+                accept_introduced_findings: None,
             }),
         };
         let mut out = Vec::new();
@@ -2539,6 +2569,7 @@ mod tests {
                 workers: 0,
                 frontend_root: None,
                 accept_preexisting_findings: false,
+                accept_introduced_findings: None,
             }),
         };
         let mut out = Vec::new();
@@ -2586,6 +2617,7 @@ mod tests {
                 workers: 0,
                 frontend_root: Some(target_repo.path().to_path_buf()),
                 accept_preexisting_findings: false,
+                accept_introduced_findings: None,
             }),
         };
         let mut out = Vec::new();
@@ -2656,6 +2688,7 @@ mod tests {
                 // own, so the gate must still fail closed against it.
                 frontend_root: Some(target_repo.path().to_path_buf()),
                 accept_preexisting_findings: false,
+                accept_introduced_findings: None,
             }),
         };
         let mut out = Vec::new();
@@ -3666,6 +3699,40 @@ present_as = "summary"
             resumed.definition.as_ref().unwrap().id,
             "review",
             "the explicit override survives resume"
+        );
+    }
+
+    #[test]
+    fn accept_introduced_findings_rejects_a_blank_reason() {
+        let args = |reason: Option<&str>| AdvanceArgs {
+            id: "w".into(),
+            outcome: None,
+            run_checks: false,
+            repo: None,
+            json: false,
+            duration_ms: None,
+            agent: None,
+            model: None,
+            role: None,
+            input_tokens: None,
+            output_tokens: None,
+            workers: 0,
+            frontend_root: None,
+            accept_preexisting_findings: false,
+            accept_introduced_findings: reason.map(str::to_string),
+        };
+        assert!(args(Some("  ")).finding_acceptance().is_err());
+        assert!(
+            args(None)
+                .finding_acceptance()
+                .unwrap()
+                .introduced_reason
+                .is_none()
+        );
+        let accepted = args(Some(" false positive ")).finding_acceptance().unwrap();
+        assert_eq!(
+            accepted.introduced_reason.as_deref(),
+            Some("false positive")
         );
     }
 }

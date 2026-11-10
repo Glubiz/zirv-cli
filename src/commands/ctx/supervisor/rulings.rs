@@ -139,6 +139,20 @@ fn choice_head(line: &str) -> Option<(usize, &str)> {
     Some((number, tail))
 }
 
+/// A reply's first line as a list-style pick (`2. not done: why`, `2) ...`): it opens with an
+/// offered option's number and a `.` or `)` separator. Returns that number and the text after it.
+fn numbered_head(line: &str, options: usize) -> Option<(usize, &str)> {
+    let line = line.trim().trim_start_matches(is_mark);
+    let digits = line.find(|c: char| !c.is_ascii_digit())?;
+    let number: usize = line[..digits].parse().ok()?;
+    let tail = line[digits..].strip_prefix(['.', ')'])?;
+    let tail = tail.trim_start_matches(is_mark);
+    if !(1..=options).contains(&number) || tail.chars().next().is_some_and(|c| !c.is_whitespace()) {
+        return None;
+    }
+    Some((number, tail))
+}
+
 /// A reply's first line as an offered option's pick: it opens with the option's own text (case
 /// and emphasis marks aside), then ends, closes its emphasis, or continues after a separator
 /// (`:` `.` `,` ` -`), and the text after it names no other offered option. Returns the 1-based
@@ -277,8 +291,9 @@ pub(crate) fn parse_reply(
                 line.is_empty() || line.starts_with("```")
             });
             let head_line = lines.next()?;
-            let (number, tail) =
-                choice_head(head_line).or_else(|| option_label(head_line, options))?;
+            let (number, tail) = choice_head(head_line)
+                .or_else(|| option_label(head_line, options))
+                .or_else(|| numbered_head(head_line, options.len()))?;
             let following: Vec<&str> = lines.collect();
             if following
                 .iter()
@@ -554,6 +569,33 @@ mod tests {
             .expect("later lines do not count");
         assert_eq!(verdict, options[0]);
         assert_eq!(parse("Both options fit; pick whichever"), None);
+    }
+
+    /// #939: `ask` options `done: ...` / `not done: ...` and a reply led by the option number.
+    #[test]
+    fn a_reply_led_by_an_option_number_parses_as_that_option() {
+        let options = vec![
+            "done: verification complete".to_string(),
+            "not done: name the missing evidence".to_string(),
+        ];
+        let parse = |text: &str| parse_reply(RulingKind::Choice, text, &options);
+        let (verdict, reason) = parse(
+            "2. not done: missing a live API check; the diff only shows an Obsidian graph change.",
+        )
+        .expect("a numbered pick");
+        assert_eq!(verdict, options[1]);
+        assert!(reason.contains("live API check"), "{reason}");
+        assert_eq!(
+            parse("1) done: verification complete").map(|(verdict, _)| verdict),
+            Some(options[0].clone())
+        );
+        assert_eq!(
+            parse("**2.** Not done, lint is red").map(|(verdict, _)| verdict),
+            Some(options[1].clone())
+        );
+        assert_eq!(parse("3. neither"), None);
+        assert_eq!(parse("2.5 hours of work"), None);
+        assert_eq!(parse("2. not done\nChoice: 1"), None);
     }
 
     #[test]

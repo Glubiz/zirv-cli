@@ -13,8 +13,8 @@ use super::super::catalogue;
 use super::super::event::input_hash;
 use super::super::event::{
     Capabilities, NormalizedEvent, PromptCache, SessionId, SessionRef, StructuralContext,
-    ToolInvocation, TranscriptUsage, UNRESOLVED_TOOL_CALL_CAP, UnresolvedToolCall, error_text_hash,
-    last_verification_run,
+    ToolInvocation, TranscriptUsage, TurnActivity, UNRESOLVED_TOOL_CALL_CAP, UnresolvedToolCall,
+    error_text_hash, last_verification_run,
 };
 use super::super::window::parse_iso8601_utc_ms;
 use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
@@ -1132,6 +1132,84 @@ pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
         .map(|(_, id, name, summary)| UnresolvedToolCall { name, id, summary })
         .collect();
 
+    out
+}
+
+/// Result text kept per tool call; the consumer caps the whole section again.
+const TURN_RESULT_CHARS: usize = 600;
+
+/// Tool calls with their results, and AskUserQuestion answers, after the last real operator
+/// prompt (the same "real" test `done_task` uses: not injected text).
+fn turn_activity(jsonl: &str) -> TurnActivity {
+    let mut out = TurnActivity::default();
+    let mut pending: HashMap<String, (String, String)> = HashMap::new();
+    for row in jsonl
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .filter(|row| row.get("isSidechain").and_then(Value::as_bool) != Some(true))
+    {
+        let message = row.get("message").cloned().unwrap_or(Value::Null);
+        match row.get("type").and_then(Value::as_str) {
+            Some("user") => {
+                if row.get("isMeta").and_then(Value::as_bool) == Some(true) {
+                    continue;
+                }
+                let prompt = user_message_text(message.get("content"));
+                if !prompt.trim().is_empty() && !super::is_injected_user_text(&prompt) {
+                    out = TurnActivity::default();
+                    pending.clear();
+                    continue;
+                }
+                let blocks = message.get("content").and_then(Value::as_array);
+                for block in blocks
+                    .into_iter()
+                    .flatten()
+                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+                {
+                    let Some((name, summary)) = block
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .and_then(|id| pending.remove(id))
+                    else {
+                        continue;
+                    };
+                    let is_error = block.get("is_error").and_then(Value::as_bool) == Some(true);
+                    // Redact before the cut: a cut through a secret leaves a fragment no detector flags.
+                    let result: String =
+                        super::super::snapshot::redact_text(&tool_result_text(block))
+                            .chars()
+                            .take(TURN_RESULT_CHARS)
+                            .collect();
+                    if name == "AskUserQuestion" && !is_error {
+                        out.answers.push(result);
+                        continue;
+                    }
+                    let status = if is_error { "error" } else { "ok" };
+                    out.tool_lines
+                        .push(format!("{name} {summary} -> {status}: {result}"));
+                }
+            }
+            Some("assistant") => {
+                for block in message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+                {
+                    let (Some(id), Some(input)) =
+                        (block.get("id").and_then(Value::as_str), block.get("input"))
+                    else {
+                        continue;
+                    };
+                    let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                    let summary = super::redacted_tool_summary(&describe_tool_input(name, input));
+                    pending.insert(id.to_string(), (name.to_string(), summary));
+                }
+            }
+            _ => {}
+        }
+    }
     out
 }
 
@@ -3057,6 +3135,10 @@ impl AgentAdapter for ClaudeAdapter {
 
     fn structural_context(&self, jsonl: &str, last_n: usize) -> StructuralContext {
         structural_context(jsonl, last_n)
+    }
+
+    fn turn_activity(&self, jsonl: &str) -> TurnActivity {
+        turn_activity(jsonl)
     }
 
     fn model_hint(&self, jsonl: &str) -> Option<String> {
@@ -6613,6 +6695,59 @@ mod tests {
         assert!(ctx.files_modified.is_empty(), "a Read is never a write");
         assert_eq!(ctx.tool_errors.len(), 1);
         assert!(ctx.tool_errors[0].contains("boom"));
+    }
+
+    /// #939/#936: only the turn after the last real prompt counts; a tool call pairs with its
+    /// result by id, and an AskUserQuestion result is the operator's answer, not tool activity.
+    #[test]
+    fn turn_activity_pairs_calls_with_results_and_collects_operator_answers() {
+        let jsonl = concat!(
+            r#"{"type":"user","message":{"content":"old prompt"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"o","name":"Bash","input":{"command":"old cmd"}}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"o","content":"old out"}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"the real prompt"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b","name":"Bash","input":{"command":"cargo test"}},{"type":"tool_use","id":"q","name":"AskUserQuestion","input":{"questions":[{"question":"Ship?"}]}}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"q","content":"User answered: Ship?=yes"},{"type":"tool_result","tool_use_id":"b","content":"1 test failed","is_error":true}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":"Stop hook feedback: keep going"}}"#,
+            "\n"
+        );
+        let turn = turn_activity(jsonl);
+        assert_eq!(turn.answers, vec!["User answered: Ship?=yes"]);
+        assert_eq!(
+            turn.tool_lines,
+            vec!["Bash cargo test -> error: 1 test failed"]
+        );
+    }
+
+    /// A secret straddling the per-result cut is redacted before the cut, never left as a prefix.
+    #[test]
+    fn turn_activity_redacts_a_tool_result_before_cutting_it() {
+        let prose: String = (0..40)
+            .map(|n| format!("compiling module {n} finished without any warning, "))
+            .collect();
+        let result = format!(
+            "{} ghp_abcdefghijklmnopqrstuvwxyz123456",
+            &prose[..TURN_RESULT_CHARS - 6]
+        );
+        let jsonl = format!(
+            "{}\n{}\n{}\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b","name":"Bash","input":{"command":"env"}}]}}"#,
+            serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b","content":result}]}}),
+            ""
+        );
+        let turn = turn_activity(&jsonl);
+        assert_eq!(turn.tool_lines.len(), 1);
+        assert!(
+            !turn.tool_lines[0].contains("ghp_a"),
+            "{}",
+            turn.tool_lines[0]
+        );
     }
 
     /// Issue #280: `Edit`/`Write`/`MultiEdit`/`NotebookEdit` land in

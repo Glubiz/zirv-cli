@@ -369,7 +369,7 @@ impl ShadowTranscript {
         let Ok(mut stmt) = conn.prepare(query) else {
             return Ok(self.jsonl.clone());
         };
-        let column_names: Vec<String> = stmt.column_names().into_iter().map(String::from).collect();
+        let column_names: Vec<String> = stmt.column_names().map(String::from).collect();
         let Ok(mut rows) = stmt.query(rusqlite::params![cursor]) else {
             return Ok(self.jsonl.clone());
         };
