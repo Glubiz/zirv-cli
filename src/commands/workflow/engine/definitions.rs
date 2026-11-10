@@ -670,6 +670,15 @@ pub struct AcceptedPreexistingFindings {
     pub at: String,
     pub blocking: usize,
     pub total: usize,
+    /// Introduced blocking findings the operator dispositioned as false positives, with `reason`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub introduced: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// Select profile-specific step data while keeping canonical id, phase, dependencies and order; profile-invariant phases use the primary step. (#542)

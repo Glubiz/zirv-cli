@@ -1,6 +1,6 @@
 [package]
 name = "zirv"
-version = "4.68.1"
+version = "4.69.1"
 edition = "2024"
 authors = ["Jonathan Solskov <josj@zirv.io>"]
 description = "A CLI tool for executing developer-defined YAML scripts with support for interactive commands and OS-specific execution."
@@ -34,8 +34,8 @@ unicode-width = "0.2.2"
 # Local wall-clock time for the dashboard's limit reset times; already in
 # the tree transitively, so no new crates.
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
-rusqlite = { version = "0.40", features = ["bundled"] }
-rmcp = { version = "=3.3.0", default-features = false, features = ["server", "client", "transport-io", "transport-async-rw"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
+rmcp = { version = "=3.9.0", default-features = false, features = ["server", "client", "transport-io", "transport-async-rw"] }
 cap-std = "4.0.3"
 
 [dev-dependencies]

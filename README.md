@@ -1061,7 +1061,11 @@ validation/toolchain surfaces and high-signal Markdown sections. `--dry-run`
 changes nothing, `--source` accepts a Markdown file or directory (including an
 Obsidian vault), and a non-empty shared bank is refused unless `--merge` is
 passed; merge mode adds missing keys and never silently overwrites curated
-entries. `--max-entries` and `--max-bytes` cap initialization.
+entries. `--max-entries` and `--max-bytes` cap initialization. Every proposed entry goes
+through the shared-bank secret screen (dry run included): a refused entry is skipped and
+its key reported, the rest are written, and the exit code is non-zero only when nothing
+was written. `--json` prints the report with each proposed key, body and refusal reason,
+so `--dry-run --json` lets you review proposals first.
 
 Every verb defaults to the **private** (machine-local) bank; pass `--shared`
 to act on the **shared**, repository-owned bank instead — see
@@ -2908,6 +2912,11 @@ an exact path or `/**` prefix, an optional evidence value, and a reason.
 Repository waivers are advisory only: they can disposition advisory craft
 findings, but only the operator-owned file can waive a blocking accessibility
 finding.
+
+`zirv workflow advance --accept-preexisting-findings` accepts pre-existing
+blocking findings; `--accept-introduced-findings <REASON>` accepts introduced
+ones judged false positives (the reason is mandatory and recorded on the
+workflow; it also accepts pre-existing findings).
 
 [Glubiz/zirv-generic-frontend](https://github.com/Glubiz/zirv-generic-frontend)
 is the reference frontend template built against this contract — it is also
@@ -6618,7 +6627,7 @@ Hooks never call a model and never wait. A trigger checks local state and
 spawns one detached `zirv ctx supervisor consult` (evidence on its stdin) that runs a single
 `zirv ctx agent <harness> --mode read-only --quiet --json --task-class review` delegation with
 `-m <model>` (the delegation ledger records the spend). The reply must match the kind's strict
-format; one that does not produces no ruling, a logged fallback, and today's behaviour (`ask` reports a redacted, 500-byte excerpt of the reply in its error). A choice reply may wrap its `CHOICE: <n>` line in markdown, a code fence or prose, may name the option by letter (`B`), and may open with the offered option's own text (`done: verification complete. Diff inspected...`); two different picks are no ruling. A ruling is
+format; one that does not produces no ruling, a logged fallback, and today's behaviour (`ask` reports a redacted, 500-byte excerpt of the reply in its error). A choice reply may wrap its `CHOICE: <n>` line in markdown, a code fence or prose, may name the option by letter (`B`), and may open with the offered option's own text (`done: verification complete. Diff inspected...`) or its number (`2. not done: ...`); two different picks are no ruling. A ruling is
 stored in `<state>/supervisor/rulings/rulings.json` (`id`, `session`, optional `workflow`, `kind`,
 `verdict`, `reason` redacted and capped at `max_advice_bytes`, `ts`, `status` open, resolved or
 overridden or lapsed) and mailed to the session (sender and topic `supervisor`). A consult's own child session
@@ -6628,7 +6637,7 @@ unit of work (a plan text, a diffstat) is consulted on once, and the helper's ow
 | Kind | Reply format | Where it bites |
 |---|---|---|
 | plan | `APPROVE` or `REVISE: <reasons>` | asked when `zirv workflow advance` completes the plan step; while a `revise` is open, advancing any later step is refused with the reason. Revising the plan artifact and re-advancing the plan step asks again, and the new ruling supersedes the old |
-| done | `DONE` or `NOT_DONE: <what is missing>` | asked at the Stop hook once per distinct evidence unit (diffstat, commit, tracked changes, the latest `zirv verify`/`zirv test` record, commits since the session started in the repo's other linked worktrees, and the real commits the agent cites), with the task (the active workflow's objective, else the latest operator request) and that verification record's per-check results in the evidence; the agent can attach evidence without an operator override by stating it in its final message: that message goes to the consult as labelled untrusted data (never instructions), commit ids in it are resolved against git, and citing a new real commit or review link is new evidence that releases a standing `not_done` and consults fresh; the ruling's reason ends with the evidence sources it read (`git diff --stat HEAD`, linked worktree commits and the agent's final message when present, the active workflow's work folder or `none`, the verification record when one exists, and the task source). The helper is told to run single-line commands only, since a read-only sandbox has no writable temp directory for a shell here-document. A turn end while the session has running native subagents or its active workflow is before the verify step is not a completion claim: no consult, no block. While a `not_done` is open the Stop hook blocks with the reason, at most 3 times per ruling, unless the evidence has moved since (a new commit, edit or verification run), when the next stop consults fresh; the workflow's final step is refused. A later `done`, or an `ask` ruling of a `done` option when the offered options include a `not done` one, resolves it. Codex's Stop hook blocks the same way |
+| done | `DONE` or `NOT_DONE: <what is missing>` | asked at the Stop hook once per distinct evidence unit (diffstat, commit, tracked changes, the latest `zirv verify`/`zirv test` record, commits since the session started in the repo's other linked worktrees, and the real commits the agent cites), with the task (the active workflow's objective, else the latest operator request) and that verification record's per-check results in the evidence; the agent can attach evidence without an operator override by stating it in its final message: that message goes to the consult as labelled untrusted data (never instructions), commit ids in it are resolved against git, and citing a new real commit or review link is new evidence that releases a standing `not_done` and consults fresh. The evidence also carries the turn's tool calls with their results and the operator's `AskUserQuestion` answers, redacted, capped to the newest and inside the same untrusted frame. A changed final message alone, under an open `not_done` and unchanged git and verification state, also consults fresh, at most 2 times; after that the ruling replays and its reason says a commit, a tracked edit or a new `zirv verify` record reopens consults. A `done` ruling is recorded but not mailed (the seat already stopped). The ruling's reason ends with the evidence sources it read (`git diff --stat HEAD`, linked worktree commits and the agent's final message when present, the active workflow's work folder or `none`, the verification record when one exists, and the task source). The helper is told to run single-line commands only, since a read-only sandbox has no writable temp directory for a shell here-document. A turn end while the session has running native subagents or its active workflow is before the verify step is not a completion claim: no consult, no block. While a `not_done` is open the Stop hook blocks with the reason, at most 3 times per ruling, unless the evidence has moved since (a new commit, edit or verification run), when the next stop consults fresh; the workflow's final step is refused. A later `done`, or an `ask` ruling of a `done` option when the offered options include a `not done` one, resolves it. Codex's Stop hook blocks the same way |
 | retry | `RETRY` or `STOP: <reason>` | asked at the third failure of a tool-call streak, in place of the seat deciding; while a `stop` is open the tool-failure hook adds the ruling as context on each further failure, and a successful tool call ends it. It is advisory context, not a mechanical block (a hook cannot stop a tool), and a `retry` never lifts a Jev stop |
 | choice | `CHOICE: <n>` and an optional `REASON:` line | `zirv ctx supervisor ask` |
 

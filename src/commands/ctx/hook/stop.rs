@@ -67,7 +67,11 @@ fn claim_key(transcript: &str) -> String {
         .unwrap_or_default()
 }
 
-fn final_message(env: EnvLookup<'_>, transcript: &str) -> Option<String> {
+/// The transcript text and its adapter, for the Stop hook's lazy reads.
+fn read_transcript(
+    env: EnvLookup<'_>,
+    transcript: &str,
+) -> Option<(Box<dyn adapters::AgentAdapter>, String)> {
     if transcript.is_empty() {
         return None;
     }
@@ -77,10 +81,52 @@ fn final_message(env: EnvLookup<'_>, transcript: &str) -> Option<String> {
         &CtxConfig::default(),
     )
     .ok()?;
-    adapter.final_assistant_message(&std::fs::read_to_string(transcript).ok()?)
+    Some((adapter, std::fs::read_to_string(transcript).ok()?))
+}
+
+fn final_message(env: EnvLookup<'_>, transcript: &str) -> Option<String> {
+    let (adapter, jsonl) = read_transcript(env, transcript)?;
+    adapter.final_assistant_message(&jsonl)
+}
+
+fn turn_activity(
+    env: EnvLookup<'_>,
+    transcript: &str,
+) -> crate::commands::ctx::event::TurnActivity {
+    read_transcript(env, transcript)
+        .map(|(adapter, jsonl)| adapter.turn_activity(&jsonl))
+        .unwrap_or_default()
+}
+
+/// The task a before-done consult judges against, from the transcript at `transcript`.
+fn supervisor_task(
+    env: EnvLookup<'_>,
+    state: &StateDir,
+    cfg: &CtxConfig,
+    repo: &Path,
+    session: &str,
+    transcript: &str,
+) -> Option<(String, String)> {
+    let adapter = adapters::select_for_identity(
+        env(adapters::AGENT_ENV).as_deref().or(cfg.agent.as_deref()),
+        &[],
+        cfg,
+    )
+    .ok();
+    let jsonl = std::fs::read_to_string(transcript).unwrap_or_default();
+    crate::commands::ctx::supervisor::done_task(state, repo, session, &jsonl, adapter.as_deref())
 }
 
 pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
+    run_stop_with(w, stdin, env, &crate::commands::ctx::supervisor::real_spawn)
+}
+
+fn run_stop_with<W: Write>(
+    w: &mut W,
+    stdin: &str,
+    env: EnvLookup<'_>,
+    spawn: &dyn Fn(&crate::commands::ctx::supervisor::ConsultRequest) -> bool,
+) -> CtxResult<i32> {
     // Every early return is deliberate: a hook that errors must still exit 0.
     let Ok(payload) = HookPayload::parse(stdin) else {
         return Ok(0);
@@ -98,7 +144,7 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
     // three blocks per ruling is what stops the loop. The shape is the documented
     // `{"decision":"block","reason":...}` (https://code.claude.com/docs/en/hooks).
     let hook_session = env(SESSION_ENV).unwrap_or_else(|| payload.session_id.clone());
-    if let Some(reason) = crate::commands::ctx::supervisor::stop_block_claimed(
+    if let Some(reason) = crate::commands::ctx::supervisor::stop_block_with(
         env,
         &payload.repo(),
         &stable_short,
@@ -106,7 +152,21 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
         &crate::commands::ctx::supervisor::Claim {
             key: claim_key(&payload.transcript_path),
             read: &|| final_message(env, &payload.transcript_path),
+            turn: &|| turn_activity(env, &payload.transcript_path),
         },
+        &|| {
+            let state = StateDir::resolve(env).ok()?;
+            let cfg = CtxConfig::load_refusal_safe(&payload.repo(), env);
+            supervisor_task(
+                env,
+                &state,
+                &cfg,
+                &payload.repo(),
+                &stable_short,
+                &payload.transcript_path,
+            )
+        },
+        spawn,
     ) {
         let _ = writeln!(w, "{}", with_stop_block(None, &reason));
         return Ok(0);
@@ -331,25 +391,21 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
             &stable_short,
             &session,
             &|| {
-                let adapter = adapters::select_for_identity(
-                    env(adapters::AGENT_ENV).as_deref().or(cfg.agent.as_deref()),
-                    &[],
-                    &cfg,
-                )
-                .ok();
-                let jsonl = std::fs::read_to_string(transcript).unwrap_or_default();
-                crate::commands::ctx::supervisor::done_task(
+                supervisor_task(
+                    env,
                     &state,
+                    &cfg,
                     &repo,
                     &stable_short,
-                    &jsonl,
-                    adapter.as_deref(),
+                    &payload.transcript_path,
                 )
             },
             &crate::commands::ctx::supervisor::Claim {
                 key: claim_key(&payload.transcript_path),
                 read: &|| final_message(env, &payload.transcript_path),
+                turn: &|| turn_activity(env, &payload.transcript_path),
             },
+            spawn,
         );
     }
 
@@ -1437,6 +1493,74 @@ mod tests {
                 .as_str()
                 .unwrap_or_default()
                 .contains("tests are missing")
+        );
+    }
+
+    /// #935/#937/#940 review round: a continuation Stop (`stop_hook_active`) never reaches
+    /// `on_stop`, so when the final message changed the stop gate itself fires the fresh
+    /// before-done consult; if that cannot be spawned the ruling replays as before.
+    #[test]
+    fn a_changed_message_on_a_continuation_stop_fires_the_consult_or_replays_the_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+        let repo = git_repo();
+        std::fs::write(repo.path().join("tracked.txt"), "two\n").expect("write");
+        let transcript = dir.path().join("transcript.jsonl");
+        let say = |text: &str| {
+            let line = serde_json::json!({"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":text}]}});
+            let mut body = std::fs::read_to_string(&transcript).unwrap_or_default();
+            body.push_str(&format!("{line}\n"));
+            std::fs::write(&transcript, body).expect("write");
+        };
+        say("first claim");
+        let state = dir.path().join("state");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state.display().to_string(),
+            ),
+            (
+                "ZIRV_CTX_SUPERVISOR_ENABLED".to_string(),
+                "true".to_string(),
+            ),
+            ("ZIRV_CTX_SUPERVISOR_MODEL".to_string(), "m".to_string()),
+        ]
+        .into();
+        let stop = |active: bool, spawn: &dyn Fn(&crate::commands::ctx::supervisor::ConsultRequest) -> bool| {
+            let stdin = serde_json::json!({
+                "session_id": "s",
+                "transcript_path": transcript,
+                "cwd": repo.path(),
+                "stop_hook_active": active,
+            })
+            .to_string();
+            let mut out = Vec::new();
+            run_stop_with(&mut out, &stdin, &|k| env.get(k).cloned(), spawn).expect("runs");
+            String::from_utf8(out).expect("utf8")
+        };
+        let spawned = std::cell::Cell::new(0);
+        let count = |_: &crate::commands::ctx::supervisor::ConsultRequest| {
+            spawned.set(spawned.get() + 1);
+            true
+        };
+        stop(false, &count);
+        assert_eq!(spawned.get(), 1, "the first stop consults");
+        crate::commands::ctx::supervisor::record_for_test(
+            &StateDir::from_root(state),
+            &crate::commands::ctx::sessions::short_id("s"),
+            "tests are missing",
+        );
+
+        say("second claim");
+        let out = stop(true, &count);
+        assert_eq!(spawned.get(), 2, "a consult fires on the continuation stop");
+        assert!(out.trim().is_empty(), "no stale block: {out}");
+
+        say("third claim");
+        let out = stop(true, &|_| false);
+        assert!(
+            out.contains("tests are missing"),
+            "the block replays: {out}"
         );
     }
 

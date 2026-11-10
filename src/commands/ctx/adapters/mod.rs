@@ -639,6 +639,12 @@ pub trait AgentAdapter: std::fmt::Debug {
     fn parse_events(&self, jsonl: &str) -> Vec<NormalizedEvent>;
     fn structural_context(&self, jsonl: &str, last_n: usize) -> StructuralContext;
 
+    /// Tool calls and AskUserQuestion answers since the last operator prompt; empty for an
+    /// adapter whose transcript shape this does not parse.
+    fn turn_activity(&self, _jsonl: &str) -> super::event::TurnActivity {
+        super::event::TurnActivity::default()
+    }
+
     /// Final report text only; structural extraction excludes tool arguments.
     fn final_assistant_message(&self, jsonl: &str) -> Option<String> {
         self.structural_context(jsonl, 1).assistant_texts.pop()

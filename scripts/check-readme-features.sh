@@ -110,7 +110,7 @@ check_coverage() {
   while IFS= read -r verb; do
     [ -z "$verb" ] && continue
     total=$((total + 1))
-    if ! printf '%s\n' "$slice" | grep -qF "\`${verb}\`"; then
+    if ! grep -qF "\`${verb}\`" <<<"$slice"; then
       missing="${missing}${verb}\n"
     fi
   done <"$verbs_file"
