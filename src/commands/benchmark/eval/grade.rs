@@ -1,7 +1,7 @@
 //! Deterministic grading of a trace against a case's expectations. Pure: no I/O, no clock.
 
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::trace::{Trace, TraceCall};
@@ -24,7 +24,7 @@ pub struct CallExpect {
     pub args: Option<Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Check {
     pub label: String,
     pub passed: bool,

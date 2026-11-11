@@ -11,15 +11,16 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
 use super::CtxResult;
 use super::config::{CheckpointConfig, CtxConfig};
-use super::state::now_secs;
-use super::{sessions, worktree};
+use super::state::{StateDir, now_secs};
+use super::{agent, log, sessions, worktree};
 
 const REF_PREFIX: &str = "refs/zirv/checkpoints/";
 /// Nested repositories without commits that one capture will exclude before giving up.
@@ -63,6 +64,8 @@ impl std::fmt::Display for Skip {
 pub enum Kind {
     Baseline,
     Turn,
+    Final,
+    PreRestore,
 }
 
 impl Kind {
@@ -70,6 +73,8 @@ impl Kind {
         match self {
             Kind::Baseline => "baseline",
             Kind::Turn => "turn",
+            Kind::Final => "final",
+            Kind::PreRestore => "pre-restore",
         }
     }
 }
@@ -82,6 +87,8 @@ pub struct Request<'a> {
     pub agent: &'a str,
     /// Agent turn this snapshot follows; defaults to the sequence number.
     pub turn: Option<u64>,
+    /// Overrides the kind otherwise derived from whether the session has a checkpoint yet.
+    pub kind: Option<Kind>,
     pub cfg: &'a CheckpointConfig,
 }
 
@@ -359,11 +366,11 @@ fn capture_with(req: &Request<'_>, after_seq_read: &dyn Fn()) -> Result<Captured
     let existing = entries(&top, Some(&short)).map_err(|e| e.skip("for-each-ref"))?;
     let previous = existing.iter().max_by_key(|e| e.seq);
     let mut seq = previous.map_or(0, |e| e.seq.saturating_add(1));
-    let mut kind = if previous.is_none() {
+    let mut kind = req.kind.unwrap_or(if previous.is_none() {
         Kind::Baseline
     } else {
         Kind::Turn
-    };
+    });
     after_seq_read();
 
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -467,7 +474,7 @@ fn capture_with(req: &Request<'_>, after_seq_read: &dyn Fn()) -> Result<Captured
                 return Err(failure);
             }
             seq = seq.saturating_add(1);
-            kind = Kind::Turn;
+            kind = req.kind.unwrap_or(Kind::Turn);
         }
         return Err(Skip::Git {
             step: "update-ref".to_string(),
@@ -537,6 +544,16 @@ fn base_of(found: &[Entry], short: &str, seq: u64, head: &str) -> Option<String>
     }
 }
 
+/// The full commit message of `commit`, for its `Zirv-*` trailers.
+fn commit_message(repo: &Path, commit: &str) -> Result<String, RunErr> {
+    run_bounded(
+        git(repo, None).args(["log", "-1", "--format=%B", commit]),
+        READ_TIMEOUT,
+        READ_CAP,
+    )
+    .map(|(out, _)| out)
+}
+
 fn trailer(message: &str, key: &str) -> String {
     let prefix = format!("{key}: ");
     message
@@ -552,12 +569,7 @@ pub fn list(repo: &Path, short: Option<&str>) -> Result<Vec<Info>, String> {
     found.sort_by(|a, b| b.ts.cmp(&a.ts).then(b.seq.cmp(&a.seq)));
     let mut infos = Vec::new();
     for entry in found.clone() {
-        let (message, _) = run_bounded(
-            git(repo, None).args(["log", "-1", "--format=%B", &entry.commit]),
-            READ_TIMEOUT,
-            READ_CAP,
-        )
-        .map_err(|e| e.skip("log").to_string())?;
+        let message = commit_message(repo, &entry.commit).map_err(|e| e.skip("log").to_string())?;
         let head = trailer(&message, "Zirv-Head");
         let base = base_of(&found, &entry.short, entry.seq, &head);
         let mut numstat = git(repo, None);
@@ -639,12 +651,7 @@ pub fn diff(
         }
         None => {
             let commit = commit_of(spec)?;
-            let (message, _) = run_bounded(
-                git(repo, None).args(["log", "-1", "--format=%B", &commit]),
-                READ_TIMEOUT,
-                READ_CAP,
-            )
-            .map_err(|e| e.skip("log").to_string())?;
+            let message = commit_message(repo, &commit).map_err(|e| e.skip("log").to_string())?;
             let head = trailer(&message, "Zirv-Head");
             let seq: u64 = spec.trim().parse().unwrap_or_default();
             if let Some(base) = base_of(&found, short, seq, &head) {
@@ -654,6 +661,468 @@ pub fn diff(
         }
     }
     run_bounded(&mut cmd, READ_TIMEOUT, READ_CAP).map_err(|e| e.skip("diff-tree").to_string())
+}
+
+/// One pending request; a busy worker leaves later requests to coalesce into the next capture.
+const QUEUE_DEPTH: usize = 1;
+const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
+/// Off-thread capture for a supervisor loop: `request` only does a `try_send`,
+/// and every git process runs on the worker thread. Dropping it takes the
+/// final capture (waiting at most `capture_timeout_secs`).
+pub struct Checkpointer {
+    tx: Option<std::sync::mpsc::SyncSender<Option<u64>>>,
+    finish: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    wait: Duration,
+}
+
+#[derive(Clone)]
+struct Worker {
+    cfg: CheckpointConfig,
+    repo: PathBuf,
+    session: String,
+    agent: String,
+    verb: &'static str,
+    state: StateDir,
+    failures: u32,
+    disabled: bool,
+}
+
+impl Worker {
+    fn log(&self, action: &str, detail: &str) {
+        let _ = log::append(
+            &self.state,
+            &log::Decision {
+                ts: now_secs(),
+                session: &self.session,
+                verb: self.verb,
+                verdict: "n/a",
+                score: 0,
+                action,
+                detail,
+                observed_at: None,
+            },
+        );
+    }
+
+    fn run(&mut self, turn: Option<u64>, kind: Option<Kind>) {
+        if self.disabled {
+            return;
+        }
+        let request = Request {
+            repo: &self.repo,
+            session: &self.session,
+            agent: &self.agent,
+            turn,
+            kind,
+            cfg: &self.cfg,
+        };
+        let Err(skip) = capture(&request) else {
+            self.failures = 0;
+            return;
+        };
+        self.log("checkpoint-skipped", &skip.to_string());
+        if !matches!(skip, Skip::MidOperation(_)) {
+            self.failures += 1;
+        }
+        let permanent = matches!(skip, Skip::NotARepo(_) | Skip::Io(_) | Skip::BadSession);
+        if permanent || self.failures >= MAX_CONSECUTIVE_FAILURES {
+            self.disabled = true;
+            self.log(
+                "checkpoint-disabled",
+                "checkpoints are off for the rest of this run",
+            );
+        }
+    }
+}
+
+impl Checkpointer {
+    /// `None` unless `[checkpoint] enabled` resolved true (or the worker cannot start).
+    pub fn start(
+        cfg: &CheckpointConfig,
+        repo: &Path,
+        state: &StateDir,
+        session: &str,
+        agent: &str,
+        verb: &'static str,
+    ) -> Option<Self> {
+        if !cfg.enabled {
+            return None;
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Option<u64>>(QUEUE_DEPTH);
+        let finish = Arc::new(AtomicBool::new(false));
+        let mut worker = Worker {
+            cfg: cfg.clone(),
+            repo: repo.to_path_buf(),
+            session: session.to_string(),
+            agent: agent.to_string(),
+            verb,
+            state: state.clone(),
+            failures: 0,
+            disabled: false,
+        };
+        let on_spawn_failure = worker.clone();
+        let wants_final = Arc::clone(&finish);
+        let spawned = std::thread::Builder::new()
+            .name("zirv-checkpoint".to_string())
+            .spawn(move || {
+                while let Ok(turn) = rx.recv() {
+                    worker.run(turn, None);
+                }
+                if wants_final.load(Ordering::Acquire) {
+                    worker.run(None, Some(Kind::Final));
+                }
+            });
+        match spawned {
+            Ok(handle) => Some(Self {
+                tx: Some(tx),
+                finish,
+                worker: Some(handle),
+                wait: Duration::from_secs(cfg.capture_timeout_secs),
+            }),
+            Err(e) => {
+                on_spawn_failure.log("checkpoint-skipped", &format!("worker thread: {e}"));
+                None
+            }
+        }
+    }
+
+    /// Asks for a capture without ever waiting; dropped when one is already pending.
+    pub fn request(&self, turn: Option<u64>) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send(turn);
+        }
+    }
+}
+
+impl Drop for Checkpointer {
+    fn drop(&mut self) {
+        self.finish.store(true, Ordering::Release);
+        drop(self.tx.take());
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        let deadline = Instant::now() + self.wait;
+        while !worker.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if worker.is_finished() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Capped per-turn file changes of the newest other session that has turn
+/// checkpoints: one `checkpoint <seq>: M a, A b, +N more` line per turn.
+pub fn recent_turn_changes(
+    repo: &Path,
+    exclude_short: &str,
+    max_turns: usize,
+    max_files: usize,
+) -> Vec<String> {
+    let Ok(mut found) = entries(repo, None) else {
+        return Vec::new();
+    };
+    found.retain(|e| e.short != exclude_short);
+    let Some(newest) = found
+        .iter()
+        .filter(|e| e.seq > 0)
+        .max_by_key(|e| (e.ts, e.seq))
+    else {
+        return Vec::new();
+    };
+    let short = newest.short.clone();
+    let mut mine: Vec<&Entry> = found.iter().filter(|e| e.short == short).collect();
+    mine.sort_by_key(|e| e.seq);
+    let mut lines = Vec::new();
+    for pair in mine.windows(2).rev().take(max_turns) {
+        let [previous, next] = pair else { continue };
+        let Ok((out, _)) = run_bounded(
+            git(repo, None)
+                .args(["diff-tree", "-r", "--no-commit-id", "--name-status"])
+                .arg(&previous.commit)
+                .arg(&next.commit),
+            READ_TIMEOUT,
+            READ_CAP,
+        ) else {
+            continue;
+        };
+        let changes: Vec<String> = out
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .map(|(status, path)| format!("{status} {}", one_line(path)))
+            .collect();
+        if changes.is_empty() {
+            continue;
+        }
+        let hidden = changes.len().saturating_sub(max_files);
+        let mut shown = changes
+            .into_iter()
+            .take(max_files)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if hidden > 0 {
+            shown.push_str(&format!(", +{hidden} more"));
+        }
+        lines.push(format!("checkpoint {}: {shown}", next.seq));
+    }
+    lines.reverse();
+    lines
+}
+
+const RESTORE_TIMEOUT: Duration = Duration::from_secs(120);
+const PLAN_LINE_CAP: usize = 200;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    Unmanaged,
+    OtherOwner,
+    LiveSession,
+    WriterLease,
+}
+
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Pure: the first of the four restore conditions (design §5) that fails.
+/// `main` is the repository the managed worktree hangs off; a session in that
+/// main checkout works a different tree and does not overlap.
+fn restore_refusal(
+    cwd: &Path,
+    main: &Path,
+    record: Option<&worktree::WorktreeRecord>,
+    short: &str,
+    live_repos: &[PathBuf],
+    writer_trees: &[PathBuf],
+) -> Option<Refusal> {
+    let managed = record
+        .filter(|r| r.status != worktree::WorktreeStatus::Removed)
+        .filter(|_| agent::is_agent_managed_worktree(main, cwd));
+    let Some(record) = managed else {
+        return Some(Refusal::Unmanaged);
+    };
+    let owner = record.owner_session.as_deref().map(sessions::short_id);
+    if owner.as_deref() != Some(short) {
+        return Some(Refusal::OtherOwner);
+    }
+    let main = canonical(main);
+    let overlaps = |repo: &PathBuf| {
+        let repo = canonical(repo);
+        repo.starts_with(cwd) || (cwd.starts_with(&repo) && repo != main)
+    };
+    if live_repos.iter().any(overlaps) {
+        return Some(Refusal::LiveSession);
+    }
+    let key = super::permit::tree_key(cwd);
+    if writer_trees
+        .iter()
+        .any(|tree| super::permit::tree_key(&canonical(tree)) == key)
+    {
+        return Some(Refusal::WriterLease);
+    }
+    None
+}
+
+fn refusal_message(cwd: &Path, owner: &str) -> String {
+    format!(
+        "Restore refused: {} is not an isolated zirv worktree owned by session {owner} (or a live session still uses it). Checkpoints restore the whole checkout; stop the session, or use 'zirv ctx checkpoint diff' and revert by hand.",
+        cwd.display()
+    )
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RestorePlan {
+    pub overwrite: Vec<String>,
+    pub delete: Vec<String>,
+}
+
+fn nul_fields(out: &str) -> impl Iterator<Item = &str> {
+    out.split('\0').filter(|f| !f.is_empty())
+}
+
+/// What restoring `commit` would overwrite and delete in the checkout at `top`.
+fn restore_plan(top: &Path, commit: &str) -> Result<RestorePlan, String> {
+    let read = |args: &[&str]| -> Result<String, String> {
+        run_bounded(git(top, None).args(args), READ_TIMEOUT, READ_CAP * 16)
+            .map(|(out, _)| out)
+            .map_err(|e| e.skip("plan").to_string())
+    };
+    let mut overwrite = std::collections::BTreeSet::new();
+    let mut delete = std::collections::BTreeSet::new();
+    for scope in [None, Some("--cached")] {
+        let mut args = vec!["diff", "--name-status", "-z", "--no-renames"];
+        args.extend(scope);
+        args.push(commit);
+        let out = read(&args)?;
+        let mut fields = nul_fields(&out);
+        while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
+            match status {
+                "A" => delete.insert(path.to_string()),
+                _ => overwrite.insert(path.to_string()),
+            };
+        }
+    }
+    let kept = read(&["ls-tree", "-r", "--name-only", "-z", commit])?;
+    let kept: std::collections::BTreeSet<&str> = nul_fields(&kept).collect();
+    let untracked = read(&["ls-files", "-o", "--exclude-standard", "-z"])?;
+    for path in nul_fields(&untracked) {
+        if kept.contains(path) {
+            overwrite.insert(path.to_string());
+        } else {
+            delete.insert(path.to_string());
+        }
+    }
+    overwrite.retain(|p| !delete.contains(p));
+    Ok(RestorePlan {
+        overwrite: overwrite.into_iter().collect(),
+        delete: delete.into_iter().collect(),
+    })
+}
+
+fn write_plan<W: Write>(w: &mut W, plan: &RestorePlan) -> CtxResult<()> {
+    for (label, paths) in [("overwrite", &plan.overwrite), ("delete", &plan.delete)] {
+        for path in paths.iter().take(PLAN_LINE_CAP) {
+            writeln!(w, "would {label}: {path}")?;
+        }
+        if paths.len() > PLAN_LINE_CAP {
+            writeln!(w, "... and {} more to {label}", paths.len() - PLAN_LINE_CAP)?;
+        }
+    }
+    if plan.overwrite.is_empty() && plan.delete.is_empty() {
+        writeln!(w, "the work tree already matches this checkpoint")?;
+    }
+    Ok(())
+}
+
+/// What `restore` needs from outside the repository, injected so tests need no live sessions.
+pub struct RestoreContext<'a> {
+    pub state: &'a StateDir,
+    pub cfg: &'a CheckpointConfig,
+    pub live_repos: Vec<PathBuf>,
+    pub writer_trees: Vec<PathBuf>,
+}
+
+pub fn run_restore<W: Write>(
+    ctx: &RestoreContext<'_>,
+    cwd: &Path,
+    w: &mut W,
+    args: &RestoreArgs,
+) -> CtxResult<i32> {
+    let cwd = canonical(cwd);
+    let probe = run_bounded(
+        git(&cwd, None).args([
+            "rev-parse",
+            "--show-toplevel",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ]),
+        READ_TIMEOUT,
+        READ_CAP,
+    );
+    let probe = probe.map(|(out, _)| out).unwrap_or_default();
+    let mut lines = probe.lines();
+    let (Some(top), Some(common)) = (lines.next(), lines.next()) else {
+        writeln!(w, "{}", refusal_message(&cwd, "-"))?;
+        return Ok(1);
+    };
+    let top = canonical(Path::new(top));
+    let main = canonical(Path::new(common))
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let record = worktree::latest_for_path(ctx.state, &super::state::repo_slug(&main), &top);
+    let owner = record
+        .as_ref()
+        .and_then(|r| r.owner_session.clone())
+        .unwrap_or_else(|| "-".to_string());
+    let short = sessions::short_id(args.session.as_deref().unwrap_or(&owner));
+    if restore_refusal(
+        &top,
+        &main,
+        record.as_ref(),
+        &short,
+        &ctx.live_repos,
+        &ctx.writer_trees,
+    )
+    .is_some()
+    {
+        writeln!(w, "{}", refusal_message(&top, &owner))?;
+        return Ok(1);
+    }
+
+    let found = entries(&top, Some(&short)).map_err(|e| e.skip("for-each-ref").to_string())?;
+    let Some(target) = found.iter().find(|e| e.seq == args.seq) else {
+        writeln!(w, "no checkpoint {} for session {short}", args.seq)?;
+        return Ok(1);
+    };
+    // A sha, not the ref: the pre-restore capture's retention may drop the target's ref.
+    let commit = target.commit.clone();
+    let plan = restore_plan(&top, &commit)?;
+    writeln!(
+        w,
+        "restore checkpoint {short}/{} onto {}",
+        args.seq,
+        top.display()
+    )?;
+    write_plan(w, &plan)?;
+    if args.dry_run {
+        return Ok(0);
+    }
+    if !args.yes {
+        writeln!(
+            w,
+            "\nre-run with --yes to restore; files above are overwritten or deleted"
+        )?;
+        return Ok(2);
+    }
+
+    let pre = capture(&Request {
+        repo: &top,
+        session: &short,
+        agent: "restore",
+        turn: None,
+        kind: Some(Kind::PreRestore),
+        cfg: ctx.cfg,
+    });
+    match pre {
+        Ok(done) => writeln!(w, "pre-restore checkpoint {}/{}", done.short, done.seq)?,
+        Err(skip) => {
+            writeln!(w, "restore aborted, no pre-restore checkpoint: {skip}")?;
+            return Ok(1);
+        }
+    }
+    let source = format!("--source={commit}");
+    let steps: [&[&str]; 2] = [
+        &["restore", &source, "--worktree", "--staged", "--", "."],
+        &["clean", "-fd"],
+    ];
+    for step in steps {
+        if let Err(e) = run_bounded(git(&top, None).args(step), RESTORE_TIMEOUT, CAPTURE_CAP) {
+            writeln!(w, "restore failed: {}", e.skip("restore"))?;
+            return Ok(1);
+        }
+    }
+    let taken_on = trailer(
+        &commit_message(&top, &commit).unwrap_or_default(),
+        "Zirv-Head",
+    );
+    let head = run_bounded(
+        git(&top, None).args(["rev-parse", "--verify", "-q", "HEAD"]),
+        READ_TIMEOUT,
+        READ_CAP,
+    )
+    .map(|(out, _)| out.trim().to_string())
+    .unwrap_or_else(|_| "unborn".to_string());
+    if head != taken_on {
+        writeln!(
+            w,
+            "note: HEAD is {head} but the checkpoint was taken on {taken_on}; HEAD was not moved"
+        )?;
+    }
+    writeln!(w, "restored checkpoint {short}/{}", args.seq)?;
+    Ok(0)
 }
 
 #[derive(Debug, clap::Args)]
@@ -672,6 +1141,11 @@ pub enum CheckpointVerb {
     List(ListArgs),
     /// Show what a checkpoint changed: `<seq>` against its base, or `<a>..<b>`.
     Diff(DiffArgs),
+    /// Restore the whole checkout of a zirv-managed worktree to checkpoint
+    /// `<seq>`. Refused unless the worktree is owned by the checkpoint's
+    /// session and nothing live uses it; takes a pre-restore checkpoint first.
+    /// Never moves HEAD. Without `--yes` prints the plan and exits 2.
+    Restore(RestoreArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -703,6 +1177,21 @@ pub struct DiffArgs {
     pub stat: bool,
     #[arg(long)]
     pub name_status: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct RestoreArgs {
+    /// Checkpoint sequence number (see `zirv ctx checkpoint list`).
+    pub seq: u64,
+    /// Session id or short id; defaults to the worktree's owner.
+    #[arg(long)]
+    pub session: Option<String>,
+    /// List what would be overwritten or deleted, and change nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Perform the restore; without it the plan is printed and the exit code is 2.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 fn format_time(ts: u64) -> String {
@@ -742,6 +1231,7 @@ pub fn run_capture<W: Write>(
         session: &session,
         agent,
         turn: args.turn,
+        kind: None,
         cfg,
     };
     match capture(&request) {
@@ -869,6 +1359,26 @@ pub fn run<W: Write>(args: &CheckpointArgs, w: &mut W) -> CtxResult<i32> {
         }
         CheckpointVerb::List(a) => run_list(&repo, w, a, session),
         CheckpointVerb::Diff(a) => run_diff(&repo, w, a, session),
+        CheckpointVerb::Restore(a) => {
+            let state = StateDir::resolve(&env)?;
+            let cfg = CtxConfig::load(&repo, &env)?.checkpoint;
+            let live_repos = sessions::list(&state)
+                .into_iter()
+                .filter(|(_, liveness)| *liveness == sessions::Liveness::Live)
+                .map(|(record, _)| record.repo)
+                .collect();
+            let writer_trees = super::permit::live_writer_records(&state)
+                .into_iter()
+                .filter_map(|record| record.tree)
+                .collect();
+            let ctx = RestoreContext {
+                state: &state,
+                cfg: &cfg,
+                live_repos,
+                writer_trees,
+            };
+            run_restore(&ctx, &repo, w, a)
+        }
     }
 }
 
@@ -890,6 +1400,7 @@ mod tests {
             session,
             agent: "claude",
             turn: None,
+            kind: None,
             cfg,
         })
     }
@@ -1018,6 +1529,7 @@ mod tests {
             session: "sess1234abcd",
             agent: "claude",
             turn: Some(7),
+            kind: None,
             cfg: &cfg(),
         })
         .expect("second");
@@ -1322,6 +1834,7 @@ mod tests {
                 session: "sess1234abcd",
                 agent: "claude",
                 turn: None,
+                kind: None,
                 cfg: &cfg,
             },
             &rival,
@@ -1402,5 +1915,408 @@ mod tests {
                 "refs/zirv/checkpoints/bbbbbbbb/1"
             ]
         );
+    }
+
+    fn wait_for(what: &str, done: impl Fn() -> bool) {
+        for _ in 0..500 {
+            if done() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    fn kinds(dir: &Path, short: &str) -> Vec<String> {
+        let mut infos = list(dir, Some(short)).expect("list");
+        infos.sort_by_key(|i| i.seq);
+        infos.into_iter().map(|i| i.kind).collect()
+    }
+
+    #[test]
+    fn a_checkpointer_takes_baseline_turn_and_final_off_the_calling_thread() {
+        if !git_available() {
+            return;
+        }
+        let dir = repo();
+        let p = dir.path();
+        let state_dir = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let cp = Checkpointer::start(&cfg(), p, &state, "sess1234abcd", "claude", "wrap")
+            .expect("enabled config starts a checkpointer");
+        cp.request(None);
+        wait_for("the baseline", || kinds(p, "sess1234").len() == 1);
+        cp.request(Some(7));
+        wait_for("the turn capture", || kinds(p, "sess1234").len() == 2);
+        drop(cp);
+        assert_eq!(kinds(p, "sess1234"), ["baseline", "turn", "final"]);
+        let turn = list(p, Some("sess1234")).expect("list");
+        assert!(turn.iter().any(|i| i.turn == "7"), "{turn:?}");
+    }
+
+    #[test]
+    fn a_disabled_config_starts_no_checkpointer_and_writes_no_ref() {
+        if !git_available() {
+            return;
+        }
+        let dir = repo();
+        let state_dir = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let off = CheckpointConfig::default();
+        assert!(
+            Checkpointer::start(&off, dir.path(), &state, "sess1234abcd", "claude", "wrap")
+                .is_none()
+        );
+        assert!(list(dir.path(), None).expect("list").is_empty());
+    }
+
+    #[test]
+    fn a_failed_capture_is_logged_as_skipped_and_never_panics_or_blocks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_dir = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let cp = Checkpointer::start(&cfg(), dir.path(), &state, "sess1234abcd", "claude", "exec")
+            .expect("starts");
+        let began = Instant::now();
+        for turn in 0..200 {
+            cp.request(Some(turn));
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "request must only try_send"
+        );
+        drop(cp);
+        let logged = std::fs::read_to_string(state.logs().join(log::LOG_FILE)).expect("log");
+        assert!(logged.contains("checkpoint-skipped"), "{logged}");
+        assert!(logged.contains("not a git work tree"), "{logged}");
+        assert!(logged.contains("checkpoint-disabled"), "{logged}");
+    }
+
+    #[test]
+    fn recent_turn_changes_lists_files_per_turn_capped_and_skips_the_current_session() {
+        if !git_available() {
+            return;
+        }
+        let dir = repo();
+        let p = dir.path();
+        snap(p, "oldsess1abcd", &cfg()).expect("baseline");
+        std::fs::write(p.join("a.txt"), "two\n").expect("write");
+        std::fs::write(p.join("b.txt"), "b\n").expect("write");
+        std::fs::write(p.join("c.txt"), "c\n").expect("write");
+        snap(p, "oldsess1abcd", &cfg()).expect("turn");
+        snap(p, "newsess2abcd", &cfg()).expect("current baseline");
+
+        let lines = recent_turn_changes(p, "newsess2", 8, 2);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("checkpoint 1: "), "{lines:?}");
+        assert!(lines[0].ends_with(", +1 more"), "{lines:?}");
+        assert!(recent_turn_changes(p, "oldsess1", 8, 2).is_empty());
+    }
+
+    fn managed(owner: &str) -> (tempfile::TempDir, PathBuf, PathBuf, StateDir) {
+        let root = tempfile::tempdir().expect("tempdir");
+        let main = canonical(root.path()).join("main");
+        std::fs::create_dir_all(&main).expect("mkdir");
+        init_repo(&main);
+        commit(&main, "a.txt", "one\n", "init");
+        commit(&main, "keep.txt", "keep\n", "keep");
+        commit(&main, ".gitignore", "ignored.log\n", "ignore");
+        let wt = main.join(".zirv/worktrees/abcd1234");
+        assert!(git_ok(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "wt",
+                wt.to_str().expect("utf8")
+            ]
+        ));
+        let wt = canonical(&wt);
+        let state = StateDir::from_root(canonical(root.path()).join("state"));
+        worktree::append_record(
+            &state,
+            &super::super::state::repo_slug(&main),
+            &worktree::WorktreeRecord {
+                path: wt.to_string_lossy().to_string(),
+                branch: "wt".to_string(),
+                base_commit: "x".to_string(),
+                owner_session: Some(owner.to_string()),
+                owner_pid: None,
+                created_at: 1,
+                status: worktree::WorktreeStatus::Active,
+                note: None,
+                setup_digest: None,
+                idled_at: None,
+            },
+        )
+        .expect("record");
+        (root, main, wt, state)
+    }
+
+    fn restore_args(seq: u64, yes: bool, dry_run: bool) -> RestoreArgs {
+        RestoreArgs {
+            seq,
+            session: None,
+            dry_run,
+            yes,
+        }
+    }
+
+    fn restore_in(
+        state: &StateDir,
+        cwd: &Path,
+        args: &RestoreArgs,
+        live: Vec<PathBuf>,
+        writers: Vec<PathBuf>,
+    ) -> (i32, String) {
+        let cfg = cfg();
+        let ctx = RestoreContext {
+            state,
+            cfg: &cfg,
+            live_repos: live,
+            writer_trees: writers,
+        };
+        let mut out = Vec::new();
+        let code = run_restore(&ctx, cwd, &mut out, args).expect("run_restore");
+        (code, String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// A worktree with a checkpoint taken, then drifted from it three ways.
+    fn drifted(owner: &str) -> (tempfile::TempDir, PathBuf, PathBuf, StateDir) {
+        let (root, main, wt, state) = managed(owner);
+        std::fs::write(wt.join("a.txt"), "at checkpoint\n").expect("write");
+        std::fs::write(wt.join("wip.txt"), "wip\n").expect("write");
+        let done = snap(&wt, owner, &cfg()).expect("checkpoint");
+        assert_eq!(done.seq, 0);
+        std::fs::write(wt.join("a.txt"), "drifted\n").expect("write");
+        std::fs::remove_file(wt.join("keep.txt")).expect("rm tracked");
+        std::fs::remove_file(wt.join("wip.txt")).expect("rm");
+        std::fs::write(wt.join("added.txt"), "added after\n").expect("write");
+        assert!(git_ok(&wt, &["add", "added.txt"]));
+        std::fs::write(wt.join("untracked.txt"), "new\n").expect("write");
+        std::fs::write(wt.join("ignored.log"), "keep me\n").expect("write");
+        (root, main, wt, state)
+    }
+
+    const OWNER: &str = "ownersess1234";
+
+    #[test]
+    fn restore_without_yes_prints_the_plan_exits_2_and_changes_nothing() {
+        if !git_available() {
+            return;
+        }
+        let (_root, _main, wt, state) = drifted(OWNER);
+        let head = git_out(&wt, &["rev-parse", "HEAD"]);
+        let (code, out) = restore_in(&state, &wt, &restore_args(0, false, false), vec![], vec![]);
+        assert_eq!(code, 2, "{out}");
+        assert!(out.contains("would delete: untracked.txt"), "{out}");
+        assert!(out.contains("would delete: added.txt"), "{out}");
+        assert!(out.contains("would overwrite: a.txt"), "{out}");
+        assert!(out.contains("re-run with --yes"), "{out}");
+        assert!(!out.contains("ignored.log"), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("a.txt")).expect("read"),
+            "drifted\n"
+        );
+        assert!(wt.join("untracked.txt").exists());
+        assert_eq!(git_out(&wt, &["rev-parse", "HEAD"]), head);
+        assert_eq!(list(&wt, Some("ownerses")).expect("list").len(), 1);
+    }
+
+    #[test]
+    fn restore_dry_run_exits_0_and_writes_nothing() {
+        if !git_available() {
+            return;
+        }
+        let (_root, _main, wt, state) = drifted(OWNER);
+        let (code, out) = restore_in(&state, &wt, &restore_args(0, true, true), vec![], vec![]);
+        assert_eq!(code, 0, "{out}");
+        assert!(out.contains("would delete: untracked.txt"), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("a.txt")).expect("read"),
+            "drifted\n"
+        );
+        assert!(wt.join("untracked.txt").exists());
+        assert_eq!(list(&wt, Some("ownerses")).expect("list").len(), 1);
+    }
+
+    #[test]
+    fn restore_rewinds_files_deletes_added_and_untracked_keeps_ignored_and_head() {
+        if !git_available() {
+            return;
+        }
+        let (_root, _main, wt, state) = drifted(OWNER);
+        let head = git_out(&wt, &["rev-parse", "HEAD"]);
+        let (code, out) = restore_in(&state, &wt, &restore_args(0, true, false), vec![], vec![]);
+        assert_eq!(code, 0, "{out}");
+        let read = |f: &str| std::fs::read_to_string(wt.join(f)).ok();
+        assert_eq!(read("a.txt").as_deref(), Some("at checkpoint\n"));
+        assert_eq!(
+            read("keep.txt").as_deref(),
+            Some("keep\n"),
+            "deleted tracked file returns"
+        );
+        assert_eq!(
+            read("wip.txt").as_deref(),
+            Some("wip\n"),
+            "deleted untracked file returns"
+        );
+        assert_eq!(
+            read("untracked.txt"),
+            None,
+            "untracked non-ignored is cleaned"
+        );
+        assert_eq!(
+            read("ignored.log").as_deref(),
+            Some("keep me\n"),
+            "ignored is never cleaned"
+        );
+        assert_eq!(git_out(&wt, &["rev-parse", "HEAD"]), head);
+        assert!(
+            !out.contains("HEAD is"),
+            "HEAD matches the checkpoint: {out}"
+        );
+        assert_eq!(kinds(&wt, "ownerses"), ["baseline", "pre-restore"]);
+    }
+
+    #[test]
+    fn restore_deletes_a_tracked_file_that_the_checkpoint_does_not_contain() {
+        if !git_available() {
+            return;
+        }
+        let (_root, _main, wt, state) = drifted(OWNER);
+        assert!(git_ok(&wt, &["commit", "-q", "-m", "commit added"]));
+        assert!(wt.join("added.txt").exists());
+        let (code, out) = restore_in(&state, &wt, &restore_args(0, true, false), vec![], vec![]);
+        assert_eq!(code, 0, "{out}");
+        assert!(
+            !wt.join("added.txt").exists(),
+            "tracked file removed from the work tree"
+        );
+        assert!(
+            git_out(&wt, &["ls-files", "added.txt"]).is_empty(),
+            "and from the index"
+        );
+        assert!(
+            out.contains("note: HEAD is"),
+            "HEAD moved on, so say so: {out}"
+        );
+        let pre = list(&wt, Some("ownerses")).expect("list");
+        assert!(
+            pre.iter().any(|i| i.kind == "pre-restore"),
+            "a pre-restore checkpoint exists to undo this: {pre:?}"
+        );
+    }
+
+    fn assert_refused(code: i32, out: &str, wt: &Path, owner: &str) {
+        assert_eq!(code, 1, "{out}");
+        assert_eq!(out.trim_end(), refusal_message(wt, owner));
+        assert_eq!(
+            std::fs::read_to_string(wt.join("a.txt")).expect("read"),
+            "drifted\n",
+            "a refusal changes nothing"
+        );
+        assert!(wt.join("untracked.txt").exists());
+    }
+
+    #[test]
+    fn restore_is_refused_outside_a_zirv_managed_worktree() {
+        if !git_available() {
+            return;
+        }
+        let (_root, main, wt, state) = drifted(OWNER);
+        std::fs::write(main.join("a.txt"), "drifted\n").expect("write");
+        std::fs::write(main.join("untracked.txt"), "x\n").expect("write");
+        let (code, out) = restore_in(&state, &main, &restore_args(0, true, false), vec![], vec![]);
+        assert_refused(code, &out, &canonical(&main), "-");
+        // A linked worktree outside `<repo>/.zirv/worktrees/` is unmanaged too.
+        let elsewhere = canonical(main.parent().expect("parent")).join("elsewhere");
+        assert!(git_ok(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "other",
+                elsewhere.to_str().expect("utf8")
+            ]
+        ));
+        std::fs::write(elsewhere.join("a.txt"), "drifted\n").expect("write");
+        std::fs::write(elsewhere.join("untracked.txt"), "x\n").expect("write");
+        let (code, out) = restore_in(
+            &state,
+            &elsewhere,
+            &restore_args(0, true, false),
+            vec![],
+            vec![],
+        );
+        assert_refused(code, &out, &canonical(&elsewhere), "-");
+        drop(wt);
+    }
+
+    #[test]
+    fn restore_is_refused_when_the_worktree_belongs_to_another_session() {
+        if !git_available() {
+            return;
+        }
+        let (_root, _main, wt, state) = drifted(OWNER);
+        let args = RestoreArgs {
+            session: Some("othersess9999".to_string()),
+            ..restore_args(0, true, false)
+        };
+        let (code, out) = restore_in(&state, &wt, &args, vec![], vec![]);
+        assert_refused(code, &out, &wt, OWNER);
+    }
+
+    #[test]
+    fn restore_is_refused_while_a_live_session_uses_the_worktree_but_not_the_main_checkout() {
+        if !git_available() {
+            return;
+        }
+        let (_root, main, wt, state) = drifted(OWNER);
+        for repo in [
+            wt.clone(),
+            wt.join("sub"),
+            wt.parent().expect("parent").to_path_buf(),
+        ] {
+            let (code, out) = restore_in(
+                &state,
+                &wt,
+                &restore_args(0, true, false),
+                vec![repo],
+                vec![],
+            );
+            assert_refused(code, &out, &wt, OWNER);
+        }
+        let (code, out) = restore_in(
+            &state,
+            &wt,
+            &restore_args(0, true, false),
+            vec![main],
+            vec![],
+        );
+        assert_eq!(
+            code, 0,
+            "a session in the main checkout works a different tree: {out}"
+        );
+    }
+
+    #[test]
+    fn restore_is_refused_while_a_writer_lease_covers_the_worktree() {
+        if !git_available() {
+            return;
+        }
+        let (_root, _main, wt, state) = drifted(OWNER);
+        let (code, out) = restore_in(
+            &state,
+            &wt,
+            &restore_args(0, true, false),
+            vec![],
+            vec![wt.clone()],
+        );
+        assert_refused(code, &out, &wt, OWNER);
     }
 }

@@ -59,7 +59,7 @@ criterion).
 | `artifact show` | shared |  |
 | `benchmark` | shared |  |
 | `benchmark auto` | shared | unattended routing probe; launches installed harnesses through the same `ctx exec` path as `benchmark run`; owns no model-calling call site of its own |
-| `benchmark eval` | shared | behaviour evals (`lint`, `plan`, `run --dry-run`); paid replay not implemented; makes no model call |
+| `benchmark eval` | shared | behaviour evals; `lint`, `plan`, `report` and `run --dry-run` make no model call; `run --yes` launches installed harnesses through the same `ctx exec` path as `benchmark run` with every tool call denied; owns no model-calling call site of its own |
 | `benchmark plan` | shared | read-only; makes no model call |
 | `benchmark report` | shared | re-renders a stored run; makes no model call |
 | `benchmark run` | shared | launches installed harnesses solo through `ctx exec`; owns no model-calling call site of its own |
@@ -76,7 +76,7 @@ criterion).
 | `ctx supervisor` | shared | off-by-default supervisor: binding rulings that only narrow, from one read-only consult through `agent::run_with`; mail delivery; runtime-neutral |
 | `ctx ask` | N15 (#484) |  |
 | `ctx capabilities` | N14 (#483) | the available/unavailable/unverified integration report the native tool service and workflow admission both read; `--probe` verifies each configured MCP server, `--require` gates a script on the engine's own admission rule |
-| `ctx checkpoint` | shared | off-by-default per-turn git snapshots under `refs/zirv/checkpoints/`; makes no model call |
+| `ctx checkpoint` | shared | off-by-default per-turn git snapshots (`capture`/`list`/`diff`/`restore`) under `refs/zirv/checkpoints/`, taken off the supervision loop by `wrap` and `exec`; makes no model call |
 | `ctx chat` | N11 (#480) |  |
 | `ctx compile` | N06 (#475) | legacy composition stays unchanged; `runtime::context` separately compiles typed native instruction/data messages with provenance and hard-budget retention |
 | `ctx config` | shared |  |

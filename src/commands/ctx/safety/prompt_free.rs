@@ -630,6 +630,8 @@ mod tests {
         assert!(free("zirv benchmark eval run --dry-run"));
         assert!(free("zirv benchmark eval lint"));
         assert!(free("zirv benchmark eval plan"));
+        assert!(free("zirv benchmark eval report --json"));
+        assert!(!free("zirv benchmark eval run --yes --max-usd 1"));
         assert!(!free("zirv benchmark eval run"));
         assert!(!free("zirv benchmark eval run --case x"));
     }
