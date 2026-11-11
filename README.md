@@ -5445,6 +5445,7 @@ Effort defaults to `low` for every class (measured against Claude Code's `medium
 prompt_cache_ttl = "5m"          # "5m" | "1h", "5m" by default; ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL -- skipped when the operator's own env already sets CLAUDE_CODE_PROMPT_CACHE_TTL/FORCE_PROMPT_CACHING_5M/ENABLE_PROMPT_CACHING_1H
 lean = true                      # true by default; false restores auto-memory, bundled skills and the tools below. Adds "autoMemoryEnabled": false and "disableBundledSkills": true to the launch settings layer and denies the `Workflow` tool (else Claude Code inlines its authoring guide, ~6k tokens) plus `ScheduleWakeup`, `ShareOnboardingGuide`, `ListAgents`, `ReportFindings`, and `Agent` for worker/single roles; ZIRV_CTX_HEADLESS_LEAN
 disallowed_tools = []            # extra tool names appended to the launch's --disallowedTools; ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS (comma-separated)
+codex_app_server = false         # codex only, unix only: true runs a headless codex delegation's first turn over `codex app-server` instead of `codex exec`; ZIRV_CTX_HEADLESS_CODEX_APP_SERVER
 
 [headless.effort]
 trivial = "low"                  # low | medium | high | xhigh | max, "low" by default for all three classes; ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL
@@ -5465,6 +5466,19 @@ session, where a human is present, is untouched. With every key unset (the
 shipped default) a headless launch differs from one built before this table
 existed only by `CLAUDE_CODE_EFFORT_LEVEL=low`, `CLAUDE_CODE_PROMPT_CACHE_TTL=5m` and the lean tool/settings surface. A launch with no prompt text to
 classify uses the effort shared by all three classes.
+
+`codex_app_server` is the one key here that touches codex. When true, the
+first launch of a zirv-built `ctx exec --prompt` codex run speaks JSON-RPC to
+`codex app-server --listen stdio://` with the same program, config flags,
+sandbox, model, env and cwd, and reports the turn's token usage like a
+`codex exec` rollout. Any failure before `turn/start` is sent (no `--listen`,
+a spawn, handshake or `thread/start` error, or a launch flag with no
+app-server equivalent) is logged as an `app-server` `fallback` decision and
+the unchanged `codex exec` launches. Once `turn/start` is sent the prompt may
+be running, so every later failure (no ack in time, an error answer, EOF, a
+failed turn) kills the server and is a failed child for the usual
+restart/resume path; the prompt is never re-run through `codex exec`.
+Restarts always use `codex exec`.
 
 The classifier sees the request text only, so the class follows its size unless its wording classifies higher: 120 or more words, or 3 or more list items, is bounded; 300 or more words, or 8 or more items, is substantial; anything shorter is trivial. There is no `architectural` key: the same text-only classifier can never return that complexity (it needs real changed paths/lines to justify), so a request that would otherwise classify architectural reads the `substantial` value instead. The default `5m` TTL suits headless runs whose turns are seconds apart; a session that idles longer than five minutes between turns re-writes its cache at that turn (set `"1h"`).
 
@@ -5906,6 +5920,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `headless.effort.substantial` | `ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL` |
 | `headless.lean` | `ZIRV_CTX_HEADLESS_LEAN` |
 | `headless.disallowed_tools` | `ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS` |
+| `headless.codex_app_server` | `ZIRV_CTX_HEADLESS_CODEX_APP_SERVER` |
 | `approvals.inbox` | `ZIRV_CTX_APPROVALS_INBOX` |
 | `approvals.hold_secs` | `ZIRV_CTX_APPROVALS_HOLD_SECS` |
 | `obfuscate.mode` | `ZIRV_CTX_OBFUSCATE_MODE` |

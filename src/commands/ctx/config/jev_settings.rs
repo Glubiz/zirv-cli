@@ -215,6 +215,9 @@ pub struct HeadlessConfig {
     pub lean: bool,
     /// Additional headless `--disallowedTools` entries; empty by default.
     pub disallowed_tools: Vec<String>,
+    /// Run a headless codex delegation's first turn over `codex app-server`, falling back
+    /// to `codex exec` on any failure before `turn/start` is sent; unix only, `false` by default (#950).
+    pub codex_app_server: bool,
 }
 
 impl Default for HeadlessConfig {
@@ -224,6 +227,7 @@ impl Default for HeadlessConfig {
             effort: HeadlessEffortConfig::default(),
             lean: true,
             disallowed_tools: Vec::new(),
+            codex_app_server: false,
         }
     }
 }

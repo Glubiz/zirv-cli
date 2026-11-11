@@ -1039,6 +1039,12 @@ pub struct OutputTap {
 }
 
 impl OutputTap {
+    /// A tap fed by the codex app-server turn driver instead of `forward`. (#950)
+    #[cfg(unix)]
+    pub(crate) fn from_channel(rx: std::sync::mpsc::Receiver<String>) -> Self {
+        Self { rx }
+    }
+
     pub fn try_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         while let Ok(line) = self.rx.try_recv() {
