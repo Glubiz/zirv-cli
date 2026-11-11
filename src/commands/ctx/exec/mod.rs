@@ -459,6 +459,7 @@ fn run_with_clock_inner<W: Write>(
     if let Some(checkpointer) = &checkpointer {
         checkpointer.request(None);
     }
+    let _pr_watch = super::pr_watch::poller::Poller::start(&cfg, repo, &state, &registry_short);
     // Rebuild session identity for every child; export harness identity even
     // without a turn-signal socket.
     let turn_env_for = |session: &SessionId| {
