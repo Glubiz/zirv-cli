@@ -10,6 +10,8 @@ mod parse;
 mod run;
 mod store;
 
+pub(crate) use parse::parse_created_url;
+pub(crate) use run::register;
 pub use run::{PrArgs, run};
 
 use serde::{Deserialize, Serialize};

@@ -1,15 +1,14 @@
 //! The PostToolUse hook: payload types, obfuscation, and `run_posttool`.
 
 use std::io::Write;
-#[cfg(test)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use super::checkpoints::cfg_or_operator_only_gate;
 use super::permission::{attention_short, finding_kinds, hook_obfuscation_options};
 use super::scope_guard::scope_guard_shell_checkpoint_note;
+use crate::commands::ctx::adapters::SESSION_ENV;
 use crate::commands::ctx::config::EnvLookup;
 use crate::commands::ctx::state::{StateDir, now_secs, repo_slug};
 use crate::commands::ctx::{CtxResult, log};
@@ -290,6 +289,53 @@ fn obfuscated_posttool_response(
     None
 }
 
+/// Registers a PR/MR watch for the lead session when a successful `gh pr create` / `glab mr create` printed its URL. Silent: refusals and failures go to the decision log only.
+fn auto_register_pr_watch(
+    payload: &PostToolPayload,
+    cwd: &Path,
+    cfg: &crate::commands::ctx::config::CtxConfig,
+    env: EnvLookup<'_>,
+) {
+    use crate::commands::ctx::pr_watch;
+    if !matches!(payload.tool_name.as_str(), "Bash" | "PowerShell")
+        || !(cfg.pr_watch.enabled && cfg.pr_watch.auto_register)
+        || payload.tool_response.interrupted
+    {
+        return;
+    }
+    let command = &payload.tool_input.command;
+    let Some(url) = pr_watch::parse_created_url(command, &payload.tool_response.stdout)
+        .or_else(|| pr_watch::parse_created_url(command, &payload.tool_response.stderr))
+    else {
+        return;
+    };
+    let Some(owner) = env(SESSION_ENV)
+        .map(|raw| crate::commands::ctx::sessions::short_id(&raw))
+        .filter(|short| !short.is_empty())
+    else {
+        return;
+    };
+    let Ok(state) = StateDir::resolve(env) else {
+        return;
+    };
+    let Err(error) = pr_watch::register(&state, cwd, env, &owner, &url) else {
+        return;
+    };
+    let _ = log::append(
+        &state,
+        &log::Decision {
+            ts: now_secs(),
+            session: &payload.session_id,
+            verb: "hook",
+            verdict: "n/a",
+            score: 0,
+            action: "pr-watch-auto-register-refused",
+            detail: &error.to_string(),
+            observed_at: None,
+        },
+    );
+}
+
 /// Store original Bash output before replacing a large result with a
 /// retrievable summary. Any parse, storage or rendering failure passes the
 /// original output through unchanged (#326). Nothing here may `unwrap`,
@@ -352,6 +398,13 @@ pub fn run_posttool_with<W: Write>(
             .map(|(cwd, cfg)| (cwd, cfg)),
         env,
     );
+
+    // Claude-only auto-registration (#949): a failure must never reach stdout, stderr or the exit code.
+    if let (Some(payload), Some((cwd, cfg))) = (&parsed, &shared)
+        && payload.agent_id.is_empty()
+    {
+        auto_register_pr_watch(payload, cwd, cfg, env);
+    }
 
     // A tool call proves any pending permission prompt has resolved; clear attention and the
     // inbox record before every later early return, the masked branch included (#456).
@@ -2215,6 +2268,133 @@ mod tests {
             out
         };
         assert_eq!(run("true"), run("false"));
+    }
+
+    const WATCH_URL: &str = "https://github.com/acme/widgets/pull/12";
+    const WATCH_SESSION: &str = "abcdef12-3456-4789-8abc-def012345678";
+
+    /// One `gh pr create` PostToolUse in a repo whose remote is github.com; returns
+    /// (hook stdout, watched URLs of the calling session).
+    fn pr_create_hook(
+        extra_env: &[(&str, &str)],
+        (stdout, stderr): (&str, &str),
+        agent_id: &str,
+        interrupted: bool,
+    ) -> (Vec<u8>, Vec<String>) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        crate::commands::ctx::worktree::tests::init_repo(&repo);
+        assert!(crate::commands::ctx::worktree::tests::run(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/widgets.git"
+            ]
+        ));
+        let mut env = std::collections::HashMap::from([
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                tmp.path().join("state").display().to_string(),
+            ),
+            (SESSION_ENV.to_string(), WATCH_SESSION.to_string()),
+            ("ZIRV_CTX_PR_WATCH".to_string(), "true".to_string()),
+            (
+                "ZIRV_CTX_PR_WATCH_AUTO_REGISTER".to_string(),
+                "true".to_string(),
+            ),
+        ]);
+        env.extend(
+            extra_env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string())),
+        );
+        let lookup = |k: &str| env.get(k).cloned();
+        let stdin = serde_json::json!({
+            "session_id": WATCH_SESSION,
+            "cwd": repo.display().to_string(),
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push && gh pr create --fill"},
+            "tool_response": {"stdout": stdout, "stderr": stderr, "interrupted": interrupted, "isImage": false},
+            "tool_use_id": "toolu_pr",
+            "agent_id": agent_id,
+        })
+        .to_string();
+        let mut out = Vec::new();
+        let code = run_posttool(&mut out, &stdin, &lookup).expect("posttool");
+        assert_eq!(code, 0);
+        let state = StateDir::resolve(&lookup).expect("state");
+        let owner = crate::commands::ctx::sessions::short_id(WATCH_SESSION);
+        let dir = state.pr_watch().join(&owner);
+        let watched = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .filter_map(|e| {
+                let record: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(e.path()).ok()?).ok()?;
+                Some(record["url"].as_str()?.to_string())
+            })
+            .collect();
+        (out, watched)
+    }
+
+    #[test]
+    fn a_lead_turn_pr_create_registers_a_watch_for_the_calling_session() {
+        let (out, watched) = pr_create_hook(&[], (&format!("{WATCH_URL}\n"), ""), "", false);
+        assert_eq!(watched, [WATCH_URL]);
+        assert!(out.is_empty(), "registration is silent");
+    }
+
+    #[test]
+    fn a_url_printed_on_stderr_registers_too() {
+        let (_, watched) = pr_create_hook(&[], ("", &format!(" {WATCH_URL}\n")), "", false);
+        assert_eq!(watched, [WATCH_URL]);
+    }
+
+    /// The same call as the registering test (the control), with one gate closed.
+    fn assert_gate_blocks(env: &[(&str, &str)], agent: &str, interrupted: bool) {
+        let out = format!("{WATCH_URL}\n");
+        let (_, watched) = pr_create_hook(env, (&out, ""), agent, interrupted);
+        assert!(watched.is_empty(), "{env:?} {agent:?} {interrupted}");
+    }
+
+    #[test]
+    fn auto_registration_is_off_while_pr_watch_is_disabled() {
+        assert_gate_blocks(&[("ZIRV_CTX_PR_WATCH", "false")], "", false);
+    }
+
+    #[test]
+    fn auto_registration_is_off_without_auto_register() {
+        assert_gate_blocks(&[("ZIRV_CTX_PR_WATCH_AUTO_REGISTER", "false")], "", false);
+    }
+
+    #[test]
+    fn a_subagent_turn_registers_nothing() {
+        assert_gate_blocks(&[], "sub-agent-1", false);
+    }
+
+    #[test]
+    fn an_interrupted_call_registers_nothing() {
+        assert_gate_blocks(&[], "", true);
+    }
+
+    #[test]
+    fn a_foreign_host_is_refused_silently_with_the_no_pr_output() {
+        let (none, _) = pr_create_hook(&[], ("nothing created\n", ""), "", false);
+        let (foreign, watched) = pr_create_hook(
+            &[],
+            ("https://evil.example/acme/widgets/pull/1\n", ""),
+            "",
+            false,
+        );
+        assert!(watched.is_empty());
+        assert_eq!(foreign, none);
     }
 
     #[test]

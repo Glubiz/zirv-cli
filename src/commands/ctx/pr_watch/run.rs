@@ -94,41 +94,13 @@ pub(super) fn run_with<W: Write>(
 
     match &args.command {
         PrVerb::Watch(a) => {
-            let Some(pr) = parse::parse_url(&a.url) else {
-                return Err(format!("zirv ctx pr watch: '{}' is not a GitHub pull request or GitLab merge request URL (https, no port, no IP address)", a.url).into());
+            let said = match register(&state, repo, env, &owner, &a.url)? {
+                Registered::Already => format!("already watching {}", a.url),
+                Registered::Added(pr) => {
+                    format!("watching {} #{} on {}", pr.repo, pr.number, pr.host)
+                }
             };
-            if let Err(allowed) = trusted_host(repo, &pr.host) {
-                return Err(format!("zirv ctx pr watch: host '{}' is not a git remote host of this repository; allowed: {allowed}", pr.host).into());
-            }
-            if store::load(&state, &owner, &a.url).is_some() {
-                writeln!(w, "zirv ctx pr watch: already watching {}", a.url)?;
-                return Ok(0);
-            }
-            let now = now_secs();
-            store::save(
-                &state,
-                &WatchRecord {
-                    url: a.url.clone(),
-                    owner,
-                    repo: repo.to_path_buf(),
-                    repo_slug: repo_slug(repo),
-                    agent: env(AGENT_ENV).unwrap_or_else(|| "any".into()),
-                    viewer: None,
-                    state: WatchState::new(now),
-                    registered_at: now,
-                    last_polled: 0,
-                    wake_seq: 0,
-                    last_error: None,
-                    consecutive_failures: 0,
-                    not_found: 0,
-                    stopped: None,
-                },
-            )?;
-            writeln!(
-                w,
-                "zirv ctx pr watch: watching {} #{} on {}",
-                pr.repo, pr.number, pr.host
-            )?;
+            writeln!(w, "zirv ctx pr watch: {said}")?;
             Ok(0)
         }
         PrVerb::Unwatch(a) => {
@@ -174,6 +146,52 @@ pub(super) fn run_with<W: Write>(
             Ok(0)
         }
     }
+}
+
+/// What [`register`] did.
+pub(crate) enum Registered {
+    Added(PrRef),
+    Already,
+}
+
+/// Validates `url` (https PR/MR, no port, no IP literal, host equals a git remote host of `repo`) and saves a watch for `owner`; the verb and the PostToolUse hook share it. Callers check `pr_watch.enabled`.
+pub(crate) fn register(
+    state: &StateDir,
+    repo: &Path,
+    env: EnvLookup<'_>,
+    owner: &str,
+    url: &str,
+) -> CtxResult<Registered> {
+    let Some(pr) = parse::parse_url(url) else {
+        return Err(format!("zirv ctx pr watch: '{url}' is not a GitHub pull request or GitLab merge request URL (https, no port, no IP address)").into());
+    };
+    if let Err(allowed) = trusted_host(repo, &pr.host) {
+        return Err(format!("zirv ctx pr watch: host '{}' is not a git remote host of this repository; allowed: {allowed}", pr.host).into());
+    }
+    if store::load(state, owner, url).is_some() {
+        return Ok(Registered::Already);
+    }
+    let now = now_secs();
+    store::save(
+        state,
+        &WatchRecord {
+            url: url.to_string(),
+            owner: owner.to_string(),
+            repo: repo.to_path_buf(),
+            repo_slug: repo_slug(repo),
+            agent: env(AGENT_ENV).unwrap_or_else(|| "any".into()),
+            viewer: None,
+            state: WatchState::new(now),
+            registered_at: now,
+            last_polled: 0,
+            wake_seq: 0,
+            last_error: None,
+            consecutive_failures: 0,
+            not_found: 0,
+            stopped: None,
+        },
+    )?;
+    Ok(Registered::Added(pr))
 }
 
 /// Ok when `host` equals a host of one of `repo`'s git remotes; otherwise Err with the allowed hosts.
