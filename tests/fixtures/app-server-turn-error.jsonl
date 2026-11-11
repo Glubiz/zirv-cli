@@ -1,0 +1,11 @@
+# The turn starts, then fails. '>' client sends, '<' server emits.
+> {"id":1,"method":"initialize","params":{"clientInfo":{"name":"zirv","version":"0.0.0"},"capabilities":{"experimentalApi":false}}}
+< {"id":1,"result":{"userAgent":"fake/0","codexHome":"/tmp/codex","platformFamily":"unix","platformOs":"linux"}}
+> {"method":"initialized"}
+> {"id":2,"method":"thread/start","params":{"approvalPolicy":"never","cwd":"/repo","sandbox":"workspace-write"}}
+< {"id":2,"result":{"thread":{"id":"thr-1","turns":[]},"model":"fake","approvalPolicy":"never"}}
+> {"id":3,"method":"turn/start","params":{"threadId":"thr-1","input":[{"type":"text","text":"do the work","text_elements":[]}]}}
+< {"id":3,"result":{"turn":{"id":"turn-1","items":[],"status":"inProgress"}}}
+< {"method":"error","params":{"threadId":"thr-1","turnId":"turn-1","willRetry":true,"error":{"message":"reconnecting 1/5"}}}
+< {"method":"error","params":{"threadId":"thr-1","turnId":"turn-1","willRetry":false,"error":{"message":"stream disconnected before completion"}}}
+< {"method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","items":[],"status":"failed","error":{"message":"stream disconnected before completion"}}}}

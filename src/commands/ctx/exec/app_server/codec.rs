@@ -65,11 +65,16 @@ pub enum ClientRequest {
         experimental_api: bool,
     },
     ThreadStart(Value),
+    // Resume, steer, interrupt and rate limits are sent by later #950 slices.
+    #[allow(dead_code)]
     ThreadResume(Value),
     TurnStart(Value),
+    #[allow(dead_code)]
     TurnSteer(Value),
+    #[allow(dead_code)]
     TurnInterrupt(Value),
     /// No params in the schema.
+    #[allow(dead_code)]
     RateLimitsRead,
 }
 
@@ -132,13 +137,26 @@ pub fn encode_initialized() -> Result<String, CodecError> {
     to_line(frame)
 }
 
-/// Answer to a server request, echoing the server's id.
-pub fn encode_response(id: &RequestId, result: Value) -> Result<String, CodecError> {
+fn answer(id: &RequestId, key: &str, value: Value) -> Result<String, CodecError> {
     let id = serde_json::to_value(id).map_err(|e| CodecError::Encode(e.to_string()))?;
     let mut frame = Map::new();
     frame.insert("id".into(), id);
-    frame.insert("result".into(), result);
+    frame.insert(key.into(), value);
     to_line(frame)
+}
+
+/// Answer to a server request, echoing the server's id.
+pub fn encode_response(id: &RequestId, result: Value) -> Result<String, CodecError> {
+    answer(id, "result", result)
+}
+
+/// Error answer to a server request, echoing the server's id.
+pub fn encode_error_response(
+    id: &RequestId,
+    code: i64,
+    message: &str,
+) -> Result<String, CodecError> {
+    answer(id, "error", json!({"code": code, "message": message}))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -295,6 +313,7 @@ impl Correlator {
         Ok(Some(Resolved { method, outcome }))
     }
 
+    #[cfg(test)]
     pub fn in_flight(&self) -> usize {
         self.pending.len()
     }
@@ -423,6 +442,10 @@ mod tests {
             encode_response(&RequestId::Str("a".into()), json!({"decision":"decline"})).unwrap();
         let v: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v, json!({"id":"a","result":{"decision":"decline"}}));
+        let line = encode_error_response(&RequestId::Num(4), -32000, "no").unwrap();
+        assert_eq!(line.matches('\n').count(), 1);
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v, json!({"id":4,"error":{"code":-32000,"message":"no"}}));
     }
 
     #[test]

@@ -1240,6 +1240,11 @@ pub(super) const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Bool,
     ),
     (
+        "ZIRV_CTX_HEADLESS_CODEX_APP_SERVER",
+        &["headless", "codex_app_server"],
+        EnvKind::Bool,
+    ),
+    (
         "ZIRV_CTX_APPROVALS_INBOX",
         &["approvals", "inbox"],
         EnvKind::Bool,
@@ -2142,6 +2147,10 @@ pub(super) const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["headless", "disallowed_tools"],
         "ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS",
+    ),
+    (
+        &["headless", "codex_app_server"],
+        "ZIRV_CTX_HEADLESS_CODEX_APP_SERVER",
     ),
 ];
 
