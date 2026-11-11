@@ -163,17 +163,32 @@ pub(super) fn run_with<W: Write>(
             if !cfg.mail.enabled {
                 return Err("zirv ctx pr poll: mail is disabled (mail.enabled = false); wakes are delivered as mail".into());
             }
-            let limits = Limits {
-                no_checks_secs: cfg.pr_watch.no_checks_minutes * 60,
-                max_wakes: cfg.pr_watch.max_wakes,
-            };
-            for rec in store::list(&state, &owner) {
-                let line = poll_one(&state, &cfg, env, &owner, &rec.url, &limits)?;
-                writeln!(w, "{}: {line}", rec.url)?;
-            }
+            poll_session(&state, &cfg, env, &owner, &mut |url, line| {
+                writeln!(w, "{url}: {line}")?;
+                Ok(())
+            })?;
             Ok(0)
         }
     }
+}
+
+/// Reads every watch of `owner` once, one at a time, reporting `(url, outcome)` to `each` as it goes.
+pub(super) fn poll_session(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    env: EnvLookup<'_>,
+    owner: &str,
+    each: &mut dyn FnMut(&str, &str) -> CtxResult<()>,
+) -> CtxResult<()> {
+    let limits = Limits {
+        no_checks_secs: cfg.pr_watch.no_checks_minutes * 60,
+        max_wakes: cfg.pr_watch.max_wakes,
+    };
+    for rec in store::list(state, owner) {
+        let line = poll_one(state, cfg, env, owner, &rec.url, &limits)?;
+        each(&rec.url, &line)?;
+    }
+    Ok(())
 }
 
 /// Ok when `host` equals a host of one of `repo`'s git remotes; otherwise Err with the allowed hosts.
@@ -440,31 +455,31 @@ fn fetch_gitlab(env: EnvLookup<'_>, rec: &WatchRecord, pr: &PrRef) -> Result<Fet
 
 #[cfg(test)]
 #[cfg(unix)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
-    const GH_URL: &str = "https://github.com/acme/widgets/pull/12";
+    pub(in super::super) const GH_URL: &str = "https://github.com/acme/widgets/pull/12";
     const GL_URL: &str = "https://gitlab.example.com/group/sub/proj/-/merge_requests/7";
-    const OWNER: &str = "abcd1234";
+    pub(in super::super) const OWNER: &str = "abcd1234";
 
     fn fixtures() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pr-watch")
     }
 
-    struct Rig {
-        _root: tempfile::TempDir,
-        bin: PathBuf,
+    pub(in super::super) struct Rig {
+        pub(in super::super) _root: tempfile::TempDir,
+        pub(in super::super) bin: PathBuf,
         state_root: PathBuf,
-        repo: PathBuf,
-        env: HashMap<String, String>,
+        pub(in super::super) repo: PathBuf,
+        pub(in super::super) env: HashMap<String, String>,
         _home: crate::commands::ctx::testenv::HomeGuard,
     }
 
     impl Rig {
-        fn new() -> Self {
+        pub(in super::super) fn new() -> Self {
             let root = tempfile::tempdir().expect("tempdir");
             let home = root.path().join("home");
             let bin = root.path().join("bin");
@@ -499,7 +514,7 @@ mod tests {
         }
 
         /// A fake CLI on the injected PATH: `body` is a sh `case` over "$1 $2".
-        fn shim(&self, name: &str, body: &str) {
+        pub(in super::super) fn shim(&self, name: &str, body: &str) {
             let path = self.bin.join(name);
             std::fs::write(
                 &path,
@@ -513,7 +528,7 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
 
-        fn gh_shim(&self, view: &str) {
+        pub(in super::super) fn gh_shim(&self, view: &str) {
             self.shim(
                 "gh",
                 &format!(
@@ -526,11 +541,11 @@ mod tests {
             );
         }
 
-        fn lookup(&self) -> impl Fn(&str) -> Option<String> + '_ {
+        pub(in super::super) fn lookup(&self) -> impl Fn(&str) -> Option<String> + '_ {
             |key| self.env.get(key).cloned()
         }
 
-        fn state(&self) -> StateDir {
+        pub(in super::super) fn state(&self) -> StateDir {
             StateDir::from_root(self.state_root.clone())
         }
 
@@ -558,7 +573,7 @@ mod tests {
             }
         }
 
-        fn watch(&self, url: &str) {
+        pub(in super::super) fn watch(&self, url: &str) {
             self.pr(PrVerb::Watch(Self::url_args(url))).expect("watch");
             // Fixture comments predate "now": make them news.
             let mut rec = store::load(&self.state(), OWNER, url).expect("record");
@@ -566,7 +581,7 @@ mod tests {
             store::save(&self.state(), &rec).expect("save");
         }
 
-        fn poll(&self) -> String {
+        pub(in super::super) fn poll(&self) -> String {
             self.pr(PrVerb::Poll(Self::session_args())).expect("poll")
         }
 
@@ -575,7 +590,7 @@ mod tests {
             assert!(said.contains("wake(s) mailed"), "{said}");
         }
 
-        fn mails(&self) -> Vec<(PathBuf, Message)> {
+        pub(in super::super) fn mails(&self) -> Vec<(PathBuf, Message)> {
             mail::list(&self.state(), &repo_slug(&self.repo), None, Some(OWNER)).unwrap_or_default()
         }
     }

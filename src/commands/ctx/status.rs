@@ -16,6 +16,7 @@ use super::mail;
 use super::memory;
 use super::permit;
 use super::pool;
+use super::pr_watch;
 use super::price;
 use super::runtime::compaction;
 use super::runtime::journal::Journal;
@@ -1884,6 +1885,15 @@ fn render_report<W: Write>(
                     )
                 )?;
             }
+        }
+
+        if let Some(line) = pr_watch::poller::status_line(cfg, &state) {
+            writeln!(
+                w,
+                "{} {}",
+                label(colour, "pr watch:"),
+                style::paint(&line, Tone::Muted, colour)
+            )?;
         }
     }
 

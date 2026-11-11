@@ -7,6 +7,7 @@
 //! injected, so identical inputs give identical verdicts.
 
 mod parse;
+pub mod poller;
 mod run;
 mod store;
 

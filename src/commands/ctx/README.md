@@ -13,7 +13,7 @@ confusingly similar names, so they get a dedicated doc instead:
 - [`SESSIONS.md`](SESSIONS.md) -- `sessions.rs` vs `session/` vs `dash/`,
   three different things all named "session".
 - `checkpoint.rs` -- per-turn git snapshots under `refs/zirv/checkpoints/` (`zirv ctx checkpoint`).
-- `pr_watch.rs` + `pr_watch/` -- PR/MR watch: `parse.rs` (gh/glab output), `store.rs` (per-session records), `run.rs` (poll sweep).
+- `pr_watch.rs` + `pr_watch/` -- PR/MR watch: `parse.rs` (gh/glab output), `store.rs` (per-session records), `run.rs` (poll sweep), `poller.rs` (background `pr-watch` thread, backoff, status line).
 
 For which files need extra review scrutiny (PTY/subprocess spawn, argv
 construction, permission/safety decisions), see [`SECURITY.md`](../../../SECURITY.md#critical-files).

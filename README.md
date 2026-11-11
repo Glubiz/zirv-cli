@@ -1311,8 +1311,22 @@ commit resets what was already reported; your own comments are ignored;
 (`no_cli`, `auth`, `not_found`, `rate_limited`, `transient`, `untrusted_host`) are recorded as
 `last_error` and shown by `list`, never mailed; two `not_found` in a row or
 eight failures in a row stop the watch. Records live under
-`<state>/pr-watch/<session short>/`. No background poller exists yet: `poll` is
-the only trigger.
+`<state>/pr-watch/<session short>/`.
+
+A background poller (thread `pr-watch`) runs the same sweep for you. Each
+supervised `wrap` session and each headless `exec` run starts one, only when
+`[pr_watch] enabled` and `[mail] enabled` are both true (wrap also skips
+degraded `--no-supervise` sessions); it stops with the session and never
+touches it. It reads one watch at a time, then waits `interval_secs` (floor
+60, jittered up to 20% shorter). Backoff: `no_cli` and `auth` wait 30 minutes,
+`rate_limited` doubles the wait, `transient` backs off exponentially, all
+capped at 30 minutes and reset by a clean sweep; eight consecutive failed
+reads stop that watch (`stopped: failures`). Failures are never mailed: see
+`last_error` and the stopped reason in `zirv ctx pr list`, and the `pr watch:`
+line of `zirv ctx status` (watch count, error kinds, stop reasons; shown only
+while the feature is enabled). Wakes arrive through the normal mail path, so
+an idle wrap session is advised and a headless run sees them in its next
+nudge. Poller faults are logged to `decisions.jsonl` as `pr-watch` rows.
 
 ```toml
 [pr_watch]
