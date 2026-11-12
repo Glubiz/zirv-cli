@@ -2013,6 +2013,38 @@ mod tests {
         assert!(recent_turn_changes(p, "oldsess1", 8, 2).is_empty());
     }
 
+    #[test]
+    fn a_same_size_edit_racing_the_index_write_is_captured() {
+        if !git_available() {
+            return;
+        }
+        let dir = repo();
+        let p = dir.path();
+        let t0 = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let set_mtime = |path: &Path| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .and_then(|f| f.set_modified(t0))
+                .expect("set mtime");
+        };
+        git_out(p, &["config", "core.checkStat", "minimal"]);
+        set_mtime(&p.join("a.txt"));
+        git_out(p, &["update-index", "--refresh"]);
+        snap(p, "racesess1abc", &cfg()).expect("baseline");
+        // Same size, same mtime as the index entry, and the index is no newer
+        // than the file: only the racy-git re-hash can see the change.
+        std::fs::write(p.join("a.txt"), "two\n").expect("write");
+        set_mtime(&p.join("a.txt"));
+        set_mtime(&p.join(".git/index"));
+        let turn = snap(p, "racesess1abc", &cfg()).expect("turn");
+        assert_eq!(
+            show(p, &turn.commit, "a.txt").as_deref(),
+            Some("two\n"),
+            "the racy same-size edit must be in the checkpoint"
+        );
+    }
+
     fn managed(owner: &str) -> (tempfile::TempDir, PathBuf, PathBuf, StateDir) {
         let root = tempfile::tempdir().expect("tempdir");
         let main = canonical(root.path()).join("main");
