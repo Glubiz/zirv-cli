@@ -447,6 +447,17 @@ pub fn run_with(
     if let Some(checkpointer) = &checkpointer {
         checkpointer.request(None);
     }
+    // Same gate as mail polling: wakes are mail, and a degraded session promises passthrough.
+    let session_short = super::sessions::short_id(session.as_str());
+    let pr_watch = if super::mail_watch::mail_polling_enabled(
+        cfg.mail.enabled,
+        &session_short,
+        supervision.degraded,
+    ) {
+        super::pr_watch::poller::Poller::start(&cfg, repo, &state_dir, &session_short)
+    } else {
+        None
+    };
 
     let mut child = pair.slave.spawn_command(command).map_err(|error| {
         format!(
@@ -639,6 +650,7 @@ pub fn run_with(
     child_guard.release();
     // Final capture; waits at most `capture_timeout_secs` and never fails the exit.
     drop(checkpointer);
+    drop(pr_watch);
     if native_successor.is_some() {
         session_guard.disown();
     } else {

@@ -7,10 +7,13 @@
 //! injected, so identical inputs give identical verdicts.
 
 mod parse;
+pub mod poller;
 mod run;
 mod store;
 
+pub(crate) use parse::parse_created_url;
 pub use run::{PrArgs, run};
+pub(crate) use run::{register, url_names_repo};
 
 use serde::{Deserialize, Serialize};
 

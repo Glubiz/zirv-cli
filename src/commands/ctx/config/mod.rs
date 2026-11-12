@@ -3010,6 +3010,8 @@ mod tests {
                 "[headless]\ndisallowed_tools = [\"WebFetch\"]\n",
                 "disallowed_tools",
             ),
+            // #950: a repo can never opt itself into the app-server transport.
+            ("[headless]\ncodex_app_server = true\n", "codex_app_server"),
             ("[headless.effort]\ntrivial = \"low\"\n", "effort.trivial"),
             (
                 "[headless.effort]\nbounded = \"medium\"\n",
@@ -3098,6 +3100,29 @@ mod tests {
         assert_eq!(cfg.headless.prompt_cache_ttl.as_deref(), Some("5m"));
         let cfg = CtxConfig::load(repo.path(), &|_| None).expect("load");
         assert!(cfg.headless.lean);
+    }
+
+    /// #950: the codex app-server transport is off unless the operator turns it on.
+    #[test]
+    fn codex_app_server_is_off_by_default_and_operator_settable() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let cfg = CtxConfig::load(repo.path(), &|_| None).expect("load");
+        assert!(!cfg.headless.codex_app_server);
+
+        let env = env_map(&[("ZIRV_CTX_HEADLESS_CODEX_APP_SERVER", "true")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(cfg.headless.codex_app_server);
+
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[headless]\ncodex_app_server = true\n",
+        )
+        .expect("write");
+        let cfg = CtxConfig::load(repo.path(), &|_| None).expect("load");
+        assert!(cfg.headless.codex_app_server);
     }
 
     /// `headless.prompt_cache_ttl` and `headless.effort.*` are constrained to

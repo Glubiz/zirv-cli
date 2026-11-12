@@ -8,13 +8,13 @@ use super::{Check, CheckStatus, Comment, Lifecycle, Mergeability};
 use crate::commands::ctx::window::parse_rfc3339_utc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Forge {
+pub(crate) enum Forge {
     Github,
     Gitlab,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct PrRef {
+pub(crate) struct PrRef {
     pub forge: Forge,
     pub host: String,
     /// `owner/repo` or the full GitLab group path.
@@ -104,6 +104,156 @@ pub(super) fn parse_url(url: &str) -> Option<PrRef> {
     None
 }
 
+/// The PR/MR URL a successful `gh pr create` / `glab mr create` printed to `stdout`, when `command` really invokes one (env prefixes and `&&`/`;`/`|` chains allowed; quoted, echoed or heredoc text never matches). Both CLIs print the URL alone on their last line, so only that line counts; `parse_url` still gates it and the forge must match the CLI.
+pub(crate) fn parse_created_url(command: &str, stdout: &str) -> Option<String> {
+    let (forge, _) = created_command(command)?;
+    let line = stdout.lines().map(str::trim).rfind(|l| !l.is_empty())?;
+    (parse_url(line)?.forge == forge).then(|| line.to_string())
+}
+
+/// The repository named by the create command's `-R`/`--repo` flag, without any host prefix.
+pub(super) fn created_repo_flag(command: &str) -> Option<String> {
+    let (_, args) = created_command(command)?;
+    let mut args = args.iter();
+    let value = loop {
+        let arg = args.next()?;
+        if let Some(value) = arg.strip_prefix("--repo=") {
+            break value;
+        }
+        if arg == "-R" || arg == "--repo" {
+            break args.next()?;
+        }
+    };
+    let value = value.strip_prefix("https://").unwrap_or(value);
+    let value = value.strip_suffix(".git").unwrap_or(value);
+    Some(value.to_ascii_lowercase())
+}
+
+/// The forge whose create command `command` invokes as a command word, with that command's arguments after the verb.
+fn created_command(command: &str) -> Option<(Forge, Vec<String>)> {
+    command_segments(command).iter().find_map(|words| {
+        let mut words = words.iter().map(String::as_str).peekable();
+        while words
+            .next_if(|w| is_env_assignment(w) || *w == "env")
+            .is_some()
+        {}
+        let program = words.next()?.rsplit(['/', '\\']).next()?;
+        let program = program.strip_suffix(".exe").unwrap_or(program);
+        let noun = words.next()?;
+        let verb = words.next()?;
+        let forge = match (program, noun, verb) {
+            ("gh", "pr", "create" | "new") => Forge::Github,
+            ("glab", "mr" | "merge-request", "create" | "new") => Forge::Gitlab,
+            _ => return None,
+        };
+        Some((forge, words.map(str::to_string).collect()))
+    })
+}
+
+fn is_env_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// Splits a shell command into simple commands of unquoted words: separators `&&`, `||`, `;`, `|`, `&` and newlines split, quotes keep their text inside one word, and heredoc bodies are dropped.
+fn command_segments(command: &str) -> Vec<Vec<String>> {
+    let chars: Vec<char> = command.chars().collect();
+    let mut segments = vec![Vec::new()];
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    let mut heredocs: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        i += 1;
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            } else if c == '\\' && q == '"' && next.is_some_and(|n| "\"$`\\".contains(n)) {
+                word.push(next.unwrap_or_default());
+                i += 1;
+            } else {
+                word.push(c);
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                in_word = true;
+            }
+            '\\' if next.is_some_and(|n| " \"'$;&|\n".contains(n)) => {
+                word.push(next.unwrap_or_default());
+                in_word = true;
+                i += 1;
+            }
+            '<' if next == Some('<') && chars.get(i + 1..i + 3) != Some(&['<', '<']) => {
+                i += 1;
+                if chars.get(i) == Some(&'-') {
+                    i += 1;
+                }
+                while chars.get(i).is_some_and(|c| *c == ' ' || *c == '\t') {
+                    i += 1;
+                }
+                let mut delim = String::new();
+                while let Some(&d) = chars.get(i)
+                    && !d.is_whitespace()
+                    && !";&|<>()".contains(d)
+                {
+                    if d != '\'' && d != '"' && d != '\\' {
+                        delim.push(d);
+                    }
+                    i += 1;
+                }
+                heredocs.push(delim);
+                in_word = true;
+                word.push_str("<<");
+            }
+            ' ' | '\t' | '\r' => flush_word(&mut segments, &mut word, &mut in_word),
+            '\n' => {
+                flush_word(&mut segments, &mut word, &mut in_word);
+                segments.push(Vec::new());
+                for delim in heredocs.drain(..) {
+                    while i < chars.len() {
+                        let end = chars[i..].iter().position(|c| *c == '\n');
+                        let stop = end.map_or(chars.len(), |e| i + e);
+                        let line: String = chars[i..stop].iter().collect();
+                        i = (stop + 1).min(chars.len());
+                        if line.trim() == delim {
+                            break;
+                        }
+                    }
+                }
+            }
+            ';' | '&' | '|' => {
+                flush_word(&mut segments, &mut word, &mut in_word);
+                if next == Some(c) {
+                    i += 1;
+                }
+                segments.push(Vec::new());
+            }
+            _ => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    flush_word(&mut segments, &mut word, &mut in_word);
+    segments
+}
+
+fn flush_word(segments: &mut [Vec<String>], word: &mut String, in_word: &mut bool) {
+    if *in_word && let Some(last) = segments.last_mut() {
+        last.push(std::mem::take(word));
+    }
+    *in_word = false;
+}
+
 /// The host of one git remote URL: `https://host/..`, `ssh://[user@]host[:port]/..` or scp-style `user@host:path`.
 pub(super) fn remote_host(url: &str) -> Option<String> {
     let url = url.trim();
@@ -117,6 +267,18 @@ pub(super) fn remote_host(url: &str) -> Option<String> {
     }
     let host = host_port.split(':').next()?;
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// The lowercased repository path of one git remote URL (`owner/repo`, no `.git`), in the same URL forms as [`remote_host`].
+pub(super) fn remote_path(url: &str) -> Option<String> {
+    let url = url.trim();
+    let path = match url.split_once("://") {
+        Some((_, rest)) => rest.split_once('/')?.1,
+        None => url.split_once(':')?.1,
+    };
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    (!path.is_empty()).then(|| path.to_ascii_lowercase())
 }
 
 fn json(text: &str) -> Result<Value, String> {
@@ -416,6 +578,79 @@ mod tests {
     const GLAB_404: &str = include_str!("../../../../tests/fixtures/pr-watch/glab-404.json");
 
     #[test]
+    fn created_urls_come_from_real_create_commands_only() {
+        const GH: &str = "https://github.com/acme/widgets/pull/12";
+        const GL: &str = "https://gitlab.example.com/group/proj/-/merge_requests/7";
+        let gh_out = format!("{GH}\n");
+        let gl_out = format!("!7 Fix it\n{GL}\n");
+        for (cmd, out, want) in [
+            ("gh pr create --fill", gh_out.as_str(), Some(GH)),
+            ("gh pr new -t 'a && b' -b \"x\"", gh_out.as_str(), Some(GH)),
+            ("glab mr create -f --yes", gl_out.as_str(), Some(GL)),
+            ("cd x && gh pr create --fill", gh_out.as_str(), Some(GH)),
+            ("git push; gh pr create", gh_out.as_str(), Some(GH)),
+            (
+                "GH_HOST=github.com GH_TOKEN=x gh pr create",
+                gh_out.as_str(),
+                Some(GH),
+            ),
+            (
+                "env FOO=1 /opt/homebrew/bin/gh pr create",
+                gh_out.as_str(),
+                Some(GH),
+            ),
+            (
+                "glab mr create",
+                format!("!7 Fix it (feat)\n {GL}\n").as_str(),
+                Some(GL),
+            ),
+            ("echo gh pr create", gh_out.as_str(), None),
+            ("echo \"gh pr create\"", gh_out.as_str(), None),
+            (
+                "echo 'x' && echo \"a; gh pr create\"",
+                gh_out.as_str(),
+                None,
+            ),
+            ("cat <<EOF\ngh pr create\nEOF", gh_out.as_str(), None),
+            (
+                "cat <<'EOF' > f.md\ngh pr create\nEOF\nls",
+                gh_out.as_str(),
+                None,
+            ),
+            ("cat <<EOF\nx\nEOF\ngh pr create", gh_out.as_str(), Some(GH)),
+            ("gh pr view 12", gh_out.as_str(), None),
+            ("gh pr create", "created nothing\n", None),
+            (
+                "gh pr create",
+                "https://github.com:8443/acme/widgets/pull/12\n",
+                None,
+            ),
+            (
+                "gh pr create",
+                "https://127.0.0.1/acme/widgets/pull/12\n",
+                None,
+            ),
+            ("gh pr create", gl_out.as_str(), None),
+            ("glab mr create", gh_out.as_str(), None),
+        ] {
+            assert_eq!(parse_created_url(cmd, out).as_deref(), want, "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_last_output_line_can_be_the_created_url() {
+        const GH: &str = "https://github.com/acme/widgets/pull/12";
+        assert_eq!(
+            parse_created_url("gh pr create", &format!("{GH}\nmore\n")),
+            None
+        );
+        assert_eq!(
+            parse_created_url("gh pr create", &format!("noise\n {GH} \n\n")).as_deref(),
+            Some(GH)
+        );
+    }
+
+    #[test]
     fn urls_parse_for_github_gitlab_and_enterprise_hosts() {
         let gh = parse_url("https://github.com/acme/widgets/pull/12").expect("github");
         assert_eq!(
@@ -660,6 +895,25 @@ mod tests {
             ("/srv/git/local.git", None),
         ] {
             assert_eq!(remote_host(url).as_deref(), host, "{url}");
+        }
+    }
+
+    #[test]
+    fn remote_paths_keep_nested_groups_and_drop_the_git_suffix() {
+        for (url, path) in [
+            ("https://GitHub.com/Acme/Widgets.git", Some("acme/widgets")),
+            (
+                "https://u:t@gitlab.example.com/g/sub/p.git",
+                Some("g/sub/p"),
+            ),
+            ("ssh://git@ghe.corp.example:2222/a/b.git", Some("a/b")),
+            (
+                "git@gitlab.cego.dk:group/sub/proj.git",
+                Some("group/sub/proj"),
+            ),
+            ("/srv/git/local.git", None),
+        ] {
+            assert_eq!(remote_path(url).as_deref(), path, "{url}");
         }
     }
 }

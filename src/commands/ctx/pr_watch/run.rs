@@ -94,41 +94,13 @@ pub(super) fn run_with<W: Write>(
 
     match &args.command {
         PrVerb::Watch(a) => {
-            let Some(pr) = parse::parse_url(&a.url) else {
-                return Err(format!("zirv ctx pr watch: '{}' is not a GitHub pull request or GitLab merge request URL (https, no port, no IP address)", a.url).into());
+            let said = match register(&state, repo, env, &owner, &a.url)? {
+                Registered::Already => format!("already watching {}", a.url),
+                Registered::Added(pr) => {
+                    format!("watching {} #{} on {}", pr.repo, pr.number, pr.host)
+                }
             };
-            if let Err(allowed) = trusted_host(repo, &pr.host) {
-                return Err(format!("zirv ctx pr watch: host '{}' is not a git remote host of this repository; allowed: {allowed}", pr.host).into());
-            }
-            if store::load(&state, &owner, &a.url).is_some() {
-                writeln!(w, "zirv ctx pr watch: already watching {}", a.url)?;
-                return Ok(0);
-            }
-            let now = now_secs();
-            store::save(
-                &state,
-                &WatchRecord {
-                    url: a.url.clone(),
-                    owner,
-                    repo: repo.to_path_buf(),
-                    repo_slug: repo_slug(repo),
-                    agent: env(AGENT_ENV).unwrap_or_else(|| "any".into()),
-                    viewer: None,
-                    state: WatchState::new(now),
-                    registered_at: now,
-                    last_polled: 0,
-                    wake_seq: 0,
-                    last_error: None,
-                    consecutive_failures: 0,
-                    not_found: 0,
-                    stopped: None,
-                },
-            )?;
-            writeln!(
-                w,
-                "zirv ctx pr watch: watching {} #{} on {}",
-                pr.repo, pr.number, pr.host
-            )?;
+            writeln!(w, "zirv ctx pr watch: {said}")?;
             Ok(0)
         }
         PrVerb::Unwatch(a) => {
@@ -163,25 +135,112 @@ pub(super) fn run_with<W: Write>(
             if !cfg.mail.enabled {
                 return Err("zirv ctx pr poll: mail is disabled (mail.enabled = false); wakes are delivered as mail".into());
             }
-            let limits = Limits {
-                no_checks_secs: cfg.pr_watch.no_checks_minutes * 60,
-                max_wakes: cfg.pr_watch.max_wakes,
-            };
-            for rec in store::list(&state, &owner) {
-                let line = poll_one(&state, &cfg, env, &owner, &rec.url, &limits)?;
-                writeln!(w, "{}: {line}", rec.url)?;
-            }
+            poll_session(&state, &cfg, env, &owner, &mut |url, line| {
+                writeln!(w, "{url}: {line}")?;
+                Ok(())
+            })?;
             Ok(0)
         }
     }
 }
 
+/// Reads every watch of `owner` once, one at a time, reporting `(url, outcome)` to `each` as it goes.
+pub(super) fn poll_session(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    env: EnvLookup<'_>,
+    owner: &str,
+    each: &mut dyn FnMut(&str, &str) -> CtxResult<()>,
+) -> CtxResult<()> {
+    let limits = Limits {
+        no_checks_secs: cfg.pr_watch.no_checks_minutes * 60,
+        max_wakes: cfg.pr_watch.max_wakes,
+    };
+    for rec in store::list(state, owner) {
+        let line = poll_one(state, cfg, env, owner, &rec.url, &limits)?;
+        each(&rec.url, &line)?;
+    }
+    Ok(())
+}
+
+/// What [`register`] did.
+pub(crate) enum Registered {
+    Added(PrRef),
+    Already,
+}
+
+/// Validates `url` (https PR/MR, no port, no IP literal, host equals a git remote host of `repo`) and saves a watch for `owner`; the verb and the PostToolUse hook share it. Callers check `pr_watch.enabled`.
+pub(crate) fn register(
+    state: &StateDir,
+    repo: &Path,
+    env: EnvLookup<'_>,
+    owner: &str,
+    url: &str,
+) -> CtxResult<Registered> {
+    let Some(pr) = parse::parse_url(url) else {
+        return Err(format!("zirv ctx pr watch: '{url}' is not a GitHub pull request or GitLab merge request URL (https, no port, no IP address)").into());
+    };
+    if let Err(allowed) = trusted_host(repo, &pr.host) {
+        return Err(format!("zirv ctx pr watch: host '{}' is not a git remote host of this repository; allowed: {allowed}", pr.host).into());
+    }
+    if store::load(state, owner, url).is_some() {
+        return Ok(Registered::Already);
+    }
+    let now = now_secs();
+    store::save(
+        state,
+        &WatchRecord {
+            url: url.to_string(),
+            owner: owner.to_string(),
+            repo: repo.to_path_buf(),
+            repo_slug: repo_slug(repo),
+            agent: env(AGENT_ENV).unwrap_or_else(|| "any".into()),
+            viewer: None,
+            state: WatchState::new(now),
+            registered_at: now,
+            last_polled: 0,
+            wake_seq: 0,
+            last_error: None,
+            consecutive_failures: 0,
+            not_found: 0,
+            stopped: None,
+        },
+    )?;
+    Ok(Registered::Added(pr))
+}
+
+/// The fetch/push URL column of `git remote -v`.
+fn remote_urls(repo: &Path) -> Vec<String> {
+    let remotes = worktree::run_git(repo, &["remote", "-v"]).unwrap_or_default();
+    remotes
+        .lines()
+        .filter_map(|line| Some(line.split_whitespace().nth(1)?.to_string()))
+        .collect()
+}
+
+/// True when `url` is a repository of one of `repo`'s git remotes or the one `command`'s `-R`/`--repo` names (case-insensitive). Auto-register only: the explicit verb trusts what the operator typed.
+pub(crate) fn url_names_repo(repo: &Path, command: &str, url: &str) -> bool {
+    let Some(pr) = parse::parse_url(url) else {
+        return false;
+    };
+    let wanted = pr.repo.to_ascii_lowercase();
+    if let Some(flag) = parse::created_repo_flag(command) {
+        let host_prefix = format!("{}/", pr.host.to_ascii_lowercase());
+        if flag.strip_prefix(&host_prefix).unwrap_or(&flag) == wanted {
+            return true;
+        }
+    }
+    remote_urls(repo).iter().any(|remote| {
+        parse::remote_host(remote).is_some_and(|host| host.eq_ignore_ascii_case(&pr.host))
+            && parse::remote_path(remote).is_some_and(|path| path == wanted)
+    })
+}
+
 /// Ok when `host` equals a host of one of `repo`'s git remotes; otherwise Err with the allowed hosts.
 fn trusted_host(repo: &Path, host: &str) -> Result<(), String> {
-    let remotes = worktree::run_git(repo, &["remote", "-v"]).unwrap_or_default();
-    let mut hosts: Vec<String> = remotes
-        .lines()
-        .filter_map(|line| parse::remote_host(line.split_whitespace().nth(1)?))
+    let mut hosts: Vec<String> = remote_urls(repo)
+        .iter()
+        .filter_map(|url| parse::remote_host(url))
         .collect();
     hosts.sort();
     hosts.dedup();
@@ -440,31 +499,31 @@ fn fetch_gitlab(env: EnvLookup<'_>, rec: &WatchRecord, pr: &PrRef) -> Result<Fet
 
 #[cfg(test)]
 #[cfg(unix)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
-    const GH_URL: &str = "https://github.com/acme/widgets/pull/12";
+    pub(in super::super) const GH_URL: &str = "https://github.com/acme/widgets/pull/12";
     const GL_URL: &str = "https://gitlab.example.com/group/sub/proj/-/merge_requests/7";
-    const OWNER: &str = "abcd1234";
+    pub(in super::super) const OWNER: &str = "abcd1234";
 
     fn fixtures() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pr-watch")
     }
 
-    struct Rig {
-        _root: tempfile::TempDir,
-        bin: PathBuf,
+    pub(in super::super) struct Rig {
+        pub(in super::super) _root: tempfile::TempDir,
+        pub(in super::super) bin: PathBuf,
         state_root: PathBuf,
-        repo: PathBuf,
-        env: HashMap<String, String>,
+        pub(in super::super) repo: PathBuf,
+        pub(in super::super) env: HashMap<String, String>,
         _home: crate::commands::ctx::testenv::HomeGuard,
     }
 
     impl Rig {
-        fn new() -> Self {
+        pub(in super::super) fn new() -> Self {
             let root = tempfile::tempdir().expect("tempdir");
             let home = root.path().join("home");
             let bin = root.path().join("bin");
@@ -499,7 +558,7 @@ mod tests {
         }
 
         /// A fake CLI on the injected PATH: `body` is a sh `case` over "$1 $2".
-        fn shim(&self, name: &str, body: &str) {
+        pub(in super::super) fn shim(&self, name: &str, body: &str) {
             let path = self.bin.join(name);
             std::fs::write(
                 &path,
@@ -513,7 +572,7 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
 
-        fn gh_shim(&self, view: &str) {
+        pub(in super::super) fn gh_shim(&self, view: &str) {
             self.shim(
                 "gh",
                 &format!(
@@ -526,11 +585,11 @@ mod tests {
             );
         }
 
-        fn lookup(&self) -> impl Fn(&str) -> Option<String> + '_ {
+        pub(in super::super) fn lookup(&self) -> impl Fn(&str) -> Option<String> + '_ {
             |key| self.env.get(key).cloned()
         }
 
-        fn state(&self) -> StateDir {
+        pub(in super::super) fn state(&self) -> StateDir {
             StateDir::from_root(self.state_root.clone())
         }
 
@@ -558,7 +617,7 @@ mod tests {
             }
         }
 
-        fn watch(&self, url: &str) {
+        pub(in super::super) fn watch(&self, url: &str) {
             self.pr(PrVerb::Watch(Self::url_args(url))).expect("watch");
             // Fixture comments predate "now": make them news.
             let mut rec = store::load(&self.state(), OWNER, url).expect("record");
@@ -566,7 +625,7 @@ mod tests {
             store::save(&self.state(), &rec).expect("save");
         }
 
-        fn poll(&self) -> String {
+        pub(in super::super) fn poll(&self) -> String {
             self.pr(PrVerb::Poll(Self::session_args())).expect("poll")
         }
 
@@ -575,9 +634,26 @@ mod tests {
             assert!(said.contains("wake(s) mailed"), "{said}");
         }
 
-        fn mails(&self) -> Vec<(PathBuf, Message)> {
+        pub(in super::super) fn mails(&self) -> Vec<(PathBuf, Message)> {
             mail::list(&self.state(), &repo_slug(&self.repo), None, Some(OWNER)).unwrap_or_default()
         }
+    }
+
+    #[test]
+    fn a_url_names_the_repo_of_a_remote_including_nested_gitlab_groups() {
+        let rig = Rig::new();
+        let gl = "https://gitlab.example.com/Group/Sub/proj/-/merge_requests/7";
+        assert!(url_names_repo(&rig.repo, "glab mr create", gl));
+        assert!(url_names_repo(&rig.repo, "gh pr create", GH_URL));
+        let other = "https://github.com/acme/other/pull/1";
+        assert!(!url_names_repo(&rig.repo, "gh pr create", other));
+        assert!(url_names_repo(
+            &rig.repo,
+            "gh pr create -R acme/other",
+            other
+        ));
+        let wrong_host = "https://gitlab.example.com/acme/widgets/-/merge_requests/1";
+        assert!(!url_names_repo(&rig.repo, "glab mr create", wrong_host));
     }
 
     #[test]

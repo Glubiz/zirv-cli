@@ -27,13 +27,13 @@ use crate::commands::workflow::classify::Complexity;
 
 mod accounting;
 #[cfg(unix)]
-#[allow(dead_code)] // unwired until #950 slice 4
 mod app_server;
 mod argv;
 mod command;
 mod compact;
 mod effort;
 mod entry;
+mod launch;
 mod restart;
 mod supervision;
 
@@ -42,7 +42,8 @@ pub use self::accounting::ExecutionReport;
 pub use self::accounting::ExecutionSegment;
 pub(crate) use self::accounting::add_usage;
 use self::accounting::{
-    evaluate_worker_budget, harvest_spend, objective_layer_for_restart, record_execution_segment,
+    evaluate_worker_budget, fold_app_server_usage, harvest_spend, objective_layer_for_restart,
+    record_execution_segment,
 };
 pub(crate) use self::argv::pins_an_existing_conversation;
 pub use self::argv::{extra_launch_flags, extract_prompt};
@@ -459,6 +460,7 @@ fn run_with_clock_inner<W: Write>(
     if let Some(checkpointer) = &checkpointer {
         checkpointer.request(None);
     }
+    let _pr_watch = super::pr_watch::poller::Poller::start(&cfg, repo, &state, &registry_short);
     // Rebuild session identity for every child; export harness identity even
     // without a turn-signal socket.
     let turn_env_for = |session: &SessionId| {
@@ -688,6 +690,9 @@ fn run_with_clock_inner<W: Write>(
     // Only the whole delegation's first launch skips pacing; recursive
     // provider handover and all restarts are continuations. (#358)
     let mut initial_launch = initial_launch_allowed;
+    // #950: only the delegation's first launch may run over codex app-server.
+    let mut app_server_launch =
+        initial_launch && launch::wants_app_server(&cfg, adapter.as_ref(), adapter_builds_launch);
 
     loop {
         pace::wait_for_window(
@@ -717,10 +722,17 @@ fn run_with_clock_inner<W: Write>(
 
         // Hold this child in the console-close registry and kill-on-close
         // job for exactly its lifetime.
-        let (mut child, tap, _child_guard) = supervise::spawn_tapped(command, stdin_prompt.clone())
-            .map_err(|error| {
-                adapters::format_launch_error(error.as_ref(), adapter.name(), adapter.program())
-            })?;
+        let (mut child, tap, _child_guard, app_server_turn) = launch::spawn(
+            command,
+            stdin_prompt.clone(),
+            std::mem::take(&mut app_server_launch),
+            &state,
+            session.as_str(),
+            w,
+        )
+        .map_err(|error| {
+            adapters::format_launch_error(error.as_ref(), adapter.name(), adapter.program())
+        })?;
         // Mark work in flight at spawn until this session reports a turn. (#281)
         session_guard.stamp_in_flight(super::sessions::Verb::Exec.as_str(), 0);
         // Consume delivered mail only after successful spawn; failure is
@@ -801,6 +813,12 @@ fn run_with_clock_inner<W: Write>(
             &mut stalled,
             args.cancellation.as_deref(),
         )?;
+        fold_app_server_usage(
+            app_server_turn,
+            adapter.as_ref(),
+            &transcript,
+            &mut prior_usage,
+        );
 
         if args
             .cancellation

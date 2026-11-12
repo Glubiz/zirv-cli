@@ -1298,6 +1298,8 @@ disabled.
 | `zirv ctx pr list` | One line per watch: head, wakes sent, last poll, last error, stopped reason. |
 | `zirv ctx pr poll` | One manual sweep: read every watch of this session, evaluate, mail what changed. |
 
+With `auto_register = true` (operator-only), a Claude session's successful `gh pr create` / `glab mr create` in Bash or PowerShell registers the URL on the last output line through the PostToolUse hook, silently, for the lead session only (never a subagent), under the same host checks as `watch` and only when its repository is one of the repo's git remotes or the command's `-R`/`--repo` repository; refusals are only logged. A fork clone whose only remote is the fork is therefore not auto-registered when the PR targets the parent: add the parent as a remote (`gh repo fork --clone` adds `upstream`) or run `zirv ctx pr watch <url>`. This is Claude-only in v1: Codex uses the explicit `zirv ctx pr watch` verb.
+
 `poll` calls `gh pr view/checks`, `gh api` (GitHub) or `glab mr view`, `glab api`
 (GitLab) with argv arrays and a 10 s timeout; token files are never read. Each
 change becomes one mail from `zirv-pr-watch` addressed to the owning session:
@@ -1311,8 +1313,22 @@ commit resets what was already reported; your own comments are ignored;
 (`no_cli`, `auth`, `not_found`, `rate_limited`, `transient`, `untrusted_host`) are recorded as
 `last_error` and shown by `list`, never mailed; two `not_found` in a row or
 eight failures in a row stop the watch. Records live under
-`<state>/pr-watch/<session short>/`. No background poller exists yet: `poll` is
-the only trigger.
+`<state>/pr-watch/<session short>/`.
+
+A background poller (thread `pr-watch`) runs the same sweep for you. Each
+supervised `wrap` session and each headless `exec` run starts one, only when
+`[pr_watch] enabled` and `[mail] enabled` are both true (wrap also skips
+degraded `--no-supervise` sessions); it stops with the session and never
+touches it. It reads one watch at a time, then waits `interval_secs` (floor
+60, jittered up to 20% shorter). Backoff: `no_cli` and `auth` wait 30 minutes,
+`rate_limited` doubles the wait, `transient` backs off exponentially, all
+capped at 30 minutes and reset by a clean sweep; eight consecutive failed
+reads stop that watch (`stopped: failures`). Failures are never mailed: see
+`last_error` and the stopped reason in `zirv ctx pr list`, and the `pr watch:`
+line of `zirv ctx status` (watch count, error kinds, stop reasons; shown only
+while the feature is enabled). Wakes arrive through the normal mail path, so
+an idle wrap session is advised and a headless run sees them in its next
+nudge. Poller faults are logged to `decisions.jsonl` as `pr-watch` rows.
 
 ```toml
 [pr_watch]
@@ -5431,6 +5447,7 @@ Effort defaults to `low` for every class (measured against Claude Code's `medium
 prompt_cache_ttl = "5m"          # "5m" | "1h", "5m" by default; ZIRV_CTX_HEADLESS_PROMPT_CACHE_TTL -- skipped when the operator's own env already sets CLAUDE_CODE_PROMPT_CACHE_TTL/FORCE_PROMPT_CACHING_5M/ENABLE_PROMPT_CACHING_1H
 lean = true                      # true by default; false restores auto-memory, bundled skills and the tools below. Adds "autoMemoryEnabled": false and "disableBundledSkills": true to the launch settings layer and denies the `Workflow` tool (else Claude Code inlines its authoring guide, ~6k tokens) plus `ScheduleWakeup`, `ShareOnboardingGuide`, `ListAgents`, `ReportFindings`, and `Agent` for worker/single roles; ZIRV_CTX_HEADLESS_LEAN
 disallowed_tools = []            # extra tool names appended to the launch's --disallowedTools; ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS (comma-separated)
+codex_app_server = false         # codex only, unix only: true runs a headless codex delegation's first turn over `codex app-server` instead of `codex exec`; ZIRV_CTX_HEADLESS_CODEX_APP_SERVER
 
 [headless.effort]
 trivial = "low"                  # low | medium | high | xhigh | max, "low" by default for all three classes; ZIRV_CTX_HEADLESS_EFFORT_TRIVIAL
@@ -5451,6 +5468,19 @@ session, where a human is present, is untouched. With every key unset (the
 shipped default) a headless launch differs from one built before this table
 existed only by `CLAUDE_CODE_EFFORT_LEVEL=low`, `CLAUDE_CODE_PROMPT_CACHE_TTL=5m` and the lean tool/settings surface. A launch with no prompt text to
 classify uses the effort shared by all three classes.
+
+`codex_app_server` is the one key here that touches codex. When true, the
+first launch of a zirv-built `ctx exec --prompt` codex run speaks JSON-RPC to
+`codex app-server --listen stdio://` with the same program, config flags,
+sandbox, model, env and cwd, and reports the turn's token usage like a
+`codex exec` rollout. Any failure before `turn/start` is sent (no `--listen`,
+a spawn, handshake or `thread/start` error, or a launch flag with no
+app-server equivalent) is logged as an `app-server` `fallback` decision and
+the unchanged `codex exec` launches. Once `turn/start` is sent the prompt may
+be running, so every later failure (no ack in time, an error answer, EOF, a
+failed turn) kills the server and is a failed child for the usual
+restart/resume path; the prompt is never re-run through `codex exec`.
+Restarts always use `codex exec`.
 
 The classifier sees the request text only, so the class follows its size unless its wording classifies higher: 120 or more words, or 3 or more list items, is bounded; 300 or more words, or 8 or more items, is substantial; anything shorter is trivial. There is no `architectural` key: the same text-only classifier can never return that complexity (it needs real changed paths/lines to justify), so a request that would otherwise classify architectural reads the `substantial` value instead. The default `5m` TTL suits headless runs whose turns are seconds apart; a session that idles longer than five minutes between turns re-writes its cache at that turn (set `"1h"`).
 
@@ -5892,6 +5922,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `headless.effort.substantial` | `ZIRV_CTX_HEADLESS_EFFORT_SUBSTANTIAL` |
 | `headless.lean` | `ZIRV_CTX_HEADLESS_LEAN` |
 | `headless.disallowed_tools` | `ZIRV_CTX_HEADLESS_DISALLOWED_TOOLS` |
+| `headless.codex_app_server` | `ZIRV_CTX_HEADLESS_CODEX_APP_SERVER` |
 | `approvals.inbox` | `ZIRV_CTX_APPROVALS_INBOX` |
 | `approvals.hold_secs` | `ZIRV_CTX_APPROVALS_HOLD_SECS` |
 | `obfuscate.mode` | `ZIRV_CTX_OBFUSCATE_MODE` |

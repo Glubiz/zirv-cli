@@ -73,6 +73,35 @@ pub(crate) fn add_usage(a: &TranscriptUsage, b: &TranscriptUsage) -> TranscriptU
     }
 }
 
+/// An app-server turn's latest cumulative usage, written by its driver; final
+/// once `done` disconnects, when the driver exits. (#950)
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(super) struct TurnUsage {
+    pub(super) slot: std::sync::Arc<std::sync::Mutex<Option<TranscriptUsage>>>,
+    pub(super) done: std::sync::mpsc::Receiver<()>,
+}
+
+/// Count an exited app-server child's own usage only when its transcript has
+/// none: the rollout stays the source of truth and nothing counts twice. (#950)
+pub(super) fn fold_app_server_usage(
+    turn: Option<TurnUsage>,
+    adapter: &dyn adapters::AgentAdapter,
+    transcript: &Path,
+    prior_usage: &mut TranscriptUsage,
+) {
+    let Some(turn) = turn else {
+        return;
+    };
+    let _ = turn.done.recv_timeout(supervise::FINAL_DRAIN_BUDGET);
+    let rollout = read_transcript_spend(adapter, transcript).map(|(usage, _)| usage);
+    if rollout.is_some_and(|usage| usage != TranscriptUsage::default()) {
+        return;
+    }
+    if let Some(usage) = turn.slot.lock().ok().and_then(|slot| *slot) {
+        *prior_usage = add_usage(prior_usage, &usage);
+    }
+}
+
 /// Harvest the outgoing transcript before minting the next session; unreadable
 /// data contributes nothing and cannot fail the restart. (#169, #169.2)
 pub(super) fn harvest_spend(
@@ -737,5 +766,41 @@ mod tests {
             log.contains("\"action\":\"nudge-restart\""),
             "the restart that must not reset the meter actually happened: {log}"
         );
+    }
+
+    /// #950: an app-server turn's own usage counts only when its rollout has none.
+    #[test]
+    fn an_app_server_turn_counts_its_usage_only_without_rollout_usage() {
+        let adapter = crate::commands::ctx::adapters::codex::CodexAdapter::new(None);
+        let turn = |tokens: u64| {
+            let (done, done_rx) = std::sync::mpsc::channel::<()>();
+            drop(done);
+            Some(TurnUsage {
+                slot: std::sync::Arc::new(std::sync::Mutex::new(Some(TranscriptUsage {
+                    input_tokens: tokens,
+                    ..TranscriptUsage::default()
+                }))),
+                done: done_rx,
+            })
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let rollout = tmp.path().join("rollout.jsonl");
+        let mut prior = TranscriptUsage {
+            output_tokens: 1,
+            ..TranscriptUsage::default()
+        };
+
+        fold_app_server_usage(turn(7), &adapter, &rollout, &mut prior);
+        assert_eq!((prior.input_tokens, prior.output_tokens), (7, 1));
+
+        std::fs::write(
+            &rollout,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":25,"output_tokens":6}}}}"#,
+        )
+        .expect("write");
+        fold_app_server_usage(turn(7), &adapter, &rollout, &mut prior);
+        assert_eq!(prior.input_tokens, 7, "the rollout already holds this turn");
+        fold_app_server_usage(None, &adapter, &rollout, &mut prior);
+        assert_eq!(prior.input_tokens, 7);
     }
 }
