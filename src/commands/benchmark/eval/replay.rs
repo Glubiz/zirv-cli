@@ -18,6 +18,7 @@ use crate::commands::workflow::research::backend::{
 
 const ROW_SCHEMA: u32 = 1;
 const STOPPED_REASON: &str = "stopped on regression";
+const DEADLINE_REASON: &str = "trial deadline reached";
 
 pub type Launcher<'a> = dyn FnMut(&LaunchSpec) -> Result<Launch, String> + 'a;
 
@@ -27,6 +28,10 @@ pub struct Opts<'a> {
     pub max_usd: f64,
     pub baseline: Option<&'a str>,
     pub stop_on_regression: bool,
+    /// No sample starts at or after this instant (a research trial's own deadline).
+    pub deadline: Option<std::time::Instant>,
+    /// A hard spend contract (research trial): an unpriced sample counts as reaching the cap.
+    pub strict_cap: bool,
     /// `<state>/eval`.
     pub root: &'a Path,
     pub work: &'a Path,
@@ -149,6 +154,9 @@ pub struct Report {
     comparisons: Vec<Comparison>,
     regressions: usize,
     surface_changed: usize,
+    /// Counted samples that failed to run or be read (not graded); kept out of the JSON report.
+    #[serde(skip)]
+    infra_failures: Vec<String>,
 }
 
 /// Verdicts in first-seen case order; a case with no counted sample (all skipped) has none.
@@ -229,6 +237,18 @@ fn build_report(
             .filter(|c| c.change == Change::Regression)
             .count(),
         surface_changed: comparisons.iter().filter(|c| c.surface_changed).count(),
+        infra_failures: rows
+            .iter()
+            .filter(|r| r.status == Status::Failed)
+            .map(|r| {
+                format!(
+                    "{} sample {}: {}",
+                    r.case,
+                    r.sample + 1,
+                    r.error.as_deref().unwrap_or("failed")
+                )
+            })
+            .collect(),
         verdicts,
         comparisons,
     }
@@ -432,12 +452,23 @@ pub fn collect(
             }
             let row = if stopped {
                 Row::skipped(case, bundle, index, STOPPED_REASON)
+            } else if opts
+                .deadline
+                .is_some_and(|d| std::time::Instant::now() >= d)
+            {
+                Row::skipped(case, bundle, index, DEADLINE_REASON)
             } else if spent >= cap_micros {
                 Row::skipped(case, bundle, index, run::SPEND_CAP_REASON)
             } else {
                 sample(case, bundle, index, opts, &dir, launch)
             };
-            spent = spent.saturating_add(row.cost_micros.unwrap_or(0));
+            let unpriced = if opts.strict_cap && row.status != Status::Skipped {
+                cap_micros
+            } else {
+                0
+            };
+            let cost = row.cost_micros.unwrap_or(unpriced);
+            spent = spent.saturating_add(cost);
             progress(&format!(
                 "{} sample {}: {}",
                 case.id,
@@ -488,7 +519,12 @@ impl Report {
         let passed = self.verdicts.iter().filter(|v| v.passed).count();
         let counted: u32 = self.verdicts.iter().map(|v| v.samples).sum();
         let over = self.spend_micros as f64 > ceiling_usd * 1_000_000.0;
-        let details = if self.verdicts.is_empty() {
+        let details = if let Some(first) = self.infra_failures.first() {
+            Some(format!(
+                "{} sample(s) failed to run, not graded; first: {first}",
+                self.infra_failures.len()
+            ))
+        } else if self.verdicts.is_empty() {
             Some("no eval case was graded".to_string())
         } else if over {
             Some(format!(

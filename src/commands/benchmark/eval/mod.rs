@@ -198,6 +198,10 @@ fn execute_with(
                 }
                 return Ok(2);
             }
+            let started = std::time::Instant::now();
+            let deadline = trial
+                .as_ref()
+                .map(|spec| started + std::time::Duration::from_secs(spec.timeout_secs));
             let root = eval_root(env)?;
             let temp = std::env::temp_dir();
             let work_root = std::fs::canonicalize(&temp)
@@ -212,28 +216,38 @@ fn execute_with(
                 max_usd,
                 baseline: baseline.as_deref(),
                 stop_on_regression,
+                deadline,
+                strict_cap: trial.is_some(),
                 root: &root,
                 work: &work,
             };
             let progress = &mut |line: &str| eprintln!("{line}");
-            let started = std::time::Instant::now();
             let report = match injected {
                 Some(launch) => replay::collect(&selected, &opts, launch, progress),
                 None => {
                     let cfg = CtxConfig::load(repo, env).map_err(|e| e.to_string())?;
                     let table = price::resolve_table(&cfg);
-                    let launcher = super::run::ExecLauncher {
-                        cfg: &cfg,
-                        env,
-                        work: &work,
-                        table: &table,
-                        timeout_secs,
-                    };
                     super::run::export_child_knobs();
                     replay::collect(
                         &selected,
                         &opts,
-                        &mut |spec| launcher.launch(spec),
+                        &mut |spec| {
+                            let timeout_secs = sample_timeout(
+                                timeout_secs,
+                                deadline.map(|d| {
+                                    d.saturating_duration_since(std::time::Instant::now())
+                                }),
+                            )
+                            .ok_or("trial deadline reached")?;
+                            super::run::ExecLauncher {
+                                cfg: &cfg,
+                                env,
+                                work: &work,
+                                table: &table,
+                                timeout_secs,
+                            }
+                            .launch(spec)
+                        },
                         progress,
                     )
                 }
@@ -294,6 +308,15 @@ fn read_trial_spec(dir: &Path) -> Result<TrialSpec, String> {
         ));
     }
     Ok(spec)
+}
+
+/// Seconds one sample may run: the per-sample limit, cut to what is left of the trial deadline;
+/// `None` once under a second remains.
+fn sample_timeout(per_sample: u64, remaining: Option<std::time::Duration>) -> Option<u64> {
+    let Some(remaining) = remaining else {
+        return Some(per_sample);
+    };
+    (remaining.as_secs() >= 1).then(|| per_sample.min(remaining.as_secs()))
 }
 
 fn eval_root(env: EnvLookup<'_>) -> Result<std::path::PathBuf, String> {
@@ -1053,5 +1076,76 @@ mod tests {
             task_ids, case_ids,
             "eval-cases/corpus.toml and the embedded eval cases have drifted"
         );
+    }
+
+    #[test]
+    fn trial_dir_reports_a_harness_failure_as_an_error_trial_not_a_low_score() {
+        for (label, launched) in [("exit", Some(3)), ("launch", None)] {
+            let h = harness();
+            let dir = trial_dir(&h, BAD, 5.0);
+            let dir_arg = dir.display().to_string();
+            let mut launch = |_: &super::super::run::LaunchSpec| match launched {
+                Some(code) => Ok(super::super::run::Launch {
+                    exit_code: code,
+                    wall_ms: 1,
+                    usage: Default::default(),
+                    cost_micros: Some(1),
+                    model: None,
+                    answer: String::new(),
+                    transcript: String::new(),
+                }),
+                None => Err("no such binary".to_string()),
+            };
+            let lookup = |key: &str| h.env.get(key).cloned();
+            let mut out = Vec::new();
+            execute_with(
+                eval_command(&["run", "--yes", "--trial-dir", &dir_arg]),
+                h.tmp.path(),
+                &lookup,
+                &mut out,
+                Some(&mut launch),
+            )
+            .unwrap();
+            let trial = TrialResult::read(&dir).unwrap();
+            assert_eq!(trial.status, TrialStatus::Error, "{label}");
+            assert!(trial.details.unwrap().contains(BAD), "{label}");
+        }
+    }
+
+    #[test]
+    fn trial_dir_treats_an_unpriced_sample_as_reaching_the_ceiling() {
+        let h = harness();
+        let dir = trial_dir(&h, "*", 5.0);
+        let launches = Launches::default();
+        assert_eq!(trial_run(&h, &dir, &["--yes"], None, &launches), Ok(0));
+        assert_eq!(launches.borrow().len(), 1);
+        let trial = TrialResult::read(&dir).unwrap();
+        assert!(!trial.cost_complete());
+    }
+
+    #[test]
+    fn a_sample_never_runs_past_the_trial_deadline() {
+        use std::time::Duration;
+        assert_eq!(sample_timeout(600, None), Some(600));
+        assert_eq!(sample_timeout(600, Some(Duration::from_secs(90))), Some(90));
+        assert_eq!(sample_timeout(60, Some(Duration::from_secs(90))), Some(60));
+        assert_eq!(sample_timeout(60, Some(Duration::ZERO)), None);
+        assert_eq!(sample_timeout(60, Some(Duration::from_millis(400))), None);
+    }
+
+    #[test]
+    fn trial_dir_launches_nothing_once_the_trial_deadline_has_passed() {
+        let h = harness();
+        let dir = trial_dir(&h, "*", 5.0);
+        let spec = std::fs::read_to_string(dir.join("spec.json")).unwrap();
+        std::fs::write(
+            dir.join("spec.json"),
+            spec.replace("\"timeout_secs\":60", "\"timeout_secs\":0"),
+        )
+        .unwrap();
+        let launches = Launches::default();
+        assert_eq!(trial_run(&h, &dir, &["--yes"], Some(1), &launches), Ok(0));
+        assert!(launches.borrow().is_empty());
+        assert_eq!(TrialResult::read(&dir).unwrap().status, TrialStatus::Error);
     }
 }
