@@ -12,6 +12,9 @@ use super::grade::{Check, grade};
 use super::trace::trace;
 use crate::commands::benchmark::run::{self, Launch, LaunchSpec, Status};
 use crate::commands::ctx::state;
+use crate::commands::workflow::research::backend::{
+    Money, SpendReport, TRIAL_SPEC_SCHEMA, TrialResult, TrialStatus,
+};
 
 const ROW_SCHEMA: u32 = 1;
 const STOPPED_REASON: &str = "stopped on regression";
@@ -24,7 +27,6 @@ pub struct Opts<'a> {
     pub max_usd: f64,
     pub baseline: Option<&'a str>,
     pub stop_on_regression: bool,
-    pub json: bool,
     /// `<state>/eval`.
     pub root: &'a Path,
     pub work: &'a Path,
@@ -385,15 +387,13 @@ fn sample(
     row
 }
 
-/// `cases` carries each case with its resolved bundle hash. Returns the exit code: 1 when a
-/// regression against the baseline was found, otherwise 0.
-pub fn run(
+/// `cases` carries each case with its resolved bundle hash.
+pub fn collect(
     cases: &[(&Case, String)],
     opts: &Opts<'_>,
     launch: &mut Launcher<'_>,
     progress: &mut dyn FnMut(&str),
-    out: &mut dyn std::io::Write,
-) -> Result<i32, String> {
+) -> Result<Report, String> {
     let baseline = opts
         .baseline
         .map(|id| load_baseline(opts.root, id))
@@ -462,9 +462,85 @@ pub fn run(
         }
         rows.append(&mut mine);
     }
-    let report = build_report(&meta, &rows, baseline.as_deref(), None);
-    super::super::emit(out, opts.json, &report, &render(&report))?;
+    Ok(build_report(&meta, &rows, baseline.as_deref(), None))
+}
+
+/// Prints the report. Returns the exit code: 1 when a regression against the baseline was found,
+/// otherwise 0.
+pub fn finish(report: &Report, json: bool, out: &mut dyn std::io::Write) -> Result<i32, String> {
+    super::super::emit(out, json, report, &render(report))?;
     Ok(i32::from(report.regressions > 0))
+}
+
+impl Report {
+    /// The research trial for a run over `selected` cases. Score (`correctness`) is the share of
+    /// selected cases that passed; a case with no counted sample (spend cap reached) counts as not
+    /// passed. A run with no counted case, or whose measured spend exceeds `ceiling_usd`, is an
+    /// error trial: the single-sample overshoot past the cap is reported, never hidden.
+    pub fn trial_result(
+        &self,
+        trial_id: &str,
+        selected: usize,
+        ceiling_usd: f64,
+        wall_ms: u64,
+        route: serde_json::Value,
+    ) -> TrialResult {
+        let passed = self.verdicts.iter().filter(|v| v.passed).count();
+        let counted: u32 = self.verdicts.iter().map(|v| v.samples).sum();
+        let over = self.spend_micros as f64 > ceiling_usd * 1_000_000.0;
+        let details = if self.verdicts.is_empty() {
+            Some("no eval case was graded".to_string())
+        } else if over {
+            Some(format!(
+                "measured spend ${:.4} exceeds the per-trial ceiling ${ceiling_usd:.4}",
+                self.spend_micros as f64 / 1_000_000.0
+            ))
+        } else {
+            None
+        };
+        let usd = self.spend_micros as f64 / 1_000_000.0;
+        TrialResult {
+            schema: TRIAL_SPEC_SCHEMA,
+            trial_id: trial_id.to_string(),
+            status: if details.is_some() {
+                TrialStatus::Error
+            } else {
+                TrialStatus::Ok
+            },
+            correctness: (!self.verdicts.is_empty())
+                .then(|| passed as f64 / selected.max(1) as f64),
+            quality: None,
+            wall_ms,
+            spend: Some(SpendReport {
+                execution: Money {
+                    reported_usd: Some(usd),
+                    estimated_usd: None,
+                    unknown_count: u64::from(self.unpriced_samples),
+                    calls: u64::from(counted),
+                },
+                overhead: Money::default(),
+                calls: u64::from(counted),
+                completeness: if self.unpriced_samples == 0 {
+                    "complete"
+                } else {
+                    "partial"
+                }
+                .to_string(),
+                receipts: BTreeMap::from([
+                    ("eval:cases_passed".to_string(), passed as u64),
+                    ("eval:cases_failed".to_string(), (selected - passed) as u64),
+                    ("eval:samples".to_string(), u64::from(counted)),
+                    (
+                        "eval:samples_skipped".to_string(),
+                        u64::from(self.skipped_samples),
+                    ),
+                ]),
+            }),
+            route: Some(route),
+            env_fingerprint: None,
+            details,
+        }
+    }
 }
 
 /// Re-render a stored run (the newest when `run_id` is `None`), compared against its baseline.
