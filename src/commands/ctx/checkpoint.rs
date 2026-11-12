@@ -378,6 +378,16 @@ fn capture_with(req: &Request<'_>, after_seq_read: &dyn Fn()) -> Result<Captured
     let real_index = git_dir.join("index");
     if real_index.exists() {
         std::fs::copy(&real_index, &temp.0).map_err(|e| Skip::Io(format!("copy index: {e}")))?;
+        // Linux gives the copy a new mtime, which hides racy entries from git's re-hash check.
+        std::fs::metadata(&real_index)
+            .and_then(|m| m.modified())
+            .and_then(|mtime| {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&temp.0)?
+                    .set_modified(mtime)
+            })
+            .map_err(|e| Skip::Io(format!("copy index mtime: {e}")))?;
     } else if head.is_some() {
         step(
             git(&top, Some(&temp.0)).args(["read-tree", "HEAD"]),
