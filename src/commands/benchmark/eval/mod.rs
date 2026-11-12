@@ -232,11 +232,10 @@ fn execute_with(
                         &selected,
                         &opts,
                         &mut |spec| {
-                            let timeout_secs = sample_timeout(
+                            let timeout_secs = replay::sample_timeout(
                                 timeout_secs,
-                                deadline.map(|d| {
-                                    d.saturating_duration_since(std::time::Instant::now())
-                                }),
+                                deadline,
+                                std::time::Instant::now(),
                             )
                             .ok_or("trial deadline reached")?;
                             super::run::ExecLauncher {
@@ -308,15 +307,6 @@ fn read_trial_spec(dir: &Path) -> Result<TrialSpec, String> {
         ));
     }
     Ok(spec)
-}
-
-/// Seconds one sample may run: the per-sample limit, cut to what is left of the trial deadline;
-/// `None` once under a second remains.
-fn sample_timeout(per_sample: u64, remaining: Option<std::time::Duration>) -> Option<u64> {
-    let Some(remaining) = remaining else {
-        return Some(per_sample);
-    };
-    (remaining.as_secs() >= 1).then(|| per_sample.min(remaining.as_secs()))
 }
 
 fn eval_root(env: EnvLookup<'_>) -> Result<std::path::PathBuf, String> {
@@ -1125,12 +1115,14 @@ mod tests {
 
     #[test]
     fn a_sample_never_runs_past_the_trial_deadline() {
-        use std::time::Duration;
-        assert_eq!(sample_timeout(600, None), Some(600));
-        assert_eq!(sample_timeout(600, Some(Duration::from_secs(90))), Some(90));
-        assert_eq!(sample_timeout(60, Some(Duration::from_secs(90))), Some(60));
-        assert_eq!(sample_timeout(60, Some(Duration::ZERO)), None);
-        assert_eq!(sample_timeout(60, Some(Duration::from_millis(400))), None);
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let at = |ms| Some(now + Duration::from_millis(ms));
+        assert_eq!(replay::sample_timeout(600, None, now), Some(600));
+        assert_eq!(replay::sample_timeout(600, at(90_000), now), Some(90));
+        assert_eq!(replay::sample_timeout(60, at(90_000), now), Some(60));
+        assert_eq!(replay::sample_timeout(60, at(0), now), None);
+        assert_eq!(replay::sample_timeout(60, at(400), now), None);
     }
 
     #[test]
@@ -1146,6 +1138,9 @@ mod tests {
         let launches = Launches::default();
         assert_eq!(trial_run(&h, &dir, &["--yes"], Some(1), &launches), Ok(0));
         assert!(launches.borrow().is_empty());
-        assert_eq!(TrialResult::read(&dir).unwrap().status, TrialStatus::Error);
+        assert_eq!(
+            TrialResult::read(&dir).unwrap().status,
+            TrialStatus::Timeout
+        );
     }
 }

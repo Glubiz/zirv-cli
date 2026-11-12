@@ -22,6 +22,20 @@ const DEADLINE_REASON: &str = "trial deadline reached";
 
 pub type Launcher<'a> = dyn FnMut(&LaunchSpec) -> Result<Launch, String> + 'a;
 
+/// Seconds one sample may run: the per-sample limit, cut to what is left of the trial `deadline`;
+/// `None` once under a second remains. The one place that decides the trial is out of time.
+pub fn sample_timeout(
+    per_sample: u64,
+    deadline: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> Option<u64> {
+    let Some(deadline) = deadline else {
+        return Some(per_sample);
+    };
+    let left = deadline.saturating_duration_since(now).as_secs();
+    (left >= 1).then(|| per_sample.min(left))
+}
+
 /// What `run` needs besides the cases; paths are resolved by the caller.
 pub struct Opts<'a> {
     pub samples: u32,
@@ -157,6 +171,8 @@ pub struct Report {
     /// Counted samples that failed to run or be read (not graded); kept out of the JSON report.
     #[serde(skip)]
     infra_failures: Vec<String>,
+    #[serde(skip)]
+    deadline_skipped: u32,
 }
 
 /// Verdicts in first-seen case order; a case with no counted sample (all skipped) has none.
@@ -249,6 +265,10 @@ fn build_report(
                 )
             })
             .collect(),
+        deadline_skipped: rows
+            .iter()
+            .filter(|r| r.skip_reason.as_deref() == Some(DEADLINE_REASON))
+            .count() as u32,
         verdicts,
         comparisons,
     }
@@ -452,10 +472,7 @@ pub fn collect(
             }
             let row = if stopped {
                 Row::skipped(case, bundle, index, STOPPED_REASON)
-            } else if opts
-                .deadline
-                .is_some_and(|d| std::time::Instant::now() >= d)
-            {
+            } else if sample_timeout(0, opts.deadline, std::time::Instant::now()).is_none() {
                 Row::skipped(case, bundle, index, DEADLINE_REASON)
             } else if spent >= cap_micros {
                 Row::skipped(case, bundle, index, run::SPEND_CAP_REASON)
@@ -524,6 +541,11 @@ impl Report {
                 "{} sample(s) failed to run, not graded; first: {first}",
                 self.infra_failures.len()
             ))
+        } else if self.deadline_skipped > 0 {
+            Some(format!(
+                "trial deadline reached after {counted} of {} samples",
+                counted + self.skipped_samples
+            ))
         } else if self.verdicts.is_empty() {
             Some("no eval case was graded".to_string())
         } else if over {
@@ -538,7 +560,9 @@ impl Report {
         TrialResult {
             schema: TRIAL_SPEC_SCHEMA,
             trial_id: trial_id.to_string(),
-            status: if details.is_some() {
+            status: if self.infra_failures.is_empty() && self.deadline_skipped > 0 {
+                TrialStatus::Timeout
+            } else if details.is_some() {
                 TrialStatus::Error
             } else {
                 TrialStatus::Ok
@@ -712,5 +736,72 @@ mod tests {
             .insert("dir/ok.txt".to_string(), "x".to_string());
         write_setup(tmp.path(), &case).unwrap();
         assert!(tmp.path().join("dir/ok.txt").is_file());
+    }
+
+    fn meta() -> Meta {
+        Meta {
+            schema: ROW_SCHEMA,
+            run_id: "r".to_string(),
+            started_at: "t".to_string(),
+            zirv_version: "v".to_string(),
+            cases: Vec::new(),
+            samples: 2,
+            max_usd: 1.0,
+            baseline: None,
+        }
+    }
+
+    #[test]
+    fn a_deadline_cut_is_a_timeout_trial_but_a_spend_cap_skip_is_not() {
+        let trial = |reason: &str| {
+            let mut skipped = row("b", 0, false, "h");
+            skipped.status = Status::Skipped;
+            skipped.skip_reason = Some(reason.to_string());
+            build_report(&meta(), &[row("a", 0, true, "h"), skipped], None, None).trial_result(
+                "t",
+                2,
+                1.0,
+                1,
+                serde_json::json!({}),
+            )
+        };
+        let cut = trial(DEADLINE_REASON);
+        assert_eq!(cut.status, TrialStatus::Timeout);
+        assert!(
+            cut.details
+                .unwrap()
+                .contains("deadline reached after 1 of 2")
+        );
+        assert_eq!(trial(run::SPEND_CAP_REASON).status, TrialStatus::Ok);
+    }
+
+    #[test]
+    fn under_a_second_before_the_deadline_collect_skips_for_the_deadline_and_launches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = super::super::corpus::embedded().unwrap();
+        let selected = [(&cases[0], "h".to_string())];
+        let opts = Opts {
+            samples: 2,
+            max_usd: 1.0,
+            baseline: None,
+            stop_on_regression: false,
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(500)),
+            strict_cap: true,
+            root: dir.path(),
+            work: &dir.path().join("work"),
+        };
+        let report = collect(
+            &selected,
+            &opts,
+            &mut |_| panic!("no sample may launch"),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(report.deadline_skipped, 2);
+        assert!(
+            report.infra_failures.is_empty(),
+            "{:?}",
+            report.infra_failures
+        );
     }
 }
