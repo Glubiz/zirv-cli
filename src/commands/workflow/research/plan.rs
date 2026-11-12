@@ -562,6 +562,7 @@ min_pairs = 0
         let expected: &[&str] = &[
             "context-compaction-forced.toml",
             "context-compaction.toml",
+            "eval-behaviour.toml",
             "fixture-demo.toml",
             "jev-determinism-approve_escalate.toml",
             "jev-determinism-approve_lower.toml",

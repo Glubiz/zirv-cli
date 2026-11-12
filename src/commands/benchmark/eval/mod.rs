@@ -68,6 +68,11 @@ pub(super) enum EvalCommand {
         /// Confirm that this spends real model quota.
         #[arg(long)]
         yes: bool,
+        /// Run as a research command backend: read `<dir>/spec.json`, grade the case its `task`
+        /// names (`*` = every case) with spend capped at its `per_trial_ceiling_usd`, and write
+        /// `<dir>/trial.json`. Needs `--yes` like any paid run.
+        #[arg(long, value_name = "dir", conflicts_with_all = ["dry_run", "cases", "baseline", "stop_on_regression", "max_usd", "timeout_secs"])]
+        trial_dir: Option<std::path::PathBuf>,
     },
     /// Re-render a stored eval run (the newest when no id is given), with its baseline comparison.
     Report {
@@ -137,7 +142,20 @@ fn execute_with(
             baseline,
             stop_on_regression,
             yes,
+            trial_dir,
         } => {
+            let trial = trial_dir.as_deref().map(read_trial_spec).transpose()?;
+            let (wanted, max_usd, timeout_secs) = match &trial {
+                Some(spec) if spec.task == "*" => {
+                    (Vec::new(), spec.ceiling_usd(), spec.timeout_secs)
+                }
+                Some(spec) => (
+                    vec![spec.task.clone()],
+                    spec.ceiling_usd(),
+                    spec.timeout_secs,
+                ),
+                None => (wanted, max_usd, timeout_secs),
+            };
             if let Some(unknown) = wanted.iter().find(|id| !cases.iter().any(|c| &c.id == *id)) {
                 crate::output::error(format!("unknown eval case '{unknown}'"));
                 return Ok(2);
@@ -194,13 +212,13 @@ fn execute_with(
                 max_usd,
                 baseline: baseline.as_deref(),
                 stop_on_regression,
-                json,
                 root: &root,
                 work: &work,
             };
             let progress = &mut |line: &str| eprintln!("{line}");
-            let code = match injected {
-                Some(launch) => replay::run(&selected, &opts, launch, progress, out),
+            let started = std::time::Instant::now();
+            let report = match injected {
+                Some(launch) => replay::collect(&selected, &opts, launch, progress),
                 None => {
                     let cfg = CtxConfig::load(repo, env).map_err(|e| e.to_string())?;
                     let table = price::resolve_table(&cfg);
@@ -212,19 +230,70 @@ fn execute_with(
                         timeout_secs,
                     };
                     super::run::export_child_knobs();
-                    replay::run(
+                    replay::collect(
                         &selected,
                         &opts,
                         &mut |spec| launcher.launch(spec),
                         progress,
-                        out,
                     )
                 }
             };
             let _ = std::fs::remove_dir_all(&work_root);
-            code
+            let report = report?;
+            if let (Some(spec), Some(dir)) = (&trial, &trial_dir) {
+                report
+                    .trial_result(
+                        &spec.trial_id,
+                        selected.len(),
+                        spec.ceiling_usd(),
+                        started.elapsed().as_millis() as u64,
+                        json!({ "harness": spec.route.harness, "model": spec.route.model }),
+                    )
+                    .write(dir)
+                    .map_err(|e| e.to_string())?;
+            }
+            replay::finish(&report, json, out)
         }
     }
+}
+
+/// The part of the research `spec.json` this adapter reads; unknown fields are ignored.
+#[derive(serde::Deserialize)]
+struct TrialSpec {
+    trial_id: String,
+    task: String,
+    timeout_secs: u64,
+    /// Absent in a spec from an older runner; refused, never treated as unlimited.
+    #[serde(default)]
+    per_trial_ceiling_usd: Option<f64>,
+    route: TrialRoute,
+}
+
+impl TrialSpec {
+    /// `read_trial_spec` guarantees the ceiling is present.
+    fn ceiling_usd(&self) -> f64 {
+        self.per_trial_ceiling_usd.unwrap_or(0.0)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct TrialRoute {
+    harness: String,
+    model: String,
+}
+
+fn read_trial_spec(dir: &Path) -> Result<TrialSpec, String> {
+    let path = dir.join("spec.json");
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let spec: TrialSpec =
+        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    if spec.per_trial_ceiling_usd.is_none() {
+        return Err(format!(
+            "{}: no per_trial_ceiling_usd; refusing to spend without a cap",
+            path.display()
+        ));
+    }
+    Ok(spec)
 }
 
 fn eval_root(env: EnvLookup<'_>) -> Result<std::path::PathBuf, String> {
@@ -850,5 +919,139 @@ mod tests {
         let (_, json) = run(&h, &["lint", "--json"]);
         let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(doc["problems"].as_array().unwrap().len(), 0);
+    }
+
+    use crate::commands::workflow::research::backend::{TrialResult, TrialStatus};
+
+    /// A research trial dir holding the `spec.json` the runner would write.
+    fn trial_dir(h: &Harness, task: &str, ceiling_usd: f64) -> std::path::PathBuf {
+        let dir = h.tmp.path().join("trial");
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = json!({
+            "schema": 1, "trial_id": "t-1", "task": task, "timeout_secs": 60,
+            "per_trial_ceiling_usd": ceiling_usd,
+            "route": { "harness": "claude", "model": "sonnet" },
+            "env": {}, "future_field": true,
+        });
+        std::fs::write(dir.join("spec.json"), spec.to_string()).unwrap();
+        dir
+    }
+
+    fn trial_run(
+        h: &Harness,
+        dir: &Path,
+        extra: &[&str],
+        cost: Option<u64>,
+        launches: &Launches,
+    ) -> Result<i32, String> {
+        let dir = dir.display().to_string();
+        let mut argv = vec!["run", "--trial-dir", dir.as_str()];
+        argv.extend_from_slice(extra);
+        replay_with(h, &argv, cost, launches, &|case, _| case != BAD).0
+    }
+
+    #[test]
+    fn trial_dir_writes_a_trial_json_scored_by_the_share_of_cases_that_pass() {
+        let h = harness();
+        let dir = trial_dir(&h, "*", 5.0);
+        let launches = Launches::default();
+        let code = trial_run(&h, &dir, &["--yes"], Some(1000), &launches);
+        assert_eq!(code, Ok(0));
+        let trial = TrialResult::read(&dir).expect("a valid trial.json");
+        assert_eq!(trial.trial_id, "t-1");
+        assert_eq!(trial.status, TrialStatus::Ok);
+        // Nine of the ten cases pass; the bad one fails every sample.
+        assert!((trial.correctness.unwrap() - 0.9).abs() < 1e-9, "{trial:?}");
+        assert_eq!(trial.receipts()["eval:cases_failed"], 1);
+        assert!((trial.cost_usd().unwrap() - 0.001 * launches.borrow().len() as f64).abs() < 1e-9);
+        assert!(trial.cost_complete());
+    }
+
+    #[test]
+    fn trial_dir_grades_only_the_case_the_spec_task_names() {
+        let h = harness();
+        let dir = trial_dir(&h, BAD, 5.0);
+        let launches = Launches::default();
+        assert_eq!(trial_run(&h, &dir, &["--yes"], Some(1), &launches), Ok(0));
+        assert!(launches.borrow().iter().all(|(case, _, _)| case == BAD));
+        let trial = TrialResult::read(&dir).unwrap();
+        assert_eq!(trial.correctness, Some(0.0));
+    }
+
+    #[test]
+    fn trial_dir_stops_at_the_spec_ceiling_and_flags_an_overshoot() {
+        let h = harness();
+        // $0.001 a launch against a $0.003 ceiling: three launches reach it, the rest are skipped.
+        let dir = trial_dir(&h, "*", 0.003);
+        let launches = Launches::default();
+        assert_eq!(
+            trial_run(&h, &dir, &["--yes"], Some(1000), &launches),
+            Ok(0)
+        );
+        assert_eq!(launches.borrow().len(), 3);
+        let trial = TrialResult::read(&dir).unwrap();
+        assert_eq!(trial.status, TrialStatus::Ok);
+        assert!(trial.cost_usd().unwrap() <= 0.003 + 1e-12);
+        assert!(trial.receipts()["eval:samples_skipped"] > 0);
+        // One launch costing more than the whole ceiling cannot be undone: the trial is an error.
+        let dir = trial_dir(&h, "*", 0.003);
+        let launches = Launches::default();
+        assert_eq!(
+            trial_run(&h, &dir, &["--yes"], Some(5000), &launches),
+            Ok(0)
+        );
+        assert_eq!(launches.borrow().len(), 1);
+        let trial = TrialResult::read(&dir).unwrap();
+        assert_eq!(trial.status, TrialStatus::Error);
+        assert!(trial.details.unwrap().contains("exceeds"));
+    }
+
+    #[test]
+    fn trial_dir_without_yes_exits_2_and_writes_nothing() {
+        let h = harness();
+        let dir = trial_dir(&h, "*", 5.0);
+        let launches = Launches::default();
+        assert_eq!(trial_run(&h, &dir, &[], Some(1), &launches), Ok(2));
+        assert!(launches.borrow().is_empty());
+        assert!(!dir.join("trial.json").exists());
+    }
+
+    #[test]
+    fn trial_dir_refuses_a_spec_without_a_ceiling_and_writes_nothing() {
+        let h = harness();
+        let dir = trial_dir(&h, "*", 5.0);
+        let mut spec: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("spec.json")).unwrap()).unwrap();
+        spec.as_object_mut()
+            .unwrap()
+            .remove("per_trial_ceiling_usd");
+        std::fs::write(dir.join("spec.json"), spec.to_string()).unwrap();
+        let launches = Launches::default();
+        let err = trial_run(&h, &dir, &["--yes"], Some(1), &launches).unwrap_err();
+        assert!(err.contains("per_trial_ceiling_usd"), "{err}");
+        assert!(launches.borrow().is_empty());
+        assert!(!dir.join("trial.json").exists());
+    }
+
+    /// The campaign corpus must list every embedded eval case once, and nothing else.
+    #[test]
+    fn the_eval_campaign_corpus_lists_exactly_the_embedded_cases() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/benchmarks/autoresearch/eval-cases/corpus.toml");
+        let tasks = crate::commands::workflow::research::corpus::Corpus::load(&path)
+            .unwrap()
+            .tasks;
+        let mut task_ids: Vec<String> = tasks.into_iter().map(|t| t.id).collect();
+        let mut case_ids: Vec<String> = corpus::embedded()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        task_ids.sort();
+        case_ids.sort();
+        assert_eq!(
+            task_ids, case_ids,
+            "eval-cases/corpus.toml and the embedded eval cases have drifted"
+        );
     }
 }
