@@ -104,17 +104,33 @@ pub(super) fn parse_url(url: &str) -> Option<PrRef> {
     None
 }
 
-/// The PR/MR URL a successful `gh pr create` / `glab mr create` printed to `stdout`, when `command` really invokes one (env prefixes and `&&`/`;`/`|` chains allowed; quoted, echoed or heredoc text never matches). Both CLIs print the URL alone on its own line; `parse_url` still gates it and the forge must match the CLI.
+/// The PR/MR URL a successful `gh pr create` / `glab mr create` printed to `stdout`, when `command` really invokes one (env prefixes and `&&`/`;`/`|` chains allowed; quoted, echoed or heredoc text never matches). Both CLIs print the URL alone on their last line, so only that line counts; `parse_url` still gates it and the forge must match the CLI.
 pub(crate) fn parse_created_url(command: &str, stdout: &str) -> Option<String> {
-    let forge = created_forge(command)?;
-    stdout.lines().map(str::trim).find_map(|line| {
-        let pr = parse_url(line)?;
-        (pr.forge == forge).then(|| line.to_string())
-    })
+    let (forge, _) = created_command(command)?;
+    let line = stdout.lines().map(str::trim).rfind(|l| !l.is_empty())?;
+    (parse_url(line)?.forge == forge).then(|| line.to_string())
 }
 
-/// The forge whose create command `command` invokes as a command word, if any.
-fn created_forge(command: &str) -> Option<Forge> {
+/// The repository named by the create command's `-R`/`--repo` flag, without any host prefix.
+pub(super) fn created_repo_flag(command: &str) -> Option<String> {
+    let (_, args) = created_command(command)?;
+    let mut args = args.iter();
+    let value = loop {
+        let arg = args.next()?;
+        if let Some(value) = arg.strip_prefix("--repo=") {
+            break value;
+        }
+        if arg == "-R" || arg == "--repo" {
+            break args.next()?;
+        }
+    };
+    let value = value.strip_prefix("https://").unwrap_or(value);
+    let value = value.strip_suffix(".git").unwrap_or(value);
+    Some(value.to_ascii_lowercase())
+}
+
+/// The forge whose create command `command` invokes as a command word, with that command's arguments after the verb.
+fn created_command(command: &str) -> Option<(Forge, Vec<String>)> {
     command_segments(command).iter().find_map(|words| {
         let mut words = words.iter().map(String::as_str).peekable();
         while words
@@ -125,11 +141,12 @@ fn created_forge(command: &str) -> Option<Forge> {
         let program = program.strip_suffix(".exe").unwrap_or(program);
         let noun = words.next()?;
         let verb = words.next()?;
-        match (program, noun, verb) {
-            ("gh", "pr", "create" | "new") => Some(Forge::Github),
-            ("glab", "mr" | "merge-request", "create" | "new") => Some(Forge::Gitlab),
-            _ => None,
-        }
+        let forge = match (program, noun, verb) {
+            ("gh", "pr", "create" | "new") => Forge::Github,
+            ("glab", "mr" | "merge-request", "create" | "new") => Forge::Gitlab,
+            _ => return None,
+        };
+        Some((forge, words.map(str::to_string).collect()))
     })
 }
 
@@ -250,6 +267,18 @@ pub(super) fn remote_host(url: &str) -> Option<String> {
     }
     let host = host_port.split(':').next()?;
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// The lowercased repository path of one git remote URL (`owner/repo`, no `.git`), in the same URL forms as [`remote_host`].
+pub(super) fn remote_path(url: &str) -> Option<String> {
+    let url = url.trim();
+    let path = match url.split_once("://") {
+        Some((_, rest)) => rest.split_once('/')?.1,
+        None => url.split_once(':')?.1,
+    };
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    (!path.is_empty()).then(|| path.to_ascii_lowercase())
 }
 
 fn json(text: &str) -> Result<Value, String> {
@@ -609,6 +638,19 @@ mod tests {
     }
 
     #[test]
+    fn only_the_last_output_line_can_be_the_created_url() {
+        const GH: &str = "https://github.com/acme/widgets/pull/12";
+        assert_eq!(
+            parse_created_url("gh pr create", &format!("{GH}\nmore\n")),
+            None
+        );
+        assert_eq!(
+            parse_created_url("gh pr create", &format!("noise\n {GH} \n\n")).as_deref(),
+            Some(GH)
+        );
+    }
+
+    #[test]
     fn urls_parse_for_github_gitlab_and_enterprise_hosts() {
         let gh = parse_url("https://github.com/acme/widgets/pull/12").expect("github");
         assert_eq!(
@@ -853,6 +895,25 @@ mod tests {
             ("/srv/git/local.git", None),
         ] {
             assert_eq!(remote_host(url).as_deref(), host, "{url}");
+        }
+    }
+
+    #[test]
+    fn remote_paths_keep_nested_groups_and_drop_the_git_suffix() {
+        for (url, path) in [
+            ("https://GitHub.com/Acme/Widgets.git", Some("acme/widgets")),
+            (
+                "https://u:t@gitlab.example.com/g/sub/p.git",
+                Some("g/sub/p"),
+            ),
+            ("ssh://git@ghe.corp.example:2222/a/b.git", Some("a/b")),
+            (
+                "git@gitlab.cego.dk:group/sub/proj.git",
+                Some("group/sub/proj"),
+            ),
+            ("/srv/git/local.git", None),
+        ] {
+            assert_eq!(remote_path(url).as_deref(), path, "{url}");
         }
     }
 }

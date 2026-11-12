@@ -209,12 +209,38 @@ pub(crate) fn register(
     Ok(Registered::Added(pr))
 }
 
+/// The fetch/push URL column of `git remote -v`.
+fn remote_urls(repo: &Path) -> Vec<String> {
+    let remotes = worktree::run_git(repo, &["remote", "-v"]).unwrap_or_default();
+    remotes
+        .lines()
+        .filter_map(|line| Some(line.split_whitespace().nth(1)?.to_string()))
+        .collect()
+}
+
+/// True when `url` is a repository of one of `repo`'s git remotes or the one `command`'s `-R`/`--repo` names (case-insensitive). Auto-register only: the explicit verb trusts what the operator typed.
+pub(crate) fn url_names_repo(repo: &Path, command: &str, url: &str) -> bool {
+    let Some(pr) = parse::parse_url(url) else {
+        return false;
+    };
+    let wanted = pr.repo.to_ascii_lowercase();
+    if let Some(flag) = parse::created_repo_flag(command) {
+        let host_prefix = format!("{}/", pr.host.to_ascii_lowercase());
+        if flag.strip_prefix(&host_prefix).unwrap_or(&flag) == wanted {
+            return true;
+        }
+    }
+    remote_urls(repo).iter().any(|remote| {
+        parse::remote_host(remote).is_some_and(|host| host.eq_ignore_ascii_case(&pr.host))
+            && parse::remote_path(remote).is_some_and(|path| path == wanted)
+    })
+}
+
 /// Ok when `host` equals a host of one of `repo`'s git remotes; otherwise Err with the allowed hosts.
 fn trusted_host(repo: &Path, host: &str) -> Result<(), String> {
-    let remotes = worktree::run_git(repo, &["remote", "-v"]).unwrap_or_default();
-    let mut hosts: Vec<String> = remotes
-        .lines()
-        .filter_map(|line| parse::remote_host(line.split_whitespace().nth(1)?))
+    let mut hosts: Vec<String> = remote_urls(repo)
+        .iter()
+        .filter_map(|url| parse::remote_host(url))
         .collect();
     hosts.sort();
     hosts.dedup();
@@ -611,6 +637,23 @@ pub(super) mod tests {
         pub(in super::super) fn mails(&self) -> Vec<(PathBuf, Message)> {
             mail::list(&self.state(), &repo_slug(&self.repo), None, Some(OWNER)).unwrap_or_default()
         }
+    }
+
+    #[test]
+    fn a_url_names_the_repo_of_a_remote_including_nested_gitlab_groups() {
+        let rig = Rig::new();
+        let gl = "https://gitlab.example.com/Group/Sub/proj/-/merge_requests/7";
+        assert!(url_names_repo(&rig.repo, "glab mr create", gl));
+        assert!(url_names_repo(&rig.repo, "gh pr create", GH_URL));
+        let other = "https://github.com/acme/other/pull/1";
+        assert!(!url_names_repo(&rig.repo, "gh pr create", other));
+        assert!(url_names_repo(
+            &rig.repo,
+            "gh pr create -R acme/other",
+            other
+        ));
+        let wrong_host = "https://gitlab.example.com/acme/widgets/-/merge_requests/1";
+        assert!(!url_names_repo(&rig.repo, "glab mr create", wrong_host));
     }
 
     #[test]

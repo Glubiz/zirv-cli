@@ -136,20 +136,23 @@ fn worst_failure(state: &StateDir, owner: &str) -> Option<Failure> {
         .max_by_key(|kind| rank(*kind))
 }
 
-/// The wait before the next sweep: `interval` when healthy, else the design's backoff, never above 30 min.
+/// The wait before the next sweep: `interval` when healthy, else the design's backoff, never above 30 min or `interval`, whichever is longer.
 fn next_delay(
     interval: Duration,
     previous: Duration,
     worst: Option<Failure>,
     streak: u32,
 ) -> Duration {
-    let delay = match worst {
-        None => interval,
-        Some(Failure::NoCli | Failure::Auth) => MAX_BACKOFF,
-        Some(Failure::RateLimited) => previous.max(interval) * 2,
-        Some(_) => interval * 2u32.saturating_pow(streak.min(16)),
+    let Some(failure) = worst else {
+        return interval;
     };
-    delay.min(MAX_BACKOFF)
+    let cap = MAX_BACKOFF.max(interval);
+    let delay = match failure {
+        Failure::NoCli | Failure::Auth => cap,
+        Failure::RateLimited => previous.max(interval).saturating_mul(2),
+        _ => interval.saturating_mul(2u32.saturating_pow(streak.min(16))),
+    };
+    delay.min(cap)
 }
 
 /// Up to 20% shorter, from the clock's sub-second noise; spreads sessions that started together.
@@ -157,7 +160,7 @@ fn jitter(delay: Duration) -> Duration {
     let noise = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.subsec_nanos() % 1000);
-    delay - delay / 5 * noise / 1000
+    delay - (delay / 5).saturating_mul(noise) / 1000
 }
 
 fn note(state: &StateDir, owner: &str, action: &str, detail: &str) {
@@ -350,6 +353,31 @@ mod tests {
             MAX_BACKOFF
         );
         assert!(jitter(base) <= base && jitter(base) >= base * 4 / 5);
+    }
+
+    #[test]
+    fn a_healthy_interval_longer_than_the_backoff_cap_is_kept() {
+        let long = Duration::from_secs(7200);
+        assert_eq!(next_delay(long, long, None, 0), long);
+        assert_eq!(next_delay(long, long, Some(Failure::NoCli), 1), long);
+        assert_eq!(next_delay(long, long, Some(Failure::Transient), 1), long);
+        assert!(jitter(long) <= long && jitter(long) >= long * 4 / 5);
+    }
+
+    #[test]
+    fn an_enormous_interval_never_panics() {
+        let huge = Duration::from_secs(u64::MAX);
+        for worst in [
+            None,
+            Some(Failure::NoCli),
+            Some(Failure::Auth),
+            Some(Failure::RateLimited),
+            Some(Failure::Transient),
+        ] {
+            let delay = next_delay(huge, huge, worst, 16);
+            assert!(delay >= MAX_BACKOFF, "{worst:?}");
+            let _ = jitter(delay);
+        }
     }
 
     #[test]

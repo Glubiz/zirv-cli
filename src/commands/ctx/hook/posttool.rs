@@ -309,6 +309,9 @@ fn auto_register_pr_watch(
     else {
         return;
     };
+    if !pr_watch::url_names_repo(cwd, command, &url) {
+        return;
+    }
     let Some(owner) = env(SESSION_ENV)
         .map(|raw| crate::commands::ctx::sessions::short_id(&raw))
         .filter(|short| !short.is_empty())
@@ -2277,6 +2280,22 @@ mod tests {
     /// (hook stdout, watched URLs of the calling session).
     fn pr_create_hook(
         extra_env: &[(&str, &str)],
+        output: (&str, &str),
+        agent_id: &str,
+        interrupted: bool,
+    ) -> (Vec<u8>, Vec<String>) {
+        pr_create_hook_for(
+            "git push && gh pr create --fill",
+            extra_env,
+            output,
+            agent_id,
+            interrupted,
+        )
+    }
+
+    fn pr_create_hook_for(
+        command: &str,
+        extra_env: &[(&str, &str)],
         (stdout, stderr): (&str, &str),
         agent_id: &str,
         interrupted: bool,
@@ -2318,7 +2337,7 @@ mod tests {
             "session_id": WATCH_SESSION,
             "cwd": repo.display().to_string(),
             "tool_name": "Bash",
-            "tool_input": {"command": "git push && gh pr create --fill"},
+            "tool_input": {"command": command},
             "tool_response": {"stdout": stdout, "stderr": stderr, "interrupted": interrupted, "isImage": false},
             "tool_use_id": "toolu_pr",
             "agent_id": agent_id,
@@ -2395,6 +2414,42 @@ mod tests {
         );
         assert!(watched.is_empty());
         assert_eq!(foreign, none);
+    }
+
+    #[test]
+    fn a_url_for_a_repo_that_is_not_a_remote_is_not_registered() {
+        let victim = "https://github.com/victim/other/pull/1\n";
+        let (_, watched) = pr_create_hook(&[], (victim, ""), "", false);
+        assert!(watched.is_empty());
+        let (_, watched) = pr_create_hook_for(
+            "gh pr create --fill; cat notes.txt",
+            &[],
+            (&format!("{WATCH_URL}\n{victim}"), ""),
+            "",
+            false,
+        );
+        assert!(watched.is_empty(), "the last line is another command's");
+    }
+
+    #[test]
+    fn a_url_that_is_not_the_last_output_line_is_not_registered() {
+        let out = format!("{WATCH_URL}\ntrailing text\n");
+        let (_, watched) = pr_create_hook(&[], (&out, ""), "", false);
+        assert!(watched.is_empty());
+    }
+
+    #[test]
+    fn a_create_naming_another_repo_with_r_registers_that_repo() {
+        let other = "https://github.com/other/repo/pull/3";
+        for command in [
+            "gh pr create -R other/repo --fill",
+            "gh pr create --repo Other/Repo",
+            "gh pr create --repo=github.com/other/repo",
+        ] {
+            let (_, watched) =
+                pr_create_hook_for(command, &[], (&format!("{other}\n"), ""), "", false);
+            assert_eq!(watched, [other], "{command}");
+        }
     }
 
     #[test]

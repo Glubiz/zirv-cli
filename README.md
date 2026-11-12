@@ -1298,7 +1298,7 @@ disabled.
 | `zirv ctx pr list` | One line per watch: head, wakes sent, last poll, last error, stopped reason. |
 | `zirv ctx pr poll` | One manual sweep: read every watch of this session, evaluate, mail what changed. |
 
-With `auto_register = true` (operator-only), a Claude session's successful `gh pr create` / `glab mr create` in Bash or PowerShell registers the printed URL through the PostToolUse hook, silently, for the lead session only (never a subagent) and under the same host/remote checks as `watch`; refusals are only logged. This is Claude-only in v1: Codex uses the explicit `zirv ctx pr watch` verb.
+With `auto_register = true` (operator-only), a Claude session's successful `gh pr create` / `glab mr create` in Bash or PowerShell registers the URL on the last output line through the PostToolUse hook, silently, for the lead session only (never a subagent), under the same host checks as `watch` and only when its repository is one of the repo's git remotes or the command's `-R`/`--repo` repository; refusals are only logged. A fork clone whose only remote is the fork is therefore not auto-registered when the PR targets the parent: add the parent as a remote (`gh repo fork --clone` adds `upstream`) or run `zirv ctx pr watch <url>`. This is Claude-only in v1: Codex uses the explicit `zirv ctx pr watch` verb.
 
 `poll` calls `gh pr view/checks`, `gh api` (GitHub) or `glab mr view`, `glab api`
 (GitLab) with argv arrays and a 10 s timeout; token files are never read. Each
