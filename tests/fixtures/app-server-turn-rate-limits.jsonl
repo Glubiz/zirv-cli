@@ -1,0 +1,15 @@
+# A turn over codex app-server that also reports live rate limits (account/rateLimits/updated). '>' client sends, '<' server emits.
+> {"id":1,"method":"initialize","params":{"clientInfo":{"name":"zirv","version":"0.0.0"},"capabilities":{"experimentalApi":false}}}
+< {"id":1,"result":{"userAgent":"fake/0","codexHome":"/tmp/codex","platformFamily":"unix","platformOs":"linux"}}
+> {"method":"initialized"}
+> {"id":2,"method":"thread/start","params":{"approvalPolicy":"never","cwd":"/repo","sandbox":"workspace-write"}}
+< {"method":"remoteControl/status/changed","params":{"status":"disabled"}}
+< {"id":2,"result":{"thread":{"id":"thr-1","path":"/tmp/codex/sessions/rollout-thr-1.jsonl","turns":[]},"model":"fake","approvalPolicy":"never"}}
+> {"id":3,"method":"turn/start","params":{"threadId":"thr-1","input":[{"type":"text","text":"do the work","text_elements":[]}]}}
+< {"id":3,"result":{"turn":{"id":"turn-1","items":[],"status":"inProgress"}}}
+< {"method":"turn/started","params":{"threadId":"thr-1","turn":{"id":"turn-1","items":[],"status":"inProgress"}}}
+< {"method":"thread/tokenUsage/updated","params":{"threadId":"thr-1","turnId":"turn-1","tokenUsage":{"total":{"inputTokens":900,"cachedInputTokens":100,"outputTokens":20,"reasoningOutputTokens":5,"totalTokens":920},"last":{"inputTokens":900,"cachedInputTokens":100,"outputTokens":20,"reasoningOutputTokens":5,"totalTokens":920},"modelContextWindow":null}}}
+< {"method":"item/completed","params":{"threadId":"thr-1","turnId":"turn-1","completedAtMs":1,"item":{"type":"agentMessage","id":"m1","text":"all done"}}}
+< {"method":"thread/tokenUsage/updated","params":{"threadId":"thr-1","turnId":"turn-1","tokenUsage":{"total":{"inputTokens":1200,"cachedInputTokens":200,"outputTokens":34,"reasoningOutputTokens":10,"totalTokens":1234},"last":{"inputTokens":300,"cachedInputTokens":100,"outputTokens":14,"reasoningOutputTokens":5,"totalTokens":314},"modelContextWindow":null}}}
+< {"method":"account/rateLimits/updated","params":{"rateLimits":{"limitId":"codex","limitName":null,"primary":{"usedPercent":42,"windowDurationMins":300,"resetsAt":4102444800},"secondary":{"usedPercent":7,"windowDurationMins":10080,"resetsAt":4102876800},"credits":null,"planType":"pro","rateLimitReachedType":null}}}
+< {"method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","items":[],"status":"completed"}}}

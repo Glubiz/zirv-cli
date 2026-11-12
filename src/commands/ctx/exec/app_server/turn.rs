@@ -26,6 +26,7 @@ use crate::commands::ctx::exec::accounting::TurnUsage;
 use crate::commands::ctx::log;
 use crate::commands::ctx::state::{StateDir, now_secs};
 use crate::commands::ctx::supervise::{ChildGuard, OutputTap};
+use crate::commands::ctx::window;
 
 /// Budget for `thread/start`'s answer, and for `turn/start`'s ack in the driver.
 pub const START_TIMEOUT: Duration = Duration::from_secs(60);
@@ -145,6 +146,27 @@ fn usage_of(total: &Value) -> Option<TranscriptUsage> {
     })
 }
 
+/// An app-server `RateLimitSnapshot` notification mapped through the shared
+/// codex mapper, which reads the rollout's snake_case shape.
+fn rate_limits_windows(params: &Value, observed_at: u64) -> Option<window::UsageWindows> {
+    let snapshot = params.get("rateLimits").filter(|v| v.is_object())?;
+    let slot = |key: &str| {
+        let node = snapshot.get(key).filter(|v| v.is_object())?;
+        Some(json!({
+            "used_percent": node.get("usedPercent")?,
+            "window_minutes": node.get("windowDurationMins"),
+            "resets_at": node.get("resetsAt"),
+        }))
+    };
+    let rollout_shaped = json!({
+        "primary": slot("primary"),
+        "secondary": slot("secondary"),
+        "credits": {"has_credits": snapshot.pointer("/credits/hasCredits")},
+        "rate_limit_reached_type": snapshot.get("rateLimitReachedType"),
+    });
+    window::windows_from_rate_limits(&rollout_shaped, observed_at)
+}
+
 /// SIGTERM the server's process group. A stdio app-server installs no
 /// handler for it (codex app-server/src/lib.rs:793-795, rust-v0.163.0), so it
 /// dies by the signal and exec sees a failed child.
@@ -213,7 +235,9 @@ impl Driver {
                         }
                     }
                 }
-                Ok(ServerFrame::Notification(_)) => {}
+                Ok(ServerFrame::Notification(ServerNotification::RateLimitsUpdated(params))) => {
+                    self.record_rate_limits(&params);
+                }
                 Err(error) => {
                     let _ = writeln!(
                         std::io::stderr(),
@@ -277,6 +301,29 @@ impl Driver {
         None
     }
 
+    /// Persist an `account/rateLimits/updated` snapshot into the codex usage
+    /// windows. Params are `{rateLimits: RateLimitSnapshot}` (camelCase,
+    /// codex app-server schema v2/AccountRateLimitsUpdatedNotification.json);
+    /// the snapshot carries no timestamp, so receipt time is its observation
+    /// time. `window::merge` keeps whichever reading is newer per slot, so a
+    /// rollout reading stamped later is never overwritten. Anything
+    /// unrecognized is logged and ignored.
+    fn record_rate_limits(&self, params: &Value) {
+        let now = now_secs();
+        let Some(fresh) = rate_limits_windows(params, now) else {
+            self.note("rate-limits-ignored", "no usable windows");
+            return;
+        };
+        let existing = window::load_for(&self.state, window::CODEX_USAGE_PROVIDER);
+        let merged = window::merge(existing.clone().unwrap_or_default(), fresh);
+        if Some(&merged) == existing.as_ref() {
+            return;
+        }
+        if let Err(error) = window::store_for(&self.state, window::CODEX_USAGE_PROVIDER, &merged) {
+            self.note("rate-limits-ignored", &format!("store failed: {error}"));
+        }
+    }
+
     /// `codex exec` prints `ERROR: <message>` to stderr; the tap scans it the same way.
     fn print_error(&mut self, message: &str) {
         if self.error.as_deref() == Some(message) {
@@ -311,6 +358,8 @@ mod tests {
     use std::io::{PipeWriter, pipe};
 
     const TURN_OK: &str = include_str!("../../../../../tests/fixtures/app-server-turn-ok.jsonl");
+    const TURN_RATE_LIMITS: &str =
+        include_str!("../../../../../tests/fixtures/app-server-turn-rate-limits.jsonl");
 
     /// Checks each client line against the script and feeds back its answer.
     struct Script {
@@ -370,6 +419,134 @@ mod tests {
             }
         };
         assert_eq!(ack.expect("matched").map(|r| r.method), Some("turn/start"));
+    }
+
+    fn driver(state: &StateDir) -> Driver {
+        let (tap, _rx) = mpsc::channel();
+        let (done, _done_rx) = mpsc::channel();
+        Driver {
+            group: 0,
+            thread_id: "thr-1".into(),
+            tap,
+            usage: Arc::new(Mutex::new(None)),
+            _done: done,
+            state: state.clone(),
+            session: "s".into(),
+            last_message: None,
+            error: None,
+        }
+    }
+
+    /// Replays `transcript` through a full driver run; returns whether the turn completed.
+    fn run_turn(transcript: &str, state: &StateDir) -> bool {
+        let mut command = Command::new("codex");
+        command
+            .args(["exec", "do the work", "--sandbox", "workspace-write"])
+            .current_dir("/repo");
+        let plan = translate::plan(&command, None).expect("plan");
+        let (reader, writer) = pipe().expect("pipe");
+        let script = Script {
+            server: FakeServer::new(parse_transcript(transcript).expect("transcript")),
+            out: writer,
+            buf: Vec::new(),
+        };
+        let mut conn = Conn::new(script, reader);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        conn.initialize("0.0.0", deadline).expect("handshake");
+        start(&mut conn, plan.thread, &plan.prompt, deadline).expect("turn/start written");
+        let driver = driver(state);
+        let usage = driver.usage.clone();
+        driver.run(conn);
+        usage.lock().is_ok_and(|u| u.is_some())
+    }
+
+    fn five_hour_percent(state: &StateDir) -> Option<f64> {
+        window::load_for(state, window::CODEX_USAGE_PROVIDER)?
+            .five_hour
+            .map(|w| w.used_percentage)
+    }
+
+    fn stored(state: &StateDir, five_hour_used: f64, observed_at: u64) {
+        let reading = window::UsageWindows {
+            five_hour: Some(window::Window {
+                used_percentage: five_hour_used,
+                resets_at: 4_102_444_800,
+                observed_at,
+                limit_reached: false,
+                overage_covered: false,
+            }),
+            seven_day: None,
+        };
+        window::store_for(state, window::CODEX_USAGE_PROVIDER, &reading).expect("store");
+    }
+
+    fn update(used: u64) -> Value {
+        json!({"rateLimits": {"primary": {"usedPercent": used, "windowDurationMins": 300,
+            "resetsAt": 4_102_444_800_u64}}})
+    }
+
+    #[test]
+    fn a_rate_limits_notification_updates_the_persisted_codex_windows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        assert!(run_turn(TURN_RATE_LIMITS, &state), "turn completes");
+        let stored = window::load_for(&state, window::CODEX_USAGE_PROVIDER).expect("persisted");
+        assert_eq!(stored.five_hour.map(|w| w.used_percentage), Some(42.0));
+        assert_eq!(stored.seven_day.map(|w| w.used_percentage), Some(7.0));
+    }
+
+    #[test]
+    fn the_notification_and_a_rollout_record_map_to_identical_windows() {
+        let at = window::parse_rfc3339_utc("2026-02-26T18:52:21Z").expect("time");
+        let rollout = r#"{"timestamp":"2026-02-26T18:52:21Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":42.0,"window_minutes":300,"resets_at":4102444800},"secondary":{"used_percent":7.0,"window_minutes":10080,"resets_at":4102876800},"credits":{"has_credits":true},"rate_limit_reached_type":null}}}"#;
+        let notification = json!({"rateLimits": {
+            "primary": {"usedPercent": 42, "windowDurationMins": 300, "resetsAt": 4_102_444_800_u64},
+            "secondary": {"usedPercent": 7, "windowDurationMins": 10080, "resetsAt": 4_102_876_800_u64},
+            "credits": {"hasCredits": true, "unlimited": false, "balance": null},
+            "rateLimitReachedType": null}});
+        let from_rollout = window::parse_rollout_line(rollout).expect("rollout");
+        assert_eq!(rate_limits_windows(&notification, at), Some(from_rollout));
+    }
+
+    #[test]
+    fn the_newer_reading_wins_in_both_directions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let now = now_secs();
+        // A rollout reading stamped after the snapshot arrives is kept.
+        stored(&state, 11.0, now + 1000);
+        driver(&state).record_rate_limits(&update(50));
+        assert_eq!(five_hour_percent(&state), Some(11.0));
+        // An older reading is replaced by the snapshot.
+        stored(&state, 11.0, now - 1000);
+        driver(&state).record_rate_limits(&update(50));
+        assert_eq!(five_hour_percent(&state), Some(50.0));
+    }
+
+    #[test]
+    fn a_malformed_notification_changes_nothing_and_the_turn_completes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        stored(&state, 11.0, 5);
+        let before = window::load_for(&state, window::CODEX_USAGE_PROVIDER);
+        let bad = r#"< {"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":"lots","windowDurationMins":300}}}}"#;
+        let transcript = TURN_OK.replace(
+            "< {\"method\":\"turn/completed\"",
+            &format!("{bad}\n< {{\"method\":\"turn/completed\""),
+        );
+        assert!(transcript.contains("lots"), "malformed line inserted");
+        assert!(run_turn(&transcript, &state), "turn completes");
+        assert_eq!(
+            window::load_for(&state, window::CODEX_USAGE_PROVIDER),
+            before
+        );
+        for params in [json!({}), json!({"rateLimits": 3}), json!(null)] {
+            driver(&state).record_rate_limits(&params);
+        }
+        assert_eq!(
+            window::load_for(&state, window::CODEX_USAGE_PROVIDER),
+            before
+        );
     }
 
     #[test]
