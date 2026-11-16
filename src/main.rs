@@ -1004,12 +1004,7 @@ mod tests {
     /// output as the clap-dispatched `zirv version` command.
     #[test]
     fn version_flag_exits_0_and_matches_version_command() {
-        let exe = std::env::current_exe().expect("current_exe");
-        let bin = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("target/debug")
-            .join(format!("zirv{}", std::env::consts::EXE_SUFFIX));
+        let bin = crate::commands::ctx::testenv::zirv_bin();
 
         let version_cmd = std::process::Command::new(&bin)
             .arg("version")
@@ -1051,12 +1046,7 @@ mod tests {
     /// end, including the process exit code.
     #[test]
     fn native_help_exits_0_and_prints_coming_soon() {
-        let exe = std::env::current_exe().expect("current_exe");
-        let bin = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("target/debug")
-            .join(format!("zirv{}", std::env::consts::EXE_SUFFIX));
+        let bin = crate::commands::ctx::testenv::zirv_bin();
 
         let out = std::process::Command::new(&bin)
             .args(["native", "--help"])
@@ -1095,12 +1085,7 @@ mod tests {
             std::fs::create_dir_all(root.path().join(".zirv")).expect("operator directory");
             std::fs::write(root.path().join(".zirv/ctx.toml"), config).expect("operator config");
         }
-        let exe = std::env::current_exe().expect("test executable");
-        let bin = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("target directory")
-            .join(format!("zirv{}", std::env::consts::EXE_SUFFIX));
+        let bin = crate::commands::ctx::testenv::zirv_bin();
         let mut command = std::process::Command::new(bin);
         for (key, _) in std::env::vars() {
             if key.starts_with("ZIRV_") || key.starts_with("CLAUDE") || key.starts_with("CODEX") {
@@ -1515,12 +1500,7 @@ mod tests {
         )
         .expect("write");
 
-        let exe = std::env::current_exe().expect("current_exe");
-        let bin = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("target/debug")
-            .join("zirv");
+        let bin = crate::commands::ctx::testenv::zirv_bin();
 
         let out = std::process::Command::new(&bin)
             .args(["memory", "--help"])

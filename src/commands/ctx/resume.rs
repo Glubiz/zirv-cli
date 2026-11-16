@@ -554,12 +554,7 @@ mod tests {
 
         // cargo test builds the bin target, so it sits next to the test
         // binary's grandparent directory (target/debug/deps/<test>).
-        let exe = std::env::current_exe().expect("current_exe");
-        let zirv = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("target dir")
-            .join("zirv");
+        let zirv = crate::commands::ctx::testenv::zirv_bin();
         // A stub agent that only records what session it was told it is: the
         // shared fake agent wants a --session-id, which an interactive launch
         // (this one) deliberately does not pass.
