@@ -214,6 +214,12 @@ cohorts stay never-pooled either way).
   floor and cost/wall reported but not gating. A `"quality"` campaign
   answers "does raising this floor make Jev's acted decisions more
   reproducible, without breaking correctness" -- not "is it cheaper."
+  `"correctness"` looks for a material win on `correctness` itself (CI lower
+  bound strictly greater than `min_effect`, on the 0-1 pass-rate scale; error,
+  timeout and crash trials count as 0.0), with the same correctness floor and
+  non-inferiority rails; a material cost or wall loss makes it a Tradeoff.
+  `campaigns/eval-behaviour.toml` uses it, since the eval adapter reports no
+  `quality`.
 - `[cohort] pressure, env` -- `pressure = "natural"|"forced"`; `env` applies
   to BOTH arms (never a candidate-only advantage) -- see
   `campaigns/context-compaction-forced.toml` for a forced-pressure cohort

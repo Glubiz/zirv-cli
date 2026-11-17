@@ -63,7 +63,8 @@ correctness_floor = 0.0
 quality_floor = 0.0
 max_correctness_regression = 0.0
 max_quality_regression = 0.0
-min_effect = 0.01
+min_effect = 0.05
+objective = "correctness"
 confidence = 0.9
 bootstrap_resamples = 2000
 
