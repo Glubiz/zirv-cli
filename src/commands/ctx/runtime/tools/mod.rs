@@ -97,18 +97,15 @@ fn resolve_frontend_runner(
 }
 
 fn frontend_runner_is_executable(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         path.metadata()
-            .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
     }
     #[cfg(not(unix))]
     {
-        true
+        path.is_file()
     }
 }
 

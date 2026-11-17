@@ -339,13 +339,7 @@ mod tests {
             &state,
             sessions::Record::new(session, "claude", &repo, sessions::Verb::Exec),
         );
-        let binary = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join(if cfg!(windows) { "zirv.exe" } else { "zirv" });
+        let binary = crate::commands::ctx::testenv::zirv_bin();
         let args = build("claude", &binary, &repo, &state, "12345678", false).unwrap();
         let config: Value =
             serde_json::from_str(args[0].strip_prefix("--mcp-config=").unwrap()).unwrap();
