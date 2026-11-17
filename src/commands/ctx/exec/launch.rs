@@ -6,13 +6,76 @@
 use super::accounting::TurnUsage;
 use super::*;
 
-/// The child, its output tap and guard, and an app-server turn's usage slot.
+/// The child, its output tap and guard, an app-server turn's usage slot, and
+/// the handle that steers or interrupts it.
 pub(super) type Launched = (
     std::process::Child,
     supervise::OutputTap,
     supervise::ChildGuard,
     Option<TurnUsage>,
+    Option<TurnControl>,
 );
+
+/// Budget for a `turn/steer` answer.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(super) const STEER_WAIT: Duration = Duration::from_secs(5);
+/// Budget for a `turn/interrupt` to end the turn before the server is killed.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(super) const INTERRUPT_WAIT: Duration = Duration::from_secs(10);
+/// How long past its own bound a caller waits for the driver's verdict.
+const REPLY_SLACK: Duration = Duration::from_secs(1);
+
+/// A request to the app-server driver, which alone writes to the server.
+/// `until` is the caller's deadline: the driver drops a request it reaches
+/// later than that, and the reply says whether it took effect.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(super) enum Control {
+    Steer {
+        text: String,
+        until: Instant,
+        reply: std::sync::mpsc::Sender<bool>,
+    },
+    Interrupt {
+        until: Instant,
+        reply: std::sync::mpsc::Sender<bool>,
+    },
+}
+
+/// Steers or interrupts the running app-server turn. Every method is `false`
+/// when the driver is gone or does not confirm in time, and the caller then
+/// does what it did before app-server existed.
+#[derive(Clone)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(super) struct TurnControl(std::sync::mpsc::Sender<Control>);
+
+#[cfg_attr(not(unix), allow(dead_code))]
+impl TurnControl {
+    pub(super) fn channel() -> (Self, std::sync::mpsc::Receiver<Control>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (Self(tx), rx)
+    }
+
+    /// Add `text` to the running turn; `true` once the server accepted it.
+    pub(super) fn steer(&self, text: &str, wait: Duration) -> bool {
+        let (reply, answer) = std::sync::mpsc::channel();
+        let control = Control::Steer {
+            text: text.to_string(),
+            until: Instant::now() + wait,
+            reply,
+        };
+        self.0.send(control).is_ok() && answer.recv_timeout(wait + REPLY_SLACK).unwrap_or(false)
+    }
+
+    /// Ask the server to end the turn; `true` once it has, and exits on its own.
+    pub(super) fn interrupt(&self, wait: Duration) -> bool {
+        let (reply, answer) = std::sync::mpsc::channel();
+        let control = Control::Interrupt {
+            until: Instant::now() + wait,
+            reply,
+        };
+        self.0.send(control).is_ok() && answer.recv_timeout(wait + REPLY_SLACK).unwrap_or(false)
+    }
+}
 
 /// The operator opted in and zirv builds this codex launch itself.
 pub(super) fn wants_app_server(
@@ -44,6 +107,7 @@ pub(super) fn spawn<W: Write>(
                     launched.tap,
                     launched.guard,
                     Some(launched.usage),
+                    Some(launched.control),
                 ));
             }
             Err(reason) => {
@@ -56,7 +120,7 @@ pub(super) fn spawn<W: Write>(
         }
     }
     let (child, tap, guard) = supervise::spawn_tapped(command, stdin_prompt)?;
-    Ok((child, tap, guard, None))
+    Ok((child, tap, guard, None, None))
 }
 
 #[cfg(test)]
@@ -243,5 +307,20 @@ mod tests {
         );
         assert_eq!(main_exec_launches(&run), 1, "{}", run.exec_argv);
         assert!(app_server_actions(&run).is_empty());
+    }
+
+    #[test]
+    fn a_codex_exec_child_has_no_steer_control() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "exit 0"]);
+        let (mut child, _tap, _guard, usage, control) =
+            super::spawn(command, None, false, &state, "s", &mut Vec::new()).expect("spawn");
+        assert!(
+            usage.is_none() && control.is_none(),
+            "a relaunch is codex exec"
+        );
+        let _ = child.wait();
     }
 }

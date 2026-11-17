@@ -12,7 +12,7 @@
 
 use std::io::Write;
 use std::process::{Child, Command};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,7 @@ use super::probe::{self, Conn, FallBackReason, Next};
 use super::translate;
 use crate::commands::ctx::event::TranscriptUsage;
 use crate::commands::ctx::exec::accounting::TurnUsage;
+use crate::commands::ctx::exec::launch::{Control, TurnControl};
 use crate::commands::ctx::log;
 use crate::commands::ctx::state::{StateDir, now_secs};
 use crate::commands::ctx::supervise::{ChildGuard, OutputTap};
@@ -31,12 +32,16 @@ use crate::commands::ctx::window;
 /// Budget for `thread/start`'s answer, and for `turn/start`'s ack in the driver.
 pub const START_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How often the driver looks up from the server's frames for a `Control`.
+const CONTROL_POLL: Duration = Duration::from_millis(100);
+
 /// A turn running over app-server: the child exec supervises and its handles.
 pub struct Launched {
     pub child: Child,
     pub guard: ChildGuard,
     pub tap: OutputTap,
     pub usage: TurnUsage,
+    pub control: TurnControl,
 }
 
 /// One `app-server` decision-log entry.
@@ -110,6 +115,7 @@ pub fn begin(
     let (tap, tap_rx) = mpsc::channel();
     let (done, done_rx) = mpsc::channel();
     let slot = Arc::new(Mutex::new(None));
+    let (control, control_rx) = TurnControl::channel();
     let driver = Driver {
         group: child.id(),
         thread_id,
@@ -120,6 +126,9 @@ pub fn begin(
         session: session.to_string(),
         last_message: None,
         error: None,
+        control: control_rx,
+        turn_id: None,
+        interrupting: None,
     };
     std::thread::spawn(move || driver.run(conn));
     Ok(Launched {
@@ -130,6 +139,7 @@ pub fn begin(
             slot,
             done: done_rx,
         },
+        control,
     })
 }
 
@@ -181,6 +191,8 @@ fn fail_child(group: u32) {
 
 enum End {
     Completed,
+    /// Ended by our own `turn/interrupt`; not a failure.
+    Interrupted,
     Failed(String),
 }
 
@@ -197,6 +209,12 @@ struct Driver {
     last_message: Option<String>,
     /// The fatal error already printed, so it is printed once.
     error: Option<String>,
+    /// Steer and interrupt requests from the supervisor; only this thread writes to the server.
+    control: Receiver<Control>,
+    /// The running turn's id, from `turn/start`'s answer.
+    turn_id: Option<String>,
+    /// A sent `turn/interrupt` still waiting for the turn to end: its bound and who to tell.
+    interrupting: Option<(Instant, Sender<bool>)>,
 }
 
 impl Driver {
@@ -204,9 +222,15 @@ impl Driver {
         // Cleared by `turn/start`'s ack; until then a quiet server fails the turn.
         let mut ack_deadline = Some(Instant::now() + START_TIMEOUT);
         let end = loop {
-            let frame = match conn.next_frame(ack_deadline) {
+            self.drain_control(&mut conn, ack_deadline.is_some());
+            let poll = Instant::now() + CONTROL_POLL;
+            let wait = ack_deadline.map_or(poll, |deadline| deadline.min(poll));
+            let frame = match conn.next_frame(Some(wait)) {
                 Next::Frame(frame) => frame,
-                Next::TimedOut => break End::Failed("turn/start was not acknowledged".into()),
+                Next::TimedOut if ack_deadline.is_some_and(|d| Instant::now() >= d) => {
+                    break End::Failed("turn/start was not acknowledged".into());
+                }
+                Next::TimedOut => continue,
                 Next::Closed => {
                     break End::Failed("the server closed stdout before the turn ended".into());
                 }
@@ -221,12 +245,22 @@ impl Driver {
                     let _ = conn.refuse(&id, &request);
                 }
                 Ok(frame @ (ServerFrame::Response { .. } | ServerFrame::Error { .. })) => {
-                    // `turn/start` is the only request still in flight.
+                    // A steer or interrupt that timed out may still answer late; only
+                    // `turn/start`'s answer decides the turn.
                     let Ok(Some(resolved)) = conn.resolve(&frame) else {
                         continue;
                     };
+                    if resolved.method != "turn/start" {
+                        continue;
+                    }
                     match resolved.outcome {
-                        Ok(_) => ack_deadline = None,
+                        Ok(ack) => {
+                            ack_deadline = None;
+                            self.turn_id = ack
+                                .pointer("/turn/id")
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
+                        }
                         Err(rpc) => {
                             break End::Failed(format!(
                                 "turn/start error {}: {}",
@@ -254,14 +288,88 @@ impl Driver {
                 self.note("turn-completed", &self.thread_id);
                 conn.close_stdin();
             }
-            End::Failed(message) => {
-                self.print_error(&message);
-                self.note("turn-failed", &message);
+            End::Interrupted => {
+                self.note("turn-interrupted", &self.thread_id);
+                conn.close_stdin();
+            }
+            End::Failed(ref message) => {
+                self.print_error(message);
+                self.note("turn-failed", message);
                 fail_child(self.group);
             }
         }
+        if let Some((_, reply)) = self.interrupting.take() {
+            let _ = reply.send(!matches!(end, End::Failed(_)));
+        }
         // Drain to EOF so the server never writes into a closed pipe.
         while let Next::Frame(_) = conn.next_frame(None) {}
+    }
+
+    /// Serve the supervisor's requests. They wait for `turn/start`'s answer,
+    /// which carries the turn id they need.
+    fn drain_control(&mut self, conn: &mut Conn, ack_pending: bool) {
+        if let Some((_, reply)) = self
+            .interrupting
+            .take_if(|(until, _)| Instant::now() >= *until)
+        {
+            self.note("interrupt-failed", "the turn did not end in time");
+            let _ = reply.send(false);
+        }
+        if ack_pending {
+            return;
+        }
+        while let Ok(control) = self.control.try_recv() {
+            match control {
+                Control::Steer { text, until, reply } => {
+                    let _ = reply.send(self.steer(conn, &text, until));
+                }
+                Control::Interrupt { until, reply } => self.interrupt(conn, until, reply),
+            }
+        }
+    }
+
+    fn steer(&self, conn: &mut Conn, text: &str, until: Instant) -> bool {
+        let Some(turn_id) = self.turn_id.as_deref() else {
+            return false;
+        };
+        if self.interrupting.is_some() || Instant::now() >= until {
+            return false;
+        }
+        let params = json!({
+            "threadId": self.thread_id,
+            "expectedTurnId": turn_id,
+            "input": [{"type": "text", "text": text, "text_elements": []}],
+        });
+        match conn.request(&ClientRequest::TurnSteer(params), until) {
+            Ok(_) => {
+                self.note("turn-steered", turn_id);
+                true
+            }
+            Err(reason) => {
+                self.note("steer-failed", &reason.to_string());
+                false
+            }
+        }
+    }
+
+    fn interrupt(&mut self, conn: &mut Conn, until: Instant, reply: Sender<bool>) {
+        let Some(turn_id) = self.turn_id.clone() else {
+            let _ = reply.send(false);
+            return;
+        };
+        if self.interrupting.is_some() || Instant::now() >= until {
+            let _ = reply.send(false);
+            return;
+        }
+        let params = json!({"threadId": self.thread_id, "turnId": turn_id});
+        match conn.request(&ClientRequest::TurnInterrupt(params), until) {
+            // The turn's own `turn/completed` settles it.
+            Ok(_) => self.interrupting = Some((until, reply)),
+            Err(reason) => {
+                self.note("interrupt-failed", &reason.to_string());
+                let _ = reply.send(false);
+            }
+        }
     }
 
     fn on(&mut self, method: &str, params: &Value) -> Option<End> {
@@ -289,6 +397,9 @@ impl Driver {
                 let status = text("/turn/status").unwrap_or_default();
                 if status == "completed" {
                     return Some(End::Completed);
+                }
+                if status == "interrupted" && self.interrupting.is_some() {
+                    return Some(End::Interrupted);
                 }
                 let message = text("/turn/error/message")
                     .map(str::to_string)
@@ -355,6 +466,7 @@ mod tests {
     use super::*;
     use crate::commands::ctx::adapters::AgentAdapter;
     use crate::commands::ctx::adapters::codex::CodexAdapter;
+    use crate::commands::ctx::exec::launch::TurnControl;
     use std::io::{PipeWriter, pipe};
 
     const TURN_OK: &str = include_str!("../../../../../tests/fixtures/app-server-turn-ok.jsonl");
@@ -366,6 +478,7 @@ mod tests {
         server: FakeServer,
         out: PipeWriter,
         buf: Vec<u8>,
+        sent: Arc<Mutex<Vec<String>>>,
     }
 
     impl Write for Script {
@@ -373,6 +486,9 @@ mod tests {
             self.buf.extend_from_slice(bytes);
             while let Some(end) = self.buf.iter().position(|b| *b == b'\n') {
                 let line: Vec<u8> = self.buf.drain(..=end).collect();
+                if let Ok(mut sent) = self.sent.lock() {
+                    sent.push(String::from_utf8_lossy(&line).trim().to_string());
+                }
                 let replies = self
                     .server
                     .on_outbound(&String::from_utf8_lossy(&line))
@@ -401,6 +517,7 @@ mod tests {
             server: FakeServer::new(parse_transcript(TURN_OK).expect("transcript")),
             out: writer,
             buf: Vec::new(),
+            sent: Arc::default(),
         };
         let mut conn = Conn::new(script, reader);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -422,6 +539,10 @@ mod tests {
     }
 
     fn driver(state: &StateDir) -> Driver {
+        driver_with_control(state, mpsc::channel().1)
+    }
+
+    fn driver_with_control(state: &StateDir, control: mpsc::Receiver<Control>) -> Driver {
         let (tap, _rx) = mpsc::channel();
         let (done, _done_rx) = mpsc::channel();
         Driver {
@@ -434,6 +555,9 @@ mod tests {
             session: "s".into(),
             last_message: None,
             error: None,
+            control,
+            turn_id: None,
+            interrupting: None,
         }
     }
 
@@ -449,6 +573,7 @@ mod tests {
             server: FakeServer::new(parse_transcript(transcript).expect("transcript")),
             out: writer,
             buf: Vec::new(),
+            sent: Arc::default(),
         };
         let mut conn = Conn::new(script, reader);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -557,5 +682,197 @@ mod tests {
         let codex = CodexAdapter::new(None).transcript_usage(rollout);
         assert_eq!(codex.map(|u| u.input_tokens), Some(1000));
         assert_eq!(usage_of(&total), codex);
+    }
+
+    /// The handshake through `turn/start`'s ack, which carries the turn id.
+    fn head() -> String {
+        TURN_OK.lines().take(9).collect::<Vec<_>>().join("\n")
+    }
+
+    const STEER: &str = r#"> {"id":4,"method":"turn/steer","params":{"threadId":"thr-1","expectedTurnId":"turn-1","input":[{"type":"text","text":"look at the mail","text_elements":[]}]}}"#;
+    const INTERRUPT: &str =
+        r#"> {"id":4,"method":"turn/interrupt","params":{"threadId":"thr-1","turnId":"turn-1"}}"#;
+    const ANSWER: &str = r#"< {"id":4,"result":{"turnId":"turn-1"}}"#;
+    const REJECTED: &str =
+        r#"< {"id":4,"error":{"code":-32600,"message":"expected turn id does not match"}}"#;
+    const INTERRUPTED: &str = r#"< {"method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","items":[],"status":"interrupted"}}}"#;
+    const COMPLETED: &str = r#"{"method":"turn/completed","params":{"threadId":"thr-1","turn":{"id":"turn-1","items":[],"status":"completed"}}}"#;
+    const SHORT: Duration = Duration::from_millis(300);
+
+    /// A driver already past `turn/start`, run on its own thread against `transcript`.
+    struct Running {
+        control: TurnControl,
+        driver: std::thread::JoinHandle<()>,
+        /// Lets a test play a server frame the script does not.
+        server: PipeWriter,
+        sent: Arc<Mutex<Vec<String>>>,
+        state: StateDir,
+        _dir: tempfile::TempDir,
+    }
+
+    fn running(transcript: &str) -> Running {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let (reader, writer) = pipe().expect("pipe");
+        let server = writer.try_clone().expect("clone");
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let script = Script {
+            server: FakeServer::new(parse_transcript(transcript).expect("transcript")),
+            out: writer,
+            buf: Vec::new(),
+            sent: sent.clone(),
+        };
+        let mut conn = Conn::new(script, reader);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        conn.initialize("0.0.0", deadline).expect("handshake");
+        start(
+            &mut conn,
+            json!({"approvalPolicy": "never", "cwd": "/repo", "sandbox": "workspace-write"}),
+            "do the work",
+            deadline,
+        )
+        .expect("turn/start written");
+        let (control, receiver) = TurnControl::channel();
+        let driver = driver_with_control(&state, receiver);
+        Running {
+            control,
+            driver: std::thread::spawn(move || driver.run(conn)),
+            server,
+            sent,
+            state,
+            _dir: dir,
+        }
+    }
+
+    impl Running {
+        fn sent(&self) -> Vec<String> {
+            self.sent.lock().map(|s| s.clone()).unwrap_or_default()
+        }
+
+        /// Ends the turn from the server side, then waits for the driver; returns the decision log.
+        fn finish(self, frames: &[&str]) -> String {
+            let mut server = self.server;
+            for frame in frames {
+                writeln!(server, "{frame}").expect("server frame");
+            }
+            drop(server);
+            self.driver.join().expect("driver exits");
+            std::fs::read_to_string(self.state.root().join("logs/decisions.jsonl"))
+                .unwrap_or_default()
+        }
+    }
+
+    #[test]
+    fn a_steer_carries_the_turn_id_from_the_ack_and_the_text() {
+        let run = running(&format!("{}\n{STEER}\n{ANSWER}\n< {COMPLETED}", head()));
+        assert!(
+            run.control
+                .steer("look at the mail", Duration::from_secs(5))
+        );
+        let sent: Value = serde_json::from_str(run.sent().last().expect("sent")).expect("json");
+        let expected: Value =
+            serde_json::from_str(STEER.strip_prefix("> ").expect("marker")).expect("json");
+        assert_eq!(sent, expected);
+        let log = run.finish(&[]);
+        assert!(log.contains("turn-completed"), "{log}");
+    }
+
+    #[test]
+    fn a_rejected_steer_is_false_and_the_turn_still_completes() {
+        let run = running(&format!("{}\n{STEER}\n{REJECTED}\n< {COMPLETED}", head()));
+        assert!(
+            !run.control
+                .steer("look at the mail", Duration::from_secs(5))
+        );
+        let log = run.finish(&[]);
+        assert!(
+            log.contains("turn-completed") && !log.contains("turn-failed"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn a_steer_with_no_answer_times_out_and_a_late_error_does_not_fail_the_turn() {
+        let run = running(&format!("{}\n{STEER}", head()));
+        let started = Instant::now();
+        assert!(!run.control.steer("look at the mail", SHORT));
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "bounded by the wait"
+        );
+        let late = r#"{"id":4,"error":{"code":-32600,"message":"late"}}"#;
+        let log = run.finish(&[late, COMPLETED]);
+        assert!(
+            log.contains("turn-completed") && !log.contains("turn-failed"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn a_steer_without_a_turn_id_writes_nothing() {
+        let no_id = head().replacen(
+            r#""turn":{"id":"turn-1","items":[],"status":"inProgress"}"#,
+            r#""turn":{}"#,
+            1,
+        );
+        let run = running(&no_id);
+        assert!(!run.control.steer("look at the mail", SHORT));
+        assert_eq!(
+            run.sent().len(),
+            4,
+            "nothing after turn/start: {:?}",
+            run.sent()
+        );
+        run.finish(&[COMPLETED]);
+    }
+
+    #[test]
+    fn a_steer_after_the_driver_exits_is_false_at_once() {
+        let run = running(TURN_OK);
+        let control = run.control.clone();
+        run.finish(&[]);
+        let started = Instant::now();
+        assert!(!control.steer("late", Duration::from_secs(5)));
+        assert!(!control.interrupt(Duration::from_secs(5)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn an_interrupt_that_completes_as_interrupted_is_clean_not_a_failed_turn() {
+        let run = running(&format!(
+            "{}\n{INTERRUPT}\n< {{\"id\":4,\"result\":{{}}}}\n{INTERRUPTED}",
+            head()
+        ));
+        assert!(run.control.interrupt(Duration::from_secs(5)));
+        let log = run.finish(&[]);
+        assert!(log.contains("turn-interrupted"), "{log}");
+        assert!(!log.contains("turn-failed"), "{log}");
+    }
+
+    #[test]
+    fn an_interrupt_with_no_reply_is_false_within_its_bound() {
+        let run = running(&format!("{}\n{INTERRUPT}", head()));
+        let started = Instant::now();
+        assert!(!run.control.interrupt(SHORT));
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "bounded by the wait"
+        );
+        run.finish(&[COMPLETED]);
+    }
+
+    #[test]
+    fn an_interrupt_answered_but_never_completed_is_false_within_its_bound() {
+        let run = running(&format!(
+            "{}\n{INTERRUPT}\n< {{\"id\":4,\"result\":{{}}}}",
+            head()
+        ));
+        let started = Instant::now();
+        assert!(!run.control.interrupt(SHORT));
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "bounded by the wait"
+        );
+        run.finish(&[COMPLETED]);
     }
 }

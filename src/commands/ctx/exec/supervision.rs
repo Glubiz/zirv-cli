@@ -12,6 +12,47 @@ fn self_heal_transcript(current: &Path, resolve: Option<&dyn Fn() -> PathBuf>) -
     (candidate != current && candidate.is_file()).then_some(candidate)
 }
 
+/// Steer the unread mail into a running app-server turn instead of restarting
+/// it; the mail is consumed only once the server took it.
+fn steer_with_mail(
+    control: &super::launch::TurnControl,
+    state: &StateDir,
+    slug: &str,
+    agent: &str,
+    short: &str,
+    cfg: &CtxConfig,
+) -> bool {
+    if !cfg.mail.enabled {
+        return false;
+    }
+    let Ok(unread) = super::mail::list(state, slug, Some(agent), Some(short)) else {
+        return false;
+    };
+    if unread.is_empty() {
+        return false;
+    }
+    let mut text =
+        String::from("New messages from other zirv sessions arrived while you worked:\n");
+    for (_, message) in &unread {
+        text.push_str(&format!(
+            "\nFrom {} ({}):\n{}\n",
+            message.from_agent, message.from_session, message.body
+        ));
+    }
+    let mut end = text.len().min(cfg.mail.max_delivered_bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    if !control.steer(&text, super::launch::STEER_WAIT) {
+        return false;
+    }
+    for (path, _) in &unread {
+        let _ = super::mail::consume_and_log(state, slug, path, short, "exec", "exec:steer");
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn supervise_run(
     child: &mut std::process::Child,
@@ -72,6 +113,8 @@ pub(super) fn supervise_run(
     stall_grace: Duration,
     stalled: &mut bool,
     cancellation: Option<&super::provider::adapter::CancellationFlag>,
+    // An app-server turn's handle: a nudge steers it and a stop interrupts it first.
+    control: Option<&super::launch::TurnControl>,
 ) -> CtxResult<Outcome> {
     // Give an over-budget child one tick to exit naturally so its own exit
     // code is preserved; kill only on a second hard-stop tick. (#203)
@@ -147,6 +190,31 @@ pub(super) fn supervise_run(
         // Claim a nudge once, then stop only if relaunch is possible; otherwise
         // leave the child and unread mail untouched.
         if let Some(from) = super::sessions::claim_nudge_marker(state, registry_short) {
+            if let Some(control) = control
+                && steer_with_mail(
+                    control,
+                    state,
+                    &super::state::repo_slug(repo),
+                    adapter.name(),
+                    session_guard.short(),
+                    cfg,
+                )
+            {
+                let _ = log::append(
+                    state,
+                    &log::Decision {
+                        ts: now_secs(),
+                        session,
+                        verb: "exec",
+                        verdict: "n/a",
+                        score: 0,
+                        action: "nudge-steered",
+                        detail: &from,
+                        observed_at: None,
+                    },
+                );
+                return Tick::Continue;
+            }
             if can_restart && nudges_used < max_nudges {
                 *nudged_by = Some(from);
                 return Tick::Stop("nudge");
@@ -385,7 +453,21 @@ pub(super) fn supervise_run(
             _ => Tick::Continue,
         }
     };
-    let outcome = supervise::supervise_child(child, deadline, poll, &mut tick)?;
+    // The server exits on its own once an interrupted turn closes its stdin.
+    let mut before_kill = |child: &mut std::process::Child| {
+        let Some(control) = control else {
+            return;
+        };
+        if !control.interrupt(super::launch::INTERRUPT_WAIT) {
+            return;
+        }
+        let exit_by = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < exit_by && matches!(child.try_wait(), Ok(None)) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let outcome =
+        supervise::supervise_child_before_kill(child, deadline, poll, &mut tick, &mut before_kill)?;
 
     // Read the final transcript before classifying a fast provider error.
     if !*limit_hit {
@@ -867,5 +949,96 @@ mod tests {
             std::env::remove_var("FAKE_AGENT_MODE");
         }
         assert_eq!(code.expect("runs"), 0, "polling still supervises the run");
+    }
+
+    fn steer_fixture() -> (
+        tempfile::TempDir,
+        StateDir,
+        String,
+        super::super::config::CtxConfig,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let slug = super::super::state::repo_slug(tmp.path());
+        (tmp, state, slug, super::super::config::CtxConfig::default())
+    }
+
+    fn deliver(state: &StateDir, slug: &str, cfg: &super::super::config::CtxConfig, body: &str) {
+        let message = super::super::mail::Message {
+            from_session: "other".into(),
+            from_agent: "claude".into(),
+            to: "codex".into(),
+            to_session: Some("sess0000".into()),
+            sent: 1,
+            body: body.into(),
+        };
+        super::super::mail::store(state, slug, &message, cfg).expect("store");
+    }
+
+    /// Plays the driver: answers one steer with `answer` and hands the text back.
+    fn answer_one_steer(
+        receiver: std::sync::mpsc::Receiver<super::super::launch::Control>,
+        answer: bool,
+    ) -> std::thread::JoinHandle<Option<String>> {
+        std::thread::spawn(
+            move || match receiver.recv_timeout(Duration::from_secs(5)) {
+                Ok(super::super::launch::Control::Steer { text, reply, .. }) => {
+                    let _ = reply.send(answer);
+                    Some(text)
+                }
+                _ => None,
+            },
+        )
+    }
+
+    #[test]
+    fn a_successful_steer_delivers_the_unread_mail_and_consumes_it() {
+        let (tmp, state, slug, cfg) = steer_fixture();
+        deliver(&state, &slug, &cfg, "please look at the failing test");
+        let (control, receiver) = super::super::launch::TurnControl::channel();
+        let driver = answer_one_steer(receiver, true);
+        assert!(steer_with_mail(
+            &control, &state, &slug, "codex", "sess0000", &cfg
+        ));
+        let text = driver.join().expect("driver").expect("a steer arrived");
+        assert!(text.contains("please look at the failing test"), "{text}");
+        let left =
+            super::super::mail::list(&state, &slug, Some("codex"), Some("sess0000")).expect("mail");
+        assert!(left.is_empty(), "consumed only after the steer succeeded");
+        drop(tmp);
+    }
+
+    #[test]
+    fn a_failed_steer_leaves_the_mail_unread_for_the_relaunch() {
+        let (tmp, state, slug, cfg) = steer_fixture();
+        deliver(&state, &slug, &cfg, "please look at the failing test");
+        let (control, receiver) = super::super::launch::TurnControl::channel();
+        let driver = answer_one_steer(receiver, false);
+        assert!(!steer_with_mail(
+            &control, &state, &slug, "codex", "sess0000", &cfg
+        ));
+        driver.join().expect("driver");
+        let left =
+            super::super::mail::list(&state, &slug, Some("codex"), Some("sess0000")).expect("mail");
+        assert_eq!(left.len(), 1);
+        drop(tmp);
+    }
+
+    #[test]
+    fn a_steer_with_no_unread_mail_or_a_gone_driver_is_false() {
+        let (tmp, state, slug, cfg) = steer_fixture();
+        let (control, receiver) = super::super::launch::TurnControl::channel();
+        assert!(!steer_with_mail(
+            &control, &state, &slug, "codex", "sess0000", &cfg
+        ));
+        deliver(&state, &slug, &cfg, "hello");
+        drop(receiver);
+        assert!(!steer_with_mail(
+            &control, &state, &slug, "codex", "sess0000", &cfg
+        ));
+        let left =
+            super::super::mail::list(&state, &slug, Some("codex"), Some("sess0000")).expect("mail");
+        assert_eq!(left.len(), 1);
+        drop(tmp);
     }
 }
