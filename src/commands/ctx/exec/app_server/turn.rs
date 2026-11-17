@@ -222,7 +222,7 @@ impl Driver {
         // Cleared by `turn/start`'s ack; until then a quiet server fails the turn.
         let mut ack_deadline = Some(Instant::now() + START_TIMEOUT);
         let end = loop {
-            self.drain_control(&mut conn, ack_deadline.is_some());
+            self.drain_control(&mut conn);
             let poll = Instant::now() + CONTROL_POLL;
             let wait = ack_deadline.map_or(poll, |deadline| deadline.min(poll));
             let frame = match conn.next_frame(Some(wait)) {
@@ -260,6 +260,7 @@ impl Driver {
                                 .pointer("/turn/id")
                                 .and_then(Value::as_str)
                                 .map(str::to_string);
+                            self.note("turn-acked", self.turn_id.as_deref().unwrap_or(""));
                         }
                         Err(rpc) => {
                             break End::Failed(format!(
@@ -305,18 +306,15 @@ impl Driver {
         while let Next::Frame(_) = conn.next_frame(None) {}
     }
 
-    /// Serve the supervisor's requests. They wait for `turn/start`'s answer,
-    /// which carries the turn id they need.
-    fn drain_control(&mut self, conn: &mut Conn, ack_pending: bool) {
+    /// Serve the supervisor's requests. Until `turn/start`'s answer there is
+    /// no turn id, so `steer` and `interrupt` answer `false` at once.
+    fn drain_control(&mut self, conn: &mut Conn) {
         if let Some((_, reply)) = self
             .interrupting
             .take_if(|(until, _)| Instant::now() >= *until)
         {
             self.note("interrupt-failed", "the turn did not end in time");
             let _ = reply.send(false);
-        }
-        if ack_pending {
-            return;
         }
         while let Ok(control) = self.control.try_recv() {
             match control {
@@ -744,6 +742,19 @@ mod tests {
         }
     }
 
+    /// `running`, once the driver has taken `turn/start`'s answer; controls
+    /// sent earlier fail at once, so tests that steer need this.
+    fn running_acked(transcript: &str) -> Running {
+        let run = running(transcript);
+        let log = run.state.root().join("logs/decisions.jsonl");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !std::fs::read_to_string(&log).is_ok_and(|text| text.contains("turn-acked")) {
+            assert!(Instant::now() < deadline, "the driver never took the ack");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        run
+    }
+
     impl Running {
         fn sent(&self) -> Vec<String> {
             self.sent.lock().map(|s| s.clone()).unwrap_or_default()
@@ -764,7 +775,7 @@ mod tests {
 
     #[test]
     fn a_steer_carries_the_turn_id_from_the_ack_and_the_text() {
-        let run = running(&format!("{}\n{STEER}\n{ANSWER}\n< {COMPLETED}", head()));
+        let run = running_acked(&format!("{}\n{STEER}\n{ANSWER}\n< {COMPLETED}", head()));
         assert!(
             run.control
                 .steer("look at the mail", Duration::from_secs(5))
@@ -779,7 +790,7 @@ mod tests {
 
     #[test]
     fn a_rejected_steer_is_false_and_the_turn_still_completes() {
-        let run = running(&format!("{}\n{STEER}\n{REJECTED}\n< {COMPLETED}", head()));
+        let run = running_acked(&format!("{}\n{STEER}\n{REJECTED}\n< {COMPLETED}", head()));
         assert!(
             !run.control
                 .steer("look at the mail", Duration::from_secs(5))
@@ -793,7 +804,7 @@ mod tests {
 
     #[test]
     fn a_steer_with_no_answer_times_out_and_a_late_error_does_not_fail_the_turn() {
-        let run = running(&format!("{}\n{STEER}", head()));
+        let run = running_acked(&format!("{}\n{STEER}", head()));
         let started = Instant::now();
         assert!(!run.control.steer("look at the mail", SHORT));
         assert!(
@@ -815,7 +826,7 @@ mod tests {
             r#""turn":{}"#,
             1,
         );
-        let run = running(&no_id);
+        let run = running_acked(&no_id);
         assert!(!run.control.steer("look at the mail", SHORT));
         assert_eq!(
             run.sent().len(),
@@ -828,7 +839,7 @@ mod tests {
 
     #[test]
     fn a_steer_after_the_driver_exits_is_false_at_once() {
-        let run = running(TURN_OK);
+        let run = running_acked(TURN_OK);
         let control = run.control.clone();
         run.finish(&[]);
         let started = Instant::now();
@@ -839,7 +850,7 @@ mod tests {
 
     #[test]
     fn an_interrupt_that_completes_as_interrupted_is_clean_not_a_failed_turn() {
-        let run = running(&format!(
+        let run = running_acked(&format!(
             "{}\n{INTERRUPT}\n< {{\"id\":4,\"result\":{{}}}}\n{INTERRUPTED}",
             head()
         ));
@@ -851,7 +862,7 @@ mod tests {
 
     #[test]
     fn an_interrupt_with_no_reply_is_false_within_its_bound() {
-        let run = running(&format!("{}\n{INTERRUPT}", head()));
+        let run = running_acked(&format!("{}\n{INTERRUPT}", head()));
         let started = Instant::now();
         assert!(!run.control.interrupt(SHORT));
         assert!(
@@ -863,7 +874,7 @@ mod tests {
 
     #[test]
     fn an_interrupt_answered_but_never_completed_is_false_within_its_bound() {
-        let run = running(&format!(
+        let run = running_acked(&format!(
             "{}\n{INTERRUPT}\n< {{\"id\":4,\"result\":{{}}}}",
             head()
         ));
@@ -873,6 +884,51 @@ mod tests {
             started.elapsed() < Duration::from_secs(4),
             "bounded by the wait"
         );
+        run.finish(&[COMPLETED]);
+    }
+
+    #[test]
+    fn a_late_steer_answer_never_decides_a_later_interrupt() {
+        let interrupt = INTERRUPT.replace(r#""id":4"#, r#""id":5"#);
+        // The steer's answer arrives late, in the middle of the interrupt's wait.
+        let run = running_acked(&format!(
+            "{}\n{STEER}\n{interrupt}\n{REJECTED}\n< {{\"id\":5,\"result\":{{}}}}\n{INTERRUPTED}",
+            head()
+        ));
+        assert!(!run.control.steer("look at the mail", SHORT));
+        assert!(
+            run.control.interrupt(Duration::from_secs(5)),
+            "the interrupt's own answer decides it, not the steer's late one"
+        );
+        let log = run.finish(&[]);
+        assert!(
+            log.contains("turn-interrupted") && !log.contains("turn-failed"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn controls_sent_before_the_turn_ack_fail_at_once() {
+        // The server never answers `turn/start`, so there is no turn id yet.
+        let mut run = running(&TURN_OK.lines().take(8).collect::<Vec<_>>().join("\n"));
+        let started = Instant::now();
+        assert!(!run.control.interrupt(Duration::from_secs(3)));
+        assert!(!run.control.steer("early", Duration::from_secs(3)));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "answered false at once, not after the bound: {:?}",
+            started.elapsed()
+        );
+        writeln!(
+            run.server,
+            "{}",
+            TURN_OK
+                .lines()
+                .nth(8)
+                .expect("ack")
+                .trim_start_matches("< ")
+        )
+        .expect("ack");
         run.finish(&[COMPLETED]);
     }
 }
