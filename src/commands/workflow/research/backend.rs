@@ -39,6 +39,8 @@ pub struct TrialSpec {
     pub env: BTreeMap<String, String>,
     pub state_dir: String,
     pub timeout_secs: u64,
+    /// The backend's declared spend ceiling for this one trial; a backend that spends must stay under it.
+    pub per_trial_ceiling_usd: f64,
     pub zirv_dir: Option<String>,
     pub strategy: Option<serde_json::Value>,
     pub cache_mode: String,
@@ -539,6 +541,7 @@ mod tests {
             env: BTreeMap::new(),
             state_dir: "state".into(),
             timeout_secs: 60,
+            per_trial_ceiling_usd: 1.0,
             zirv_dir: None,
             strategy: None,
             cache_mode: "cold".into(),

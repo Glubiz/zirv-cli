@@ -12,11 +12,29 @@ use super::grade::{Check, grade};
 use super::trace::trace;
 use crate::commands::benchmark::run::{self, Launch, LaunchSpec, Status};
 use crate::commands::ctx::state;
+use crate::commands::workflow::research::backend::{
+    Money, SpendReport, TRIAL_SPEC_SCHEMA, TrialResult, TrialStatus,
+};
 
 const ROW_SCHEMA: u32 = 1;
 const STOPPED_REASON: &str = "stopped on regression";
+const DEADLINE_REASON: &str = "trial deadline reached";
 
 pub type Launcher<'a> = dyn FnMut(&LaunchSpec) -> Result<Launch, String> + 'a;
+
+/// Seconds one sample may run: the per-sample limit, cut to what is left of the trial `deadline`;
+/// `None` once under a second remains. The one place that decides the trial is out of time.
+pub fn sample_timeout(
+    per_sample: u64,
+    deadline: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> Option<u64> {
+    let Some(deadline) = deadline else {
+        return Some(per_sample);
+    };
+    let left = deadline.saturating_duration_since(now).as_secs();
+    (left >= 1).then(|| per_sample.min(left))
+}
 
 /// What `run` needs besides the cases; paths are resolved by the caller.
 pub struct Opts<'a> {
@@ -24,7 +42,10 @@ pub struct Opts<'a> {
     pub max_usd: f64,
     pub baseline: Option<&'a str>,
     pub stop_on_regression: bool,
-    pub json: bool,
+    /// No sample starts at or after this instant (a research trial's own deadline).
+    pub deadline: Option<std::time::Instant>,
+    /// A hard spend contract (research trial): an unpriced sample counts as reaching the cap.
+    pub strict_cap: bool,
     /// `<state>/eval`.
     pub root: &'a Path,
     pub work: &'a Path,
@@ -147,6 +168,11 @@ pub struct Report {
     comparisons: Vec<Comparison>,
     regressions: usize,
     surface_changed: usize,
+    /// Counted samples that failed to run or be read (not graded); kept out of the JSON report.
+    #[serde(skip)]
+    infra_failures: Vec<String>,
+    #[serde(skip)]
+    deadline_skipped: u32,
 }
 
 /// Verdicts in first-seen case order; a case with no counted sample (all skipped) has none.
@@ -227,6 +253,22 @@ fn build_report(
             .filter(|c| c.change == Change::Regression)
             .count(),
         surface_changed: comparisons.iter().filter(|c| c.surface_changed).count(),
+        infra_failures: rows
+            .iter()
+            .filter(|r| r.status == Status::Failed)
+            .map(|r| {
+                format!(
+                    "{} sample {}: {}",
+                    r.case,
+                    r.sample + 1,
+                    r.error.as_deref().unwrap_or("failed")
+                )
+            })
+            .collect(),
+        deadline_skipped: rows
+            .iter()
+            .filter(|r| r.skip_reason.as_deref() == Some(DEADLINE_REASON))
+            .count() as u32,
         verdicts,
         comparisons,
     }
@@ -385,15 +427,13 @@ fn sample(
     row
 }
 
-/// `cases` carries each case with its resolved bundle hash. Returns the exit code: 1 when a
-/// regression against the baseline was found, otherwise 0.
-pub fn run(
+/// `cases` carries each case with its resolved bundle hash.
+pub fn collect(
     cases: &[(&Case, String)],
     opts: &Opts<'_>,
     launch: &mut Launcher<'_>,
     progress: &mut dyn FnMut(&str),
-    out: &mut dyn std::io::Write,
-) -> Result<i32, String> {
+) -> Result<Report, String> {
     let baseline = opts
         .baseline
         .map(|id| load_baseline(opts.root, id))
@@ -432,12 +472,20 @@ pub fn run(
             }
             let row = if stopped {
                 Row::skipped(case, bundle, index, STOPPED_REASON)
+            } else if sample_timeout(0, opts.deadline, std::time::Instant::now()).is_none() {
+                Row::skipped(case, bundle, index, DEADLINE_REASON)
             } else if spent >= cap_micros {
                 Row::skipped(case, bundle, index, run::SPEND_CAP_REASON)
             } else {
                 sample(case, bundle, index, opts, &dir, launch)
             };
-            spent = spent.saturating_add(row.cost_micros.unwrap_or(0));
+            let unpriced = if opts.strict_cap && row.status != Status::Skipped {
+                cap_micros
+            } else {
+                0
+            };
+            let cost = row.cost_micros.unwrap_or(unpriced);
+            spent = spent.saturating_add(cost);
             progress(&format!(
                 "{} sample {}: {}",
                 case.id,
@@ -462,9 +510,97 @@ pub fn run(
         }
         rows.append(&mut mine);
     }
-    let report = build_report(&meta, &rows, baseline.as_deref(), None);
-    super::super::emit(out, opts.json, &report, &render(&report))?;
+    Ok(build_report(&meta, &rows, baseline.as_deref(), None))
+}
+
+/// Prints the report. Returns the exit code: 1 when a regression against the baseline was found,
+/// otherwise 0.
+pub fn finish(report: &Report, json: bool, out: &mut dyn std::io::Write) -> Result<i32, String> {
+    super::super::emit(out, json, report, &render(report))?;
     Ok(i32::from(report.regressions > 0))
+}
+
+impl Report {
+    /// The research trial for a run over `selected` cases. Score (`correctness`) is the share of
+    /// selected cases that passed; a case with no counted sample (spend cap reached) counts as not
+    /// passed. A run with no counted case, or whose measured spend exceeds `ceiling_usd`, is an
+    /// error trial: the single-sample overshoot past the cap is reported, never hidden.
+    pub fn trial_result(
+        &self,
+        trial_id: &str,
+        selected: usize,
+        ceiling_usd: f64,
+        wall_ms: u64,
+        route: serde_json::Value,
+    ) -> TrialResult {
+        let passed = self.verdicts.iter().filter(|v| v.passed).count();
+        let counted: u32 = self.verdicts.iter().map(|v| v.samples).sum();
+        let over = self.spend_micros as f64 > ceiling_usd * 1_000_000.0;
+        let details = if let Some(first) = self.infra_failures.first() {
+            Some(format!(
+                "{} sample(s) failed to run, not graded; first: {first}",
+                self.infra_failures.len()
+            ))
+        } else if self.deadline_skipped > 0 {
+            Some(format!(
+                "trial deadline reached after {counted} of {} samples",
+                counted + self.skipped_samples
+            ))
+        } else if self.verdicts.is_empty() {
+            Some("no eval case was graded".to_string())
+        } else if over {
+            Some(format!(
+                "measured spend ${:.4} exceeds the per-trial ceiling ${ceiling_usd:.4}",
+                self.spend_micros as f64 / 1_000_000.0
+            ))
+        } else {
+            None
+        };
+        let usd = self.spend_micros as f64 / 1_000_000.0;
+        TrialResult {
+            schema: TRIAL_SPEC_SCHEMA,
+            trial_id: trial_id.to_string(),
+            status: if self.infra_failures.is_empty() && self.deadline_skipped > 0 {
+                TrialStatus::Timeout
+            } else if details.is_some() {
+                TrialStatus::Error
+            } else {
+                TrialStatus::Ok
+            },
+            correctness: (!self.verdicts.is_empty())
+                .then(|| passed as f64 / selected.max(1) as f64),
+            quality: None,
+            wall_ms,
+            spend: Some(SpendReport {
+                execution: Money {
+                    reported_usd: Some(usd),
+                    estimated_usd: None,
+                    unknown_count: u64::from(self.unpriced_samples),
+                    calls: u64::from(counted),
+                },
+                overhead: Money::default(),
+                calls: u64::from(counted),
+                completeness: if self.unpriced_samples == 0 {
+                    "complete"
+                } else {
+                    "partial"
+                }
+                .to_string(),
+                receipts: BTreeMap::from([
+                    ("eval:cases_passed".to_string(), passed as u64),
+                    ("eval:cases_failed".to_string(), (selected - passed) as u64),
+                    ("eval:samples".to_string(), u64::from(counted)),
+                    (
+                        "eval:samples_skipped".to_string(),
+                        u64::from(self.skipped_samples),
+                    ),
+                ]),
+            }),
+            route: Some(route),
+            env_fingerprint: None,
+            details,
+        }
+    }
 }
 
 /// Re-render a stored run (the newest when `run_id` is `None`), compared against its baseline.
@@ -600,5 +736,72 @@ mod tests {
             .insert("dir/ok.txt".to_string(), "x".to_string());
         write_setup(tmp.path(), &case).unwrap();
         assert!(tmp.path().join("dir/ok.txt").is_file());
+    }
+
+    fn meta() -> Meta {
+        Meta {
+            schema: ROW_SCHEMA,
+            run_id: "r".to_string(),
+            started_at: "t".to_string(),
+            zirv_version: "v".to_string(),
+            cases: Vec::new(),
+            samples: 2,
+            max_usd: 1.0,
+            baseline: None,
+        }
+    }
+
+    #[test]
+    fn a_deadline_cut_is_a_timeout_trial_but_a_spend_cap_skip_is_not() {
+        let trial = |reason: &str| {
+            let mut skipped = row("b", 0, false, "h");
+            skipped.status = Status::Skipped;
+            skipped.skip_reason = Some(reason.to_string());
+            build_report(&meta(), &[row("a", 0, true, "h"), skipped], None, None).trial_result(
+                "t",
+                2,
+                1.0,
+                1,
+                serde_json::json!({}),
+            )
+        };
+        let cut = trial(DEADLINE_REASON);
+        assert_eq!(cut.status, TrialStatus::Timeout);
+        assert!(
+            cut.details
+                .unwrap()
+                .contains("deadline reached after 1 of 2")
+        );
+        assert_eq!(trial(run::SPEND_CAP_REASON).status, TrialStatus::Ok);
+    }
+
+    #[test]
+    fn under_a_second_before_the_deadline_collect_skips_for_the_deadline_and_launches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = super::super::corpus::embedded().unwrap();
+        let selected = [(&cases[0], "h".to_string())];
+        let opts = Opts {
+            samples: 2,
+            max_usd: 1.0,
+            baseline: None,
+            stop_on_regression: false,
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(500)),
+            strict_cap: true,
+            root: dir.path(),
+            work: &dir.path().join("work"),
+        };
+        let report = collect(
+            &selected,
+            &opts,
+            &mut |_| panic!("no sample may launch"),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(report.deadline_skipped, 2);
+        assert!(
+            report.infra_failures.is_empty(),
+            "{:?}",
+            report.infra_failures
+        );
     }
 }

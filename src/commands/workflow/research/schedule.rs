@@ -525,6 +525,7 @@ pub(crate) fn dispatch_batch(
                             env,
                             state_dir: trial_state_dir.to_string_lossy().to_string(),
                             timeout_secs,
+                            per_trial_ceiling_usd: backend_cfg.per_trial_ceiling_usd,
                             zirv_dir: runtime.zirv_dir.clone(),
                             strategy: runtime.strategy.clone(),
                             cache_mode: cache_mode.as_str().to_string(),

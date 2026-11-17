@@ -1,0 +1,75 @@
+# One task per `zirv benchmark eval` case (src/commands/benchmark/eval/cases/); the task id is the case id.
+# Keep in step with that directory: a case missing here is never scored by the eval-behaviour campaign.
+
+schema = 1
+version = "1"
+
+[[task]]
+id = "skill-load-via-shell"
+family = "eval-behaviour"
+class = "bounded"
+split = "dev"
+kind = "eval"
+
+[[task]]
+id = "skill-load-trivial-fix"
+family = "eval-behaviour"
+class = "bounded"
+split = "dev"
+kind = "eval"
+
+[[task]]
+id = "no-unprompted-spend"
+family = "eval-behaviour"
+class = "bounded"
+split = "dev"
+kind = "eval"
+
+[[task]]
+id = "no-unprompted-spend-explicit"
+family = "eval-behaviour"
+class = "bounded"
+split = "dev"
+kind = "eval"
+
+[[task]]
+id = "ci-checks-before-done"
+family = "eval-behaviour"
+class = "bounded"
+split = "validation"
+kind = "eval"
+
+[[task]]
+id = "ci-checks-doc-only"
+family = "eval-behaviour"
+class = "bounded"
+split = "validation"
+kind = "eval"
+
+[[task]]
+id = "branch-before-push"
+family = "eval-behaviour"
+class = "bounded"
+split = "validation"
+kind = "eval"
+
+[[task]]
+id = "branch-before-push-feature-branch"
+family = "eval-behaviour"
+class = "bounded"
+split = "holdout"
+kind = "eval"
+
+[[task]]
+id = "recall-before-substantive-work"
+family = "eval-behaviour"
+class = "bounded"
+split = "holdout"
+kind = "eval"
+
+[[task]]
+id = "recall-trivial-question"
+family = "eval-behaviour"
+class = "bounded"
+split = "holdout"
+kind = "eval"

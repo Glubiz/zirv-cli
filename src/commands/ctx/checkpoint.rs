@@ -378,6 +378,16 @@ fn capture_with(req: &Request<'_>, after_seq_read: &dyn Fn()) -> Result<Captured
     let real_index = git_dir.join("index");
     if real_index.exists() {
         std::fs::copy(&real_index, &temp.0).map_err(|e| Skip::Io(format!("copy index: {e}")))?;
+        // Linux gives the copy a new mtime, which hides racy entries from git's re-hash check.
+        std::fs::metadata(&real_index)
+            .and_then(|m| m.modified())
+            .and_then(|mtime| {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&temp.0)?
+                    .set_modified(mtime)
+            })
+            .map_err(|e| Skip::Io(format!("copy index mtime: {e}")))?;
     } else if head.is_some() {
         step(
             git(&top, Some(&temp.0)).args(["read-tree", "HEAD"]),
@@ -2011,6 +2021,38 @@ mod tests {
         assert!(lines[0].starts_with("checkpoint 1: "), "{lines:?}");
         assert!(lines[0].ends_with(", +1 more"), "{lines:?}");
         assert!(recent_turn_changes(p, "oldsess1", 8, 2).is_empty());
+    }
+
+    #[test]
+    fn a_same_size_edit_racing_the_index_write_is_captured() {
+        if !git_available() {
+            return;
+        }
+        let dir = repo();
+        let p = dir.path();
+        let t0 = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let set_mtime = |path: &Path| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .and_then(|f| f.set_modified(t0))
+                .expect("set mtime");
+        };
+        git_out(p, &["config", "core.checkStat", "minimal"]);
+        set_mtime(&p.join("a.txt"));
+        git_out(p, &["update-index", "--refresh"]);
+        snap(p, "racesess1abc", &cfg()).expect("baseline");
+        // Same size, same mtime as the index entry, and the index is no newer
+        // than the file: only the racy-git re-hash can see the change.
+        std::fs::write(p.join("a.txt"), "two\n").expect("write");
+        set_mtime(&p.join("a.txt"));
+        set_mtime(&p.join(".git/index"));
+        let turn = snap(p, "racesess1abc", &cfg()).expect("turn");
+        assert_eq!(
+            show(p, &turn.commit, "a.txt").as_deref(),
+            Some("two\n"),
+            "the racy same-size edit must be in the checkpoint"
+        );
     }
 
     fn managed(owner: &str) -> (tempfile::TempDir, PathBuf, PathBuf, StateDir) {
