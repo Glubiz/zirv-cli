@@ -813,6 +813,7 @@ fn run_with_clock_inner<W: Write>(
             &mut stalled,
             args.cancellation.as_deref(),
             turn_control.as_ref(),
+            parent_short.as_deref(),
         )?;
         fold_app_server_usage(
             app_server_turn,

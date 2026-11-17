@@ -1328,7 +1328,7 @@ fn render_mail_group(group: &[&super::mail::Message], header: &str, cap: usize) 
 
 /// Parent authority must come from the reader's trusted launch identity, never a sender's own claim (#249).
 /// Budget parent mail first and peers from the remainder; mixed trust groups must not double the cap.
-fn render_mail_block(
+pub(super) fn render_mail_block(
     messages: &[super::mail::Message],
     cap: usize,
     parent_short: Option<&str>,
