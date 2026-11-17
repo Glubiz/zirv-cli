@@ -189,6 +189,29 @@ pub(crate) mod testenv {
         TestRepo { _dir: dir, path }
     }
 
+    /// The built `zirv` binary: the first `<ancestor>/zirv` that is a file above
+    /// `start`. Cargo puts test executables under `target/debug/deps/` or, since
+    /// 1.100, `target/debug/build/zirv/<hash>/`, so the depth is not fixed.
+    pub(crate) fn find_zirv_bin(start: &Path) -> Option<PathBuf> {
+        let name = format!("zirv{}", std::env::consts::EXE_SUFFIX);
+        start
+            .ancestors()
+            .skip(1)
+            .map(|dir| dir.join(&name))
+            .find(|candidate| candidate.is_file())
+    }
+
+    /// [`find_zirv_bin`] from the running test executable; run `cargo build` first.
+    pub(crate) fn zirv_bin() -> PathBuf {
+        let exe = std::env::current_exe().expect("current_exe");
+        find_zirv_bin(&exe).unwrap_or_else(|| {
+            panic!(
+                "no built zirv binary above {}; run `cargo build` first",
+                exe.display()
+            )
+        })
+    }
+
     /// Points the home directory (and optionally the working directory) at a
     /// test directory, putting every one of them back on drop.
     ///
@@ -1638,12 +1661,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".zirv")).expect("mkdir");
         std::fs::write(dir.path().join(".zirv/ctx.toml"), "not = \"a script\"\n").expect("write");
 
-        let exe = std::env::current_exe().expect("current_exe");
-        let bin = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("target/debug")
-            .join("zirv");
+        let bin = testenv::zirv_bin();
 
         let out = std::process::Command::new(&bin)
             .args(["ctx", "score", "--help"])
@@ -1656,5 +1674,54 @@ mod tests {
             text.contains("--transcript"),
             "built-in ctx help expected, got: {text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod zirv_bin_tests {
+    use super::testenv::find_zirv_bin;
+
+    fn touch(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, "").expect("write");
+    }
+
+    fn bin_name() -> String {
+        format!("zirv{}", std::env::consts::EXE_SUFFIX)
+    }
+
+    #[test]
+    fn the_old_deps_layout_resolves_to_the_debug_binary() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let exe = root.path().join("target/debug/deps/zirv-abc");
+        touch(&exe);
+        touch(&root.path().join("target/debug").join(bin_name()));
+        assert_eq!(
+            find_zirv_bin(&exe),
+            Some(root.path().join("target/debug").join(bin_name()))
+        );
+    }
+
+    #[test]
+    fn the_cargo_1_100_build_dir_layout_skips_the_build_zirv_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let exe = root
+            .path()
+            .join("target/debug/build/zirv/0a1b2c/deps/zirv-abc");
+        touch(&exe);
+        assert!(root.path().join("target/debug/build/zirv").is_dir());
+        touch(&root.path().join("target/debug").join(bin_name()));
+        assert_eq!(
+            find_zirv_bin(&exe),
+            Some(root.path().join("target/debug").join(bin_name()))
+        );
+    }
+
+    #[test]
+    fn a_missing_binary_is_none() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let exe = root.path().join("target/debug/build/zirv/0a1b2c/zirv-abc");
+        touch(&exe);
+        assert_eq!(find_zirv_bin(&exe), None);
     }
 }

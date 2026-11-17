@@ -101,20 +101,12 @@ mod tests {
 
     #[cfg(unix)]
     use std::io::Read;
+    #[cfg(unix)]
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     #[cfg(any(unix, windows))]
-    pub(crate) fn zirv_bin() -> PathBuf {
-        // cargo test builds the bin target, so it sits next to the test binary's
-        // grandparent directory (target/debug/deps/<test> -> target/debug/zirv).
-        std::env::current_exe()
-            .expect("current_exe")
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("target dir")
-            .join(if cfg!(windows) { "zirv.exe" } else { "zirv" })
-    }
+    pub(crate) use crate::commands::ctx::testenv::zirv_bin;
 
     #[cfg(unix)]
     pub(crate) fn fixture(name: &str) -> PathBuf {

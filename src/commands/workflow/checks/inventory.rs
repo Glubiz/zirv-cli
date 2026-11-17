@@ -276,6 +276,7 @@ fn excluded_model_call(path: &str, function: &str) -> bool {
             "src/commands/ctx/exec/command.rs",
             "headless_resume_launch" | "prompt_delivery_via_stdin"
         ) | ("src/commands/ctx/measure.rs", "current_binary_mtime")
+            | ("src/commands/ctx/mod.rs", "zirv_bin")
             | (
                 "src/commands/ctx/run_loop.rs",
                 "prompt_delivery_via_stdin" | "zirv_invocation"

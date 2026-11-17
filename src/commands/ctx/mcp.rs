@@ -2189,13 +2189,7 @@ mod tests {
                 std::fs::write(dir.join("sentinel"), "preserve legacy state").unwrap();
             }
         }
-        let binary = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join(if cfg!(windows) { "zirv.exe" } else { "zirv" });
+        let binary = super::super::testenv::zirv_bin();
         let mut cmd = Command::new(binary);
         super::super::testenv::scrub_supervision_env_for_test_cmd(&mut cmd);
         super::super::testenv::scrub_operator_profile_env_for_test_cmd(&mut cmd);
@@ -2369,13 +2363,7 @@ mod tests {
     #[test]
     fn doctor_checks_a_real_server_and_reports_policy_failure() {
         let f = Fixture::new();
-        let binary = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join(if cfg!(windows) { "zirv.exe" } else { "zirv" });
+        let binary = super::super::testenv::zirv_bin();
         let run = || {
             let mut cmd = Command::new(&binary);
             super::super::testenv::scrub_supervision_env_for_test_cmd(&mut cmd);
