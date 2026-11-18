@@ -87,6 +87,19 @@ pub fn supervise_child(
     poll: Duration,
     on_tick: &mut dyn FnMut() -> Tick,
 ) -> CtxResult<Outcome> {
+    supervise_child_before_kill(child, deadline, poll, on_tick, &mut |_| {})
+}
+
+/// `supervise_child`, calling `before_kill` on the still-running child ahead
+/// of each deadline or tick-stop `terminate`, so a caller can ask it to stop
+/// itself first. The kill still follows; `before_kill` only gets to go first.
+pub fn supervise_child_before_kill(
+    child: &mut Child,
+    deadline: Instant,
+    poll: Duration,
+    on_tick: &mut dyn FnMut() -> Tick,
+    before_kill: &mut dyn FnMut(&mut Child),
+) -> CtxResult<Outcome> {
     // Due now, not `+ poll`: the very first iteration must still fire
     // `on_tick` immediately, exactly like the pre-fix loop's own first pass
     // (`try_wait` -> deadline -> `on_tick` -> sleep, in that order, with no
@@ -98,11 +111,13 @@ pub fn supervise_child(
         }
         let now = Instant::now();
         if now >= deadline {
+            before_kill(child);
             terminate(child, Duration::from_secs(5))?;
             return Ok(Outcome::TimedOut);
         }
         if now >= next_tick {
             if let Tick::Stop(reason) = on_tick() {
+                before_kill(child);
                 terminate(child, Duration::from_secs(5))?;
                 return Ok(Outcome::StoppedByTick(reason));
             }
@@ -2128,5 +2143,43 @@ mod tests {
             reaped,
             "closing the last kill-on-close job handle must reap the child"
         );
+    }
+
+    #[test]
+    fn before_kill_runs_ahead_of_a_deadline_kill_and_a_tick_stop_but_not_a_clean_exit() {
+        let mut calls = 0;
+        let mut child = spawn(sh("sleep 30")).expect("spawn");
+        let outcome = supervise_child_before_kill(
+            &mut child,
+            Instant::now() + Duration::from_millis(200),
+            Duration::from_millis(20),
+            &mut || Tick::Continue,
+            &mut |c| {
+                assert!(c.try_wait().expect("try_wait").is_none(), "still running");
+                calls += 1;
+            },
+        )
+        .expect("supervise");
+        assert_eq!(outcome, Outcome::TimedOut);
+        let mut child = spawn(sh("sleep 30")).expect("spawn");
+        let outcome = supervise_child_before_kill(
+            &mut child,
+            Instant::now() + Duration::from_secs(10),
+            Duration::from_millis(20),
+            &mut || Tick::Stop("nudge"),
+            &mut |_| calls += 1,
+        )
+        .expect("supervise");
+        assert_eq!(outcome, Outcome::StoppedByTick("nudge"));
+        let mut child = spawn(sh("exit 0")).expect("spawn");
+        supervise_child_before_kill(
+            &mut child,
+            Instant::now() + Duration::from_secs(10),
+            Duration::from_millis(20),
+            &mut || Tick::Continue,
+            &mut |_| calls += 1,
+        )
+        .expect("supervise");
+        assert_eq!(calls, 2, "timeout and tick stop only");
     }
 }

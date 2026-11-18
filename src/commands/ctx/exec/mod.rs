@@ -722,7 +722,7 @@ fn run_with_clock_inner<W: Write>(
 
         // Hold this child in the console-close registry and kill-on-close
         // job for exactly its lifetime.
-        let (mut child, tap, _child_guard, app_server_turn) = launch::spawn(
+        let (mut child, tap, _child_guard, app_server_turn, turn_control) = launch::spawn(
             command,
             stdin_prompt.clone(),
             std::mem::take(&mut app_server_launch),
@@ -812,6 +812,8 @@ fn run_with_clock_inner<W: Write>(
             Duration::from_secs(cfg.supervise.stall_grace_secs),
             &mut stalled,
             args.cancellation.as_deref(),
+            turn_control.as_ref(),
+            parent_short.as_deref(),
         )?;
         fold_app_server_usage(
             app_server_turn,

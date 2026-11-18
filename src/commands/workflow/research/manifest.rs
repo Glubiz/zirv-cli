@@ -575,6 +575,22 @@ max_uses = 1
     }
 
     #[test]
+    fn criteria_objective_correctness_is_accepted() {
+        let text = minimal_toml("\n[criteria]\nobjective = \"correctness\"\n");
+        let manifest = Manifest::parse(&text).expect("objective = \"correctness\" must parse");
+        assert_eq!(manifest.criteria.objective, Objective::Correctness);
+    }
+
+    #[test]
+    fn the_eval_behaviour_campaign_promotes_on_correctness() {
+        let text =
+            include_str!("../../../../docs/benchmarks/autoresearch/campaigns/eval-behaviour.toml");
+        let manifest = Manifest::parse(text).expect("eval-behaviour.toml must parse");
+        assert_eq!(manifest.criteria.objective, Objective::Correctness);
+        assert_eq!(manifest.criteria.min_effect, 0.05);
+    }
+
+    #[test]
     fn a_candidate_cannot_carry_a_budgets_field() {
         let text = minimal_toml(
             r#"

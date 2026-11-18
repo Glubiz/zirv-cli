@@ -50,13 +50,14 @@ pub enum TrialStatus {
     Crash,
 }
 
-/// Promotion objective: Efficiency requires a material cost or wall-time win; Quality requires an answer-stability win.
+/// Promotion objective: Efficiency requires a material cost or wall-time win; Quality requires an answer-stability win; Correctness requires a correctness win.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Objective {
     #[default]
     Efficiency,
     Quality,
+    Correctness,
 }
 
 impl Objective {
@@ -64,6 +65,7 @@ impl Objective {
         match self {
             Objective::Efficiency => "efficiency",
             Objective::Quality => "quality",
+            Objective::Correctness => "correctness",
         }
     }
 }
@@ -369,6 +371,9 @@ fn summarize_arm(obs: &[&Observation]) -> ArmSummary {
 ///      a quality win with no such loss -> [`Verdict::Accept`]; no quality
 ///      win, or quality never measured for this cohort (`d_quality` is
 ///      `None`) -> [`Verdict::Inconclusive`].
+///    - `Objective::Correctness`: the same shape as `Quality`, but on
+///      `d_correctness` (CI lower above `+min_effect`); failed trials already
+///      count as correctness 0.0, so they can never produce a win.
 fn evaluate_cohort(
     all_obs: &[Observation],
     cohort: &str,
@@ -701,6 +706,29 @@ fn evaluate_cohort(
                 }
             }
         },
+        Objective::Correctness => match &d_correctness {
+            None => {
+                reasons.push(format!("{cohort}: correctness was never measured"));
+                Verdict::Inconclusive
+            }
+            Some(iv) => {
+                let correctness_win = iv.lo > criteria.min_effect;
+                if correctness_win && (cost_loss || wall_loss) {
+                    reasons.push(format!(
+                        "{cohort}: material correctness win offset by a material loss on cost or wall"
+                    ));
+                    Verdict::Tradeoff
+                } else if correctness_win {
+                    reasons.push(format!(
+                        "{cohort}: material correctness win with no offsetting loss"
+                    ));
+                    Verdict::Accept
+                } else {
+                    reasons.push(format!("{cohort}: no material correctness win"));
+                    Verdict::Inconclusive
+                }
+            }
+        },
     };
 
     cohort_decision(
@@ -784,7 +812,9 @@ pub fn adjusted_confidence(base: f64, k: usize) -> f64 {
 /// cost (if every pair's cost is complete) nor wall time improves by at
 /// least half of `min_effect`; `Quality` discards instead when either arm
 /// has no quality values, or when the candidate's quality mean does not
-/// exceed the baseline's by at least half of `min_effect`.
+/// exceed the baseline's by at least half of `min_effect`; `Correctness`
+/// discards when the candidate's correctness mean does not exceed the
+/// baseline's by at least half of `min_effect`.
 pub fn screen(obs: &[Observation], criteria: &Criteria) -> ScreenVerdict {
     let candidate_obs: Vec<&Observation> = obs.iter().filter(|o| o.arm == Arm::Candidate).collect();
     if candidate_obs.is_empty() || candidate_obs.iter().all(|o| o.excluded.is_some()) {
@@ -813,17 +843,28 @@ pub fn screen(obs: &[Observation], criteria: &Criteria) -> ScreenVerdict {
         .iter()
         .filter(|o| o.arm == Arm::Baseline && o.excluded.is_none())
         .collect();
+    let baseline_correctness: Vec<f64> = baseline_active
+        .iter()
+        .map(|o| trial_correctness(o))
+        .collect();
     if !baseline_active.is_empty() {
-        let baseline_correctness: Vec<f64> = baseline_active
-            .iter()
-            .map(|o| trial_correctness(o))
-            .collect();
         let baseline_mean = stats::mean(&baseline_correctness);
         if candidate_mean < baseline_mean - criteria.max_correctness_regression {
             return ScreenVerdict::Discard {
                 reason: "correctness regression vs baseline".to_string(),
             };
         }
+    }
+
+    if matches!(criteria.objective, Objective::Correctness) {
+        if baseline_active.is_empty()
+            || candidate_mean - stats::mean(&baseline_correctness) < criteria.min_effect / 2.0
+        {
+            return ScreenVerdict::Discard {
+                reason: "no material correctness point-estimate improvement".to_string(),
+            };
+        }
+        return ScreenVerdict::Survive;
     }
 
     if matches!(criteria.objective, Objective::Quality) {
@@ -974,7 +1015,8 @@ pub fn excluded_by_reason(obs: &[Observation]) -> BTreeMap<String, usize> {
 /// [`simplest`]. Under `Objective::Efficiency`: the first cohort with a
 /// usable `rel_cost`, else the first cohort with a usable `rel_wall`. Under
 /// `Objective::Quality`: the first cohort with a usable `d_quality` -- the
-/// axis the quality objective actually promotes on. A `Decision`
+/// axis the quality objective actually promotes on; `Objective::Correctness`
+/// likewise with `d_correctness`. A `Decision`
 /// in practice represents one candidate's result for the promotion gate it
 /// was built from, which commonly holds a single reported cohort; when it
 /// holds several, the first cohort's primary axis stands in for the whole
@@ -989,6 +1031,12 @@ fn primary_interval(
             .cohorts
             .iter()
             .find_map(|c| c.d_quality.as_ref().map(|iv| ("quality", iv)));
+    }
+    if matches!(objective, Objective::Correctness) {
+        return decision
+            .cohorts
+            .iter()
+            .find_map(|c| c.d_correctness.as_ref().map(|iv| ("correctness", iv)));
     }
     for c in &decision.cohorts {
         if let Some(iv) = &c.rel_cost {
@@ -1010,8 +1058,9 @@ fn intervals_overlap(a: &Interval, b: &Interval) -> bool {
 /// Among the `Accept` decisions, finds the best primary benefit -- under
 /// `Objective::Efficiency` the lowest `rel_cost` point estimate, falling
 /// back to `rel_wall` when a decision has no usable cost axis; under
-/// `Objective::Quality` the highest `d_quality` point estimate (more
-/// positive is a bigger quality win) -- see [`primary_interval`]. Then
+/// `Objective::Quality` the highest `d_quality` (and `Objective::Correctness`
+/// the highest `d_correctness`) point estimate (more
+/// positive is a bigger win) -- see [`primary_interval`]. Then
 /// returns the lowest-complexity id among every winner whose same-axis
 /// interval overlaps the best one's (an "equivalent" win, per the design's
 /// simplicity criterion -- a marginally better number is not worth extra
@@ -1034,7 +1083,7 @@ pub fn simplest<'a>(
         return None;
     }
 
-    let best = if matches!(objective, Objective::Quality) {
+    let best = if matches!(objective, Objective::Quality | Objective::Correctness) {
         accepted
             .iter()
             .max_by(|a, b| a.2.point.partial_cmp(&b.2.point).unwrap())
@@ -1193,6 +1242,80 @@ mod tests {
             objective: Objective::Quality,
             ..fast_criteria()
         }
+    }
+
+    fn correctness_criteria() -> Criteria {
+        Criteria {
+            objective: Objective::Correctness,
+            ..fast_criteria()
+        }
+    }
+
+    #[test]
+    fn correctness_objective_accepts_a_correctness_win_with_flat_cost_and_wall() {
+        let obs = matched_pairs("cohort-a", 8, 0.5, 0.9, 1.0, 1.0, 1000, 1000);
+        let decision = evaluate(&obs, &correctness_criteria(), 0.95, 1);
+        assert_eq!(decision.verdict, Verdict::Accept);
+        assert!(decision.cohorts[0].d_correctness.is_some());
+    }
+
+    #[test]
+    fn correctness_win_with_material_cost_loss_is_a_tradeoff() {
+        let obs = matched_pairs("cohort-a", 8, 0.5, 0.9, 1.0, 1.5, 1000, 1000);
+        let decision = evaluate(&obs, &correctness_criteria(), 0.95, 1);
+        assert_eq!(decision.verdict, Verdict::Tradeoff);
+    }
+
+    #[test]
+    fn correctness_objective_does_not_promote_a_cost_win_with_flat_correctness() {
+        let obs = matched_pairs("cohort-a", 8, 0.9, 0.9, 1.0, 0.2, 2000, 1000);
+        let decision = evaluate(&obs, &correctness_criteria(), 0.95, 1);
+        assert_eq!(decision.verdict, Verdict::Inconclusive);
+    }
+
+    #[test]
+    fn correctness_objective_never_promotes_failed_candidate_trials() {
+        let mut obs = matched_pairs("cohort-a", 8, 0.5, 1.0, 1.0, 1.0, 1000, 1000);
+        for o in obs.iter_mut().filter(|o| o.arm == Arm::Candidate) {
+            o.status = TrialStatus::Timeout;
+        }
+        let decision = evaluate(&obs, &correctness_criteria(), 0.95, 1);
+        assert_eq!(decision.verdict, Verdict::Reject);
+    }
+
+    #[test]
+    fn screen_under_correctness_discards_a_no_gain_candidate_and_keeps_a_gaining_one() {
+        let criteria = correctness_criteria();
+
+        let no_gain = matched_pairs("cohort-a", 6, 0.9, 0.9, 1.0, 0.2, 2000, 1000);
+        assert_eq!(
+            screen(&no_gain, &criteria),
+            ScreenVerdict::Discard {
+                reason: "no material correctness point-estimate improvement".to_string()
+            }
+        );
+
+        let gains = matched_pairs("cohort-a", 6, 0.5, 0.9, 1.0, 1.0, 1000, 1000);
+        assert_eq!(screen(&gains, &criteria), ScreenVerdict::Survive);
+    }
+
+    #[test]
+    fn simplest_under_correctness_picks_the_largest_correctness_win() {
+        let criteria = correctness_criteria();
+        let big = evaluate(
+            &matched_pairs("cohort-a", 8, 0.4, 0.9, 1.0, 1.0, 1000, 1000),
+            &criteria,
+            0.95,
+            1,
+        );
+        let small = evaluate(
+            &matched_pairs("cohort-a", 8, 0.7, 0.9, 1.0, 1.0, 1000, 1000),
+            &criteria,
+            0.95,
+            1,
+        );
+        let winners = vec![("big", 5, &big), ("small", 1, &small)];
+        assert_eq!(simplest(&winners, Objective::Correctness), Some("big"));
     }
 
     #[test]

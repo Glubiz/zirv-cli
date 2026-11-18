@@ -138,11 +138,16 @@ impl Conn {
 
     /// Write `request` without waiting; `resolve` matches its answer later.
     pub fn send(&mut self, request: &ClientRequest) -> Result<(), FallBackReason> {
-        let (_, line) = self
+        self.send_tracked(request).map(|_| ())
+    }
+
+    fn send_tracked(&mut self, request: &ClientRequest) -> Result<RequestId, FallBackReason> {
+        let (id, line) = self
             .correlator
             .send(request)
             .map_err(FallBackReason::Decode)?;
-        self.write_line(&line)
+        self.write_line(&line)?;
+        Ok(id)
     }
 
     /// The reader's next frame, waiting until `deadline`, or for good without one.
@@ -165,14 +170,14 @@ impl Conn {
         }
     }
 
-    /// Send `request` and wait until `deadline` for its answer. Notifications
+    /// Send `request` and wait until `deadline` for its own answer. Notifications
     /// on the way are kept for `next_frame`; server requests are refused.
     pub fn request(
         &mut self,
         request: &ClientRequest,
         deadline: Instant,
     ) -> Result<Value, FallBackReason> {
-        self.send(request)?;
+        let sent = self.send_tracked(request)?;
         loop {
             let frame = match self.recv(Some(deadline)) {
                 Next::Frame(frame) => frame.map_err(FallBackReason::Decode)?,
@@ -188,12 +193,14 @@ impl Conn {
                     }
                     self.backlog.push_back(frame);
                 }
-                ServerFrame::Response { .. } | ServerFrame::Error { .. } => {
-                    if let Some(resolved) = self
+                ServerFrame::Response { ref id, .. } | ServerFrame::Error { ref id, .. } => {
+                    let ours = *id == sent;
+                    let resolved = self
                         .correlator
                         .resolve(&frame)
-                        .map_err(FallBackReason::Decode)?
-                    {
+                        .map_err(FallBackReason::Decode)?;
+                    // A late answer to an earlier, abandoned request is nobody's to act on.
+                    if let Some(resolved) = resolved.filter(|_| ours) {
                         return resolved.outcome.map_err(FallBackReason::Rpc);
                     }
                 }
