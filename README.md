@@ -5482,11 +5482,13 @@ be running, so every later failure (no ack in time, an error answer, EOF, a
 failed turn) kills the server and is a failed child for the usual
 restart/resume path; the prompt is never re-run through `codex exec`.
 Restarts always use `codex exec`. While the first-launch turn runs, a nudge is
-sent to it as `turn/steer` with the unread mail (consumed only once the server
-accepts it) instead of restarting, and does not count against `max_nudges`;
-any steer failure falls back to the usual kill and relaunch. Every stop (nudge,
-compaction, budget, limit, stall, timeout) first sends `turn/interrupt` and
-waits up to 10 s for the turn to end, then kills the server as before.
+sent to it as `turn/steer` with the unread mail, rendered with the same delivery
+envelope, screening flags and trust labels as mail delivered at launch (consumed
+only once the server accepts it) instead of restarting, and does not count
+against `max_nudges`; any steer failure falls back to the usual kill and
+relaunch. Every stop (nudge, compaction, budget, limit, stall, timeout) first
+sends `turn/interrupt` and waits up to 10 s for the turn to end, then kills the
+server as before.
 
 During an app-server turn the server's `account/rateLimits/updated` notifications feed the codex usage windows live through the same mapper as rollout scraping; the newer reading per window wins, and rollout scraping stays the fallback.
 
