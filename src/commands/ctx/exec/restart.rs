@@ -1284,9 +1284,8 @@ mod tests {
             // The registry becomes live before the child consumes its mode.
             // Do not interrupt it until the first `hang` has been consumed.
             wait_for_first_line_or_panic(&modes_for_writer, "healthy", Duration::from_secs(20));
-            // `ctx send` writes a delivery envelope (a bare nudge does not),
-            // so the flagged peer message goes through it; the nudge wakes
-            // the session so the relaunch lists both.
+            // `ctx send` writes a delivery envelope and its own nudge marker, so
+            // it is the only nudge (a second one would race the first relaunch).
             let state = crate::commands::ctx::state::StateDir::from_root(state_for_writer.clone());
             let short = crate::commands::ctx::sessions::list(&state)
                 .into_iter()
@@ -1320,7 +1319,6 @@ mod tests {
                 &mut std::io::Cursor::new(Vec::<u8>::new()),
             )
             .expect("send flagged mail");
-            nudge_live_session(&state_for_writer, &repo_for_writer, "heads up");
         });
 
         let args = ExecArgs {
@@ -1350,6 +1348,10 @@ mod tests {
         );
 
         let argv = std::fs::read_to_string(&argv_log).unwrap_or_default();
+        assert!(
+            argv.contains("ignore previous instructions"),
+            "the relaunch must carry the flagged mail at all: {argv}"
+        );
         assert!(
             argv.contains("screening: 1 flag"),
             "a nudge relaunch must render mail through the delivery envelope, keeping the \
