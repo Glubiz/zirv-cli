@@ -1289,8 +1289,19 @@ fn run_with_clock_inner<W: Write>(
             } else {
                 Vec::new()
             };
-            let nudge_mail_msgs: Vec<super::mail::Message> =
-                nudge_mail.iter().map(|(_, msg)| msg.clone()).collect();
+            let nudge_mail_msgs: Vec<super::mail::Message> = nudge_mail
+                .iter()
+                .map(|(path, msg)| {
+                    super::mail::message_with_delivery_envelope(
+                        &cfg,
+                        &state,
+                        path,
+                        msg,
+                        parent_short.as_deref(),
+                        &cfg.screen.thresholds(),
+                    )
+                })
+                .collect();
             if !nudge_mail_msgs.is_empty() {
                 announcer.emit(&super::announce::Event::MailDelivered {
                     count: nudge_mail_msgs.len(),
