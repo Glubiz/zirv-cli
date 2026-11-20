@@ -5490,6 +5490,8 @@ relaunch. Every stop (nudge, compaction, budget, limit, stall, timeout) first
 sends `turn/interrupt` and waits up to 10 s for the turn to end, then kills the
 server as before.
 
+With `approvals.codex_headless` on as well, the turn's command approvals go to the parent's dashboard instead of being refused (see [Approvals inbox](#approvals-inbox)).
+
 During an app-server turn the server's `account/rateLimits/updated` notifications feed the codex usage windows live through the same mapper as rollout scraping; the newer reading per window wins, and rollout scraping stays the fallback.
 
 The classifier sees the request text only, so the class follows its size unless its wording classifies higher: 120 or more words, or 3 or more list items, is bounded; 300 or more words, or 8 or more items, is substantial; anything shorter is trivial. There is no `architectural` key: the same text-only classifier can never return that complexity (it needs real changed paths/lines to justify), so a request that would otherwise classify architectural reads the `substantial` value instead. The default `5m` TTL suits headless runs whose turns are seconds apart; a session that idles longer than five minutes between turns re-writes its cache at that turn (set `"1h"`).
@@ -5536,6 +5538,7 @@ and its keys):
 [approvals]
 inbox = true        # hold Claude PermissionRequests for the owning dashboard; ZIRV_CTX_APPROVALS_INBOX
 hold_secs = 300     # 1-570; the native dialog shows after this long; the hook timeout is hold_secs + 30; ZIRV_CTX_APPROVALS_HOLD_SECS
+codex_headless = false  # unix only: answer a headless codex app-server worker's command approvals from its parent's dashboard; ZIRV_CTX_APPROVALS_CODEX_HEADLESS
 ```
 
 Each held request also carries display-only details for the dashboard to
@@ -5560,9 +5563,32 @@ draws a "Yes, and don't ask again for ..." option, which the dialog reader
 reports (with its key) as `always`; no Codex request is listed or answered by
 the inbox yet.
 
-Both keys are `REPO_FORBIDDEN`: a repository cannot switch the inbox on or
-stretch a hold. With `inbox = false` (the default), or with no live dashboard
-serving the session, the hook behaves exactly as before and adds no latency.
+All three keys are `REPO_FORBIDDEN`: a repository cannot switch the inbox on,
+stretch a hold, or opt a codex worker in. With `inbox = false` (the default), or
+with no live dashboard serving the session, the hook behaves exactly as before
+and adds no latency.
+
+**`codex_headless`** (off by default) is active only together with
+`headless.codex_app_server` and `inbox`. While active, and unless the launch
+passed its own `-a/--ask-for-approval` (an explicit `-a never` turns it off for
+that run), the thread starts with `approvalPolicy: "on-request"` and the
+app-server driver holds each `item/commandExecution/requestApproval` for the
+dashboard of the worker's verified parent session (`ZIRV_CTX_PARENT_SESSION`,
+the same socket and peer-pid check as a Claude hold), bounded by `hold_secs`.
+The operator sees the command and `reason` redacted, flattened and capped, under
+the fixed label `codex command`, and can answer **allow** (once) or **deny**.
+Every other outcome answers `decline`: no parent, no live dashboard, a
+missing or dead owner, a mismatched peer, a timeout, a full dashboard queue,
+params for another thread or turn, `serverRequest/resolved`, or the turn
+ending. File-change approvals are declined at once, because their params carry
+no diff to show. `acceptForSession`, the execpolicy and network amendments and
+`cancel` are never sent, and always-allow is never offered. Permissions, the
+legacy approval methods, `item/tool/*`, auth and MCP elicitation keep being
+refused as before. Each request is logged as `approval-requested` and then
+`approval-decided` or `approval-declined` (reason `no-dashboard`, `no-parent`,
+`timeout`, `resolved-elsewhere`, `error` or `policy`); a late answer is
+`approval-late` and dropped. A request that arrives while a steer or interrupt
+awaits its own answer is refused as before.
 
 #### Tool-output compaction
 
@@ -5935,6 +5961,7 @@ therefore has nothing to narrow here, and nothing to widen either.
 | `headless.codex_app_server` | `ZIRV_CTX_HEADLESS_CODEX_APP_SERVER` |
 | `approvals.inbox` | `ZIRV_CTX_APPROVALS_INBOX` |
 | `approvals.hold_secs` | `ZIRV_CTX_APPROVALS_HOLD_SECS` |
+| `approvals.codex_headless` | `ZIRV_CTX_APPROVALS_CODEX_HEADLESS` |
 | `obfuscate.mode` | `ZIRV_CTX_OBFUSCATE_MODE` |
 | `obfuscate.entropy` | `ZIRV_CTX_OBFUSCATE_ENTROPY` |
 | `obfuscate.prompt` | `ZIRV_CTX_OBFUSCATE_PROMPT` |
