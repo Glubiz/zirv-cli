@@ -1191,8 +1191,7 @@ mod tests {
             "{}\n{request}\n> {{\"id\":7,{REFUSED}}}\n< {COMPLETED}",
             head()
         ));
-        let sent = run.sent();
-        let log = run.finish(&[]);
+        let (log, sent) = run.finish_with_sent(&[]);
         assert_eq!(last_sent(&sent), frame(&format!(r#"{{"id":7,{REFUSED}}}"#)));
         assert!(log.contains("turn-completed"), "{log}");
     }
@@ -1222,8 +1221,7 @@ mod tests {
                     bridge.clone(),
                     tempfile::tempdir().expect("tempdir"),
                 ));
-                let sent = run.sent();
-                run.finish(&[]);
+                let (_, sent) = run.finish_with_sent(&[]);
                 assert_eq!(
                     last_sent(&sent),
                     frame(&format!(r#"{{"id":9,{wanted}}}"#)),
@@ -1742,6 +1740,10 @@ mod tests {
             "the steer is answered while the approval is held"
         );
         assert!(started.elapsed() < Duration::from_secs(4));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while stub.requests().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert_eq!(
             stub.requests().len(),
             1,
@@ -1802,12 +1804,12 @@ mod tests {
             "{}\n{}\n{}\n{}\n{}\n< {COMPLETED}",
             head(),
             server_request(7, COMMAND, &command_params(secret)),
+            accept(7),
             server_request(
                 8,
                 COMMAND,
                 &command_params(&format!("{long}\u{1b}[31m red")),
             ),
-            accept(7),
             accept(8),
         );
         let run = running_with(
