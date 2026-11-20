@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -249,6 +250,8 @@ struct Pending {
     asked: Instant,
     /// The driver declines the request itself past this, whatever the holder does.
     deadline: Instant,
+    /// Set when the entry leaves `pending`, so its holder hangs up on the dashboard.
+    cancel: Arc<AtomicBool>,
 }
 
 /// A holder thread's report: which hold it was, and the operator's decision if any.
@@ -317,7 +320,7 @@ impl Driver {
                 }
                 Ok(ServerFrame::Notification(ServerNotification::RequestResolved(id))) => {
                     // Codex no longer waits: any answer for it is dropped.
-                    if self.pending.remove(&id).is_some() {
+                    if self.take_pending(&id).is_some() {
                         self.note(
                             "approval-declined",
                             &format!("resolved-elsewhere id={}", approve::show(&id)),
@@ -427,6 +430,8 @@ impl Driver {
             id.clone(),
             approve::distinct(&id, &ask),
         );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let held_cancel = cancel.clone();
         let spawned = std::thread::Builder::new()
             .name("zirv-codex-approval".into())
             .spawn(move || {
@@ -437,7 +442,7 @@ impl Driver {
                 };
                 // A panicking holder still reports, as no answer.
                 let decision = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    approvals::hold_for_dashboard(
+                    approvals::hold_for_dashboard_until(
                         &state,
                         &parent,
                         approve::TOOL,
@@ -445,6 +450,7 @@ impl Driver {
                         &ask.command,
                         details,
                         bridge.hold,
+                        Some(&held_cancel),
                     )
                 }))
                 .ok()
@@ -464,6 +470,7 @@ impl Driver {
                 hold,
                 asked: now,
                 deadline: now + bridge.hold + HOLD_SLACK,
+                cancel,
             },
         );
     }
@@ -480,7 +487,7 @@ impl Driver {
                 );
                 continue;
             };
-            self.pending.remove(&held.id);
+            self.take_pending(&held.id);
             let hold = self.bridge.as_ref().map_or(Duration::ZERO, |b| b.hold);
             let verdict = approve::decide(held.decision, asked.elapsed(), hold);
             self.answer(conn, &held.id, verdict, "");
@@ -493,18 +500,31 @@ impl Driver {
             .map(|(id, _)| id.clone())
             .collect();
         for id in expired {
-            self.pending.remove(&id);
+            self.take_pending(&id);
             self.answer(conn, &id, Verdict::Decline("timeout"), "holder gone");
         }
     }
 
     /// Decline every request still waiting; the server may already be gone, so a failed write is only noted.
     fn decline_pending(&mut self, conn: &mut Conn, reason: &'static str, why: &str) {
-        let mut waiting: Vec<_> = std::mem::take(&mut self.pending).into_iter().collect();
-        waiting.sort_by_key(|(_, p)| p.hold);
-        for (id, _) in waiting {
+        let mut waiting: Vec<_> = self
+            .pending
+            .iter()
+            .map(|(id, p)| (p.hold, id.clone()))
+            .collect();
+        waiting.sort_by_key(|(hold, _)| *hold);
+        for (_, id) in waiting {
+            self.take_pending(&id);
             self.answer(conn, &id, Verdict::Decline(reason), why);
         }
+    }
+
+    /// The one place a request leaves `pending`: its holder is told to stop, so the dashboard
+    /// never keeps offering Allow for a request that is already answered or gone.
+    fn take_pending(&mut self, id: &RequestId) -> Option<Pending> {
+        let pending = self.pending.remove(id)?;
+        pending.cancel.store(true, Ordering::SeqCst);
+        Some(pending)
     }
 
     /// Write one request's answer and log it. The only place an approval answer is written.
@@ -1246,6 +1266,8 @@ mod tests {
         short: String,
         _session: crate::commands::ctx::sessions::SessionGuard,
         seen: Arc<Mutex<Vec<approvals::Request>>>,
+        /// How many unanswered connections the client has closed.
+        closed: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     fn stub_dashboard(state: &StateDir, owner: u32, replies: Vec<Option<&'static str>>) -> Stub {
@@ -1266,9 +1288,12 @@ mod tests {
         let seen: Arc<Mutex<Vec<approvals::Request>>> = Arc::default();
         let replies = Arc::new(Mutex::new(std::collections::VecDeque::from(replies)));
         let record_seen = seen.clone();
+        let closed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let record_closed = closed.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let (seen, replies) = (record_seen.clone(), replies.clone());
+                let closed = record_closed.clone();
                 std::thread::spawn(move || {
                     let mut line = String::new();
                     if std::io::BufReader::new(&stream)
@@ -1292,8 +1317,14 @@ mod tests {
                             let _ = (&stream).write_all(reply.as_bytes());
                             std::thread::sleep(Duration::from_millis(500));
                         }
-                        // Never answered: the connection stays open until the hold ends.
-                        None => std::thread::sleep(Duration::from_secs(10)),
+                        // Never answered: counts the moment the client hangs up.
+                        None => {
+                            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                            let mut byte = [0u8; 1];
+                            if matches!(std::io::Read::read(&mut &stream, &mut byte), Ok(0)) {
+                                closed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
                     }
                 });
             }
@@ -1302,10 +1333,23 @@ mod tests {
             short,
             _session: session,
             seen,
+            closed,
         }
     }
 
     impl Stub {
+        /// Waits up to `wait` for the client to hang up on `n` unanswered requests.
+        fn closed_within(&self, n: usize, wait: Duration) -> bool {
+            let deadline = Instant::now() + wait;
+            while self.closed.load(std::sync::atomic::Ordering::SeqCst) < n {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            true
+        }
+
         fn requests(&self) -> Vec<approvals::Request> {
             self.seen.lock().map(|s| s.clone()).unwrap_or_default()
         }
@@ -1565,6 +1609,7 @@ mod tests {
             hold,
             asked: Instant::now(),
             deadline: Instant::now() + Duration::from_secs(60),
+            cancel: Arc::default(),
         }
     }
 
@@ -1622,6 +1667,7 @@ mod tests {
                 hold: 1,
                 asked: Instant::now(),
                 deadline: Instant::now(),
+                cancel: Arc::default(),
             },
         );
         driver.drain_verdicts(&mut conn);
@@ -1873,5 +1919,46 @@ mod tests {
             "{log}"
         );
         assert!(stub.requests().is_empty(), "no dashboard contact");
+    }
+
+    /// A request held at the stub with a 60 s hold, for the tests that end it some other way.
+    fn held_for_a_minute(tail: &str) -> (Running, Stub) {
+        let transcript = format!(
+            "{}\n{}\n{tail}",
+            head(),
+            server_request(7, COMMAND, &command_params("cargo test"))
+        );
+        let (run, stub) = bridged(vec![None], Duration::from_secs(60), &transcript);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while stub.requests().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(stub.requests().len(), 1, "held at the dashboard");
+        (run, stub)
+    }
+
+    #[test]
+    fn a_resolved_request_stops_its_hold_at_the_dashboard() {
+        let (mut run, stub) = held_for_a_minute("");
+        writeln!(
+            run.server,
+            r#"{{"method":"serverRequest/resolved","params":{{"threadId":"thr-1","requestId":7}}}}"#
+        )
+        .expect("resolved");
+        assert!(
+            stub.closed_within(1, Duration::from_secs(2)),
+            "the dashboard still holds a request codex no longer waits for"
+        );
+        run.finish(&[COMPLETED]);
+    }
+
+    #[test]
+    fn the_turn_ending_stops_every_hold_at_the_dashboard() {
+        let (run, stub) = held_for_a_minute(&decline(7));
+        run.finish_with_sent(&[COMPLETED]);
+        assert!(
+            stub.closed_within(1, Duration::from_secs(2)),
+            "the dashboard still holds a request of a finished turn"
+        );
     }
 }
