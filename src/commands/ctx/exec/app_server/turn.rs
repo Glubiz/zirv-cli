@@ -1338,25 +1338,35 @@ mod tests {
         }
     }
 
+    /// A run acked past `turn/start` with the bridge pointed at a stub dashboard that answers `replies`.
+    fn bridged(
+        replies: Vec<Option<&'static str>>,
+        hold: Duration,
+        transcript: &str,
+    ) -> (Running, Stub) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let stub = stub_dashboard(&state, std::process::id(), replies);
+        let run = acked(running_with(
+            transcript,
+            Some(bridge_to(&stub.short, hold)),
+            dir,
+        ));
+        (run, stub)
+    }
+
     /// One command approval, held against a stub that answers `reply`; returns the lines the client wrote and the log.
     fn one_approval(
         reply: Option<&'static str>,
         verdict: &str,
         hold: Duration,
     ) -> (Vec<String>, String) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(dir.path().to_path_buf());
-        let stub = stub_dashboard(&state, std::process::id(), vec![reply]);
         let transcript = format!(
             "{}\n{}\n{verdict}\n< {COMPLETED}",
             head(),
             server_request(7, COMMAND, &command_params("cargo test"))
         );
-        let run = acked(running_with(
-            &transcript,
-            Some(bridge_to(&stub.short, hold)),
-            dir,
-        ));
+        let (run, _stub) = bridged(vec![reply], hold, &transcript);
         let (log, sent) = run.finish_with_sent(&[]);
         assert_no_wider_scope(&sent);
         (sent, log)
@@ -1409,20 +1419,13 @@ mod tests {
 
     #[test]
     fn the_request_never_offers_an_always_rule() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(dir.path().to_path_buf());
-        let stub = stub_dashboard(&state, std::process::id(), vec![Some(ALLOW)]);
         let transcript = format!(
             "{}\n{}\n{}\n< {COMPLETED}",
             head(),
             server_request(7, COMMAND, &command_params("cargo test")),
             accept(7)
         );
-        let run = acked(running_with(
-            &transcript,
-            Some(bridge_to(&stub.short, Duration::from_secs(5))),
-            dir,
-        ));
+        let (run, stub) = bridged(vec![Some(ALLOW)], Duration::from_secs(5), &transcript);
         run.finish(&[]);
         let requests = stub.requests();
         assert_eq!(requests.len(), 1);
@@ -1431,7 +1434,7 @@ mod tests {
         assert_eq!(requests[0].short, stub.short);
     }
 
-    /// A run whose parent short is `bridge_parent` and whose only dashboard is `stub_for`, if any.
+    /// One approval that `setup` leaves with no usable dashboard; asserts it is declined at once.
     fn declined_without_a_live_dashboard(
         setup: impl FnOnce(&StateDir) -> (Option<Stub>, Option<String>),
     ) -> (String, Vec<String>, Option<Stub>) {
@@ -1693,19 +1696,12 @@ mod tests {
 
     #[test]
     fn server_request_resolved_drops_pending_without_a_write() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(dir.path().to_path_buf());
-        let stub = stub_dashboard(&state, std::process::id(), vec![None]);
         let transcript = format!(
             "{}\n{}",
             head(),
             server_request(7, COMMAND, &command_params("cargo test"))
         );
-        let run = acked(running_with(
-            &transcript,
-            Some(bridge_to(&stub.short, Duration::from_secs(5))),
-            dir,
-        ));
+        let (run, _stub) = bridged(vec![None], Duration::from_secs(5), &transcript);
         let resolved =
             r#"{"method":"serverRequest/resolved","params":{"threadId":"thr-1","requestId":7}}"#;
         let (log, sent) = run.finish_with_sent(&[resolved, COMPLETED]);
@@ -1719,20 +1715,13 @@ mod tests {
 
     #[test]
     fn a_hold_does_not_block_a_steer() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(dir.path().to_path_buf());
-        let stub = stub_dashboard(&state, std::process::id(), vec![None]);
         let transcript = format!(
             "{}\n{}\n{STEER}\n{ANSWER}\n{}",
             head(),
             server_request(7, COMMAND, &command_params("cargo test")),
             decline(7)
         );
-        let run = acked(running_with(
-            &transcript,
-            Some(bridge_to(&stub.short, Duration::from_secs(30))),
-            dir,
-        ));
+        let (run, stub) = bridged(vec![None], Duration::from_secs(30), &transcript);
         let started = Instant::now();
         assert!(
             run.control
@@ -1760,9 +1749,6 @@ mod tests {
 
     #[test]
     fn turn_end_declines_every_pending_request() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(dir.path().to_path_buf());
-        let stub = stub_dashboard(&state, std::process::id(), vec![None, None]);
         let transcript = format!(
             "{}\n{}\n{}\n{}\n{}",
             head(),
@@ -1771,11 +1757,7 @@ mod tests {
             decline(7),
             decline(8),
         );
-        let run = acked(running_with(
-            &transcript,
-            Some(bridge_to(&stub.short, Duration::from_secs(30))),
-            dir,
-        ));
+        let (run, _stub) = bridged(vec![None, None], Duration::from_secs(30), &transcript);
         let (log, sent) = run.finish_with_sent(&[COMPLETED]);
         for id in [7, 8] {
             assert_eq!(
@@ -1851,20 +1833,13 @@ mod tests {
 
     #[test]
     fn two_identical_commands_do_not_collide_on_the_dashboard() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(dir.path().to_path_buf());
-        let stub = stub_dashboard(&state, std::process::id(), vec![None, None]);
         let transcript = format!(
             "{}\n{}\n{}",
             head(),
             server_request(7, COMMAND, &command_params("cargo test")),
             server_request(8, COMMAND, &command_params("cargo test"))
         );
-        let run = acked(running_with(
-            &transcript,
-            Some(bridge_to(&stub.short, Duration::from_secs(30))),
-            dir,
-        ));
+        let (run, stub) = bridged(vec![None, None], Duration::from_secs(30), &transcript);
         let deadline = Instant::now() + Duration::from_secs(5);
         while stub.requests().len() < 2 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
@@ -1877,9 +1852,6 @@ mod tests {
 
     #[test]
     fn file_change_requests_are_declined_without_a_hold() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(dir.path().to_path_buf());
-        let stub = stub_dashboard(&state, std::process::id(), vec![Some(ALLOW)]);
         let transcript = format!(
             "{}\n{}\n{}\n< {COMPLETED}",
             head(),
@@ -1890,11 +1862,7 @@ mod tests {
             ),
             decline(7)
         );
-        let run = acked(running_with(
-            &transcript,
-            Some(bridge_to(&stub.short, Duration::from_secs(5))),
-            dir,
-        ));
+        let (run, stub) = bridged(vec![Some(ALLOW)], Duration::from_secs(5), &transcript);
         let (log, sent) = run.finish_with_sent(&[]);
         assert_eq!(
             answers(&sent, 7),
