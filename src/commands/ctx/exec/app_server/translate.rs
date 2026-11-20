@@ -18,6 +18,8 @@ pub struct Plan {
     pub server_flags: Vec<String>,
     /// `thread/start` params.
     pub thread: Value,
+    /// The caller passed `-a/--ask-for-approval`, so its policy is theirs.
+    pub approval_explicit: bool,
     pub prompt: String,
 }
 
@@ -56,6 +58,7 @@ pub fn plan(command: &Command, stdin_prompt: Option<&str>) -> Result<Plan, FallB
     };
     let mut server_flags = Vec::new();
     let mut thread = Map::new();
+    let mut approval_explicit = false;
     // `codex exec`'s own default; an explicit approval flag below replaces it.
     thread.insert("approvalPolicy".into(), "never".into());
     if let Some(cwd) = command.get_current_dir() {
@@ -83,6 +86,7 @@ pub fn plan(command: &Command, stdin_prompt: Option<&str>) -> Result<Plan, FallB
             "-a" | "--ask-for-approval" => {
                 let value = flag_value(inline, &mut rest, name)?;
                 thread.insert("approvalPolicy".into(), value.into());
+                approval_explicit = true;
             }
             _ => return Err(unsupported(arg.clone())),
         }
@@ -91,6 +95,7 @@ pub fn plan(command: &Command, stdin_prompt: Option<&str>) -> Result<Plan, FallB
         prefix: args.get(..exec).unwrap_or_default().to_vec(),
         server_flags,
         thread: Value::Object(thread),
+        approval_explicit,
         prompt,
     })
 }
@@ -231,5 +236,21 @@ mod tests {
                 "an `exec` launch without a prompt".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn only_an_explicit_approval_flag_marks_the_policy_as_the_callers() {
+        let planned = |args: &[&str]| {
+            let mut command = Command::new("codex");
+            command.arg("exec").args(args);
+            plan(&command, None).expect("plan")
+        };
+        assert!(!planned(&["go"]).approval_explicit);
+        for flag in [["-a", "never"], ["--ask-for-approval", "on-request"]] {
+            let explicit = planned(&["go", flag[0], flag[1]]);
+            assert!(explicit.approval_explicit, "{flag:?}");
+            assert_eq!(explicit.thread["approvalPolicy"], flag[1]);
+        }
+        assert!(planned(&["go", "--ask-for-approval=never"]).approval_explicit);
     }
 }

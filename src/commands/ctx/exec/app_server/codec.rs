@@ -162,7 +162,12 @@ pub fn encode_error_response(
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServerNotification {
     RateLimitsUpdated(Value),
-    Other { method: String, params: Value },
+    /// `serverRequest/resolved`: codex no longer waits for this request's answer.
+    RequestResolved(RequestId),
+    Other {
+        method: String,
+        params: Value,
+    },
 }
 
 /// Server-initiated requests: the approval family from the schema, plus a
@@ -199,6 +204,13 @@ pub enum ServerFrame {
 fn notification_from(method: String, params: Value) -> ServerNotification {
     match method.as_str() {
         "account/rateLimits/updated" => ServerNotification::RateLimitsUpdated(params),
+        "serverRequest/resolved" => params
+            .get("requestId")
+            .and_then(|id| serde_json::from_value(id.clone()).ok())
+            .map_or(
+                ServerNotification::Other { method, params },
+                ServerNotification::RequestResolved,
+            ),
         _ => ServerNotification::Other { method, params },
     }
 }
@@ -478,6 +490,24 @@ mod tests {
                 params: json!({})
             })
         );
+        for (id, want) in [
+            ("7", RequestId::Num(7)),
+            ("\"a-1\"", RequestId::Str("a-1".into())),
+        ] {
+            let line = format!(
+                r#"{{"method":"serverRequest/resolved","params":{{"threadId":"t","requestId":{id}}}}}"#
+            );
+            assert_eq!(
+                decode_line(&line).unwrap(),
+                ServerFrame::Notification(ServerNotification::RequestResolved(want))
+            );
+        }
+        // A resolution that names no usable request is kept as a plain notification.
+        assert!(matches!(
+            decode_line(r#"{"method":"serverRequest/resolved","params":{"requestId":1.5}}"#)
+                .unwrap(),
+            ServerFrame::Notification(ServerNotification::Other { .. })
+        ));
         let approvals = [
             ("item/commandExecution/requestApproval", "CommandApproval"),
             ("item/fileChange/requestApproval", "FileChangeApproval"),
