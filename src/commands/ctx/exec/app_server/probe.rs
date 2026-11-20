@@ -252,6 +252,12 @@ impl Conn {
         self.write_line(&line)
     }
 
+    /// Answer a server request with `result`, echoing the server's id.
+    pub fn answer(&mut self, id: &RequestId, result: Value) -> Result<(), FallBackReason> {
+        let line = encode_response(id, result).map_err(FallBackReason::Decode)?;
+        self.write_line(&line)
+    }
+
     /// EOF on the server's stdin; a stdio app-server then exits 0.
     pub fn close_stdin(&mut self) {
         self.stdin = Box::new(std::io::sink());

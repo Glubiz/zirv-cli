@@ -77,6 +77,27 @@ impl TurnControl {
     }
 }
 
+/// The operator's opt-in to answer a headless codex worker's command approvals
+/// from its parent's dashboard (#950). Absent, every server request is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(super) struct ApprovalBridge {
+    /// The worker's verified parent session, whose dashboard answers; none declines everything.
+    pub(super) parent: Option<String>,
+    pub(super) hold: Duration,
+}
+
+/// The bridge for this run: active only with the app-server transport, the approvals inbox
+/// and `approvals.codex_headless` all on, all of them operator-only keys.
+pub(super) fn approval_bridge(cfg: &CtxConfig, parent: Option<&str>) -> Option<ApprovalBridge> {
+    (cfg.headless.codex_app_server && cfg.approvals.inbox && cfg.approvals.codex_headless).then(
+        || ApprovalBridge {
+            parent: parent.map(str::to_string),
+            hold: Duration::from_secs(cfg.approvals.hold_secs),
+        },
+    )
+}
+
 /// The operator opted in and zirv builds this codex launch itself.
 pub(super) fn wants_app_server(
     cfg: &CtxConfig,
@@ -91,16 +112,17 @@ pub(super) fn spawn<W: Write>(
     command: Command,
     stdin_prompt: Option<String>,
     app_server: bool,
+    bridge: Option<ApprovalBridge>,
     state: &StateDir,
     session: &str,
     w: &mut W,
 ) -> CtxResult<Launched> {
     #[cfg(not(unix))]
-    let _ = (app_server, state, session, &w);
+    let _ = (app_server, &bridge, state, session, &w);
     #[cfg(unix)]
     if app_server {
         use super::app_server::turn;
-        match turn::begin(&command, stdin_prompt.as_deref(), state, session) {
+        match turn::begin(&command, stdin_prompt.as_deref(), bridge, state, session) {
             Ok(launched) => {
                 return Ok((
                     launched.child,
@@ -316,11 +338,49 @@ mod tests {
         let mut command = std::process::Command::new("sh");
         command.args(["-c", "exit 0"]);
         let (mut child, _tap, _guard, usage, control) =
-            super::spawn(command, None, false, &state, "s", &mut Vec::new()).expect("spawn");
+            super::spawn(command, None, false, None, &state, "s", &mut Vec::new()).expect("spawn");
         assert!(
             usage.is_none() && control.is_none(),
             "a relaunch is codex exec"
         );
         let _ = child.wait();
+    }
+
+    #[test]
+    fn the_approval_bridge_needs_the_transport_the_inbox_and_its_own_key() {
+        use super::{ApprovalBridge, approval_bridge};
+        let mut cfg = crate::commands::ctx::config::CtxConfig::default();
+        cfg.approvals.hold_secs = 42;
+        for (transport, inbox, key) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+            (false, false, false),
+        ] {
+            cfg.headless.codex_app_server = transport;
+            cfg.approvals.inbox = inbox;
+            cfg.approvals.codex_headless = key;
+            assert_eq!(
+                approval_bridge(&cfg, Some("abc12345")),
+                None,
+                "{transport} {inbox} {key}"
+            );
+        }
+        cfg.headless.codex_app_server = true;
+        cfg.approvals.inbox = true;
+        cfg.approvals.codex_headless = true;
+        let on = |parent: Option<&str>| approval_bridge(&cfg, parent);
+        assert_eq!(
+            on(Some("abc12345")),
+            Some(ApprovalBridge {
+                parent: Some("abc12345".into()),
+                hold: std::time::Duration::from_secs(42),
+            })
+        );
+        assert_eq!(
+            on(None).map(|b| b.parent),
+            Some(None),
+            "no parent still bridges, and declines"
+        );
     }
 }

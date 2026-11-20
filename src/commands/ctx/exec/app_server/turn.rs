@@ -10,6 +10,7 @@
 //! `codex exec`. A completed turn prints its final message and closes stdin,
 //! so the server exits 0. Token usage lands in the shared slot exec's report reads.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::process::{Child, Command};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -18,12 +19,16 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use super::codec::{ClientRequest, CodecError, ServerFrame, ServerNotification};
+use super::approve::{self, Verdict};
+use super::codec::{
+    ClientRequest, CodecError, RequestId, ServerFrame, ServerNotification, ServerRequest,
+};
 use super::probe::{self, Conn, FallBackReason, Next};
 use super::translate;
+use crate::commands::ctx::approvals::{self, Decision, RequestDetails};
 use crate::commands::ctx::event::TranscriptUsage;
 use crate::commands::ctx::exec::accounting::TurnUsage;
-use crate::commands::ctx::exec::launch::{Control, TurnControl};
+use crate::commands::ctx::exec::launch::{ApprovalBridge, Control, TurnControl};
 use crate::commands::ctx::log;
 use crate::commands::ctx::state::{StateDir, now_secs};
 use crate::commands::ctx::supervise::{ChildGuard, OutputTap};
@@ -34,6 +39,9 @@ pub const START_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How often the driver looks up from the server's frames for a `Control`.
 const CONTROL_POLL: Duration = Duration::from_millis(100);
+
+/// How long past its hold a request may stay pending before the driver declines it itself.
+const HOLD_SLACK: Duration = Duration::from_secs(5);
 
 /// A turn running over app-server: the child exec supervises and its handles.
 pub struct Launched {
@@ -87,10 +95,12 @@ pub fn start(
 pub fn begin(
     exec_command: &Command,
     stdin_prompt: Option<&str>,
+    bridge: Option<ApprovalBridge>,
     state: &StateDir,
     session: &str,
 ) -> Result<Launched, FallBackReason> {
-    let plan = translate::plan(exec_command, stdin_prompt)?;
+    let mut plan = translate::plan(exec_command, stdin_prompt)?;
+    let bridge = approve::seed_policy(&mut plan.thread, plan.approval_explicit, bridge);
     let mut connected = probe::connect(
         &exec_command.get_program().to_string_lossy(),
         &plan.prefix,
@@ -116,6 +126,7 @@ pub fn begin(
     let (done, done_rx) = mpsc::channel();
     let slot = Arc::new(Mutex::new(None));
     let (control, control_rx) = TurnControl::channel();
+    let (verdicts_tx, verdicts) = mpsc::channel();
     let driver = Driver {
         group: child.id(),
         thread_id,
@@ -129,6 +140,11 @@ pub fn begin(
         control: control_rx,
         turn_id: None,
         interrupting: None,
+        bridge,
+        pending: HashMap::new(),
+        next_hold: 0,
+        verdicts_tx,
+        verdicts,
     };
     std::thread::spawn(move || driver.run(conn));
     Ok(Launched {
@@ -215,6 +231,31 @@ struct Driver {
     turn_id: Option<String>,
     /// A sent `turn/interrupt` still waiting for the turn to end: its bound and who to tell.
     interrupting: Option<(Instant, Sender<bool>)>,
+    /// The approvals bridge, when the operator opted in; otherwise every server request is refused.
+    bridge: Option<ApprovalBridge>,
+    /// Approval requests held for the operator, by the server's request id. An id leaves this map
+    /// before its answer is written, so each is answered at most once.
+    pending: HashMap<RequestId, Pending>,
+    next_hold: u64,
+    /// Holder threads report here; the driver stays the only writer to the server.
+    verdicts_tx: Sender<Held>,
+    verdicts: Receiver<Held>,
+}
+
+/// A request waiting on the operator.
+struct Pending {
+    /// Tells this hold from a later request that reuses the id.
+    hold: u64,
+    asked: Instant,
+    /// The driver declines the request itself past this, whatever the holder does.
+    deadline: Instant,
+}
+
+/// A holder thread's report: which hold it was, and the operator's decision if any.
+struct Held {
+    id: RequestId,
+    hold: u64,
+    decision: Option<Decision>,
 }
 
 impl Driver {
@@ -223,6 +264,7 @@ impl Driver {
         let mut ack_deadline = Some(Instant::now() + START_TIMEOUT);
         let end = loop {
             self.drain_control(&mut conn);
+            self.drain_verdicts(&mut conn);
             let poll = Instant::now() + CONTROL_POLL;
             let wait = ack_deadline.map_or(poll, |deadline| deadline.min(poll));
             let frame = match conn.next_frame(Some(wait)) {
@@ -242,7 +284,7 @@ impl Driver {
                     }
                 }
                 Ok(ServerFrame::Request { id, request }) => {
-                    let _ = conn.refuse(&id, &request);
+                    self.on_request(&mut conn, id, request);
                 }
                 Ok(frame @ (ServerFrame::Response { .. } | ServerFrame::Error { .. })) => {
                     // A steer or interrupt that timed out may still answer late; only
@@ -273,6 +315,15 @@ impl Driver {
                 Ok(ServerFrame::Notification(ServerNotification::RateLimitsUpdated(params))) => {
                     self.record_rate_limits(&params);
                 }
+                Ok(ServerFrame::Notification(ServerNotification::RequestResolved(id))) => {
+                    // Codex no longer waits: any answer for it is dropped.
+                    if self.pending.remove(&id).is_some() {
+                        self.note(
+                            "approval-declined",
+                            &format!("resolved-elsewhere id={}", approve::show(&id)),
+                        );
+                    }
+                }
                 Err(error) => {
                     let _ = writeln!(
                         std::io::stderr(),
@@ -281,6 +332,7 @@ impl Driver {
                 }
             }
         };
+        self.decline_pending(&mut conn, "error", "turn ended");
         match end {
             End::Completed => {
                 if let Some(message) = self.last_message.take() {
@@ -323,6 +375,156 @@ impl Driver {
                 }
                 Control::Interrupt { until, reply } => self.interrupt(conn, until, reply),
             }
+        }
+    }
+
+    /// A server request: with the bridge on, command approvals are held for the operator and
+    /// file changes declined; everything else, and everything with the bridge off, is refused.
+    fn on_request(&mut self, conn: &mut Conn, id: RequestId, request: ServerRequest) {
+        match request {
+            ServerRequest::CommandApproval(params) if self.bridge.is_some() => {
+                self.command_approval(conn, id, &params);
+            }
+            // The params carry no diff, so the operator could only approve blind.
+            ServerRequest::FileChangeApproval(_) if self.bridge.is_some() => {
+                self.answer(conn, &id, Verdict::Decline("policy"), "file change");
+            }
+            other => {
+                let _ = conn.refuse(&id, &other);
+            }
+        }
+    }
+
+    fn command_approval(&mut self, conn: &mut Conn, id: RequestId, params: &Value) {
+        let Some(bridge) = self.bridge.clone() else {
+            return;
+        };
+        let ask = match approve::parse_command(params, &self.thread_id, self.turn_id.as_deref()) {
+            Ok(ask) => ask,
+            Err(why) => return self.answer(conn, &id, Verdict::Decline("error"), why),
+        };
+        let Some(parent) = bridge.parent else {
+            return self.answer(conn, &id, Verdict::Decline("no-parent"), "");
+        };
+        if self.pending.len() >= approvals::MAX_PENDING {
+            return self.answer(conn, &id, Verdict::Decline("error"), "too many pending");
+        }
+        self.next_hold += 1;
+        let hold = self.next_hold;
+        let now = Instant::now();
+        self.note(
+            "approval-requested",
+            &format!(
+                "id={} item={} parent={parent} command={}",
+                approve::show(&id),
+                ask.item_id,
+                approvals::redacted_preview(&ask.command)
+            ),
+        );
+        let (state, tx, held_id, key) = (
+            self.state.clone(),
+            self.verdicts_tx.clone(),
+            id.clone(),
+            approve::distinct(&id, &ask),
+        );
+        let spawned = std::thread::Builder::new()
+            .name("zirv-codex-approval".into())
+            .spawn(move || {
+                let details = RequestDetails {
+                    cwd: ask.cwd,
+                    reason: ask.reason,
+                    ..RequestDetails::default()
+                };
+                // A panicking holder still reports, as no answer.
+                let decision = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    approvals::hold_for_dashboard(
+                        &state,
+                        &parent,
+                        approve::TOOL,
+                        &key,
+                        &ask.command,
+                        details,
+                        bridge.hold,
+                    )
+                }))
+                .ok()
+                .flatten();
+                let _ = tx.send(Held {
+                    id: held_id,
+                    hold,
+                    decision,
+                });
+            });
+        if spawned.is_err() {
+            return self.answer(conn, &id, Verdict::Decline("error"), "no holder thread");
+        }
+        self.pending.insert(
+            id,
+            Pending {
+                hold,
+                asked: now,
+                deadline: now + bridge.hold + HOLD_SLACK,
+            },
+        );
+    }
+
+    /// Write the holders' decisions, and decline whatever outlived its hold.
+    fn drain_verdicts(&mut self, conn: &mut Conn) {
+        while let Ok(held) = self.verdicts.try_recv() {
+            let current = self.pending.get(&held.id).map(|p| (p.hold, p.asked));
+            let Some((_, asked)) = current.filter(|(hold, _)| *hold == held.hold) else {
+                // Resolved, timed out, or the id was reused: never applied to another request.
+                self.note(
+                    "approval-late",
+                    &format!("id={} dropped", approve::show(&held.id)),
+                );
+                continue;
+            };
+            self.pending.remove(&held.id);
+            let hold = self.bridge.as_ref().map_or(Duration::ZERO, |b| b.hold);
+            let verdict = approve::decide(held.decision, asked.elapsed(), hold);
+            self.answer(conn, &held.id, verdict, "");
+        }
+        let now = Instant::now();
+        let expired: Vec<RequestId> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| now >= p.deadline)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired {
+            self.pending.remove(&id);
+            self.answer(conn, &id, Verdict::Decline("timeout"), "holder gone");
+        }
+    }
+
+    /// Decline every request still waiting; the server may already be gone, so a failed write is only noted.
+    fn decline_pending(&mut self, conn: &mut Conn, reason: &'static str, why: &str) {
+        let mut waiting: Vec<_> = std::mem::take(&mut self.pending).into_iter().collect();
+        waiting.sort_by_key(|(_, p)| p.hold);
+        for (id, _) in waiting {
+            self.answer(conn, &id, Verdict::Decline(reason), why);
+        }
+    }
+
+    /// Write one request's answer and log it. The only place an approval answer is written.
+    fn answer(&self, conn: &mut Conn, id: &RequestId, verdict: Verdict, extra: &str) {
+        let (action, detail) = match verdict {
+            Verdict::Accept => ("approval-decided", "allow".to_string()),
+            Verdict::Deny => ("approval-decided", "deny".to_string()),
+            Verdict::Decline(reason) => ("approval-declined", reason.to_string()),
+        };
+        let extra = if extra.is_empty() {
+            String::new()
+        } else {
+            format!(" ({extra})")
+        };
+        match conn.answer(id, approve::wire(verdict)) {
+            Ok(()) => self.note(action, &format!("{detail} id={}{extra}", approve::show(id))),
+            Err(error) => self.note(
+                "approval-declined",
+                &format!("error id={} write failed: {error}", approve::show(id)),
+            ),
         }
     }
 
@@ -543,6 +745,7 @@ mod tests {
     fn driver_with_control(state: &StateDir, control: mpsc::Receiver<Control>) -> Driver {
         let (tap, _rx) = mpsc::channel();
         let (done, _done_rx) = mpsc::channel();
+        let (verdicts_tx, verdicts) = mpsc::channel();
         Driver {
             group: 0,
             thread_id: "thr-1".into(),
@@ -556,6 +759,11 @@ mod tests {
             control,
             turn_id: None,
             interrupting: None,
+            bridge: None,
+            pending: HashMap::new(),
+            next_hold: 0,
+            verdicts_tx,
+            verdicts,
         }
     }
 
@@ -709,7 +917,15 @@ mod tests {
     }
 
     fn running(transcript: &str) -> Running {
-        let dir = tempfile::tempdir().expect("tempdir");
+        running_with(transcript, None, tempfile::tempdir().expect("tempdir"))
+    }
+
+    /// `running` with the approvals bridge `bridge`, in `dir` (which a stub dashboard may already use).
+    fn running_with(
+        transcript: &str,
+        bridge: Option<ApprovalBridge>,
+        dir: tempfile::TempDir,
+    ) -> Running {
         let state = StateDir::from_root(dir.path().to_path_buf());
         let (reader, writer) = pipe().expect("pipe");
         let server = writer.try_clone().expect("clone");
@@ -731,7 +947,8 @@ mod tests {
         )
         .expect("turn/start written");
         let (control, receiver) = TurnControl::channel();
-        let driver = driver_with_control(&state, receiver);
+        let mut driver = driver_with_control(&state, receiver);
+        driver.bridge = bridge;
         Running {
             control,
             driver: std::thread::spawn(move || driver.run(conn)),
@@ -745,7 +962,10 @@ mod tests {
     /// `running`, once the driver has taken `turn/start`'s answer; controls
     /// sent earlier fail at once, so tests that steer need this.
     fn running_acked(transcript: &str) -> Running {
-        let run = running(transcript);
+        acked(running(transcript))
+    }
+
+    fn acked(run: Running) -> Running {
         let log = run.state.root().join("logs/decisions.jsonl");
         let deadline = Instant::now() + Duration::from_secs(5);
         while !std::fs::read_to_string(&log).is_ok_and(|text| text.contains("turn-acked")) {
@@ -758,6 +978,13 @@ mod tests {
     impl Running {
         fn sent(&self) -> Vec<String> {
             self.sent.lock().map(|s| s.clone()).unwrap_or_default()
+        }
+
+        /// `finish`, also returning every line the client wrote.
+        fn finish_with_sent(self, frames: &[&str]) -> (String, Vec<String>) {
+            let sent = self.sent.clone();
+            let log = self.finish(frames);
+            (log, sent.lock().map(|s| s.clone()).unwrap_or_default())
         }
 
         /// Ends the turn from the server side, then waits for the driver; returns the decision log.
@@ -930,5 +1157,751 @@ mod tests {
         )
         .expect("ack");
         run.finish(&[COMPLETED]);
+    }
+    const REFUSED: &str =
+        r#""error":{"code":-32000,"message":"a headless zirv turn answers no requests"}"#;
+
+    fn frame(text: &str) -> Value {
+        serde_json::from_str(text).expect("json frame")
+    }
+
+    fn last_sent(sent: &[String]) -> Value {
+        frame(sent.last().expect("a sent line"))
+    }
+
+    /// A server request frame, as the script emits it.
+    fn server_request(id: u64, method: &str, params: &str) -> String {
+        format!(r#"< {{"id":{id},"method":"{method}","params":{params}}}"#)
+    }
+
+    fn command_params(command: &str) -> String {
+        json!({"threadId": "thr-1", "turnId": "turn-1", "itemId": "item-1", "startedAtMs": 1,
+            "command": command, "cwd": "/repo"})
+        .to_string()
+    }
+
+    #[test]
+    fn bridge_off_refuses_an_approval_request_as_today() {
+        let request = server_request(
+            7,
+            "item/commandExecution/requestApproval",
+            &command_params("rm -rf /"),
+        );
+        let run = running_acked(&format!(
+            "{}\n{request}\n> {{\"id\":7,{REFUSED}}}\n< {COMPLETED}",
+            head()
+        ));
+        let sent = run.sent();
+        let log = run.finish(&[]);
+        assert_eq!(last_sent(&sent), frame(&format!(r#"{{"id":7,{REFUSED}}}"#)));
+        assert!(log.contains("turn-completed"), "{log}");
+    }
+
+    #[test]
+    fn other_server_requests_are_still_refused() {
+        let cases = [
+            ("item/permissions/requestApproval", None),
+            ("applyPatchApproval", None),
+            ("execCommandApproval", None),
+            ("item/tool/call", None),
+            ("attestation/generate", None),
+            (
+                "mcpServer/elicitation/request",
+                Some(r#""result":{"action":"cancel"}"#),
+            ),
+        ];
+        for bridge in [None, Some(bridge_to("abc123", Duration::from_secs(5)))] {
+            for (method, answer) in cases {
+                let request = server_request(9, method, &command_params("ls"));
+                let wanted = answer.unwrap_or(REFUSED);
+                let run = acked(running_with(
+                    &format!(
+                        "{}\n{request}\n> {{\"id\":9,{wanted}}}\n< {COMPLETED}",
+                        head()
+                    ),
+                    bridge.clone(),
+                    tempfile::tempdir().expect("tempdir"),
+                ));
+                let sent = run.sent();
+                run.finish(&[]);
+                assert_eq!(
+                    last_sent(&sent),
+                    frame(&format!(r#"{{"id":9,{wanted}}}"#)),
+                    "{method} with the bridge {}",
+                    if bridge.is_some() { "on" } else { "off" }
+                );
+            }
+        }
+    }
+    // ---- the approvals bridge (#950 slice 6) ----
+
+    fn bridge_to(parent: &str, hold: Duration) -> ApprovalBridge {
+        ApprovalBridge {
+            parent: Some(parent.to_string()),
+            hold,
+        }
+    }
+
+    /// A stand-in dashboard for the pane `short`: a registered session owned by `owner`, and a
+    /// socket that records every request it is sent and answers them in order (`None` never answers).
+    struct Stub {
+        short: String,
+        _session: crate::commands::ctx::sessions::SessionGuard,
+        seen: Arc<Mutex<Vec<approvals::Request>>>,
+    }
+
+    fn stub_dashboard(state: &StateDir, owner: u32, replies: Vec<Option<&'static str>>) -> Stub {
+        use crate::commands::ctx::sessions::{Record, SessionGuard, Verb};
+        use std::io::BufRead;
+        let mut record = Record::new(
+            "pane-abc1",
+            "claude",
+            std::path::Path::new("/repo"),
+            Verb::Dash,
+        );
+        record.owner_pid = Some(owner);
+        let short = record.short.clone();
+        let session = SessionGuard::register(state, record);
+        std::fs::create_dir_all(state.sockets()).expect("sockets dir");
+        let listener = std::os::unix::net::UnixListener::bind(approvals::socket_path(state, owner))
+            .expect("bind");
+        let seen: Arc<Mutex<Vec<approvals::Request>>> = Arc::default();
+        let replies = Arc::new(Mutex::new(std::collections::VecDeque::from(replies)));
+        let record_seen = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let (seen, replies) = (record_seen.clone(), replies.clone());
+                std::thread::spawn(move || {
+                    let mut line = String::new();
+                    if std::io::BufReader::new(&stream)
+                        .read_line(&mut line)
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if let (Ok(request), Ok(mut seen)) =
+                        (serde_json::from_str(line.trim()), seen.lock())
+                    {
+                        seen.push(request);
+                    }
+                    let reply = replies
+                        .lock()
+                        .ok()
+                        .and_then(|mut r| r.pop_front())
+                        .flatten();
+                    match reply {
+                        Some(reply) => {
+                            let _ = (&stream).write_all(reply.as_bytes());
+                            std::thread::sleep(Duration::from_millis(500));
+                        }
+                        // Never answered: the connection stays open until the hold ends.
+                        None => std::thread::sleep(Duration::from_secs(10)),
+                    }
+                });
+            }
+        });
+        Stub {
+            short,
+            _session: session,
+            seen,
+        }
+    }
+
+    impl Stub {
+        fn requests(&self) -> Vec<approvals::Request> {
+            self.seen.lock().map(|s| s.clone()).unwrap_or_default()
+        }
+    }
+
+    const ALLOW: &str = "{\"decision\":\"allow\"}\n";
+    const COMMAND: &str = "item/commandExecution/requestApproval";
+
+    /// Frames in `sent` that answer server request `id`.
+    fn answers(sent: &[String], id: u64) -> Vec<Value> {
+        sent.iter()
+            .map(|line| frame(line))
+            .filter(|f| f["id"] == id && f.get("method").is_none())
+            .collect()
+    }
+
+    fn accept(id: u64) -> String {
+        format!(r#"> {{"id":{id},"result":{{"decision":"accept"}}}}"#)
+    }
+
+    fn decline(id: u64) -> String {
+        format!(r#"> {{"id":{id},"result":{{"decision":"decline"}}}}"#)
+    }
+
+    fn assert_no_wider_scope(sent: &[String]) {
+        for line in sent {
+            for word in ["acceptForSession", "Amendment", "cancel"] {
+                assert!(!line.contains(word), "{word} written: {line}");
+            }
+        }
+    }
+
+    /// One command approval, held against a stub that answers `reply`; returns the lines the client wrote and the log.
+    fn one_approval(
+        reply: Option<&'static str>,
+        verdict: &str,
+        hold: Duration,
+    ) -> (Vec<String>, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let stub = stub_dashboard(&state, std::process::id(), vec![reply]);
+        let transcript = format!(
+            "{}\n{}\n{verdict}\n< {COMPLETED}",
+            head(),
+            server_request(7, COMMAND, &command_params("cargo test"))
+        );
+        let run = acked(running_with(
+            &transcript,
+            Some(bridge_to(&stub.short, hold)),
+            dir,
+        ));
+        let (log, sent) = run.finish_with_sent(&[]);
+        assert_no_wider_scope(&sent);
+        (sent, log)
+    }
+
+    #[test]
+    fn an_allow_from_the_parent_dashboard_writes_accept_with_the_servers_id() {
+        let (sent, log) = one_approval(Some(ALLOW), &accept(7), Duration::from_secs(5));
+        assert_eq!(
+            answers(&sent, 7),
+            vec![frame(r#"{"id":7,"result":{"decision":"accept"}}"#)]
+        );
+        assert!(log.contains("approval-requested"), "{log}");
+        assert!(
+            log.contains("approval-decided") && log.contains("allow id=7"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn deny_release_and_garbage_decisions_write_decline() {
+        for (reply, noted) in [
+            ("{\"decision\":\"deny\"}\n", "deny id=7"),
+            ("{\"decision\":\"release\"}\n", "policy id=7"),
+            ("{\"decision\":\"acceptForSession\"}\n", "no-dashboard id=7"),
+            ("not json\n", "no-dashboard id=7"),
+        ] {
+            let (sent, log) = one_approval(Some(reply), &decline(7), Duration::from_secs(5));
+            assert_eq!(
+                answers(&sent, 7),
+                vec![frame(r#"{"id":7,"result":{"decision":"decline"}}"#)],
+                "{reply}"
+            );
+            assert!(log.contains(noted), "{reply}: {log}");
+        }
+    }
+
+    #[test]
+    fn allow_always_is_accepted_once_and_never_as_a_session_scope() {
+        let (sent, _) = one_approval(
+            Some("{\"decision\":\"allow_always\"}\n"),
+            &accept(7),
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            answers(&sent, 7),
+            vec![frame(r#"{"id":7,"result":{"decision":"accept"}}"#)]
+        );
+    }
+
+    #[test]
+    fn the_request_never_offers_an_always_rule() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let stub = stub_dashboard(&state, std::process::id(), vec![Some(ALLOW)]);
+        let transcript = format!(
+            "{}\n{}\n{}\n< {COMPLETED}",
+            head(),
+            server_request(7, COMMAND, &command_params("cargo test")),
+            accept(7)
+        );
+        let run = acked(running_with(
+            &transcript,
+            Some(bridge_to(&stub.short, Duration::from_secs(5))),
+            dir,
+        ));
+        run.finish(&[]);
+        let requests = stub.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].always, None);
+        assert_eq!(requests[0].tool, "codex command");
+        assert_eq!(requests[0].short, stub.short);
+    }
+
+    /// A run whose parent short is `bridge_parent` and whose only dashboard is `stub_for`, if any.
+    fn declined_without_a_live_dashboard(
+        setup: impl FnOnce(&StateDir) -> (Option<Stub>, Option<String>),
+    ) -> (String, Vec<String>, Option<Stub>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let (stub, parent) = setup(&state);
+        let transcript = format!(
+            "{}\n{}\n{}\n< {COMPLETED}",
+            head(),
+            server_request(7, COMMAND, &command_params("cargo test")),
+            decline(7)
+        );
+        let bridge = ApprovalBridge {
+            parent,
+            hold: Duration::from_secs(5),
+        };
+        let started = Instant::now();
+        let (log, sent) = acked(running_with(&transcript, Some(bridge), dir)).finish_with_sent(&[]);
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "declined at once, not at the hold"
+        );
+        assert_eq!(
+            answers(&sent, 7),
+            vec![frame(r#"{"id":7,"result":{"decision":"decline"}}"#)]
+        );
+        (log, sent, stub)
+    }
+
+    #[test]
+    fn no_dashboard_declines() {
+        let (log, _, _) = declined_without_a_live_dashboard(|_| (None, Some("abc12345".into())));
+        assert!(log.contains("no-dashboard id=7"), "{log}");
+    }
+
+    #[test]
+    fn no_parent_short_declines_and_nothing_reaches_a_dashboard() {
+        let (log, _, stub) = declined_without_a_live_dashboard(|state| {
+            (
+                Some(stub_dashboard(state, std::process::id(), vec![Some(ALLOW)])),
+                None,
+            )
+        });
+        assert!(log.contains("no-parent id=7"), "{log}");
+        assert!(stub.expect("stub").requests().is_empty());
+    }
+
+    #[test]
+    fn a_dead_owner_pid_declines() {
+        let (log, _, stub) = declined_without_a_live_dashboard(|state| {
+            let mut gone = Command::new("true").spawn().expect("spawn");
+            gone.wait().expect("wait");
+            let stub = stub_dashboard(state, gone.id(), vec![Some(ALLOW)]);
+            let short = stub.short.clone();
+            (Some(stub), Some(short))
+        });
+        assert!(log.contains("no-dashboard id=7"), "{log}");
+        assert!(stub.expect("stub").requests().is_empty());
+    }
+
+    #[test]
+    fn a_peer_pid_that_is_not_the_recorded_owner_declines_before_anything_is_sent() {
+        let (log, _, stub) = declined_without_a_live_dashboard(|state| {
+            // Alive, but not the process that owns the socket this test binds.
+            let stub = stub_dashboard(
+                state,
+                std::os::unix::process::parent_id(),
+                vec![Some(ALLOW)],
+            );
+            let short = stub.short.clone();
+            (Some(stub), Some(short))
+        });
+        assert!(log.contains("no-dashboard id=7"), "{log}");
+        assert!(
+            stub.expect("stub").requests().is_empty(),
+            "an unauthenticated peer gets no request"
+        );
+    }
+
+    #[test]
+    fn a_hold_that_times_out_declines() {
+        let started = Instant::now();
+        let (sent, log) = one_approval(None, &decline(7), Duration::from_millis(300));
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "bounded by the hold"
+        );
+        assert_eq!(
+            answers(&sent, 7),
+            vec![frame(r#"{"id":7,"result":{"decision":"decline"}}"#)]
+        );
+        assert!(log.contains("timeout id=7"), "{log}");
+    }
+
+    /// A driver with no server: its writes land in the returned buffer.
+    fn lone_driver(state: &StateDir, hold: Duration) -> (Driver, Conn, Arc<Mutex<Vec<u8>>>) {
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if let Ok(mut buf) = self.0.lock() {
+                    buf.extend_from_slice(bytes);
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let conn = Conn::new(Capture(written.clone()), std::io::empty());
+        let mut driver = driver(state);
+        driver.bridge = Some(bridge_to("abc12345", hold));
+        driver.turn_id = Some("turn-1".into());
+        (driver, conn, written)
+    }
+
+    fn written_lines(written: &Arc<Mutex<Vec<u8>>>) -> Vec<String> {
+        let bytes = written.lock().map(|b| b.clone()).unwrap_or_default();
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn pending_at(hold: u64) -> Pending {
+        Pending {
+            hold,
+            asked: Instant::now(),
+            deadline: Instant::now() + Duration::from_secs(60),
+        }
+    }
+
+    #[test]
+    fn a_late_verdict_is_dropped_and_never_decides_a_different_request() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let (mut driver, mut conn, written) = lone_driver(&state, Duration::from_secs(5));
+        let (n, next) = (RequestId::Num(7), RequestId::Num(8));
+        // 7 already timed out and was declined; 8 is the live request.
+        driver.pending.insert(next.clone(), pending_at(2));
+        let late = |id: &RequestId, hold: u64| Held {
+            id: id.clone(),
+            hold,
+            decision: Some(Decision::Allow),
+        };
+        // An allow for the answered id, an allow for the live id from an earlier hold, and one that
+        // reuses the id: none may be written.
+        for held in [late(&n, 1), late(&next, 1)] {
+            driver.verdicts_tx.send(held).expect("send");
+        }
+        driver.drain_verdicts(&mut conn);
+        assert!(
+            written_lines(&written).is_empty(),
+            "{:?}",
+            written_lines(&written)
+        );
+        assert!(
+            driver.pending.contains_key(&next),
+            "the live request stays pending"
+        );
+        driver.verdicts_tx.send(late(&next, 2)).expect("send");
+        driver.drain_verdicts(&mut conn);
+        assert_eq!(
+            written_lines(&written)
+                .iter()
+                .map(|l| frame(l))
+                .collect::<Vec<_>>(),
+            vec![frame(r#"{"id":8,"result":{"decision":"accept"}}"#)],
+            "only its own hold decides it"
+        );
+        let log =
+            std::fs::read_to_string(state.root().join("logs/decisions.jsonl")).unwrap_or_default();
+        assert_eq!(log.matches("approval-late").count(), 2, "{log}");
+    }
+
+    #[test]
+    fn a_pending_request_past_its_deadline_is_declined_by_the_driver() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let (mut driver, mut conn, written) = lone_driver(&state, Duration::from_secs(5));
+        driver.pending.insert(
+            RequestId::Num(7),
+            Pending {
+                hold: 1,
+                asked: Instant::now(),
+                deadline: Instant::now(),
+            },
+        );
+        driver.drain_verdicts(&mut conn);
+        assert_eq!(
+            written_lines(&written)
+                .iter()
+                .map(|l| frame(l))
+                .collect::<Vec<_>>(),
+            vec![frame(r#"{"id":7,"result":{"decision":"decline"}}"#)]
+        );
+        assert!(driver.pending.is_empty());
+    }
+
+    #[test]
+    fn the_pending_cap_declines_the_overflow_unheld() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let (mut driver, mut conn, written) = lone_driver(&state, Duration::from_secs(5));
+        for n in 0..approvals::MAX_PENDING {
+            driver
+                .pending
+                .insert(RequestId::Num(n as i64 + 100), pending_at(n as u64));
+        }
+        let request = ServerRequest::CommandApproval(frame(&command_params("ls")));
+        driver.on_request(&mut conn, RequestId::Num(7), request);
+        assert_eq!(
+            written_lines(&written)
+                .iter()
+                .map(|l| frame(l))
+                .collect::<Vec<_>>(),
+            vec![frame(r#"{"id":7,"result":{"decision":"decline"}}"#)]
+        );
+        assert_eq!(driver.pending.len(), approvals::MAX_PENDING);
+    }
+
+    #[test]
+    fn a_request_for_another_thread_or_turn_or_without_a_command_is_declined_unheld() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let stub = stub_dashboard(&state, std::process::id(), vec![Some(ALLOW)]);
+        let (mut driver, mut conn, written) = lone_driver(&state, Duration::from_secs(5));
+        driver.bridge = Some(bridge_to(&stub.short, Duration::from_secs(5)));
+        for (n, patch) in [
+            json!({"threadId": "thr-other"}),
+            json!({"turnId": "turn-other"}),
+            json!({"command": null}),
+            json!({"itemId": null}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut params = frame(&command_params("ls"));
+            params
+                .as_object_mut()
+                .expect("object")
+                .extend(patch.as_object().expect("object").clone());
+            driver.on_request(
+                &mut conn,
+                RequestId::Num(n as i64),
+                ServerRequest::CommandApproval(params),
+            );
+        }
+        let lines = written_lines(&written);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(
+            lines.iter().all(|l| l.contains(r#""decision":"decline""#)),
+            "{lines:?}"
+        );
+        assert!(driver.pending.is_empty());
+        assert!(stub.requests().is_empty(), "nothing was held");
+    }
+
+    #[test]
+    fn server_request_resolved_drops_pending_without_a_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let stub = stub_dashboard(&state, std::process::id(), vec![None]);
+        let transcript = format!(
+            "{}\n{}",
+            head(),
+            server_request(7, COMMAND, &command_params("cargo test"))
+        );
+        let run = acked(running_with(
+            &transcript,
+            Some(bridge_to(&stub.short, Duration::from_secs(5))),
+            dir,
+        ));
+        let resolved =
+            r#"{"method":"serverRequest/resolved","params":{"threadId":"thr-1","requestId":7}}"#;
+        let (log, sent) = run.finish_with_sent(&[resolved, COMPLETED]);
+        assert!(
+            answers(&sent, 7).is_empty(),
+            "no answer for a resolved request: {sent:?}"
+        );
+        assert!(log.contains("resolved-elsewhere id=7"), "{log}");
+        assert!(log.contains("turn-completed"), "{log}");
+    }
+
+    #[test]
+    fn a_hold_does_not_block_a_steer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let stub = stub_dashboard(&state, std::process::id(), vec![None]);
+        let transcript = format!(
+            "{}\n{}\n{STEER}\n{ANSWER}\n{}",
+            head(),
+            server_request(7, COMMAND, &command_params("cargo test")),
+            decline(7)
+        );
+        let run = acked(running_with(
+            &transcript,
+            Some(bridge_to(&stub.short, Duration::from_secs(30))),
+            dir,
+        ));
+        let started = Instant::now();
+        assert!(
+            run.control
+                .steer("look at the mail", Duration::from_secs(5)),
+            "the steer is answered while the approval is held"
+        );
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert_eq!(
+            stub.requests().len(),
+            1,
+            "the approval is held at the dashboard"
+        );
+        let (log, sent) = run.finish_with_sent(&[COMPLETED]);
+        assert!(log.contains("turn-steered"), "{log}");
+        assert_eq!(
+            answers(&sent, 7),
+            vec![frame(r#"{"id":7,"result":{"decision":"decline"}}"#)],
+            "the turn's end declines it"
+        );
+    }
+
+    #[test]
+    fn turn_end_declines_every_pending_request() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let stub = stub_dashboard(&state, std::process::id(), vec![None, None]);
+        let transcript = format!(
+            "{}\n{}\n{}\n{}\n{}",
+            head(),
+            server_request(7, COMMAND, &command_params("cargo test")),
+            server_request(8, COMMAND, &command_params("cargo test")),
+            decline(7),
+            decline(8),
+        );
+        let run = acked(running_with(
+            &transcript,
+            Some(bridge_to(&stub.short, Duration::from_secs(30))),
+            dir,
+        ));
+        let (log, sent) = run.finish_with_sent(&[COMPLETED]);
+        for id in [7, 8] {
+            assert_eq!(
+                answers(&sent, id),
+                vec![frame(&format!(
+                    r#"{{"id":{id},"result":{{"decision":"decline"}}}}"#
+                ))],
+                "{sent:?}"
+            );
+        }
+        assert!(log.contains("turn ended"), "{log}");
+        assert_no_wider_scope(&sent);
+    }
+
+    #[test]
+    fn command_text_is_redacted_escape_free_and_truncation_makes_allow_inert() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let stub = stub_dashboard(&state, std::process::id(), vec![Some(ALLOW), Some(ALLOW)]);
+        let secret = "echo ghp_1234567890abcdefghijklmnopqrstuvwx";
+        let long = format!(
+            "echo {}",
+            (0..60).map(|n| format!("arg{n} ")).collect::<String>()
+        );
+        let transcript = format!(
+            "{}\n{}\n{}\n{}\n{}\n< {COMPLETED}",
+            head(),
+            server_request(7, COMMAND, &command_params(secret)),
+            server_request(
+                8,
+                COMMAND,
+                &command_params(&format!("{long}\u{1b}[31m red")),
+            ),
+            accept(7),
+            accept(8),
+        );
+        let run = running_with(
+            &transcript,
+            Some(bridge_to(&stub.short, Duration::from_secs(5))),
+            dir,
+        );
+        let (log, _) = acked(run).finish_with_sent(&[]);
+        assert!(
+            !log.contains("ghp_1234567890"),
+            "the log carries only the redacted command: {log}"
+        );
+        let requests = stub.requests();
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            assert_eq!(request.tool, "codex command");
+            assert!(
+                !request.preview.contains('\u{1b}') && !request.command.contains('\u{1b}'),
+                "no escape reaches the operator"
+            );
+            assert!(!request.preview.contains("ghp_1234567890"));
+            assert!(!request.command.contains("ghp_1234567890"));
+        }
+        assert_ne!(requests[0].id, requests[1].id);
+        let truncated = requests
+            .iter()
+            .find(|r| r.preview.ends_with('\u{2026}'))
+            .expect("the long one");
+        assert!(
+            !truncated.fully_shown,
+            "a truncated command is not answerable"
+        );
+        let redacted = requests.iter().find(|r| r.preview.contains("redacted"));
+        assert!(
+            redacted.is_some_and(|r| !r.fully_shown),
+            "the secret line is replaced by its summary, and cannot be answered"
+        );
+    }
+
+    #[test]
+    fn two_identical_commands_do_not_collide_on_the_dashboard() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let stub = stub_dashboard(&state, std::process::id(), vec![None, None]);
+        let transcript = format!(
+            "{}\n{}\n{}",
+            head(),
+            server_request(7, COMMAND, &command_params("cargo test")),
+            server_request(8, COMMAND, &command_params("cargo test"))
+        );
+        let run = acked(running_with(
+            &transcript,
+            Some(bridge_to(&stub.short, Duration::from_secs(30))),
+            dir,
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while stub.requests().len() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let requests = stub.requests();
+        assert_eq!(requests.len(), 2, "both reached the dashboard");
+        assert_ne!(requests[0].id, requests[1].id);
+        run.finish(&[COMPLETED]);
+    }
+
+    #[test]
+    fn file_change_requests_are_declined_without_a_hold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let stub = stub_dashboard(&state, std::process::id(), vec![Some(ALLOW)]);
+        let transcript = format!(
+            "{}\n{}\n{}\n< {COMPLETED}",
+            head(),
+            server_request(
+                7,
+                "item/fileChange/requestApproval",
+                r#"{"threadId":"thr-1","turnId":"turn-1","itemId":"item-1","startedAtMs":1}"#
+            ),
+            decline(7)
+        );
+        let run = acked(running_with(
+            &transcript,
+            Some(bridge_to(&stub.short, Duration::from_secs(5))),
+            dir,
+        ));
+        let (log, sent) = run.finish_with_sent(&[]);
+        assert_eq!(
+            answers(&sent, 7),
+            vec![frame(r#"{"id":7,"result":{"decision":"decline"}}"#)]
+        );
+        assert!(
+            log.contains("approval-declined") && log.contains("policy id=7"),
+            "{log}"
+        );
+        assert!(stub.requests().is_empty(), "no dashboard contact");
     }
 }

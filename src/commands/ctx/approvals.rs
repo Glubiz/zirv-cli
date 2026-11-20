@@ -33,7 +33,7 @@ use std::time::Duration;
 const MAX_LINE_BYTES: u64 = 8 * 1024;
 /// Most requests one dashboard holds or serves connections for at once.
 #[cfg(unix)]
-const MAX_PENDING: usize = 32;
+pub const MAX_PENDING: usize = 32;
 const PREVIEW_COLS: usize = 200;
 /// The redacted full command or input summary a request carries for the details view.
 const COMMAND_COLS: usize = 600;
