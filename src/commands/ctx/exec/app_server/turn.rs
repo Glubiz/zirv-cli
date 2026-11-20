@@ -464,6 +464,14 @@ impl Driver {
         if spawned.is_err() {
             return self.answer(conn, &id, Verdict::Decline("error"), "no holder thread");
         }
+        // A live id sent again: stop the old hold, and answer nothing, since an answer for this id
+        // would read as the new request's.
+        if self.take_pending(&id).is_some() {
+            self.note(
+                "approval-declined",
+                &format!("error id={} (id reused)", approve::show(&id)),
+            );
+        }
         self.pending.insert(
             id,
             Pending {
@@ -1960,5 +1968,17 @@ mod tests {
             stub.closed_within(1, Duration::from_secs(2)),
             "the dashboard still holds a request of a finished turn"
         );
+    }
+
+    #[test]
+    fn a_reused_pending_id_stops_the_old_hold() {
+        let (mut run, stub) = held_for_a_minute("");
+        let again = server_request(7, COMMAND, &command_params("cargo test"));
+        writeln!(run.server, "{}", again.trim_start_matches("< ")).expect("second request");
+        assert!(
+            stub.closed_within(1, Duration::from_secs(2)),
+            "the first hold is still offered at the dashboard after its id was reused"
+        );
+        run.finish(&[COMPLETED]);
     }
 }
