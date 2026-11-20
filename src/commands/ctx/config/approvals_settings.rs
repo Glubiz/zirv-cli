@@ -13,6 +13,8 @@ pub struct ApprovalsConfig {
     pub inbox: bool,
     /// Seconds a hook holds a request before the native pane dialog shows.
     pub hold_secs: u64,
+    /// Route a headless codex app-server worker's command approvals to its parent's dashboard (#950); needs `inbox` and `headless.codex_app_server`.
+    pub codex_headless: bool,
 }
 
 impl Default for ApprovalsConfig {
@@ -20,6 +22,7 @@ impl Default for ApprovalsConfig {
         Self {
             inbox: false,
             hold_secs: 300,
+            codex_headless: false,
         }
     }
 }
@@ -45,6 +48,9 @@ impl ApprovalsConfig {
         }
         if let Some(raw) = env("ZIRV_CTX_APPROVALS_INBOX") {
             cfg.inbox = matches!(raw.trim(), "true" | "1");
+        }
+        if let Some(raw) = env("ZIRV_CTX_APPROVALS_CODEX_HEADLESS") {
+            cfg.codex_headless = matches!(raw.trim(), "true" | "1");
         }
         if let Some(raw) = env("ZIRV_CTX_APPROVALS_HOLD_SECS") {
             cfg.hold_secs = raw.trim().parse()?;
@@ -83,13 +89,15 @@ mod tests {
             let cfg = ApprovalsConfig {
                 inbox: true,
                 hold_secs: bad,
+                ..ApprovalsConfig::default()
             };
             assert!(cfg.validate().is_err(), "{bad} must be rejected");
         }
         assert!(
             ApprovalsConfig {
                 inbox: true,
-                hold_secs: MAX_HOLD_SECS
+                hold_secs: MAX_HOLD_SECS,
+                ..ApprovalsConfig::default()
             }
             .validate()
             .is_ok()
