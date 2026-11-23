@@ -251,8 +251,28 @@ fn default_rust_test_command(nextest_available: bool, has_lib_target: bool) -> S
     }
 }
 
+/// True when `repo` is a linked worktree of another checkout. (#970, #974)
+fn is_linked_worktree(repo: &Path) -> bool {
+    let canonical = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    crate::commands::ctx::pathutil::worktree_identity(repo) != canonical
+}
+
+/// Where the repository's `.zirv` configuration lives: a linked worktree without its own
+/// `.zirv/verify.toml` (e.g. `.zirv/` untracked in the main checkout) reads the main checkout's. (#974)
+pub(crate) fn config_root(repo: &Path) -> PathBuf {
+    if repo.join(".zirv").join("verify.toml").exists() || !is_linked_worktree(repo) {
+        return repo.to_path_buf();
+    }
+    let main = crate::commands::ctx::pathutil::worktree_identity(repo);
+    if main.join(".zirv").join("verify.toml").exists() {
+        main
+    } else {
+        repo.to_path_buf()
+    }
+}
+
 fn load_or_discover_raw(repo: &Path) -> CtxResult<Discovered> {
-    let path = repo.join(".zirv").join("verify.toml");
+    let path = config_root(repo).join(".zirv").join("verify.toml");
     if path.exists() {
         let metadata = std::fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -745,6 +765,12 @@ fn discover_gitlab_checks(repo: &Path, notes: &mut Vec<String>) -> Vec<CheckSpec
             unsafe_names.len()
         ));
     }
+    // gitlab-ci-local's containers cannot follow a linked worktree's `.git` file, so `--needs` fails spuriously there. (#970)
+    let needs = if is_linked_worktree(repo) {
+        ""
+    } else {
+        " --needs"
+    };
     let mut specs = Vec::new();
     for name in safe {
         if let Some(needed) = gitlab_risky_need(&jobs, &name) {
@@ -756,7 +782,7 @@ fn discover_gitlab_checks(repo: &Path, notes: &mut Vec<String>) -> Vec<CheckSpec
         specs.push(ci_check(
             format!("gitlab-{}", id_slug(&name)),
             gitlab_job_kind(&name),
-            format!("gitlab-ci-local {} --needs", shell_quote(&name)),
+            format!("gitlab-ci-local {}{needs}", shell_quote(&name)),
         ));
     }
     specs
@@ -3251,7 +3277,7 @@ fn run_mode(
     // Not `?`: an unparseable ctx.toml closes the repo-check gate (and
     // announces itself) rather than failing the whole command, which a
     // checkout could otherwise use to brick `zirv test`/`zirv verify`.
-    let repo_gates = super::repo_gates(repo);
+    let repo_gates = super::repo_gates(&config_root(repo));
     let repo_checks_enabled = repo_gates.checks;
     let mut notes = resolved.notes;
     // Capture HEAD once before any check runs so early and main paths compare against the same commit snapshot. (#699)
@@ -5031,6 +5057,111 @@ mod tests {
         } else {
             "touch ran"
         }
+    }
+
+    /// A linked worktree of `main` on a new branch; the caller keeps the returned guard alive.
+    fn linked_worktree(main: &Path) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wt");
+        let status = Command::new("git")
+            .args(["worktree", "add", "-q", "-b", "wt-branch"])
+            .arg(&path)
+            .current_dir(main)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git worktree add failed");
+        (dir, path)
+    }
+
+    /// #974: the repository's untracked `.zirv/verify.toml` lives in the main checkout only.
+    #[test]
+    fn linked_worktree_discovers_main_checkout_verify_toml_and_runs_in_the_worktree() {
+        let main = git_repo();
+        write_verify_toml(
+            main.path(),
+            "schema_version=1\n[[checks]]\nid='probe'\nkind='custom'\ncommand='true'\nchanged=true\n",
+        );
+        let (_guard, worktree) = linked_worktree(main.path());
+        std::fs::write(worktree.join("feature.txt"), "x\n").unwrap();
+        let state_root = tempdir().unwrap();
+        let report = with_state(state_root.path(), || {
+            run_mode(&worktree, VerificationMode::Changed, &[], true)
+        })
+        .expect("the worktree must discover the main checkout's checks");
+        assert_eq!(report.repo, worktree);
+        assert_eq!(report.checks[0].id, "probe");
+        assert!(
+            report
+                .changed_paths
+                .iter()
+                .any(|p| p.to_string_lossy().contains("feature.txt"))
+        );
+    }
+
+    /// #974: discovering from the main checkout keeps the repo-check gate.
+    #[test]
+    fn linked_worktree_keeps_the_repo_check_gate_for_main_checkout_checks() {
+        let main = git_repo();
+        write_verify_toml(
+            main.path(),
+            &format!(
+                "schema_version=1\n[[checks]]\nid='sneaky'\nkind='custom'\ncommand='{}'\n",
+                marker_command()
+            ),
+        );
+        let (_guard, worktree) = linked_worktree(main.path());
+        let state_root = tempdir().unwrap();
+        let report = with_state(state_root.path(), || {
+            // SAFETY: single-threaded suite.
+            unsafe {
+                std::env::set_var("ZIRV_CTX_WORKFLOW_REPO_CHECKS", "false");
+            }
+            let report = run_mode(&worktree, VerificationMode::Final, &[], false);
+            unsafe {
+                std::env::remove_var("ZIRV_CTX_WORKFLOW_REPO_CHECKS");
+            }
+            report.unwrap()
+        });
+        assert!(!worktree.join("ran").exists());
+        assert_eq!(report.checks[0].status, CheckStatus::Skipped);
+    }
+
+    /// #970: gitlab-ci-local containers cannot follow a worktree's `.git` file, so no `--needs` there.
+    #[test]
+    fn gitlab_discovery_omits_needs_in_a_linked_worktree_only() {
+        let main = git_repo();
+        ci_write(main.path(), ".gitlab-ci.yml", "phpunit:\n  script: [x]\n");
+        let main_ids = load_or_discover(main.path()).unwrap();
+        assert!(main_ids.checks[0].spec.command.ends_with("--needs"));
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(main.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "ci",
+            ])
+            .current_dir(main.path())
+            .status()
+            .unwrap();
+        let (_guard, worktree) = linked_worktree(main.path());
+        let resolved = load_or_discover(&worktree).unwrap();
+        assert_eq!(resolved.checks[0].spec.id, "gitlab-phpunit");
+        assert!(
+            !resolved.checks[0].spec.command.contains("--needs"),
+            "{}",
+            resolved.checks[0].spec.command
+        );
     }
 
     #[test]

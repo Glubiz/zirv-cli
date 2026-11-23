@@ -407,11 +407,14 @@ pub fn detect(
 ) -> CtxResult<DetectorReport> {
     let repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
     let mut truncated = false;
+    let mut since_base = None;
     let (scope, paths) = if !requested.is_empty() {
         (DetectorScope::Explicit, requested.to_vec())
     } else if all {
         let (paths, scan_truncated) = collect_all(&repo)?;
         truncated = scan_truncated;
+        // Tag introduced vs pre-existing exactly as the workflow gate does; no base means no tags. (#969)
+        since_base = super::verification::changed_paths_since_base(&repo).ok();
         (DetectorScope::All, paths)
     } else {
         (
@@ -419,7 +422,7 @@ pub fn detect(
             super::verification::changed_paths(&repo)?,
         )
     };
-    detect_with_scope(state, &repo, scope, paths, truncated, None)
+    detect_with_scope(state, &repo, scope, paths, truncated, since_base.as_deref())
 }
 
 /// Use since-base paths for Test’s changed-only scan and for pre-existing tags on Review/Verify’s full scan. (#251, #255)
@@ -464,6 +467,10 @@ fn detect_with_scope(
     paths.retain(|path| is_frontend_source(repo, path));
     paths.sort();
     paths.dedup();
+    // Changed files first so a size/count cap only ever drops untouched (pre-existing) files. (#969)
+    if let Some(baseline) = preexisting_baseline {
+        paths.sort_by_key(|path| !baseline.contains(path));
+    }
     truncated |= paths.len() > MAX_FILES;
     paths.truncate(MAX_FILES);
 
@@ -2297,6 +2304,58 @@ mod tests {
                 .iter()
                 .any(|path| path.to_string_lossy().contains("ignored")),
             "a gitignored directory must not be scanned: {paths:?}"
+        );
+    }
+
+    /// #969: `frontend check --all` and the workflow gate tag introduced vs pre-existing the same way.
+    #[test]
+    fn check_all_classifies_findings_like_the_workflow_gate() {
+        let repo = tempfile::tempdir().expect("repo");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(
+            repo.path().join("Old.tsx"),
+            "export const Old = () => <img src={x} />;\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        git(&["checkout", "-q", "-b", "feature"]);
+        std::fs::write(
+            repo.path().join("New.tsx"),
+            "export const New = () => <img src={y} alt=\"\" />;\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "feature"]);
+        let state = StateDir::from_root(tempfile::tempdir().unwrap().path().to_path_buf());
+        let all = detect(&state, repo.path(), &[], true).unwrap();
+        let gate = detect_for_workflow(&state, repo.path(), true).unwrap();
+        assert_eq!(all.preexisting_blocking_count(), 1, "{:?}", all.findings);
+        assert_eq!(
+            (
+                all.introduced_blocking_count(),
+                all.preexisting_blocking_count()
+            ),
+            (
+                gate.introduced_blocking_count(),
+                gate.preexisting_blocking_count()
+            )
         );
     }
 

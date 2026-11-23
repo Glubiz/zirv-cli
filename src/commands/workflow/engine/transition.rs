@@ -838,7 +838,11 @@ pub fn advance_with_evidence(
                 let introduced_accepted = introduced > 0 && reason_given;
                 let preexisting_accepted =
                     accept_findings.preexisting || preexisting_already_accepted || reason_given;
-                if report.truncated
+                // Changed files are scanned first, so a truncated scan with no introduced finding only
+                // left untouched (pre-existing) files unscanned; the operator can accept that. (#969)
+                let truncation_blocks =
+                    report.truncated && !(introduced == 0 && preexisting_accepted);
+                if truncation_blocks
                     || (introduced > 0 && !introduced_accepted)
                     || (preexisting > 0 && !preexisting_accepted)
                 {
@@ -847,6 +851,11 @@ pub fn advance_with_evidence(
                         accept_hint.push_str(&format!(
                             "; pass --accept-preexisting-findings to accept {preexisting} pre-existing blocking finding(s) and proceed"
                         ));
+                    }
+                    if report.truncated && introduced == 0 && !preexisting_accepted {
+                        accept_hint.push_str(
+                            "; the scan hit its file/size limit (changed files are scanned first, so the unscanned remainder is untouched code): pass --accept-preexisting-findings to accept the unscanned remainder and proceed",
+                        );
                     }
                     if introduced > 0 {
                         accept_hint.push_str(&format!(
@@ -2097,6 +2106,66 @@ mod tests {
         assert!(
             !with_flag.contains("automatically ran the detector"),
             "the flag must let the detector gate pass its pre-existing findings: {with_flag}"
+        );
+    }
+
+    /// #969: a truncated Review/Verify scan with 0 introduced findings advances once the operator accepts pre-existing findings.
+    #[test]
+    fn truncated_scan_with_no_introduced_findings_accepts_preexisting_flag() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run vcs");
+            assert!(status.success(), "vcs {args:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        for index in 0..260 {
+            std::fs::write(
+                repo.path().join(format!("Old{index:03}.tsx")),
+                "export const Old = () => <img src={avatar} />;\n",
+            )
+            .unwrap();
+        }
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "base"]);
+        run(&["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo.path().join("style.css"), ".card { color: red; }\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "clean style"]);
+
+        let mut classification = low_classification();
+        classification.risk = RiskBand::Medium;
+        classification.work_domain.domain = WorkDomain::Frontend;
+        classification.work_domain.score = 55;
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "review a frontend component".into(),
+            WorkflowKind::Review,
+            None,
+            true,
+            classification,
+        );
+        state.status = WorkflowStatus::Running;
+
+        let with_flag = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, true)
+            .map(|_| String::new())
+            .unwrap_or_else(|error| error.to_string());
+        assert!(
+            !with_flag.contains("automatically ran the detector"),
+            "{with_flag}"
         );
     }
 
