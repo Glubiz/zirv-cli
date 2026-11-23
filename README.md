@@ -1672,7 +1672,9 @@ protocol and harness: [docs/benchmarks/wrapped-vs-vanilla.md](docs/benchmarks/wr
   covers every required check. See [The full verb
   set](#the-full-verb-set).
 - **Repository check configuration** — optional, schema-versioned
-  `.zirv/verify.toml` declares check id/kind/command/path patterns/phase
+  `.zirv/verify.toml` (a linked worktree without its own copy, e.g. with
+  `.zirv/` untracked, reads the main checkout's file and its repo-check
+  gates, and still runs the checks against the worktree) declares check id/kind/command/path patterns/phase
   eligibility/timeout; without it, Cargo commands and `npm run` scripts are
   discovered from the manifests present (the root, or, with no root
   `Cargo.toml`/`package.json`, up to 8 immediate subdirectories via
@@ -1681,7 +1683,9 @@ protocol and harness: [docs/benchmarks/wrapped-vs-vanilla.md](docs/benchmarks/wr
   test-stage jobs of a root `.gitlab-ci.yml` (the include-resolved
   `.gitlab-ci-local/expanded-gitlab-ci.yml` cache that `gitlab-ci-local --list`
   writes wins over the root copy; root-only jobs resolve `extends`) run as
-  `gitlab-ci-local '<job>' --needs` (ids `gitlab-<job>`). Jobs with `trigger:`,
+  `gitlab-ci-local '<job>' --needs` (ids `gitlab-<job>`; in a linked git
+  worktree `--needs` is omitted because gitlab-ci-local's containers cannot
+  follow the worktree's `.git` file). Jobs with `trigger:`,
   manual rules or an unresolvable `extends` are skipped, and a job whose
   `needs:` chain reaches a stage other than `.pre`/`build`/`test` or a script
   with an outward verb (`docker push`, `git push`, `kubectl apply`,
@@ -3031,6 +3035,12 @@ finding.
 blocking findings; `--accept-introduced-findings <REASON>` accepts introduced
 ones judged false positives (the reason is mandatory and recorded on the
 workflow; it also accepts pre-existing findings).
+
+A truncated full-surface scan (file/size limit) lists changed files first, so
+with 0 introduced blocking findings `--accept-preexisting-findings` also
+accepts the unscanned remainder; the error says so. `frontend check --all`
+tags introduced vs pre-existing against the same diff base as the workflow
+gate.
 
 [Glubiz/zirv-generic-frontend](https://github.com/Glubiz/zirv-generic-frontend)
 is the reference frontend template built against this contract — it is also
