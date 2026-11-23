@@ -22,7 +22,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(unix)]
 use std::path::Path;
 #[cfg(unix)]
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(unix)]
 use std::sync::{Arc, mpsc};
 #[cfg(unix)]
@@ -33,7 +33,7 @@ use std::time::Duration;
 const MAX_LINE_BYTES: u64 = 8 * 1024;
 /// Most requests one dashboard holds or serves connections for at once.
 #[cfg(unix)]
-const MAX_PENDING: usize = 32;
+pub const MAX_PENDING: usize = 32;
 const PREVIEW_COLS: usize = 200;
 /// The redacted full command or input summary a request carries for the details view.
 const COMMAND_COLS: usize = 600;
@@ -504,8 +504,32 @@ pub fn peer_pid(_stream: &UnixStream) -> Option<u32> {
 
 /// Hook side: send one request to the dashboard at `sock` and wait for its decision.
 /// `None` for every failure, so the caller prints nothing and the native dialog shows.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 pub fn hold(sock: &Path, owner_pid: u32, request: &Request, hold: Duration) -> Option<Decision> {
+    hold_until(sock, owner_pid, request, hold, None)
+}
+
+#[cfg(unix)]
+fn is_timeout(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+/// Longest the wait for a reply goes without looking at `cancel`.
+#[cfg(unix)]
+const CANCEL_SLICE: Duration = Duration::from_millis(200);
+
+/// `hold`, ending early with `None` (and the connection closed) once `cancel` is set.
+#[cfg(unix)]
+pub fn hold_until(
+    sock: &Path,
+    owner_pid: u32,
+    request: &Request,
+    hold: Duration,
+    cancel: Option<&AtomicBool>,
+) -> Option<Decision> {
     let stream = UnixStream::connect(sock).ok()?;
     // Anything on this path can bind a socket; only the dashboard that owns the pane may answer.
     if peer_pid(&stream)? != owner_pid {
@@ -523,11 +547,22 @@ pub fn hold(sock: &Path, owner_pid: u32, request: &Request, hold: Duration) -> O
     let mut byte = [0u8; 1];
     loop {
         let remaining = deadline.checked_duration_since(Instant::now())?;
+        let cancelling = cancel.is_some();
+        if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+            return None;
+        }
+        let wait = if cancelling {
+            remaining.min(CANCEL_SLICE)
+        } else {
+            remaining
+        };
         // A peer that already answered and closed makes macOS refuse a new timeout; the first one still bounds the read.
-        let _ = stream.set_read_timeout(Some(remaining.max(Duration::from_millis(1))));
+        let _ = stream.set_read_timeout(Some(wait.max(Duration::from_millis(1))));
         match (&stream).read(&mut byte) {
             Ok(1) if byte[0] == b'\n' => break,
             Ok(1) if (buf.len() as u64) < MAX_LINE_BYTES => buf.push(byte[0]),
+            // A slice ran out: look at `cancel` and the deadline again.
+            Err(e) if cancelling && is_timeout(&e) => {}
             _ => return None,
         }
     }
@@ -1015,6 +1050,31 @@ pub fn hold_for_dashboard(
     details: RequestDetails,
     hold_for: Duration,
 ) -> Option<Decision> {
+    hold_for_dashboard_until(
+        state,
+        short,
+        tool,
+        command,
+        preview_source,
+        details,
+        hold_for,
+        None,
+    )
+}
+
+/// `hold_for_dashboard`, ending early with `None` once `cancel` is set.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+pub fn hold_for_dashboard_until(
+    state: &StateDir,
+    short: &str,
+    tool: &str,
+    command: &str,
+    preview_source: &str,
+    details: RequestDetails,
+    hold_for: Duration,
+    cancel: Option<&AtomicBool>,
+) -> Option<Decision> {
     if !is_safe_name(short) {
         return None;
     }
@@ -1031,7 +1091,7 @@ pub fn hold_for_dashboard(
     // Claude may run two identical handlers for one call; only the first holds, the other prints nothing.
     let single_flight = single_flight(state, short, &request.id)?;
     let record = write_record(state, &request).ok()?;
-    let decision = hold(&sock, owner_pid, &request, hold_for);
+    let decision = hold_until(&sock, owner_pid, &request, hold_for, cancel);
     match decision {
         Some(Decision::Allow | Decision::AllowAlways | Decision::Deny) => {
             let _ = std::fs::remove_file(&record);

@@ -726,6 +726,7 @@ fn run_with_clock_inner<W: Write>(
             command,
             stdin_prompt.clone(),
             std::mem::take(&mut app_server_launch),
+            launch::approval_bridge(&cfg, parent_short.as_deref()),
             &state,
             session.as_str(),
             w,

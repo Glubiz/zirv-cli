@@ -3065,6 +3065,35 @@ mod tests {
         assert!(CtxConfig::load(repo.path(), &|k| bad.get(k).cloned()).is_err());
     }
 
+    /// #950 slice 6: a repository cannot opt a headless codex worker's approvals into the bridge, but the environment can.
+    #[test]
+    fn approvals_codex_headless_is_repo_forbidden_and_env_settable() {
+        let empty = env_map(&[]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("tempdir");
+        assert!(
+            !CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect("load")
+                .approvals
+                .codex_headless,
+            "off by default"
+        );
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[approvals]\ncodex_headless = true\n",
+        )
+        .expect("write");
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repository must not set approvals.codex_headless");
+        assert!(is_repo_forbidden(err.as_ref()), "{err}");
+        let env = env_map(&[("ZIRV_CTX_APPROVALS_CODEX_HEADLESS", "true")]);
+        let clean = tempfile::tempdir().expect("tempdir");
+        let cfg = CtxConfig::load(clean.path(), &|k| env.get(k).cloned()).expect("load");
+        assert!(cfg.approvals.codex_headless);
+    }
+
     /// The operator's own escape hatches: `~/.zirv/ctx.toml` and every
     /// `ZIRV_CTX_HEADLESS_*` env var may still set these keys.
     #[test]
