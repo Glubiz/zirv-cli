@@ -4165,6 +4165,7 @@ impl NativePaneRuntime {
             brainstorm: false,
             no_brainstorm: false,
             profile: None,
+            take_over: false,
             json: false,
         };
         match engine::start_workflow(&self.state, &args) {

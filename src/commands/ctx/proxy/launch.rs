@@ -89,9 +89,11 @@ pub fn start_named_workflow(
         brainstorm: false,
         no_brainstorm: true,
         profile: None,
+        take_over: false,
         json: false,
     };
-    let outcome = engine::start_workflow(&state, &args).map_err(|error| error.to_string())?;
+    let outcome =
+        engine::start_workflow_auto(&state, &args, session).map_err(|error| error.to_string())?;
     Ok(WorkflowStart::Started {
         id: outcome.state.id,
     })
@@ -286,6 +288,7 @@ mod tests {
                 brainstorm: false,
                 no_brainstorm: false,
                 profile: None,
+                take_over: false,
                 json: false,
             },
         )

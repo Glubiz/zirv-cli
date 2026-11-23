@@ -183,14 +183,28 @@ pub fn nudge_due(
 }
 
 /// The nudge cannot infer a workflow kind without task text; enforce mode also names its delegation gate. Proportional wording permits bounded work to finish without a workflow.
-pub fn nudge_text(signals: &AdoptionSignals, policy: AdoptionPolicy) -> String {
-    let mut text = format!(
-        "[zirv workflow] this has grown into substantial work ({} edit calls over {} turns) \
-         with no active zirv workflow. If it spans several areas or carries real risk, start \
-         one now: zirv workflow start --task \"<summary>\". A bounded change may finish \
-         without one.",
-        signals.edit_like_calls, signals.turns
-    );
+pub fn nudge_text(
+    signals: &AdoptionSignals,
+    policy: AdoptionPolicy,
+    other_owner: Option<(&str, &str)>,
+) -> String {
+    let mut text = match other_owner {
+        // The repository's active slot is shared; a start would be refused or would displace the owner. (#966)
+        Some((session, workflow)) => format!(
+            "[zirv workflow] this has grown into substantial work ({} edit calls over {} turns), \
+             but this repository's active workflow {workflow} is owned by live session {session}. \
+             Coordinate with that session before starting another; `zirv workflow start` refuses \
+             to displace it unless --take-over is given.",
+            signals.edit_like_calls, signals.turns
+        ),
+        None => format!(
+            "[zirv workflow] this has grown into substantial work ({} edit calls over {} turns) \
+             with no active zirv workflow. If it spans several areas or carries real risk, start \
+             one now: zirv workflow start --task \"<summary>\". A bounded change may finish \
+             without one.",
+            signals.edit_like_calls, signals.turns
+        ),
+    };
     if policy == AdoptionPolicy::Enforce {
         // ASCII double-hyphen, not a real em dash: this text rides the Stop
         // hook's `systemMessage` and `UserPromptSubmit`'s `additionalContext`,
@@ -401,7 +415,7 @@ mod tests {
             turns: 9,
             skill_loads: 0,
         };
-        let text = nudge_text(&s, AdoptionPolicy::Nudge);
+        let text = nudge_text(&s, AdoptionPolicy::Nudge, None);
         assert!(text.contains("7 edit calls over 9 turns"), "{text}");
         assert!(text.contains("zirv workflow start --task"), "{text}");
         assert!(!text.contains("enforce"), "{text}");
@@ -439,6 +453,25 @@ mod tests {
         assert!(is_substantial(&new_by_turns));
     }
 
+    /// #966: with another live session owning the repository's active workflow, the
+    /// hint names the owner and does not advise starting one.
+    #[test]
+    fn nudge_text_names_the_owning_session_instead_of_advising_start() {
+        let s = AdoptionSignals {
+            edit_like_calls: 7,
+            turns: 9,
+            skill_loads: 0,
+        };
+        let text = nudge_text(&s, AdoptionPolicy::Nudge, Some(("abcd1234", "c46ba4ff")));
+        assert!(
+            text.contains("abcd1234") && text.contains("c46ba4ff"),
+            "{text}"
+        );
+        assert!(text.contains("Coordinate"), "{text}");
+        assert!(!text.contains("start one now"), "{text}");
+        assert!(!text.contains("no active zirv workflow"), "{text}");
+    }
+
     #[test]
     fn nudge_text_under_enforce_names_the_delegation_gate() {
         let s = AdoptionSignals {
@@ -446,7 +479,7 @@ mod tests {
             turns: 5,
             skill_loads: 0,
         };
-        let text = nudge_text(&s, AdoptionPolicy::Enforce);
+        let text = nudge_text(&s, AdoptionPolicy::Enforce, None);
         assert!(text.contains("workflow.adoption = enforce"), "{text}");
         assert!(text.contains("zirv agent delegation is held"), "{text}");
     }
