@@ -1213,6 +1213,30 @@ fn turn_activity(jsonl: &str) -> TurnActivity {
     out
 }
 
+/// The text of the last assistant row that carries text or a tool call, unless that row calls a
+/// tool: text ahead of a tool call is mid-turn narration, and a transcript not yet flushed with
+/// the turn-ending message must not pass it off as the final report (#956).
+fn final_message(jsonl: &str) -> Option<String> {
+    let calls_tool = |message: &Value| {
+        message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+            })
+    };
+    let message = jsonl
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .filter(|row| row.get("isSidechain").and_then(Value::as_bool) != Some(true))
+        .filter(|row| row.get("type").and_then(Value::as_str) == Some("assistant"))
+        .filter_map(|row| row.get("message").cloned())
+        .rfind(|message| calls_tool(message) || !text_of(message).trim().is_empty())?;
+    (!calls_tool(&message)).then(|| text_of(&message))
+}
+
 fn keep_last<T>(items: &mut Vec<T>, last_n: usize) {
     if items.len() > last_n {
         items.drain(..items.len() - last_n);
@@ -3139,6 +3163,10 @@ impl AgentAdapter for ClaudeAdapter {
 
     fn turn_activity(&self, jsonl: &str) -> TurnActivity {
         turn_activity(jsonl)
+    }
+
+    fn final_assistant_message(&self, jsonl: &str) -> Option<String> {
+        final_message(jsonl)
     }
 
     fn model_hint(&self, jsonl: &str) -> Option<String> {
@@ -6722,6 +6750,34 @@ mod tests {
         assert_eq!(
             turn.tool_lines,
             vec!["Bash cargo test -> error: 1 test failed"]
+        );
+    }
+
+    /// #956: the consult judges the turn-ending message; text ahead of a tool call is mid-turn
+    /// narration, so an unflushed final message reads as no claim rather than that narration.
+    #[test]
+    fn the_final_message_is_the_turn_ending_text_never_mid_turn_narration() {
+        let narration = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Before writing up, I will pull the cost data."}]}}"#;
+        let call = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b","name":"Bash","input":{"command":"ls"}}]}}"#;
+        let result = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b","content":"ok"}]}}"#;
+        let ending = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Findings: all verified."}]}}"#;
+        let unflushed = [narration, call, result].join("\n");
+        assert_eq!(
+            ClaudeAdapter::new(None).final_assistant_message(&unflushed),
+            None
+        );
+        let flushed = [narration, call, result, ending].join("\n");
+        assert_eq!(
+            ClaudeAdapter::new(None)
+                .final_assistant_message(&flushed)
+                .as_deref(),
+            Some("Findings: all verified.")
+        );
+        assert_eq!(
+            ClaudeAdapter::new(None)
+                .final_assistant_message(ending)
+                .as_deref(),
+            Some("Findings: all verified.")
         );
     }
 

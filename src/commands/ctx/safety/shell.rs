@@ -171,11 +171,12 @@ pub(super) fn tokenize_segments(command: &str) -> Vec<(String, bool)> {
 }
 
 /// The separator right before a segment: `&&` (runs only on success), `||`
-/// (runs only on failure) or anything else.
+/// (runs only on failure), `;`/newline (runs regardless) or anything else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Join {
     And,
     Or,
+    Seq,
     Other,
 }
 
@@ -213,7 +214,7 @@ pub(super) fn tokenize_segments_joined(command: &str) -> Vec<(String, bool, Join
         } else if c == ';' || c == '\n' {
             segments.push((std::mem::take(&mut current), preceded_by_pipe, join));
             preceded_by_pipe = false;
-            join = Join::Other;
+            join = Join::Seq;
             i += 1;
         } else if c == '|' && next == Some('&') {
             segments.push((std::mem::take(&mut current), preceded_by_pipe, join));
