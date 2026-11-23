@@ -1280,7 +1280,7 @@ fn git_paths(stdout: &[u8]) -> impl Iterator<Item = PathBuf> + '_ {
 }
 
 pub fn changed_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
-    changed_paths_at_root(&git_root(repo))
+    changed_paths_at_root(&git_root(repo), true)
 }
 
 /// Paths a session may have written source into: tracked changes against HEAD (minus `.zirv/work`
@@ -1357,8 +1357,9 @@ pub struct CandidateEdits {
     pub untracked: Vec<PathBuf>,
 }
 
-fn changed_paths_at_root(root: &Path) -> CtxResult<Vec<PathBuf>> {
+fn changed_paths_at_root(root: &Path, include_untracked: bool) -> CtxResult<Vec<PathBuf>> {
     let mut paths = Vec::new();
+    let sources = if include_untracked { 2 } else { 1 };
     for args in [
         &["diff", "--name-only", "-z", "HEAD"][..],
         &[
@@ -1368,7 +1369,10 @@ fn changed_paths_at_root(root: &Path) -> CtxResult<Vec<PathBuf>> {
             "--exclude-standard",
             "--full-name",
         ][..],
-    ] {
+    ]
+    .into_iter()
+    .take(sources)
+    {
         let output = git_at(root).args(args).output()?;
         if !output.status.success() {
             return Err(format!(
@@ -1464,7 +1468,7 @@ impl ChangeScan {
     pub fn paths(&mut self) -> CtxResult<&[PathBuf]> {
         if self.paths.is_none() {
             let root = self.root();
-            self.paths = Some(changed_paths_at_root(&root)?);
+            self.paths = Some(changed_paths_at_root(&root, true)?);
         }
         Ok(self.paths.as_deref().unwrap_or_default())
     }
@@ -1474,8 +1478,21 @@ pub fn change_fingerprint(repo: &Path) -> CtxResult<u64> {
     change_fingerprint_with(&mut ChangeScan::new(repo))
 }
 
+/// The fingerprint over tracked changes only, so a run can tell its own untracked cache and artifact writes from edits to tracked files. (#963)
+fn tracked_change_fingerprint(repo: &Path) -> CtxResult<u64> {
+    let root = git_root(repo);
+    let paths = changed_paths_at_root(&root, false)?;
+    fingerprint_over(&root, &paths)
+}
+
 pub fn change_fingerprint_with(scan: &mut ChangeScan) -> CtxResult<u64> {
     let root = scan.root();
+    let paths = scan.paths()?.to_vec();
+    fingerprint_over(&root, &paths)
+}
+
+fn fingerprint_over(root: &Path, paths: &[PathBuf]) -> CtxResult<u64> {
+    let root = root.to_path_buf();
     let head = git_at(&root).args(["rev-parse", "HEAD"]).output()?;
     if !head.status.success() {
         return Err("cannot fingerprint repository HEAD".into());
@@ -1486,7 +1503,6 @@ pub fn change_fingerprint_with(scan: &mut ChangeScan) -> CtxResult<u64> {
     }
     let mut input = String::from_utf8_lossy(&head.stdout).into_owned();
     input.push_str(&String::from_utf8_lossy(&diff.stdout));
-    let paths = scan.paths()?;
     // One `hash-object` for every plain file; `--stdin-paths` splits on newlines and unquotes a
     // leading `"`, so those names fall back to a spawn of their own below.
     let batchable: Vec<&PathBuf> = paths
@@ -3047,6 +3063,48 @@ pub fn latest_is_fresh_and_passing(
     latest_is_fresh_and_passing_scan(state, repo, &mut ChangeScan::new(repo), final_only, branch)
 }
 
+/// The first condition that keeps the latest report from satisfying a Test/Verify gate, so a refusal names its cause rather than a bare "failed". (#963)
+pub fn gate_refusal_reason(state: &StateDir, repo: &Path, final_only: bool) -> CtxResult<String> {
+    let Some(report) = load_latest(state, repo)? else {
+        return Ok("no verification report exists for this checkout".to_string());
+    };
+    if final_only && report.mode != VerificationMode::Final {
+        return Ok(format!(
+            "latest report {} is a {:?} run; this step needs a Final (`zirv verify`) report",
+            report.id, report.mode
+        ));
+    }
+    if !report.narrowed_to.is_empty() {
+        return Ok(format!(
+            "latest report {} was narrowed to checks [{}] and cannot cover the whole change set",
+            report.id,
+            report.narrowed_to.join(", ")
+        ));
+    }
+    let current = change_fingerprint(repo)?;
+    if report.change_fingerprint != current {
+        return Ok(format!(
+            "latest report {} was recorded for change set {:016x} but the tree is now {current:016x}: files changed after the run began; rerun the checks",
+            report.id, report.change_fingerprint
+        ));
+    }
+    let unmet: Vec<String> = report
+        .checks
+        .iter()
+        .filter(|check| check.status != CheckStatus::Passed)
+        .map(|check| format!("{} ({:?})", check.id, check.status))
+        .collect();
+    Ok(format!(
+        "latest report {} has check(s) not passed: {}",
+        report.id,
+        if unmet.is_empty() {
+            "none recorded".to_string()
+        } else {
+            unmet.join(", ")
+        }
+    ))
+}
+
 /// [`latest_is_fresh_and_passing`] over a caller-owned scan of `repo`, so the caller can reuse the
 /// changed paths this check already listed.
 pub fn latest_is_fresh_and_passing_scan(
@@ -3374,6 +3432,7 @@ fn run_mode(
     let started_at = now_secs();
     // Capture the change fingerprint before checks so edits during a long suite cannot appear tested.
     let change_fingerprint = change_fingerprint(repo)?;
+    let tracked_before = tracked_change_fingerprint(repo)?;
     // Reuse fresh, full evidence for an identical fingerprint in Final mode; dry runs only preview execution.
     let state_for_reuse = if mode == VerificationMode::Final && !dry_run {
         StateDir::resolve(&|key| std::env::var(key).ok()).ok()
@@ -3463,6 +3522,12 @@ fn run_mode(
             reused_ids.join(", ")
         ));
     }
+    // Checks write caches and artifacts (for example `.gitlab-ci-local/`); when they left every tracked file alone, record the tree they leave behind so a passing run is not born stale. A check that edits a tracked file keeps the pre-run fingerprint. (#963)
+    let change_fingerprint = if !dry_run && tracked_change_fingerprint(repo)? == tracked_before {
+        self::change_fingerprint(repo)?
+    } else {
+        change_fingerprint
+    };
     Ok(VerificationReport {
         schema_version: VERIFY_REPORT_SCHEMA_VERSION,
         id: uuid::Uuid::new_v4().to_string(),
@@ -6209,6 +6274,27 @@ mod tests {
             report.change_fingerprint,
             change_fingerprint(repo.path()).unwrap(),
             "the report must describe the tree as it was before the edit"
+        );
+    }
+
+    /// #963: a check that only writes untracked caches or artifacts (`.gitlab-ci-local/`, result
+    /// caches) must not leave its own passing report stale for the tree it leaves behind.
+    #[test]
+    fn untracked_artifacts_written_by_checks_do_not_stale_the_evidence() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        write_verify_toml(
+            repo.path(),
+            "schema_version=1\n[[checks]]\nid='cache'\nkind='custom'\ncommand='echo x >> cache.out'\n",
+        );
+        let report = with_state(state_root.path(), || {
+            run_mode(repo.path(), VerificationMode::Final, &[], false).expect("run")
+        });
+        assert_eq!(report.checks[0].status, CheckStatus::Passed);
+        assert_eq!(
+            report.change_fingerprint,
+            change_fingerprint(repo.path()).unwrap(),
+            "the report must describe the tree the check leaves behind when it only wrote untracked files"
         );
     }
 

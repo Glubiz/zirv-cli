@@ -186,6 +186,7 @@ impl super::NativeToolClient {
             brainstorm: false,
             no_brainstorm: false,
             profile: None,
+            take_over: false,
             json: true,
         };
         let outcome =

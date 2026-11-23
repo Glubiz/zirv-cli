@@ -2330,7 +2330,7 @@ untouched-template check always runs first.
 zirv workflow list [--json] [--built-in-only] [--repo <path>]        # registry ids: layer/version/hash/domains
 zirv workflow show feature [--json] [--built-in-only] [--repo <path>] # one definition's steps
 zirv workflow classify --task "..."               # classify without starting; like start, untracked files are not part of the change
-zirv workflow start feature --task "..." [--agent claude] [--built-in-only] [--brainstorm|--no-brainstorm] [--branch <name>]
+zirv workflow start feature --task "..." [--agent claude] [--built-in-only] [--brainstorm|--no-brainstorm] [--branch <name>] [--take-over]
 zirv workflow status [id]                         # one instance, or the active one; shows brainstorm: on|off, Jev tags, per-step wall-clock, and pinned definition/drift
 zirv workflow resume <id>                         # restore as the active workflow
 zirv workflow context [id]                        # the current step's resolved skill context
@@ -2639,16 +2639,39 @@ decision is already explainable from `reasons` alone, which a model call
 would only obscure for the near-certain-floor cases it would actually apply
 to; see the design note for the full reasoning.
 
-`zirv workflow start` never refuses because another workflow is already
+`zirv workflow start` does not refuse because another workflow is already
 active for this repository -- multiple workflows per repository are
-legitimate, and `zirv workflow resume <id>` restores any of them. When the
-new start silently changes which workflow this repository's active pointer
-names -- a DIFFERENT, still-running (`Running`/`AwaitingApproval`) workflow
-was active -- it prints one best-effort note to STDERR after the new
+legitimate, and `zirv workflow resume <id>` restores any of them. The one
+exception is a workflow owned by ANOTHER LIVE session: while the repository's
+active pointer names a `Running`/`AwaitingApproval` workflow bound to a live
+session other than the caller, an explicit `zirv workflow start` exits
+non-zero naming the owning session and workflow, and leaves the pointer
+alone; pass `--take-over` to make the new workflow active anyway. The
+ownership check, pointer write and session binding happen under one
+per-repository lock. An automatic start (prompt-hook or chat-proxy
+`workflow.auto_start`) never refuses: it binds the new workflow to the
+starting session only and leaves the owner's pointer in place, and it
+classifies from the prompt text alone (no `git diff` of the checkout, so a
+merged branch's history or another session's edits are not scored as its
+change). `zirv workflow close` clears the pointer only when it names the closed
+workflow. When a start does change which workflow the active pointer names --
+a DIFFERENT, still-running workflow was active and no live session owned it
+(or `--take-over`) -- it prints one best-effort note to STDERR after the new
 workflow is saved: `note: workflow <old-instance-id> (<old definition id>)
 is no longer this repository's active workflow; restore it with: zirv
 workflow resume <old-instance-id>`. Stdout/`--json` output is unaffected
-either way.
+either way. The adoption nudge names the owning session instead of advising
+a start when another live session owns the active workflow.
+
+When a Test/Verify gate refuses (`zirv workflow run-checks`, or
+`advance --outcome success`), it prints `gate refused: <reason>` (the error
+carries `reason: <reason>`): no report, a non-Final or narrowed report, a
+report recorded for a different change set, or checks that did not pass. A
+verification run records the change fingerprint before its checks, but when
+the checks leave every tracked file untouched the report records the tree
+they leave behind, so untracked artifacts a check writes (for example
+`.gitlab-ci-local/`) do not make its own passing report stale. A check that
+edits a tracked file keeps the pre-run fingerprint and the report is stale.
 
 ### Lifecycle and artifacts
 

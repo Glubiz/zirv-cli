@@ -624,7 +624,18 @@ pub(super) fn adoption_stop_nudge(
     };
     let workflow_text = due.then(|| {
         record.last_nudged_turn = Some(record.turns);
-        adoption::nudge_text(&signals, cfg.workflow.adoption)
+        let owner = engine::foreign_active_owner(
+            state,
+            repo,
+            Some(&super::permission::attention_short(env, session)),
+        );
+        adoption::nudge_text(
+            &signals,
+            cfg.workflow.adoption,
+            owner
+                .as_ref()
+                .map(|(short, active)| (short.as_str(), active.id.as_str())),
+        )
     });
 
     // Own gate (`prompt.skill_index`), own due check, own cadence field --

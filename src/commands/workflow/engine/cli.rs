@@ -163,6 +163,10 @@ pub struct StartArgs {
     /// profile can otherwise only be fixed by abandoning the workflow).
     #[arg(long, value_enum)]
     pub profile: Option<WorkflowProfile>,
+    /// Make this workflow the repository's active one even while it is owned
+    /// by another live session's Running workflow (#966).
+    #[arg(long)]
+    pub take_over: bool,
     #[arg(long)]
     pub json: bool,
 }
@@ -581,6 +585,10 @@ pub(super) fn run_required_checks(
     )? {
         Ok(crate::commands::workflow::verification::GateOutcome::Pass)
     } else {
+        let reason = crate::commands::workflow::verification::gate_refusal_reason(
+            state_dir, repo, final_only,
+        )?;
+        writeln!(writer, "gate refused: {reason}")?;
         Ok(crate::commands::workflow::verification::GateOutcome::Fail)
     }
 }
@@ -1008,6 +1016,27 @@ pub(super) fn best_effort_write_displacement_note(mut writer: impl std::io::Writ
 /// [`active_workflow_displaced_note`]); stdout/`--json` output is unaffected
 /// either way.
 pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<StartOutcome> {
+    start_workflow_as(state_dir, args, None, false)
+}
+
+/// Automatic start for `session`: classifies from the task text alone (no repository
+/// measurement) and never repoints the active pointer away from another live session's
+/// workflow; the new workflow binds to `session` only. (#966, #977)
+pub fn start_workflow_auto(
+    state_dir: &StateDir,
+    args: &StartArgs,
+    session: Option<&str>,
+) -> CtxResult<StartOutcome> {
+    start_workflow_as(state_dir, args, session, true)
+}
+
+fn start_workflow_as(
+    state_dir: &StateDir,
+    args: &StartArgs,
+    session: Option<&str>,
+    auto: bool,
+) -> CtxResult<StartOutcome> {
+    let starter = session.map(str::to_string).or_else(calling_session_short);
     let repo = resolve_repo(args.repo.as_deref())?;
     // Resolve any registry id through the same start path; use the standard unknown-workflow wording. (#542)
     let registry = load_workflow_registry(&repo, args.built_in_only)?;
@@ -1036,7 +1065,11 @@ pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<Start
         branch: args.branch.clone(),
         json: false,
     };
-    let mut classification = classify::from_plan_args(&classify_args)?;
+    let mut classification = if auto {
+        classify::from_task_text_args(&classify_args)?
+    } else {
+        classify::from_plan_args(&classify_args)?
+    };
     // Refine intent before pack selection when enabled; start has no profile domain-tag surface. (#782)
     crate::commands::workflow::profile::refine_intent_via_jev(
         &repo,
@@ -1146,10 +1179,35 @@ pub fn start_workflow(state_dir: &StateDir, args: &StartArgs) -> CtxResult<Start
     }
     // Starting a workflow must never pre-create an unfilled artifact or mutate the worktree/index; context still exposes its path and template.
     let work_dir_gitignored = work_dir_is_gitignored(&state.repo);
-    save(state_dir, &state, true)?;
+    // Ownership check, pointer write and session binding are one atomic step so two concurrent starts cannot both pass the guard. (#966)
+    let _active_lock = lock_active_pointer(state_dir, &state.repo)?;
+    let keep_pointer = match foreign_active_owner(state_dir, &state.repo, starter.as_deref()) {
+        Some((short, active)) if !args.take_over => {
+            if !auto {
+                return Err(format!(
+                    "workflow {} ({}) is active in this repository and owned by live session {short}; \
+                     starting another would displace it. Coordinate with that session, or pass \
+                     --take-over to make the new workflow active",
+                    active.id,
+                    active.kind.as_str()
+                )
+                .into());
+            }
+            true
+        }
+        _ => false,
+    };
+    if keep_pointer {
+        save_preserving_active(state_dir, &state)?;
+    } else {
+        save(state_dir, &state, true)?;
+    }
     // Bind the workflow to this session for pane-specific status; absent session context is a quiet best-effort skip.
-    bind_started_workflow_to_calling_session(state_dir, &state.id);
+    if let Some(short) = &starter {
+        crate::commands::ctx::sessions::bind_workflow_id(state_dir, short, &state.id);
+    }
     if let Some(old) = previously_active
+        && !keep_pointer
         && old.id != state.id
         && matches!(
             old.status,
@@ -2750,6 +2808,7 @@ mod tests {
                 brainstorm: false,
                 no_brainstorm: false,
                 profile: None,
+                take_over: false,
                 json: false,
             }),
         };
@@ -2768,6 +2827,197 @@ mod tests {
             crate::commands::ctx::sessions::workflow_id_for(&state_dir, &short).as_deref(),
             Some(started.id.as_str())
         );
+    }
+
+    /// #966: session A (live) owns the repository's active workflow. B's explicit start refuses
+    /// naming A and the workflow, leaves A's active workflow alone, and succeeds with --take-over.
+    #[test]
+    fn explicit_start_never_displaces_another_live_sessions_active_workflow() {
+        use crate::commands::ctx::sessions::{Record, SessionGuard, Verb, short_id};
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let (a_id, b_id) = (
+            "aaaa1111bbbb2222cccc3333dddd4444",
+            "eeee5555ffff6666aaaa7777bbbb8888",
+        );
+        let start_as = |session: &str, take_over: bool| {
+            let _env = crate::commands::ctx::testenv::VarGuard::set(&[
+                (
+                    "ZIRV_CTX_STATE_DIR",
+                    Some(root.path().to_str().expect("utf-8 tempdir path")),
+                ),
+                ("ZIRV_CTX_SESSION", Some(session)),
+            ]);
+            let mut args = auto_start_args(repo.path(), "fix a database retry bug");
+            args.paths = vec![PathBuf::from("src/commands/ctx/safety.rs")];
+            args.changed_lines = Some(40);
+            args.id = Some("bugfix".into());
+            args.take_over = take_over;
+            run(
+                &WorkflowArgs {
+                    command: WorkflowSubcommand::Start(args),
+                },
+                &mut Vec::new(),
+            )
+        };
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let record = |id: &str| Record::new(id, "claude", repo.path(), Verb::Chat);
+        let _a = SessionGuard::register(&state_dir, record(a_id));
+        let _b = SessionGuard::register(&state_dir, record(b_id));
+
+        start_as(a_id, false).unwrap();
+        let a_workflow = load_active(&state_dir, repo.path()).unwrap().unwrap();
+
+        let refused = start_as(b_id, false)
+            .expect_err("B must not displace A")
+            .to_string();
+        assert!(refused.contains(&short_id(a_id)), "{refused}");
+        assert!(refused.contains(&a_workflow.id), "{refused}");
+        assert!(refused.contains("--take-over"), "{refused}");
+        let active = load_active(&state_dir, repo.path()).unwrap().unwrap();
+        assert_eq!(active.id, a_workflow.id, "A's workflow stays active");
+
+        start_as(b_id, true).expect("--take-over repoints");
+        let active = load_active(&state_dir, repo.path()).unwrap().unwrap();
+        assert_ne!(
+            active.id, a_workflow.id,
+            "--take-over makes B's workflow active"
+        );
+        assert_eq!(
+            crate::commands::ctx::sessions::workflow_id_for(&state_dir, &short_id(b_id)),
+            Some(active.id)
+        );
+    }
+
+    /// #966/#977: B's auto-start binds to B only, never repoints A's active workflow, and once
+    /// B's workflow is closed the active lookup still resolves A's Running workflow.
+    #[test]
+    fn auto_start_keeps_the_owners_active_workflow_and_survives_close() {
+        use crate::commands::ctx::sessions::{Record, SessionGuard, Verb, short_id};
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let (a_id, b_id) = (
+            "aaaa1111bbbb2222cccc3333dddd4444",
+            "eeee5555ffff6666aaaa7777bbbb8888",
+        );
+        let record = |id: &str| Record::new(id, "claude", repo.path(), Verb::Chat);
+        let _a = SessionGuard::register(&state_dir, record(a_id));
+        let _b = SessionGuard::register(&state_dir, record(b_id));
+        let mut a_args = auto_start_args(repo.path(), "fix a database retry bug");
+        a_args.id = Some("bugfix".into());
+        let a_workflow = start_workflow_auto(&state_dir, &a_args, Some(&short_id(a_id)))
+            .unwrap()
+            .state;
+
+        let b_args = auto_start_args(repo.path(), "Merged, clean up and continue");
+        let b_workflow = start_workflow_auto(&state_dir, &b_args, Some(&short_id(b_id)))
+            .unwrap()
+            .state;
+        assert_ne!(a_workflow.id, b_workflow.id);
+        assert_eq!(
+            load_active(&state_dir, repo.path()).unwrap().unwrap().id,
+            a_workflow.id,
+            "auto-start must not repoint A's active workflow"
+        );
+        assert_eq!(
+            crate::commands::ctx::sessions::workflow_id_for(&state_dir, &short_id(b_id)),
+            Some(b_workflow.id.clone())
+        );
+
+        close(
+            &state_dir,
+            load(&state_dir, repo.path(), &b_workflow.id).unwrap(),
+            None,
+        )
+        .or_else(|_| {
+            close_unstarted(
+                &state_dir,
+                load(&state_dir, repo.path(), &b_workflow.id).unwrap(),
+                None,
+            )
+        })
+        .unwrap();
+        let active = load_active(&state_dir, repo.path()).unwrap().unwrap();
+        assert_eq!(active.id, a_workflow.id);
+        assert_eq!(active.status, WorkflowStatus::Running);
+    }
+
+    /// #977: auto-start classifies from the prompt alone, so a branch's committed history or
+    /// another session's uncommitted diff is never counted as its own change.
+    #[test]
+    fn auto_start_classification_ignores_the_checkouts_diff() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(repo.path().join("README.md"), "readme\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        git(&["checkout", "-q", "-b", "feature/done"]);
+        for index in 0..30 {
+            std::fs::write(
+                repo.path().join(format!("file{index}.rs")),
+                "line\n".repeat(80),
+            )
+            .unwrap();
+        }
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "committed branch history"]);
+
+        let args = auto_start_args(repo.path(), "Merged, clean up and continue");
+        let auto = start_workflow_auto(&state_dir, &args, None).unwrap().state;
+        assert_eq!(
+            auto.classification.changed_files, 0,
+            "{:?}",
+            auto.classification
+        );
+        assert_eq!(
+            auto.classification.changed_lines, 0,
+            "{:?}",
+            auto.classification
+        );
+        assert!(
+            auto.classification
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("text-only")),
+            "{:?}",
+            auto.classification.reasons
+        );
+    }
+
+    /// Start arguments for tests that classify and start without declaring any change scope.
+    fn auto_start_args(repo: &Path, task: &str) -> StartArgs {
+        StartArgs {
+            id: None,
+            task: task.to_string(),
+            agent: None,
+            built_in_only: true,
+            repo: Some(repo.to_path_buf()),
+            paths: Vec::new(),
+            changed_lines: None,
+            tests_changed: false,
+            complexity: None,
+            risk: None,
+            branch: None,
+            frontend_root: None,
+            brainstorm: false,
+            no_brainstorm: true,
+            profile: None,
+            take_over: false,
+            json: false,
+        }
     }
 
     /// #255 recovery path (i): a task classified General/Standard (no
@@ -2802,6 +3052,7 @@ mod tests {
                 brainstorm: false,
                 no_brainstorm: false,
                 profile: Some(WorkflowProfile::Frontend),
+                take_over: false,
                 json: false,
             }),
         };
@@ -2853,6 +3104,7 @@ mod tests {
                 brainstorm: false,
                 no_brainstorm: false,
                 profile: None,
+                take_over: false,
                 json: false,
             }),
         };
@@ -2903,6 +3155,7 @@ mod tests {
                 brainstorm: false,
                 no_brainstorm: false,
                 profile: None,
+                take_over: false,
                 json: false,
             }),
         };
@@ -2982,6 +3235,7 @@ mod tests {
                 brainstorm: false,
                 no_brainstorm: false,
                 profile: None,
+                take_over: false,
                 json: false,
             }),
         };
@@ -3096,6 +3350,7 @@ mod tests {
             brainstorm: false,
             no_brainstorm: false,
             profile: None,
+            take_over: false,
             json: false,
         };
 
@@ -3634,6 +3889,7 @@ present_as = "summary"
                 brainstorm: false,
                 no_brainstorm: false,
                 profile: None,
+                take_over: false,
                 json: false,
             }),
         };
@@ -3679,6 +3935,7 @@ present_as = "summary"
                 brainstorm: false,
                 no_brainstorm: false,
                 profile: None,
+                take_over: false,
                 json: false,
             }),
         };

@@ -672,6 +672,41 @@ pub(super) fn save_inactive_if_active(
     Ok(())
 }
 
+/// Hold the repository's active-pointer lock so an ownership check and the pointer write that follows it are one atomic step across processes. (#966)
+pub(super) fn lock_active_pointer(
+    state_dir: &StateDir,
+    repo: &Path,
+) -> CtxResult<crate::commands::ctx::state::FileLock> {
+    let dir = repo_dir(state_dir, repo);
+    create_private_dir_all(&dir)?;
+    crate::commands::ctx::state::acquire_lock(&dir.join("active.lock"))
+}
+
+/// The live session, other than `starter`, that owns the workflow this repository's active pointer names while it is Running or AwaitingApproval; returns its short id and the workflow. (#966)
+pub fn foreign_active_owner(
+    state_dir: &StateDir,
+    repo: &Path,
+    starter: Option<&str>,
+) -> Option<(String, WorkflowState)> {
+    let id = read_active_pointer(state_dir, repo).ok().flatten()?;
+    let active = load(state_dir, repo, &id).ok()?;
+    if !matches!(
+        active.status,
+        WorkflowStatus::Running | WorkflowStatus::AwaitingApproval
+    ) {
+        return None;
+    }
+    let owner = crate::commands::ctx::sessions::workflow_bindings(state_dir)
+        .into_iter()
+        .find(|(short, bound)| {
+            *bound == id
+                && Some(short.as_str()) != starter
+                && crate::commands::ctx::sessions::short_is_live(state_dir, short)
+        })?
+        .0;
+    Some((owner, active))
+}
+
 /// Search the literal checkout first, then sibling checkouts for an explicit workflow id; the id makes this widening unambiguous. (#467)
 pub(super) fn resolve_state_path_for_id(
     state: &StateDir,

@@ -122,16 +122,10 @@ pub(super) fn record_workflow_attention(
     );
 }
 
-/// Bind attention by session id alone; missing adapter identity must not lose the workflow binding, and headless callers skip quietly.
-pub(super) fn bind_started_workflow_to_calling_session(state_dir: &StateDir, workflow_id: &str) {
-    let Ok(session_id) = std::env::var(crate::commands::ctx::adapters::SESSION_ENV) else {
-        return;
-    };
-    if session_id.is_empty() {
-        return;
-    }
-    let short = crate::commands::ctx::sessions::short_id(&session_id);
-    crate::commands::ctx::sessions::bind_workflow_id(state_dir, &short, workflow_id);
+/// The calling session's short id from the harness environment; headless callers have none.
+pub(super) fn calling_session_short() -> Option<String> {
+    let session_id = std::env::var(crate::commands::ctx::adapters::SESSION_ENV).ok()?;
+    (!session_id.is_empty()).then(|| crate::commands::ctx::sessions::short_id(&session_id))
 }
 
 pub(super) fn adapter_by_name(
@@ -1055,8 +1049,14 @@ pub fn advance_with_evidence(
                             current.id
                         ),
                     );
+                    let reason = crate::commands::workflow::verification::gate_refusal_reason(
+                        state_dir,
+                        &state.repo,
+                        final_only,
+                    )
+                    .unwrap_or_else(|error| format!("cannot determine the cause: {error}"));
                     return Err(format!(
-                        "step '{}' requires fresh passing evidence for the current change set; run `{command}`\n{announcement}",
+                        "step '{}' requires fresh passing evidence for the current change set; run `{command}`\n{announcement}\nreason: {reason}",
                         current.id
                     )
                     .into());
@@ -3500,6 +3500,7 @@ present_as = "summary"
                 brainstorm: false,
                 no_brainstorm: false,
                 profile: None,
+                take_over: false,
                 json: false,
             }),
         };
