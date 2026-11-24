@@ -2880,6 +2880,10 @@ mod tests {
     #[test]
     fn orchestrator_repo_write_target_treats_an_unenterable_cd_target_as_unproven() {
         use std::os::unix::fs::PermissionsExt;
+        // access(X_OK) always succeeds for root, so the directory cannot be made unenterable.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
         let base = tempfile::tempdir().expect("tempdir");
         let base = base.path().canonicalize().expect("canonical");
         let repo = base.join("repo");

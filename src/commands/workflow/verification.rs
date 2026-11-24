@@ -1528,27 +1528,36 @@ fn untracked_snapshot(repo: &Path) -> CtxResult<UntrackedSnapshot> {
     Ok(UntrackedSnapshot { files, dirs })
 }
 
-/// True when every untracked path added, removed or rewritten between the snapshots lives in a directory that was wholly untracked. (#963)
+/// True when every untracked path added, removed or rewritten between the snapshots lives in a directory that was wholly untracked before the run, or in a new hidden top-level directory such as `.gitlab-ci-local/`. (#963)
 fn untracked_changes_stay_in_untracked_dirs(
     before: &UntrackedSnapshot,
     after: &UntrackedSnapshot,
 ) -> bool {
-    let changed = before
+    let is_new_hidden_top_level = |dir: &Path| {
+        let mut components = dir.components();
+        components
+            .next()
+            .is_some_and(|part| part.as_os_str().to_string_lossy().starts_with('.'))
+            && components.next().is_none()
+    };
+    let mut changed = before
         .files
         .iter()
         .filter(|(path, stat)| after.files.get(*path) != Some(*stat))
-        .map(|(path, _)| path)
         .chain(
             after
                 .files
                 .iter()
-                .filter(|(path, stat)| before.files.get(*path) != Some(*stat))
-                .map(|(path, _)| path),
-        );
-    let dirs: Vec<&PathBuf> = before.dirs.iter().chain(&after.dirs).collect();
-    changed
-        .into_iter()
-        .all(|path| dirs.iter().any(|dir| path.starts_with(dir)))
+                .filter(|(path, stat)| before.files.get(*path) != Some(*stat)),
+        )
+        .map(|(path, _)| path);
+    changed.all(|path| {
+        before.dirs.iter().any(|dir| path.starts_with(dir))
+            || after
+                .dirs
+                .iter()
+                .any(|dir| is_new_hidden_top_level(dir) && path.starts_with(dir))
+    })
 }
 
 pub fn change_fingerprint_with(scan: &mut ChangeScan) -> CtxResult<u64> {
@@ -6397,6 +6406,38 @@ mod tests {
             report.change_fingerprint,
             change_fingerprint(repo.path()).unwrap(),
             "a new file in a tracked directory must leave the report describing the pre-run tree"
+        );
+    }
+
+    /// #963: a directory created during the run is not a check artifact dir, so a new `src/newdir/x.rs` keeps the evidence stale.
+    #[test]
+    fn untracked_file_in_a_directory_created_during_the_run_keeps_the_evidence_stale() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        std::fs::create_dir(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/lib.rs"), "fn a() {}\n").unwrap();
+        for args in [&["add", "."][..], &["commit", "-q", "-m", "src"][..]] {
+            let status = Command::new("git")
+                .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        write_verify_toml(
+            repo.path(),
+            "schema_version=1\n[[checks]]\nid='new'\nkind='custom'\ncommand='mkdir src/newdir && echo x > src/newdir/x.rs'\n",
+        );
+        let report = with_state(state_root.path(), || {
+            run_mode(repo.path(), VerificationMode::Final, &[], false).expect("run")
+        });
+        assert_eq!(report.checks[0].status, CheckStatus::Passed);
+        assert_ne!(
+            report.change_fingerprint,
+            change_fingerprint(repo.path()).unwrap(),
+            "a file in a directory the run created must leave the report describing the pre-run tree"
         );
     }
 

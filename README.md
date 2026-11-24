@@ -2669,13 +2669,16 @@ carries `reason: <reason>`): no report, a non-Final or narrowed report, a
 report recorded for a different change set, or checks that did not pass. A
 verification run records the change fingerprint before its checks, but when
 the checks leave every tracked file untouched and every untracked path they
-added, removed or rewrote sits in a wholly-untracked directory, the report
-records the tree they leave behind, so untracked artifacts a check writes (for
-example under `.gitlab-ci-local/`) do not make its own passing report stale.
-A check that edits a tracked file, or writes an untracked file in a tracked
-directory (for example `src/new.rs` or a root-level file), keeps the pre-run
+added, removed or rewrote sits in a directory that was already wholly untracked
+before the run, or in a new hidden top-level directory (for example
+`.gitlab-ci-local/` on its first run), the report records the tree they leave
+behind, so untracked artifacts a check writes there do not make its own passing
+report stale. A check that edits a tracked file, or writes an untracked file
+anywhere else (a tracked directory such as `src/`, a directory it created
+itself such as `src/newdir/`, or a root-level file), keeps the pre-run
 fingerprint and the report is stale. Remaining limit: a concurrent edit inside
-a wholly-untracked directory during the run counts as tested.
+a directory that was already wholly untracked, or inside a new hidden top-level
+directory, during the run counts as tested.
 
 ### Lifecycle and artifacts
 
