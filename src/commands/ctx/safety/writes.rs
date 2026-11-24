@@ -1615,6 +1615,13 @@ fn orchestrator_repo_write_target_in(
                 _ => session_cwd.clone(),
             };
             cd_proven = cwd != session_cwd && Path::new(&cwd).is_dir();
+            // `is_dir` proves existence only; a directory without search permission makes the real `cd` fail. (#957)
+            #[cfg(unix)]
+            {
+                cd_proven = cd_proven
+                    && std::ffi::CString::new(cwd.as_str())
+                        .is_ok_and(|path| unsafe { libc::access(path.as_ptr(), libc::X_OK) } == 0);
+            }
             continue;
         }
 
@@ -2866,6 +2873,35 @@ mod tests {
             "{hint}"
         );
         assert!(check("cd \"$D\"; cat > rel.md").is_some_and(|h| h.contains("absolute path")));
+    }
+
+    /// #957: a directory `cd` cannot enter (mode 0o000) is an unproven `cd`, so the write is denied with the hint.
+    #[cfg(unix)]
+    #[test]
+    fn orchestrator_repo_write_target_treats_an_unenterable_cd_target_as_unproven() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().expect("tempdir");
+        let base = base.path().canonicalize().expect("canonical");
+        let repo = base.join("repo");
+        let locked = base.join("locked");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        std::fs::create_dir_all(&locked).expect("locked dir");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let repo_s = repo.to_string_lossy().to_string();
+        let repo_root_of = |path: &str| {
+            (path == repo_s || path.starts_with(&format!("{repo_s}/"))).then(|| repo_s.clone())
+        };
+        let hint = orchestrator_repo_write_target(
+            &format!("cd {}; echo x > rel.md", locked.display()),
+            &repo_s,
+            &repo_root_of,
+            &|_| None,
+        );
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("restore");
+        assert!(
+            hint.is_some_and(|h| h.contains("absolute path")),
+            "an unenterable cd target must be unproven"
+        );
     }
 
     /// Groups, `||`-skipped cds and other dir-changing builtins must not leave

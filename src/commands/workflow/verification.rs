@@ -1485,6 +1485,72 @@ fn tracked_change_fingerprint(repo: &Path) -> CtxResult<u64> {
     fingerprint_over(&root, &paths)
 }
 
+/// Untracked files with their size and mtime, plus the wholly-untracked directories git collapses. (#963)
+struct UntrackedSnapshot {
+    files: std::collections::HashMap<PathBuf, (u64, Option<std::time::SystemTime>)>,
+    dirs: Vec<PathBuf>,
+}
+
+fn untracked_snapshot(repo: &Path) -> CtxResult<UntrackedSnapshot> {
+    let root = git_root(repo);
+    let list = |extra: &[&str]| -> CtxResult<Vec<PathBuf>> {
+        let output = git_at(&root)
+            .args([
+                "ls-files",
+                "-z",
+                "--others",
+                "--exclude-standard",
+                "--full-name",
+            ])
+            .args(extra)
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "cannot inspect untracked paths: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+        Ok(git_paths(&output.stdout).collect())
+    };
+    let files = list(&[])?
+        .into_iter()
+        .filter(|path| !super::classify::is_workflow_work_path(path))
+        .filter_map(|path| {
+            let metadata = std::fs::symlink_metadata(root.join(&path)).ok()?;
+            Some((path, (metadata.len(), metadata.modified().ok())))
+        })
+        .collect();
+    let dirs = list(&["--directory"])?
+        .into_iter()
+        .filter(|entry| entry.to_string_lossy().ends_with('/'))
+        .collect();
+    Ok(UntrackedSnapshot { files, dirs })
+}
+
+/// True when every untracked path added, removed or rewritten between the snapshots lives in a directory that was wholly untracked. (#963)
+fn untracked_changes_stay_in_untracked_dirs(
+    before: &UntrackedSnapshot,
+    after: &UntrackedSnapshot,
+) -> bool {
+    let changed = before
+        .files
+        .iter()
+        .filter(|(path, stat)| after.files.get(*path) != Some(*stat))
+        .map(|(path, _)| path)
+        .chain(
+            after
+                .files
+                .iter()
+                .filter(|(path, stat)| before.files.get(*path) != Some(*stat))
+                .map(|(path, _)| path),
+        );
+    let dirs: Vec<&PathBuf> = before.dirs.iter().chain(&after.dirs).collect();
+    changed
+        .into_iter()
+        .all(|path| dirs.iter().any(|dir| path.starts_with(dir)))
+}
+
 pub fn change_fingerprint_with(scan: &mut ChangeScan) -> CtxResult<u64> {
     let root = scan.root();
     let paths = scan.paths()?.to_vec();
@@ -3433,6 +3499,7 @@ fn run_mode(
     // Capture the change fingerprint before checks so edits during a long suite cannot appear tested.
     let change_fingerprint = change_fingerprint(repo)?;
     let tracked_before = tracked_change_fingerprint(repo)?;
+    let untracked_before = untracked_snapshot(repo)?;
     // Reuse fresh, full evidence for an identical fingerprint in Final mode; dry runs only preview execution.
     let state_for_reuse = if mode == VerificationMode::Final && !dry_run {
         StateDir::resolve(&|key| std::env::var(key).ok()).ok()
@@ -3522,8 +3589,11 @@ fn run_mode(
             reused_ids.join(", ")
         ));
     }
-    // Checks write caches and artifacts (for example `.gitlab-ci-local/`); when they left every tracked file alone, record the tree they leave behind so a passing run is not born stale. A check that edits a tracked file keeps the pre-run fingerprint. (#963)
-    let change_fingerprint = if !dry_run && tracked_change_fingerprint(repo)? == tracked_before {
+    // Checks write caches and artifacts (for example `.gitlab-ci-local/`); when they left every tracked file alone and every untracked change sits in a wholly-untracked directory, record the tree they leave behind so a passing run is not born stale. Any other edit keeps the pre-run fingerprint. (#963)
+    let change_fingerprint = if !dry_run
+        && tracked_change_fingerprint(repo)? == tracked_before
+        && untracked_changes_stay_in_untracked_dirs(&untracked_before, &untracked_snapshot(repo)?)
+    {
         self::change_fingerprint(repo)?
     } else {
         change_fingerprint
@@ -6285,7 +6355,7 @@ mod tests {
         let state_root = tempdir().unwrap();
         write_verify_toml(
             repo.path(),
-            "schema_version=1\n[[checks]]\nid='cache'\nkind='custom'\ncommand='echo x >> cache.out'\n",
+            "schema_version=1\n[[checks]]\nid='cache'\nkind='custom'\ncommand='mkdir -p .gitlab-ci-local && echo x >> .gitlab-ci-local/cache.out'\n",
         );
         let report = with_state(state_root.path(), || {
             run_mode(repo.path(), VerificationMode::Final, &[], false).expect("run")
@@ -6295,6 +6365,38 @@ mod tests {
             report.change_fingerprint,
             change_fingerprint(repo.path()).unwrap(),
             "the report must describe the tree the check leaves behind when it only wrote untracked files"
+        );
+    }
+
+    /// #963: an untracked file written into a tracked directory may be source, so it still counts as an edit made during the run.
+    #[test]
+    fn untracked_file_in_a_tracked_directory_keeps_the_evidence_stale() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        std::fs::create_dir(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/lib.rs"), "fn a() {}\n").unwrap();
+        for args in [&["add", "."][..], &["commit", "-q", "-m", "src"][..]] {
+            let status = Command::new("git")
+                .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        write_verify_toml(
+            repo.path(),
+            "schema_version=1\n[[checks]]\nid='new'\nkind='custom'\ncommand='echo x > src/new.rs'\n",
+        );
+        let report = with_state(state_root.path(), || {
+            run_mode(repo.path(), VerificationMode::Final, &[], false).expect("run")
+        });
+        assert_eq!(report.checks[0].status, CheckStatus::Passed);
+        assert_ne!(
+            report.change_fingerprint,
+            change_fingerprint(repo.path()).unwrap(),
+            "a new file in a tracked directory must leave the report describing the pre-run tree"
         );
     }
 

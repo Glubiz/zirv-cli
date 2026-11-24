@@ -224,6 +224,9 @@ pub struct DetectorReport {
     pub analyzed_files: Vec<PathBuf>,
     pub analyzed_bytes: usize,
     pub truncated: bool,
+    /// Changed (since-base) frontend files the scan did not read in full; empty when all were. (#969)
+    #[serde(default)]
+    pub unscanned_changed_files: Vec<PathBuf>,
     pub findings: Vec<DetectorFinding>,
     #[serde(default)]
     pub waivers_loaded: usize,
@@ -471,6 +474,16 @@ fn detect_with_scope(
     if let Some(baseline) = preexisting_baseline {
         paths.sort_by_key(|path| !baseline.contains(path));
     }
+    let changed_paths: Vec<PathBuf> = preexisting_baseline
+        .map(|baseline| {
+            paths
+                .iter()
+                .filter(|path| baseline.contains(path))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut fully_scanned = std::collections::HashSet::new();
     truncated |= paths.len() > MAX_FILES;
     paths.truncate(MAX_FILES);
 
@@ -484,6 +497,7 @@ fn detect_with_scope(
         }
         let (relative, absolute) = resolve_file(repo, &requested_path)?;
         if !absolute.exists() {
+            fully_scanned.insert(requested_path);
             continue;
         }
         let metadata = std::fs::symlink_metadata(&absolute)?;
@@ -504,6 +518,9 @@ fn detect_with_scope(
             .take(MAX_FILE_BYTES.min(u64::try_from(remaining).unwrap_or(u64::MAX)))
             .read_to_end(&mut bytes)?;
         analyzed_bytes = analyzed_bytes.saturating_add(bytes.len());
+        if u64::try_from(bytes.len()).is_ok_and(|read| read >= metadata.len()) {
+            fully_scanned.insert(requested_path);
+        }
         analyze(&relative, &String::from_utf8_lossy(&bytes), &mut findings);
         analyzed_files.push(relative);
         if findings.len() >= MAX_FINDINGS {
@@ -526,6 +543,10 @@ fn detect_with_scope(
     let waivers = load_waivers(repo)?;
     let waivers_rejected = apply_waivers(&mut findings, &waivers);
     let not_applicable = analyzed_files.is_empty() && !truncated;
+    let unscanned_changed_files: Vec<PathBuf> = changed_paths
+        .into_iter()
+        .filter(|path| !fully_scanned.contains(path))
+        .collect();
 
     let change_fingerprint = super::verification::change_fingerprint(repo)?;
     let report = DetectorReport {
@@ -539,6 +560,7 @@ fn detect_with_scope(
         analyzed_files,
         analyzed_bytes,
         truncated,
+        unscanned_changed_files,
         findings,
         waivers_loaded: waivers.len(),
         waivers_rejected,
@@ -2440,6 +2462,7 @@ mod tests {
             analyzed_files: Vec::new(),
             analyzed_bytes: 0,
             truncated: false,
+            unscanned_changed_files: Vec::new(),
             findings: Vec::new(),
             waivers_loaded: 0,
             waivers_rejected: 0,
@@ -2507,6 +2530,7 @@ mod tests {
             analyzed_files: vec![PathBuf::from("one.tsx")],
             analyzed_bytes: 10,
             truncated: false,
+            unscanned_changed_files: Vec::new(),
             findings: Vec::new(),
             waivers_loaded: 0,
             waivers_rejected: 0,

@@ -551,10 +551,9 @@ fn done_unit(state: &StateDir, repo: &Path, stat: &str, fingerprint: &str) -> St
     )
 }
 
-/// Names, sizes and mtimes of the files under a repo's `.zirv/work`, where a workflow's artifacts
+/// A digest of the names, sizes and mtimes of every file under a repo's `.zirv/work`, where a workflow's artifacts
 /// live untracked: writing one is evidence the agent recorded, so it must move the unit (#970).
 fn work_artifacts_stamp(root: &Path) -> String {
-    const MAX_ENTRIES: usize = 200;
     let mut stamp = Vec::new();
     let mut dirs = vec![(root.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = dirs.pop() {
@@ -582,8 +581,7 @@ fn work_artifacts_stamp(root: &Path) -> String {
         }
     }
     stamp.sort();
-    stamp.truncate(MAX_ENTRIES);
-    stamp.join("\n")
+    crate::commands::workflow::engine::hash_bytes(stamp.join("\n").as_bytes())
 }
 
 /// Whether this turn end may be a completion claim: not while the session has running native
@@ -1975,6 +1973,20 @@ mod tests {
     use std::cell::{Cell, RefCell};
 
     use super::*;
+
+    /// #970: past 200 files, an artifact whose path sorts last must still move the stamp.
+    #[test]
+    fn work_artifacts_stamp_sees_a_file_sorting_after_the_two_hundredth() {
+        let repo = tempfile::tempdir().expect("repo");
+        let root = repo.path().join(".zirv/work");
+        std::fs::create_dir_all(root.join("wf")).unwrap();
+        for index in 0..250 {
+            std::fs::write(root.join(format!("wf/a{index:03}.md")), "x").unwrap();
+        }
+        let before = work_artifacts_stamp(&root);
+        std::fs::write(root.join("wf/zzz-last.md"), "new").unwrap();
+        assert_ne!(before, work_artifacts_stamp(&root));
+    }
 
     fn enabled_cfg() -> CtxConfig {
         let mut cfg = CtxConfig::default();

@@ -2668,10 +2668,14 @@ When a Test/Verify gate refuses (`zirv workflow run-checks`, or
 carries `reason: <reason>`): no report, a non-Final or narrowed report, a
 report recorded for a different change set, or checks that did not pass. A
 verification run records the change fingerprint before its checks, but when
-the checks leave every tracked file untouched the report records the tree
-they leave behind, so untracked artifacts a check writes (for example
-`.gitlab-ci-local/`) do not make its own passing report stale. A check that
-edits a tracked file keeps the pre-run fingerprint and the report is stale.
+the checks leave every tracked file untouched and every untracked path they
+added, removed or rewrote sits in a wholly-untracked directory, the report
+records the tree they leave behind, so untracked artifacts a check writes (for
+example under `.gitlab-ci-local/`) do not make its own passing report stale.
+A check that edits a tracked file, or writes an untracked file in a tracked
+directory (for example `src/new.rs` or a root-level file), keeps the pre-run
+fingerprint and the report is stale. Remaining limit: a concurrent edit inside
+a wholly-untracked directory during the run counts as tested.
 
 ### Lifecycle and artifacts
 
@@ -3059,9 +3063,11 @@ blocking findings; `--accept-introduced-findings <REASON>` accepts introduced
 ones judged false positives (the reason is mandatory and recorded on the
 workflow; it also accepts pre-existing findings).
 
-A truncated full-surface scan (file/size limit) lists changed files first, so
-with 0 introduced blocking findings `--accept-preexisting-findings` also
-accepts the unscanned remainder; the error says so. `frontend check --all`
+A truncated full-surface scan (file/size limit) lists changed files first. When
+every changed file was read in full and there are 0 introduced blocking
+findings, `--accept-preexisting-findings` also accepts the unscanned remainder;
+the error says so. If a changed file was skipped or only partly read (over the
+per-file or total byte limit), the gate keeps blocking and names it. `frontend check --all`
 tags introduced vs pre-existing against the same diff base as the workflow
 gate.
 
