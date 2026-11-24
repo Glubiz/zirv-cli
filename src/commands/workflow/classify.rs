@@ -968,7 +968,28 @@ pub fn from_args(args: &ClassifyArgs) -> CtxResult<Classification> {
 /// only raise complexity (an explicit `--complexity` stands). With no diff evidence the
 /// classification says it is text-only.
 pub fn from_plan_args(args: &ClassifyArgs) -> CtxResult<Classification> {
-    let mut classification = classify_args(args, false)?;
+    finish_plan_classification(args, classify_args(args, false)?)
+}
+
+/// Classify from the task text alone, measuring no git state: an automatic start must not score the
+/// branch's committed history or another session's uncommitted work as its own change. (#977)
+pub fn from_task_text_args(args: &ClassifyArgs) -> CtxResult<Classification> {
+    let input = ClassificationInput {
+        task: args.task.clone(),
+        paths: Vec::new(),
+        changed_lines: 0,
+        tests_changed: false,
+        intent_override: args.intent,
+        complexity_override: args.complexity,
+        risk_override: args.risk,
+    };
+    finish_plan_classification(args, classify(&input)?)
+}
+
+fn finish_plan_classification(
+    args: &ClassifyArgs,
+    mut classification: Classification,
+) -> CtxResult<Classification> {
     if args.complexity.is_none() {
         let text_only = crate::commands::ctx::proxy::decision::try_classify_request(&args.task)
             .map(|text_only| text_only.complexity);

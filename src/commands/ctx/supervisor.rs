@@ -534,6 +534,7 @@ fn latest_verification(state: &StateDir, repo: &Path) -> Option<(String, String)
 /// latest verification record and `fingerprint` (linked-worktree commits, refs the agent cites),
 /// so a new commit, edit or `zirv verify` run is new evidence and a repeat of the same state is not.
 fn done_unit(state: &StateDir, repo: &Path, stat: &str, fingerprint: &str) -> String {
+    let artifacts = work_artifacts_stamp(&repo.join(".zirv/work"));
     let head = git_stdout(repo, &["rev-parse", "HEAD"]).unwrap_or_default();
     // Tracked changes only: a stray untracked file must not read as new evidence.
     let status =
@@ -544,9 +545,43 @@ fn done_unit(state: &StateDir, repo: &Path, stat: &str, fingerprint: &str) -> St
     format!(
         "done:{}",
         crate::commands::workflow::engine::hash_bytes(
-            format!("{stat}\n{head}\n{status}\n{verification}\n{fingerprint}").as_bytes()
+            format!("{stat}\n{head}\n{status}\n{verification}\n{fingerprint}\n{artifacts}")
+                .as_bytes()
         )
     )
+}
+
+/// A digest of the names, sizes and mtimes of every file under a repo's `.zirv/work`, where a workflow's artifacts
+/// live untracked: writing one is evidence the agent recorded, so it must move the unit (#970).
+fn work_artifacts_stamp(root: &Path) -> String {
+    let mut stamp = Vec::new();
+    let mut dirs = vec![(root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() && depth < 3 {
+                dirs.push((entry.path(), depth + 1));
+                continue;
+            }
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |since| since.as_nanos());
+            stamp.push(format!(
+                "{} {} {modified}",
+                entry.path().display(),
+                meta.len()
+            ));
+        }
+    }
+    stamp.sort();
+    crate::commands::workflow::engine::hash_bytes(stamp.join("\n").as_bytes())
 }
 
 /// Whether this turn end may be a completion claim: not while the session has running native
@@ -1042,8 +1077,8 @@ pub(crate) fn stop_block_with(
 }
 
 const NO_RECONSULT_NOTE: &str = "No new supervisor consult will run for a changed final message \
-     alone: it runs again after a commit, a tracked edit or a new `zirv verify` record changes \
-     the evidence.";
+     alone: it runs again after a commit, a tracked edit or a new `zirv verify` record (or a workflow artifact written under `.zirv/work/`) \
+     changes the evidence.";
 
 /// What the tool-failure hook adds while an open `stop` ruling stands for the session.
 pub(crate) fn retry_stop_note(state: &StateDir, cfg: &CtxConfig, session: &str) -> Option<String> {
@@ -1938,6 +1973,20 @@ mod tests {
     use std::cell::{Cell, RefCell};
 
     use super::*;
+
+    /// #970: past 200 files, an artifact whose path sorts last must still move the stamp.
+    #[test]
+    fn work_artifacts_stamp_sees_a_file_sorting_after_the_two_hundredth() {
+        let repo = tempfile::tempdir().expect("repo");
+        let root = repo.path().join(".zirv/work");
+        std::fs::create_dir_all(root.join("wf")).unwrap();
+        for index in 0..250 {
+            std::fs::write(root.join(format!("wf/a{index:03}.md")), "x").unwrap();
+        }
+        let before = work_artifacts_stamp(&root);
+        std::fs::write(root.join("wf/zzz-last.md"), "new").unwrap();
+        assert_ne!(before, work_artifacts_stamp(&root));
+    }
 
     fn enabled_cfg() -> CtxConfig {
         let mut cfg = CtxConfig::default();
@@ -4144,6 +4193,25 @@ mod tests {
         let (block, fired) = driver.gate("m4", "DONE");
         assert_eq!(block, None, "new evidence is not replayed");
         assert!(fired.is_some(), "a commit re-opens the consult");
+    }
+
+    /// #970: recording evidence in an untracked workflow artifact under `.zirv/work/<id>/` is new
+    /// evidence: the next stop consults afresh instead of replaying the not_done ruling.
+    #[test]
+    fn an_untracked_workflow_artifact_is_new_evidence_for_a_not_done_ruling() {
+        let (dir, driver) = stop_driver();
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&dir.path().join("home"));
+        assert!(driver.stop("claim", "NOT_DONE: CI unverified").is_some());
+        assert!(
+            driver.block("claim").is_some(),
+            "replayed while nothing moved"
+        );
+        let work = driver.repo.join(".zirv/work/wf1");
+        std::fs::create_dir_all(&work).expect("work dir");
+        std::fs::write(work.join("recommendation.md"), "pipeline 1 success\n").expect("write");
+        let (block, fired) = driver.gate("claim", "DONE");
+        assert_eq!(block, None, "new evidence is not replayed");
+        assert!(fired.is_some(), "the artifact triggers a fresh consult");
     }
 
     /// #944: a `done` before-done ruling is recorded but not mailed, and a message-only change

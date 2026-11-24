@@ -251,8 +251,31 @@ fn default_rust_test_command(nextest_available: bool, has_lib_target: bool) -> S
     }
 }
 
+/// True when `repo` is a linked worktree of another checkout. (#970, #974)
+fn is_linked_worktree(repo: &Path) -> bool {
+    let canonical = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    crate::commands::ctx::pathutil::worktree_identity(repo) != canonical
+}
+
+/// Where the repository's `.zirv` configuration lives: a linked worktree without its own
+/// `.zirv/verify.toml` (e.g. `.zirv/` untracked in the main checkout) reads the main checkout's. (#974)
+pub(crate) fn config_root(repo: &Path) -> PathBuf {
+    if repo.join(".zirv").join("verify.toml").exists() {
+        return repo.to_path_buf();
+    }
+    let main = crate::commands::ctx::pathutil::worktree_identity(repo);
+    if main == repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf()) {
+        return repo.to_path_buf();
+    }
+    if main.join(".zirv").join("verify.toml").exists() {
+        main
+    } else {
+        repo.to_path_buf()
+    }
+}
+
 fn load_or_discover_raw(repo: &Path) -> CtxResult<Discovered> {
-    let path = repo.join(".zirv").join("verify.toml");
+    let path = config_root(repo).join(".zirv").join("verify.toml");
     if path.exists() {
         let metadata = std::fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -745,6 +768,12 @@ fn discover_gitlab_checks(repo: &Path, notes: &mut Vec<String>) -> Vec<CheckSpec
             unsafe_names.len()
         ));
     }
+    // gitlab-ci-local's containers cannot follow a linked worktree's `.git` file, so `--needs` fails spuriously there. (#970)
+    let needs = if is_linked_worktree(repo) {
+        ""
+    } else {
+        " --needs"
+    };
     let mut specs = Vec::new();
     for name in safe {
         if let Some(needed) = gitlab_risky_need(&jobs, &name) {
@@ -756,7 +785,7 @@ fn discover_gitlab_checks(repo: &Path, notes: &mut Vec<String>) -> Vec<CheckSpec
         specs.push(ci_check(
             format!("gitlab-{}", id_slug(&name)),
             gitlab_job_kind(&name),
-            format!("gitlab-ci-local {} --needs", shell_quote(&name)),
+            format!("gitlab-ci-local {}{needs}", shell_quote(&name)),
         ));
     }
     specs
@@ -1253,8 +1282,21 @@ fn git_paths(stdout: &[u8]) -> impl Iterator<Item = PathBuf> + '_ {
         })
 }
 
+/// Run `git <args>` at `root` and return its NUL-separated paths.
+fn git_list_paths(root: &Path, args: &[&str]) -> CtxResult<Vec<PathBuf>> {
+    let output = git_at(root).args(args).output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "cannot inspect changed paths: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(git_paths(&output.stdout).collect())
+}
+
 pub fn changed_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
-    changed_paths_at_root(&git_root(repo))
+    changed_paths_at_root(&git_root(repo), true)
 }
 
 /// Paths a session may have written source into: tracked changes against HEAD (minus `.zirv/work`
@@ -1262,22 +1304,11 @@ pub fn changed_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
 /// (`.zirv/`, `.claude/`, `.idea/`, `.DS_Store`). (#922)
 pub fn candidate_edit_paths(repo: &Path) -> CtxResult<CandidateEdits> {
     let root = git_root(repo);
-    let git_list = |args: &[&str]| -> CtxResult<Vec<PathBuf>> {
-        let output = git_at(&root).args(args).output()?;
-        if !output.status.success() {
-            return Err(format!(
-                "cannot inspect changed paths: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
-            .into());
-        }
-        Ok(git_paths(&output.stdout).collect())
-    };
     let is_hidden = |path: &Path| {
         path.components()
             .any(|part| part.as_os_str().to_string_lossy().starts_with('.'))
     };
-    let mut tracked: Vec<PathBuf> = git_list(&["diff", "--name-only", "-z", "HEAD"])?
+    let mut tracked: Vec<PathBuf> = git_list_paths(&root, &["diff", "--name-only", "-z", "HEAD"])?
         .into_iter()
         .filter(|path| {
             !super::classify::is_workflow_work_path(path) && !path.starts_with(".zirv/memory")
@@ -1285,14 +1316,17 @@ pub fn candidate_edit_paths(repo: &Path) -> CtxResult<CandidateEdits> {
         .collect();
     // Untracked directories come back collapsed; each is expanded only until the cap is reached.
     // Plain files first, so a big collapsed directory never crowds a lone new file out.
-    let (dirs, mut untracked): (Vec<PathBuf>, Vec<PathBuf>) = git_list(&[
-        "ls-files",
-        "-z",
-        "--others",
-        "--exclude-standard",
-        "--full-name",
-        "--directory",
-    ])?
+    let (dirs, mut untracked): (Vec<PathBuf>, Vec<PathBuf>) = git_list_paths(
+        &root,
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--exclude-standard",
+            "--full-name",
+            "--directory",
+        ],
+    )?
     .into_iter()
     .filter(|entry| !is_hidden(entry))
     .partition(|entry| entry.to_string_lossy().ends_with('/'));
@@ -1302,15 +1336,18 @@ pub fn candidate_edit_paths(repo: &Path) -> CtxResult<CandidateEdits> {
             break;
         }
         let dir = dir.to_string_lossy().into_owned();
-        let inside = git_list(&[
-            "ls-files",
-            "-z",
-            "--others",
-            "--exclude-standard",
-            "--full-name",
-            "--",
-            &dir,
-        ])?;
+        let inside = git_list_paths(
+            &root,
+            &[
+                "ls-files",
+                "-z",
+                "--others",
+                "--exclude-standard",
+                "--full-name",
+                "--",
+                &dir,
+            ],
+        )?;
         untracked.extend(inside.into_iter().filter(|path| !is_hidden(path)));
     }
     untracked.truncate(UNTRACKED_CANDIDATES_MAX);
@@ -1331,8 +1368,9 @@ pub struct CandidateEdits {
     pub untracked: Vec<PathBuf>,
 }
 
-fn changed_paths_at_root(root: &Path) -> CtxResult<Vec<PathBuf>> {
+fn changed_paths_at_root(root: &Path, include_untracked: bool) -> CtxResult<Vec<PathBuf>> {
     let mut paths = Vec::new();
+    let sources = if include_untracked { 2 } else { 1 };
     for args in [
         &["diff", "--name-only", "-z", "HEAD"][..],
         &[
@@ -1342,17 +1380,13 @@ fn changed_paths_at_root(root: &Path) -> CtxResult<Vec<PathBuf>> {
             "--exclude-standard",
             "--full-name",
         ][..],
-    ] {
-        let output = git_at(root).args(args).output()?;
-        if !output.status.success() {
-            return Err(format!(
-                "cannot inspect changed paths: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
-            .into());
-        }
+    ]
+    .into_iter()
+    .take(sources)
+    {
         paths.extend(
-            git_paths(&output.stdout)
+            git_list_paths(root, args)?
+                .into_iter()
                 // Exclude workflow bookkeeping under `.zirv/work` from change fingerprints so concurrent artifact edits cannot stale review evidence. (#229, #232)
                 .filter(|path: &PathBuf| !super::classify::is_workflow_work_path(path))
                 // An untracked nested repo or linked worktree lists as a directory, which `hash-object` cannot hash. (#945)
@@ -1383,16 +1417,9 @@ pub fn changed_paths_since_base(repo: &Path) -> CtxResult<Vec<PathBuf>> {
             "--full-name",
         ][..],
     ] {
-        let output = git_at(&root).args(args).output()?;
-        if !output.status.success() {
-            return Err(format!(
-                "cannot inspect changed paths: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
-            .into());
-        }
         paths.extend(
-            git_paths(&output.stdout)
+            git_list_paths(&root, args)?
+                .into_iter()
                 .filter(|path: &PathBuf| !super::classify::is_workflow_work_path(path)),
         );
     }
@@ -1438,7 +1465,7 @@ impl ChangeScan {
     pub fn paths(&mut self) -> CtxResult<&[PathBuf]> {
         if self.paths.is_none() {
             let root = self.root();
-            self.paths = Some(changed_paths_at_root(&root)?);
+            self.paths = Some(changed_paths_at_root(&root, true)?);
         }
         Ok(self.paths.as_deref().unwrap_or_default())
     }
@@ -1448,8 +1475,92 @@ pub fn change_fingerprint(repo: &Path) -> CtxResult<u64> {
     change_fingerprint_with(&mut ChangeScan::new(repo))
 }
 
+/// The fingerprint over tracked changes only, so a run can tell its own untracked cache and artifact writes from edits to tracked files. (#963)
+fn tracked_change_fingerprint(repo: &Path) -> CtxResult<u64> {
+    let root = git_root(repo);
+    let paths = changed_paths_at_root(&root, false)?;
+    fingerprint_over(&root, &paths)
+}
+
+/// Untracked files with their size and mtime, plus the wholly-untracked directories git collapses. (#963)
+struct UntrackedSnapshot {
+    files: std::collections::HashMap<PathBuf, (u64, Option<std::time::SystemTime>)>,
+    dirs: Vec<PathBuf>,
+}
+
+fn untracked_snapshot(repo: &Path) -> CtxResult<UntrackedSnapshot> {
+    let root = git_root(repo);
+    let list = |extra: &[&str]| {
+        git_list_paths(
+            &root,
+            &[
+                &[
+                    "ls-files",
+                    "-z",
+                    "--others",
+                    "--exclude-standard",
+                    "--full-name",
+                ][..],
+                extra,
+            ]
+            .concat(),
+        )
+    };
+    let files = list(&[])?
+        .into_iter()
+        .filter(|path| !super::classify::is_workflow_work_path(path))
+        .filter_map(|path| {
+            let metadata = std::fs::symlink_metadata(root.join(&path)).ok()?;
+            Some((path, (metadata.len(), metadata.modified().ok())))
+        })
+        .collect();
+    let dirs = list(&["--directory"])?
+        .into_iter()
+        .filter(|entry| entry.to_string_lossy().ends_with('/'))
+        .collect();
+    Ok(UntrackedSnapshot { files, dirs })
+}
+
+/// True when every untracked path added, removed or rewritten between the snapshots lives in a directory that was wholly untracked before the run, or in a new hidden top-level directory such as `.gitlab-ci-local/`. (#963)
+fn untracked_changes_stay_in_untracked_dirs(
+    before: &UntrackedSnapshot,
+    after: &UntrackedSnapshot,
+) -> bool {
+    let is_new_hidden_top_level = |dir: &Path| {
+        let mut components = dir.components();
+        components
+            .next()
+            .is_some_and(|part| part.as_os_str().to_string_lossy().starts_with('.'))
+            && components.next().is_none()
+    };
+    let mut changed = before
+        .files
+        .iter()
+        .filter(|(path, stat)| after.files.get(*path) != Some(*stat))
+        .chain(
+            after
+                .files
+                .iter()
+                .filter(|(path, stat)| before.files.get(*path) != Some(*stat)),
+        )
+        .map(|(path, _)| path);
+    changed.all(|path| {
+        before.dirs.iter().any(|dir| path.starts_with(dir))
+            || after
+                .dirs
+                .iter()
+                .any(|dir| is_new_hidden_top_level(dir) && path.starts_with(dir))
+    })
+}
+
 pub fn change_fingerprint_with(scan: &mut ChangeScan) -> CtxResult<u64> {
     let root = scan.root();
+    let paths = scan.paths()?.to_vec();
+    fingerprint_over(&root, &paths)
+}
+
+fn fingerprint_over(root: &Path, paths: &[PathBuf]) -> CtxResult<u64> {
+    let root = root.to_path_buf();
     let head = git_at(&root).args(["rev-parse", "HEAD"]).output()?;
     if !head.status.success() {
         return Err("cannot fingerprint repository HEAD".into());
@@ -1460,7 +1571,6 @@ pub fn change_fingerprint_with(scan: &mut ChangeScan) -> CtxResult<u64> {
     }
     let mut input = String::from_utf8_lossy(&head.stdout).into_owned();
     input.push_str(&String::from_utf8_lossy(&diff.stdout));
-    let paths = scan.paths()?;
     // One `hash-object` for every plain file; `--stdin-paths` splits on newlines and unquotes a
     // leading `"`, so those names fall back to a spawn of their own below.
     let batchable: Vec<&PathBuf> = paths
@@ -3021,6 +3131,48 @@ pub fn latest_is_fresh_and_passing(
     latest_is_fresh_and_passing_scan(state, repo, &mut ChangeScan::new(repo), final_only, branch)
 }
 
+/// The first condition that keeps the latest report from satisfying a Test/Verify gate, so a refusal names its cause rather than a bare "failed". (#963)
+pub fn gate_refusal_reason(state: &StateDir, repo: &Path, final_only: bool) -> CtxResult<String> {
+    let Some(report) = load_latest(state, repo)? else {
+        return Ok("no verification report exists for this checkout".to_string());
+    };
+    if final_only && report.mode != VerificationMode::Final {
+        return Ok(format!(
+            "latest report {} is a {:?} run; this step needs a Final (`zirv verify`) report",
+            report.id, report.mode
+        ));
+    }
+    if !report.narrowed_to.is_empty() {
+        return Ok(format!(
+            "latest report {} was narrowed to checks [{}] and cannot cover the whole change set",
+            report.id,
+            report.narrowed_to.join(", ")
+        ));
+    }
+    let current = change_fingerprint(repo)?;
+    if report.change_fingerprint != current {
+        return Ok(format!(
+            "latest report {} was recorded for change set {:016x} but the tree is now {current:016x}: files changed after the run began; rerun the checks",
+            report.id, report.change_fingerprint
+        ));
+    }
+    let unmet: Vec<String> = report
+        .checks
+        .iter()
+        .filter(|check| check.status != CheckStatus::Passed)
+        .map(|check| format!("{} ({:?})", check.id, check.status))
+        .collect();
+    Ok(format!(
+        "latest report {} has check(s) not passed: {}",
+        report.id,
+        if unmet.is_empty() {
+            "none recorded".to_string()
+        } else {
+            unmet.join(", ")
+        }
+    ))
+}
+
 /// [`latest_is_fresh_and_passing`] over a caller-owned scan of `repo`, so the caller can reuse the
 /// changed paths this check already listed.
 pub fn latest_is_fresh_and_passing_scan(
@@ -3251,7 +3403,7 @@ fn run_mode(
     // Not `?`: an unparseable ctx.toml closes the repo-check gate (and
     // announces itself) rather than failing the whole command, which a
     // checkout could otherwise use to brick `zirv test`/`zirv verify`.
-    let repo_gates = super::repo_gates(repo);
+    let repo_gates = super::repo_gates(&config_root(repo));
     let repo_checks_enabled = repo_gates.checks;
     let mut notes = resolved.notes;
     // Capture HEAD once before any check runs so early and main paths compare against the same commit snapshot. (#699)
@@ -3348,6 +3500,8 @@ fn run_mode(
     let started_at = now_secs();
     // Capture the change fingerprint before checks so edits during a long suite cannot appear tested.
     let change_fingerprint = change_fingerprint(repo)?;
+    let tracked_before = tracked_change_fingerprint(repo)?;
+    let untracked_before = untracked_snapshot(repo)?;
     // Reuse fresh, full evidence for an identical fingerprint in Final mode; dry runs only preview execution.
     let state_for_reuse = if mode == VerificationMode::Final && !dry_run {
         StateDir::resolve(&|key| std::env::var(key).ok()).ok()
@@ -3437,6 +3591,15 @@ fn run_mode(
             reused_ids.join(", ")
         ));
     }
+    // Checks write caches and artifacts (for example `.gitlab-ci-local/`); when they left every tracked file alone and every untracked change sits in a wholly-untracked directory, record the tree they leave behind so a passing run is not born stale. Any other edit keeps the pre-run fingerprint. (#963)
+    let change_fingerprint = if !dry_run
+        && tracked_change_fingerprint(repo)? == tracked_before
+        && untracked_changes_stay_in_untracked_dirs(&untracked_before, &untracked_snapshot(repo)?)
+    {
+        self::change_fingerprint(repo)?
+    } else {
+        change_fingerprint
+    };
     Ok(VerificationReport {
         schema_version: VERIFY_REPORT_SCHEMA_VERSION,
         id: uuid::Uuid::new_v4().to_string(),
@@ -5033,6 +5196,111 @@ mod tests {
         }
     }
 
+    /// A linked worktree of `main` on a new branch; the caller keeps the returned guard alive.
+    fn linked_worktree(main: &Path) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wt");
+        let status = Command::new("git")
+            .args(["worktree", "add", "-q", "-b", "wt-branch"])
+            .arg(&path)
+            .current_dir(main)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git worktree add failed");
+        (dir, path)
+    }
+
+    /// #974: the repository's untracked `.zirv/verify.toml` lives in the main checkout only.
+    #[test]
+    fn linked_worktree_discovers_main_checkout_verify_toml_and_runs_in_the_worktree() {
+        let main = git_repo();
+        write_verify_toml(
+            main.path(),
+            "schema_version=1\n[[checks]]\nid='probe'\nkind='custom'\ncommand='true'\nchanged=true\n",
+        );
+        let (_guard, worktree) = linked_worktree(main.path());
+        std::fs::write(worktree.join("feature.txt"), "x\n").unwrap();
+        let state_root = tempdir().unwrap();
+        let report = with_state(state_root.path(), || {
+            run_mode(&worktree, VerificationMode::Changed, &[], true)
+        })
+        .expect("the worktree must discover the main checkout's checks");
+        assert_eq!(report.repo, worktree);
+        assert_eq!(report.checks[0].id, "probe");
+        assert!(
+            report
+                .changed_paths
+                .iter()
+                .any(|p| p.to_string_lossy().contains("feature.txt"))
+        );
+    }
+
+    /// #974: discovering from the main checkout keeps the repo-check gate.
+    #[test]
+    fn linked_worktree_keeps_the_repo_check_gate_for_main_checkout_checks() {
+        let main = git_repo();
+        write_verify_toml(
+            main.path(),
+            &format!(
+                "schema_version=1\n[[checks]]\nid='sneaky'\nkind='custom'\ncommand='{}'\n",
+                marker_command()
+            ),
+        );
+        let (_guard, worktree) = linked_worktree(main.path());
+        let state_root = tempdir().unwrap();
+        let report = with_state(state_root.path(), || {
+            // SAFETY: single-threaded suite.
+            unsafe {
+                std::env::set_var("ZIRV_CTX_WORKFLOW_REPO_CHECKS", "false");
+            }
+            let report = run_mode(&worktree, VerificationMode::Final, &[], false);
+            unsafe {
+                std::env::remove_var("ZIRV_CTX_WORKFLOW_REPO_CHECKS");
+            }
+            report.unwrap()
+        });
+        assert!(!worktree.join("ran").exists());
+        assert_eq!(report.checks[0].status, CheckStatus::Skipped);
+    }
+
+    /// #970: gitlab-ci-local containers cannot follow a worktree's `.git` file, so no `--needs` there.
+    #[test]
+    fn gitlab_discovery_omits_needs_in_a_linked_worktree_only() {
+        let main = git_repo();
+        ci_write(main.path(), ".gitlab-ci.yml", "phpunit:\n  script: [x]\n");
+        let main_ids = load_or_discover(main.path()).unwrap();
+        assert!(main_ids.checks[0].spec.command.ends_with("--needs"));
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(main.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "ci",
+            ])
+            .current_dir(main.path())
+            .status()
+            .unwrap();
+        let (_guard, worktree) = linked_worktree(main.path());
+        let resolved = load_or_discover(&worktree).unwrap();
+        assert_eq!(resolved.checks[0].spec.id, "gitlab-phpunit");
+        assert!(
+            !resolved.checks[0].spec.command.contains("--needs"),
+            "{}",
+            resolved.checks[0].spec.command
+        );
+    }
+
     #[test]
     fn disabled_repo_checks_are_listed_but_never_executed() {
         let repo = git_repo();
@@ -6078,6 +6346,91 @@ mod tests {
             report.change_fingerprint,
             change_fingerprint(repo.path()).unwrap(),
             "the report must describe the tree as it was before the edit"
+        );
+    }
+
+    /// #963: a check that only writes untracked caches or artifacts (`.gitlab-ci-local/`, result
+    /// caches) must not leave its own passing report stale for the tree it leaves behind.
+    #[test]
+    fn untracked_artifacts_written_by_checks_do_not_stale_the_evidence() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        write_verify_toml(
+            repo.path(),
+            "schema_version=1\n[[checks]]\nid='cache'\nkind='custom'\ncommand='mkdir -p .gitlab-ci-local && echo x >> .gitlab-ci-local/cache.out'\n",
+        );
+        let report = with_state(state_root.path(), || {
+            run_mode(repo.path(), VerificationMode::Final, &[], false).expect("run")
+        });
+        assert_eq!(report.checks[0].status, CheckStatus::Passed);
+        assert_eq!(
+            report.change_fingerprint,
+            change_fingerprint(repo.path()).unwrap(),
+            "the report must describe the tree the check leaves behind when it only wrote untracked files"
+        );
+    }
+
+    /// #963: an untracked file written into a tracked directory may be source, so it still counts as an edit made during the run.
+    #[test]
+    fn untracked_file_in_a_tracked_directory_keeps_the_evidence_stale() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        std::fs::create_dir(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/lib.rs"), "fn a() {}\n").unwrap();
+        for args in [&["add", "."][..], &["commit", "-q", "-m", "src"][..]] {
+            let status = Command::new("git")
+                .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        write_verify_toml(
+            repo.path(),
+            "schema_version=1\n[[checks]]\nid='new'\nkind='custom'\ncommand='echo x > src/new.rs'\n",
+        );
+        let report = with_state(state_root.path(), || {
+            run_mode(repo.path(), VerificationMode::Final, &[], false).expect("run")
+        });
+        assert_eq!(report.checks[0].status, CheckStatus::Passed);
+        assert_ne!(
+            report.change_fingerprint,
+            change_fingerprint(repo.path()).unwrap(),
+            "a new file in a tracked directory must leave the report describing the pre-run tree"
+        );
+    }
+
+    /// #963: a directory created during the run is not a check artifact dir, so a new `src/newdir/x.rs` keeps the evidence stale.
+    #[test]
+    fn untracked_file_in_a_directory_created_during_the_run_keeps_the_evidence_stale() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        std::fs::create_dir(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/lib.rs"), "fn a() {}\n").unwrap();
+        for args in [&["add", "."][..], &["commit", "-q", "-m", "src"][..]] {
+            let status = Command::new("git")
+                .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        write_verify_toml(
+            repo.path(),
+            "schema_version=1\n[[checks]]\nid='new'\nkind='custom'\ncommand='mkdir src/newdir && echo x > src/newdir/x.rs'\n",
+        );
+        let report = with_state(state_root.path(), || {
+            run_mode(repo.path(), VerificationMode::Final, &[], false).expect("run")
+        });
+        assert_eq!(report.checks[0].status, CheckStatus::Passed);
+        assert_ne!(
+            report.change_fingerprint,
+            change_fingerprint(repo.path()).unwrap(),
+            "a file in a directory the run created must leave the report describing the pre-run tree"
         );
     }
 

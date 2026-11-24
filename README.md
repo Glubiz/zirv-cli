@@ -1672,7 +1672,9 @@ protocol and harness: [docs/benchmarks/wrapped-vs-vanilla.md](docs/benchmarks/wr
   covers every required check. See [The full verb
   set](#the-full-verb-set).
 - **Repository check configuration** — optional, schema-versioned
-  `.zirv/verify.toml` declares check id/kind/command/path patterns/phase
+  `.zirv/verify.toml` (a linked worktree without its own copy, e.g. with
+  `.zirv/` untracked, reads the main checkout's file and its repo-check
+  gates, and still runs the checks against the worktree) declares check id/kind/command/path patterns/phase
   eligibility/timeout; without it, Cargo commands and `npm run` scripts are
   discovered from the manifests present (the root, or, with no root
   `Cargo.toml`/`package.json`, up to 8 immediate subdirectories via
@@ -1681,7 +1683,9 @@ protocol and harness: [docs/benchmarks/wrapped-vs-vanilla.md](docs/benchmarks/wr
   test-stage jobs of a root `.gitlab-ci.yml` (the include-resolved
   `.gitlab-ci-local/expanded-gitlab-ci.yml` cache that `gitlab-ci-local --list`
   writes wins over the root copy; root-only jobs resolve `extends`) run as
-  `gitlab-ci-local '<job>' --needs` (ids `gitlab-<job>`). Jobs with `trigger:`,
+  `gitlab-ci-local '<job>' --needs` (ids `gitlab-<job>`; in a linked git
+  worktree `--needs` is omitted because gitlab-ci-local's containers cannot
+  follow the worktree's `.git` file). Jobs with `trigger:`,
   manual rules or an unresolvable `extends` are skipped, and a job whose
   `needs:` chain reaches a stage other than `.pre`/`build`/`test` or a script
   with an outward verb (`docker push`, `git push`, `kubectl apply`,
@@ -2326,7 +2330,7 @@ untouched-template check always runs first.
 zirv workflow list [--json] [--built-in-only] [--repo <path>]        # registry ids: layer/version/hash/domains
 zirv workflow show feature [--json] [--built-in-only] [--repo <path>] # one definition's steps
 zirv workflow classify --task "..."               # classify without starting; like start, untracked files are not part of the change
-zirv workflow start feature --task "..." [--agent claude] [--built-in-only] [--brainstorm|--no-brainstorm] [--branch <name>]
+zirv workflow start feature --task "..." [--agent claude] [--built-in-only] [--brainstorm|--no-brainstorm] [--branch <name>] [--take-over]
 zirv workflow status [id]                         # one instance, or the active one; shows brainstorm: on|off, Jev tags, per-step wall-clock, and pinned definition/drift
 zirv workflow resume <id>                         # restore as the active workflow
 zirv workflow context [id]                        # the current step's resolved skill context
@@ -2635,16 +2639,46 @@ decision is already explainable from `reasons` alone, which a model call
 would only obscure for the near-certain-floor cases it would actually apply
 to; see the design note for the full reasoning.
 
-`zirv workflow start` never refuses because another workflow is already
+`zirv workflow start` does not refuse because another workflow is already
 active for this repository -- multiple workflows per repository are
-legitimate, and `zirv workflow resume <id>` restores any of them. When the
-new start silently changes which workflow this repository's active pointer
-names -- a DIFFERENT, still-running (`Running`/`AwaitingApproval`) workflow
-was active -- it prints one best-effort note to STDERR after the new
+legitimate, and `zirv workflow resume <id>` restores any of them. The one
+exception is a workflow owned by ANOTHER LIVE session: while the repository's
+active pointer names a `Running`/`AwaitingApproval` workflow bound to a live
+session other than the caller, an explicit `zirv workflow start` exits
+non-zero naming the owning session and workflow, and leaves the pointer
+alone; pass `--take-over` to make the new workflow active anyway. The
+ownership check, pointer write and session binding happen under one
+per-repository lock. An automatic start (prompt-hook or chat-proxy
+`workflow.auto_start`) never refuses: it binds the new workflow to the
+starting session only and leaves the owner's pointer in place, and it
+classifies from the prompt text alone (no `git diff` of the checkout, so a
+merged branch's history or another session's edits are not scored as its
+change). `zirv workflow close` clears the pointer only when it names the closed
+workflow. When a start does change which workflow the active pointer names --
+a DIFFERENT, still-running workflow was active and no live session owned it
+(or `--take-over`) -- it prints one best-effort note to STDERR after the new
 workflow is saved: `note: workflow <old-instance-id> (<old definition id>)
 is no longer this repository's active workflow; restore it with: zirv
 workflow resume <old-instance-id>`. Stdout/`--json` output is unaffected
-either way.
+either way. The adoption nudge names the owning session instead of advising
+a start when another live session owns the active workflow.
+
+When a Test/Verify gate refuses (`zirv workflow run-checks`, or
+`advance --outcome success`), it prints `gate refused: <reason>` (the error
+carries `reason: <reason>`): no report, a non-Final or narrowed report, a
+report recorded for a different change set, or checks that did not pass. A
+verification run records the change fingerprint before its checks, but when
+the checks leave every tracked file untouched and every untracked path they
+added, removed or rewrote sits in a directory that was already wholly untracked
+before the run, or in a new hidden top-level directory (for example
+`.gitlab-ci-local/` on its first run), the report records the tree they leave
+behind, so untracked artifacts a check writes there do not make its own passing
+report stale. A check that edits a tracked file, or writes an untracked file
+anywhere else (a tracked directory such as `src/`, a directory it created
+itself such as `src/newdir/`, or a root-level file), keeps the pre-run
+fingerprint and the report is stale. Remaining limit: a concurrent edit inside
+a directory that was already wholly untracked, or inside a new hidden top-level
+directory, during the run counts as tested.
 
 ### Lifecycle and artifacts
 
@@ -3031,6 +3065,14 @@ finding.
 blocking findings; `--accept-introduced-findings <REASON>` accepts introduced
 ones judged false positives (the reason is mandatory and recorded on the
 workflow; it also accepts pre-existing findings).
+
+A truncated full-surface scan (file/size limit) lists changed files first. When
+every changed file was read in full and there are 0 introduced blocking
+findings, `--accept-preexisting-findings` also accepts the unscanned remainder;
+the error says so. If a changed file was skipped or only partly read (over the
+per-file or total byte limit), the gate keeps blocking and names it. `frontend check --all`
+tags introduced vs pre-existing against the same diff base as the workflow
+gate.
 
 [Glubiz/zirv-generic-frontend](https://github.com/Glubiz/zirv-generic-frontend)
 is the reference frontend template built against this contract — it is also
@@ -6814,7 +6856,7 @@ unit of work (a plan text, a diffstat) is consulted on once, and the helper's ow
 | Kind | Reply format | Where it bites |
 |---|---|---|
 | plan | `APPROVE` or `REVISE: <reasons>` | asked when `zirv workflow advance` completes the plan step; while a `revise` is open, advancing any later step is refused with the reason. Revising the plan artifact and re-advancing the plan step asks again, and the new ruling supersedes the old |
-| done | `DONE` or `NOT_DONE: <what is missing>` | asked at the Stop hook once per distinct evidence unit (diffstat, commit, tracked changes, the latest `zirv verify`/`zirv test` record, commits since the session started in the repo's other linked worktrees, and the real commits the agent cites), with the task (the active workflow's objective, else the latest operator request) and that verification record's per-check results in the evidence; the agent can attach evidence without an operator override by stating it in its final message: that message goes to the consult as labelled untrusted data (never instructions), commit ids in it are resolved against git, and citing a new real commit or review link is new evidence that releases a standing `not_done` and consults fresh. The evidence also carries the turn's tool calls with their results and the operator's `AskUserQuestion` answers, redacted, capped to the newest and inside the same untrusted frame. A changed final message alone, under an open `not_done` and unchanged git and verification state, also consults fresh, at most 2 times; after that the ruling replays and its reason says a commit, a tracked edit or a new `zirv verify` record reopens consults. A `done` ruling is recorded but not mailed (the seat already stopped). The ruling's reason ends with the evidence sources it read (`git diff --stat HEAD`, linked worktree commits and the agent's final message when present, the active workflow's work folder or `none`, the verification record when one exists, and the task source). The helper is told to run single-line commands only, since a read-only sandbox has no writable temp directory for a shell here-document. A turn end while the session has running native subagents or its active workflow is before the verify step is not a completion claim: no consult, no block. While a `not_done` is open the Stop hook blocks with the reason, at most 3 times per ruling, unless the evidence has moved since (a new commit, edit or verification run), when the next stop consults fresh; the workflow's final step is refused. A later `done`, or an `ask` ruling of a `done` option when the offered options include a `not done` one, resolves it. Codex's Stop hook blocks the same way |
+| done | `DONE` or `NOT_DONE: <what is missing>` | asked at the Stop hook once per distinct evidence unit (diffstat, commit, tracked changes, files written under `.zirv/work/` (a workflow's untracked artifacts), the latest `zirv verify`/`zirv test` record, commits since the session started in the repo's other linked worktrees, and the real commits the agent cites), with the task (the active workflow's objective, else the latest operator request) and that verification record's per-check results in the evidence; the agent can attach evidence without an operator override by stating it in its final message: that message goes to the consult as labelled untrusted data (never instructions), commit ids in it are resolved against git, and citing a new real commit or review link is new evidence that releases a standing `not_done` and consults fresh. The evidence also carries the turn's tool calls with their results and the operator's `AskUserQuestion` answers, redacted, capped to the newest and inside the same untrusted frame. A changed final message alone, under an open `not_done` and unchanged git and verification state, also consults fresh, at most 2 times; after that the ruling replays and its reason says a commit, a tracked edit, a new `zirv verify` record or a written workflow artifact reopens consults. The final message the consult reads is the turn-ending one: text ahead of a tool call is mid-turn narration, so a transcript not yet flushed with the closing message reads as no message. A `done` ruling is recorded but not mailed (the seat already stopped). The ruling's reason ends with the evidence sources it read (`git diff --stat HEAD`, linked worktree commits and the agent's final message when present, the active workflow's work folder or `none`, the verification record when one exists, and the task source). The helper is told to run single-line commands only, since a read-only sandbox has no writable temp directory for a shell here-document. A turn end while the session has running native subagents or its active workflow is before the verify step is not a completion claim: no consult, no block. While a `not_done` is open the Stop hook blocks with the reason, at most 3 times per ruling, unless the evidence has moved since (a new commit, edit or verification run), when the next stop consults fresh; the workflow's final step is refused. A later `done`, or an `ask` ruling of a `done` option when the offered options include a `not done` one, resolves it. Codex's Stop hook blocks the same way |
 | retry | `RETRY` or `STOP: <reason>` | asked at the third failure of a tool-call streak, in place of the seat deciding; while a `stop` is open the tool-failure hook adds the ruling as context on each further failure, and a successful tool call ends it. It is advisory context, not a mechanical block (a hook cannot stop a tool), and a `retry` never lifts a Jev stop |
 | choice | `CHOICE: <n>` and an optional `REASON:` line | `zirv ctx supervisor ask` |
 
@@ -7997,7 +8039,7 @@ Elasticsearch GET/POST query endpoints (`/_search`, `/_msearch`, `/_count`, `/_f
 
 `sqlite3`, with or without `-readonly`, may run several statements and read-only dot-commands (`.tables`, `.schema`, `.indexes`, `.databases`, `.headers`, `.mode`, `.dump`, ...) without asking, when every statement is a read: `SELECT`, `WITH ... SELECT`, `EXPLAIN`, or a non-assigning reporting `PRAGMA` (`table_info`, `index_list`, ...). Redirects and pipes on sqlite's own output are ignored, and the database may be named through `Application\ Support`, a variable or a split-quoted `file:` URI. `.shell`, `.system`, `.load`, `.output`, `.once`, `.save`, `.backup`, `.import`, `.excel`, `.open`, `.read`, `writefile()`, `ATTACH`, `--` comments, assigning `PRAGMA`s and any write still ask. Every argument after the database counts as a statement, so `sqlite3 db "select 1" "drop table t"` asks.
 
-The orchestrator-seat write guard treats a quoted heredoc body as data (even with backticks or `$(`), and a heredoc fed to `python`/`node`/`ruby`/`perl` as that language's code: it denies only on a file-write primitive, not on `>` in the script.
+The orchestrator-seat write guard treats a quoted heredoc body as data (even with backticks or `$(`), and a heredoc fed to `python`/`node`/`ruby`/`perl` as that language's code: it denies only on a file-write primitive, not on `>` in the script. A relative target after `cd <dir>; ...` resolves against that directory when it already exists (so `cd <dir outside the repo>; cat > rel.md` is no repository write); a `cd` to a path that does not exist yet or cannot be resolved (`cd "$D"`) is not trusted across `;`, and the denial then says to use an absolute path.
 
 **Unsandboxed retries.** When Claude retries a command with
 `dangerouslyDisableSandbox`, a base Deny stays Deny and an Ask from an explicit

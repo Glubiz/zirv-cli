@@ -122,16 +122,10 @@ pub(super) fn record_workflow_attention(
     );
 }
 
-/// Bind attention by session id alone; missing adapter identity must not lose the workflow binding, and headless callers skip quietly.
-pub(super) fn bind_started_workflow_to_calling_session(state_dir: &StateDir, workflow_id: &str) {
-    let Ok(session_id) = std::env::var(crate::commands::ctx::adapters::SESSION_ENV) else {
-        return;
-    };
-    if session_id.is_empty() {
-        return;
-    }
-    let short = crate::commands::ctx::sessions::short_id(&session_id);
-    crate::commands::ctx::sessions::bind_workflow_id(state_dir, &short, workflow_id);
+/// The calling session's short id from the harness environment; headless callers have none.
+pub(super) fn calling_session_short() -> Option<String> {
+    let session_id = std::env::var(crate::commands::ctx::adapters::SESSION_ENV).ok()?;
+    (!session_id.is_empty()).then(|| crate::commands::ctx::sessions::short_id(&session_id))
 }
 
 pub(super) fn adapter_by_name(
@@ -838,7 +832,12 @@ pub fn advance_with_evidence(
                 let introduced_accepted = introduced > 0 && reason_given;
                 let preexisting_accepted =
                     accept_findings.preexisting || preexisting_already_accepted || reason_given;
-                if report.truncated
+                // Changed files are scanned first; a truncated scan is acceptable only when every
+                // changed file was read in full, so the unscanned remainder is untouched code. (#969)
+                let changed_fully_scanned = report.unscanned_changed_files.is_empty();
+                let truncation_blocks = report.truncated
+                    && !(introduced == 0 && preexisting_accepted && changed_fully_scanned);
+                if truncation_blocks
                     || (introduced > 0 && !introduced_accepted)
                     || (preexisting > 0 && !preexisting_accepted)
                 {
@@ -847,6 +846,22 @@ pub fn advance_with_evidence(
                         accept_hint.push_str(&format!(
                             "; pass --accept-preexisting-findings to accept {preexisting} pre-existing blocking finding(s) and proceed"
                         ));
+                    }
+                    if report.truncated && !changed_fully_scanned {
+                        let names: Vec<String> = report
+                            .unscanned_changed_files
+                            .iter()
+                            .take(5)
+                            .map(|path| path.display().to_string())
+                            .collect();
+                        accept_hint.push_str(&format!(
+                            "; a changed file could not be fully scanned ({}), so its findings are unknown and cannot be accepted: reduce it or scan it explicitly",
+                            names.join(", ")
+                        ));
+                    } else if report.truncated && introduced == 0 && !preexisting_accepted {
+                        accept_hint.push_str(
+                            "; the scan hit its file/size limit (changed files are scanned first, so the unscanned remainder is untouched code): pass --accept-preexisting-findings to accept the unscanned remainder and proceed",
+                        );
                     }
                     if introduced > 0 {
                         accept_hint.push_str(&format!(
@@ -1046,8 +1061,14 @@ pub fn advance_with_evidence(
                             current.id
                         ),
                     );
+                    let reason = crate::commands::workflow::verification::gate_refusal_reason(
+                        state_dir,
+                        &state.repo,
+                        final_only,
+                    )
+                    .unwrap_or_else(|error| format!("cannot determine the cause: {error}"));
                     return Err(format!(
-                        "step '{}' requires fresh passing evidence for the current change set; run `{command}`\n{announcement}",
+                        "step '{}' requires fresh passing evidence for the current change set; run `{command}`\n{announcement}\nreason: {reason}",
                         current.id
                     )
                     .into());
@@ -2100,6 +2121,133 @@ mod tests {
         );
     }
 
+    /// #969: a truncated Review/Verify scan with 0 introduced findings advances once the operator accepts pre-existing findings.
+    #[test]
+    fn truncated_scan_with_no_introduced_findings_accepts_preexisting_flag() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run vcs");
+            assert!(status.success(), "vcs {args:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        for index in 0..260 {
+            std::fs::write(
+                repo.path().join(format!("Old{index:03}.tsx")),
+                "export const Old = () => <img src={avatar} />;\n",
+            )
+            .unwrap();
+        }
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "base"]);
+        run(&["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo.path().join("style.css"), ".card { color: red; }\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "clean style"]);
+
+        let mut classification = low_classification();
+        classification.risk = RiskBand::Medium;
+        classification.work_domain.domain = WorkDomain::Frontend;
+        classification.work_domain.score = 55;
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "review a frontend component".into(),
+            WorkflowKind::Review,
+            None,
+            true,
+            classification,
+        );
+        state.status = WorkflowStatus::Running;
+
+        let with_flag = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, true)
+            .map(|_| String::new())
+            .unwrap_or_else(|error| error.to_string());
+        assert!(
+            !with_flag.contains("automatically ran the detector"),
+            "{with_flag}"
+        );
+    }
+
+    /// #969: accepting pre-existing findings never waives a changed file the scan skipped for size.
+    #[test]
+    fn truncated_scan_with_an_unscanned_changed_file_refuses_the_preexisting_flag() {
+        let repo = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let state_dir = StateDir::from_root(root.path().to_path_buf());
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("run vcs");
+            assert!(status.success(), "vcs {args:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        for index in 0..260 {
+            std::fs::write(
+                repo.path().join(format!("Old{index:03}.tsx")),
+                "export const Old = () => <img src={avatar} />;\n",
+            )
+            .unwrap();
+        }
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "base"]);
+        run(&["checkout", "-q", "-b", "feature"]);
+        std::fs::write(
+            repo.path().join("Big.tsx"),
+            format!(
+                "// {}\nexport const Big = () => <img src={{a}} />;\n",
+                "x".repeat(300 * 1024)
+            ),
+        )
+        .unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "big component"]);
+
+        let mut classification = low_classification();
+        classification.risk = RiskBand::Medium;
+        classification.work_domain.domain = WorkDomain::Frontend;
+        classification.work_domain.score = 55;
+        let mut state = WorkflowState::start(
+            repo.path().to_path_buf(),
+            "review a frontend component".into(),
+            WorkflowKind::Review,
+            None,
+            true,
+            classification,
+        );
+        state.status = WorkflowStatus::Running;
+
+        let with_flag = advance_with_evidence(&state_dir, state, StepOutcome::Success, None, true)
+            .map(|_| String::new())
+            .unwrap_or_else(|error| error.to_string());
+        assert!(
+            with_flag.contains("could not be fully scanned") && with_flag.contains("Big.tsx"),
+            "{with_flag}"
+        );
+    }
+
     /// Reviewer finding: the acceptance was only mutated on the in-memory
     /// `WorkflowState`, so if a LATER gate in this same `advance` call (the
     /// render/visual-review gate, right after the detector gate) still
@@ -2413,6 +2561,7 @@ mod tests {
             analyzed_files: vec![PathBuf::from("App.tsx")],
             analyzed_bytes: 64,
             truncated: false,
+            unscanned_changed_files: Vec::new(),
             findings: Vec::new(),
             waivers_loaded: 0,
             waivers_rejected: 0,
@@ -2507,6 +2656,7 @@ mod tests {
             analyzed_files: vec![PathBuf::from("App.tsx")],
             analyzed_bytes: 64,
             truncated: false,
+            unscanned_changed_files: Vec::new(),
             findings: Vec::new(),
             waivers_loaded: 0,
             waivers_rejected: 0,
@@ -3431,6 +3581,7 @@ present_as = "summary"
                 brainstorm: false,
                 no_brainstorm: false,
                 profile: None,
+                take_over: false,
                 json: false,
             }),
         };

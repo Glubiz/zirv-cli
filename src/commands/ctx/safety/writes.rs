@@ -1560,11 +1560,19 @@ fn orchestrator_repo_write_target_in(
     // reaches here as a segment-leading `cd`, so it cannot leak.
     let session_cwd = cwd.to_string();
     let mut cwd = session_cwd.clone();
+    // The tracked `cd` target is an existing directory, so a following `;`
+    // segment runs there even though `cd` could in principle have failed.
+    let mut cd_proven = false;
+    // A `cd` was seen earlier, and a `;` after it could not be proven to land there.
+    let mut cd_seen = false;
+    let mut cd_hint = false;
     let segments = tokenize_segments_joined(&sanitized);
     for (index, (segment, preceded_by_pipe, join)) in segments.iter().enumerate() {
         let preceded_by_pipe = *preceded_by_pipe;
-        if *join != Join::And {
+        if *join != Join::And && !(*join == Join::Seq && cd_proven) {
+            cd_hint |= *join == Join::Seq && cd_seen;
             cwd = session_cwd.clone();
+            cd_proven = false;
         }
         // `$PWD`, `${PWD}`, `$(pwd)` and `` `pwd` `` are the tracked directory.
         let segment = &substitute_pwd(segment, &cwd);
@@ -1598,6 +1606,7 @@ fn orchestrator_repo_write_target_in(
             if piped || *join == Join::Or {
                 continue;
             }
+            cd_seen = true;
             // A `cd` this guard cannot resolve literally may land anywhere.
             cwd = match tokens.as_slice() {
                 [_, path] if !path.starts_with('-') => resolve_repo_write_target(path, &cwd)
@@ -1605,6 +1614,14 @@ fn orchestrator_repo_write_target_in(
                     .unwrap_or_else(|| session_cwd.clone()),
                 _ => session_cwd.clone(),
             };
+            cd_proven = cwd != session_cwd && Path::new(&cwd).is_dir();
+            // `is_dir` proves existence only; a directory without search permission makes the real `cd` fail. (#957)
+            #[cfg(unix)]
+            {
+                cd_proven = cd_proven
+                    && std::ffi::CString::new(cwd.as_str())
+                        .is_ok_and(|path| unsafe { libc::access(path.as_ptr(), libc::X_OK) } == 0);
+            }
             continue;
         }
 
@@ -1658,7 +1675,7 @@ fn orchestrator_repo_write_target_in(
         if let Some(targets) = segment_write_targets(&neutralize_heredoc_operator(segment)) {
             for target in &targets {
                 if let Some(hit) = repo_write_violation(target, &cwd, repo_root_of, env) {
-                    return Some(hit);
+                    return Some(with_cd_hint(hit, cd_hint));
                 }
             }
         }
@@ -1668,7 +1685,7 @@ fn orchestrator_repo_write_target_in(
         {
             for target in sed_perl_inplace_targets(&program, &argv) {
                 if let Some(hit) = repo_write_violation(&target, &cwd, repo_root_of, env) {
-                    return Some(hit);
+                    return Some(with_cd_hint(hit, cd_hint));
                 }
             }
         }
@@ -1696,6 +1713,17 @@ fn orchestrator_repo_write_target_in(
         }
     }
     None
+}
+
+/// Tell the seat why a relative target after `cd ...;` was judged against the
+/// session cwd, so it can use an absolute path (#957).
+fn with_cd_hint(hit: String, cd_hint: bool) -> String {
+    if cd_hint {
+        return format!(
+            "{hit} (the preceding `cd` could not be proven to take effect; use an absolute path)"
+        );
+    }
+    hit
 }
 
 /// Replace `$PWD`, `${PWD}`, `$(pwd)` and `` `pwd` `` in `segment` with `cwd`
@@ -2806,6 +2834,78 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    /// Issue #957: a `;`/newline `cd` into an existing directory takes effect
+    /// for the next segment; outside the repo it is no repository write, inside
+    /// it still is, and an unprovable `cd` says so in the denial.
+    #[test]
+    fn orchestrator_repo_write_target_follows_an_existing_cd_across_semicolons() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let base = base.path().canonicalize().expect("canonical");
+        let repo = base.join("repo");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(repo.join("sub")).expect("repo dir");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let repo_s = repo.to_string_lossy().to_string();
+        let repo_root_of = |path: &str| {
+            (path == repo_s || path.starts_with(&format!("{repo_s}/"))).then(|| repo_s.clone())
+        };
+        let check = |command: &str| {
+            orchestrator_repo_write_target(command, &repo_s, &repo_root_of, &|_| None)
+        };
+        let out = outside.display();
+        for command in [
+            format!("cd {out}; cat > rel.md <<EOF\nx\nEOF"),
+            format!("cd {out}\ncat > rel.md"),
+            format!("cd {out} && true; echo a > rel.md"),
+        ] {
+            assert_eq!(check(&command), None, "{command}");
+        }
+        let inside = repo.join("sub");
+        assert_eq!(
+            check(&format!("cd {}; cat > rel.md", inside.display())),
+            Some("rel.md".to_string())
+        );
+        let hint = check("cd /nonexistent/x; echo a > rel.md").expect("denied");
+        assert!(
+            hint.starts_with("rel.md (") && hint.contains("absolute path"),
+            "{hint}"
+        );
+        assert!(check("cd \"$D\"; cat > rel.md").is_some_and(|h| h.contains("absolute path")));
+    }
+
+    /// #957: a directory `cd` cannot enter (mode 0o000) is an unproven `cd`, so the write is denied with the hint.
+    #[cfg(unix)]
+    #[test]
+    fn orchestrator_repo_write_target_treats_an_unenterable_cd_target_as_unproven() {
+        use std::os::unix::fs::PermissionsExt;
+        // access(X_OK) always succeeds for root, so the directory cannot be made unenterable.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let base = tempfile::tempdir().expect("tempdir");
+        let base = base.path().canonicalize().expect("canonical");
+        let repo = base.join("repo");
+        let locked = base.join("locked");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        std::fs::create_dir_all(&locked).expect("locked dir");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let repo_s = repo.to_string_lossy().to_string();
+        let repo_root_of = |path: &str| {
+            (path == repo_s || path.starts_with(&format!("{repo_s}/"))).then(|| repo_s.clone())
+        };
+        let hint = orchestrator_repo_write_target(
+            &format!("cd {}; echo x > rel.md", locked.display()),
+            &repo_s,
+            &repo_root_of,
+            &|_| None,
+        );
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("restore");
+        assert!(
+            hint.is_some_and(|h| h.contains("absolute path")),
+            "an unenterable cd target must be unproven"
+        );
     }
 
     /// Groups, `||`-skipped cds and other dir-changing builtins must not leave

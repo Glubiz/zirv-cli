@@ -746,7 +746,7 @@ pub(super) fn prompt_adoption_nudge(
             )
             .then(|| {
                 record.last_nudged_turn = Some(record.turns);
-                adoption::nudge_text(&signals, cfg.workflow.adoption)
+                adoption::nudge_text(&signals, cfg.workflow.adoption, None)
             })
         })
         .flatten();

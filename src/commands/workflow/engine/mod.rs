@@ -7,7 +7,9 @@ mod session_context;
 mod state;
 mod transition;
 
-pub use cli::{StartArgs, WorkflowArgs, WorkflowSubcommand, run, start_workflow};
+pub use cli::{
+    StartArgs, WorkflowArgs, WorkflowSubcommand, run, start_workflow, start_workflow_auto,
+};
 pub(crate) use cli::{
     detach, load_workflow_registry, resolve_repo, resolve_state, write_definition_status,
     write_registry_entry, write_registry_list, write_start_outcome, write_state,
@@ -23,7 +25,10 @@ pub use lifecycle::{
 pub use session_context::{
     AbandonedWorkflow, abandoned_workflows, changed_step_context, step_context_note,
 };
-pub use state::{WorkflowState, load, load_active, load_active_for_session, state_mtime_secs};
+pub use state::{
+    WorkflowState, foreign_active_owner, load, load_active, load_active_for_session,
+    state_mtime_secs,
+};
 pub(crate) use state::{
     hash_bytes, load_active_read_only, read_accepted_artifact, save, save_preserving_active,
 };
