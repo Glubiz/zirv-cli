@@ -260,10 +260,13 @@ fn is_linked_worktree(repo: &Path) -> bool {
 /// Where the repository's `.zirv` configuration lives: a linked worktree without its own
 /// `.zirv/verify.toml` (e.g. `.zirv/` untracked in the main checkout) reads the main checkout's. (#974)
 pub(crate) fn config_root(repo: &Path) -> PathBuf {
-    if repo.join(".zirv").join("verify.toml").exists() || !is_linked_worktree(repo) {
+    if repo.join(".zirv").join("verify.toml").exists() {
         return repo.to_path_buf();
     }
     let main = crate::commands::ctx::pathutil::worktree_identity(repo);
+    if main == repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf()) {
+        return repo.to_path_buf();
+    }
     if main.join(".zirv").join("verify.toml").exists() {
         main
     } else {
@@ -1279,6 +1282,19 @@ fn git_paths(stdout: &[u8]) -> impl Iterator<Item = PathBuf> + '_ {
         })
 }
 
+/// Run `git <args>` at `root` and return its NUL-separated paths.
+fn git_list_paths(root: &Path, args: &[&str]) -> CtxResult<Vec<PathBuf>> {
+    let output = git_at(root).args(args).output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "cannot inspect changed paths: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(git_paths(&output.stdout).collect())
+}
+
 pub fn changed_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
     changed_paths_at_root(&git_root(repo), true)
 }
@@ -1288,22 +1304,11 @@ pub fn changed_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
 /// (`.zirv/`, `.claude/`, `.idea/`, `.DS_Store`). (#922)
 pub fn candidate_edit_paths(repo: &Path) -> CtxResult<CandidateEdits> {
     let root = git_root(repo);
-    let git_list = |args: &[&str]| -> CtxResult<Vec<PathBuf>> {
-        let output = git_at(&root).args(args).output()?;
-        if !output.status.success() {
-            return Err(format!(
-                "cannot inspect changed paths: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
-            .into());
-        }
-        Ok(git_paths(&output.stdout).collect())
-    };
     let is_hidden = |path: &Path| {
         path.components()
             .any(|part| part.as_os_str().to_string_lossy().starts_with('.'))
     };
-    let mut tracked: Vec<PathBuf> = git_list(&["diff", "--name-only", "-z", "HEAD"])?
+    let mut tracked: Vec<PathBuf> = git_list_paths(&root, &["diff", "--name-only", "-z", "HEAD"])?
         .into_iter()
         .filter(|path| {
             !super::classify::is_workflow_work_path(path) && !path.starts_with(".zirv/memory")
@@ -1311,14 +1316,17 @@ pub fn candidate_edit_paths(repo: &Path) -> CtxResult<CandidateEdits> {
         .collect();
     // Untracked directories come back collapsed; each is expanded only until the cap is reached.
     // Plain files first, so a big collapsed directory never crowds a lone new file out.
-    let (dirs, mut untracked): (Vec<PathBuf>, Vec<PathBuf>) = git_list(&[
-        "ls-files",
-        "-z",
-        "--others",
-        "--exclude-standard",
-        "--full-name",
-        "--directory",
-    ])?
+    let (dirs, mut untracked): (Vec<PathBuf>, Vec<PathBuf>) = git_list_paths(
+        &root,
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--exclude-standard",
+            "--full-name",
+            "--directory",
+        ],
+    )?
     .into_iter()
     .filter(|entry| !is_hidden(entry))
     .partition(|entry| entry.to_string_lossy().ends_with('/'));
@@ -1328,15 +1336,18 @@ pub fn candidate_edit_paths(repo: &Path) -> CtxResult<CandidateEdits> {
             break;
         }
         let dir = dir.to_string_lossy().into_owned();
-        let inside = git_list(&[
-            "ls-files",
-            "-z",
-            "--others",
-            "--exclude-standard",
-            "--full-name",
-            "--",
-            &dir,
-        ])?;
+        let inside = git_list_paths(
+            &root,
+            &[
+                "ls-files",
+                "-z",
+                "--others",
+                "--exclude-standard",
+                "--full-name",
+                "--",
+                &dir,
+            ],
+        )?;
         untracked.extend(inside.into_iter().filter(|path| !is_hidden(path)));
     }
     untracked.truncate(UNTRACKED_CANDIDATES_MAX);
@@ -1373,16 +1384,9 @@ fn changed_paths_at_root(root: &Path, include_untracked: bool) -> CtxResult<Vec<
     .into_iter()
     .take(sources)
     {
-        let output = git_at(root).args(args).output()?;
-        if !output.status.success() {
-            return Err(format!(
-                "cannot inspect changed paths: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
-            .into());
-        }
         paths.extend(
-            git_paths(&output.stdout)
+            git_list_paths(root, args)?
+                .into_iter()
                 // Exclude workflow bookkeeping under `.zirv/work` from change fingerprints so concurrent artifact edits cannot stale review evidence. (#229, #232)
                 .filter(|path: &PathBuf| !super::classify::is_workflow_work_path(path))
                 // An untracked nested repo or linked worktree lists as a directory, which `hash-object` cannot hash. (#945)
@@ -1413,16 +1417,9 @@ pub fn changed_paths_since_base(repo: &Path) -> CtxResult<Vec<PathBuf>> {
             "--full-name",
         ][..],
     ] {
-        let output = git_at(&root).args(args).output()?;
-        if !output.status.success() {
-            return Err(format!(
-                "cannot inspect changed paths: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
-            .into());
-        }
         paths.extend(
-            git_paths(&output.stdout)
+            git_list_paths(&root, args)?
+                .into_iter()
                 .filter(|path: &PathBuf| !super::classify::is_workflow_work_path(path)),
         );
     }
@@ -1493,25 +1490,21 @@ struct UntrackedSnapshot {
 
 fn untracked_snapshot(repo: &Path) -> CtxResult<UntrackedSnapshot> {
     let root = git_root(repo);
-    let list = |extra: &[&str]| -> CtxResult<Vec<PathBuf>> {
-        let output = git_at(&root)
-            .args([
-                "ls-files",
-                "-z",
-                "--others",
-                "--exclude-standard",
-                "--full-name",
-            ])
-            .args(extra)
-            .output()?;
-        if !output.status.success() {
-            return Err(format!(
-                "cannot inspect untracked paths: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
-            .into());
-        }
-        Ok(git_paths(&output.stdout).collect())
+    let list = |extra: &[&str]| {
+        git_list_paths(
+            &root,
+            &[
+                &[
+                    "ls-files",
+                    "-z",
+                    "--others",
+                    "--exclude-standard",
+                    "--full-name",
+                ][..],
+                extra,
+            ]
+            .concat(),
+        )
     };
     let files = list(&[])?
         .into_iter()
