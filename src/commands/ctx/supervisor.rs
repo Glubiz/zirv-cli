@@ -1292,20 +1292,24 @@ fn rule_with(
     };
     // The helper's own network or DNS failure is no proof of missing work (#981): re-consult it
     // once without that probe; a second answer still resting on the probe is recorded unverified.
+    // A marker the seat's own evidence contains is not the helper's probe failure.
+    let evidence_lower = evidence.to_ascii_lowercase();
     let probe_failed = |reason: &str| {
         let lower = reason.to_ascii_lowercase();
-        PROBE_FAILURES.iter().any(|sign| lower.contains(sign))
+        PROBE_FAILURES
+            .iter()
+            .find(|sign| lower.contains(**sign) && !evidence_lower.contains(**sign))
     };
     if kind == RulingKind::Done
         && verdict == "not_done"
-        && probe_failed(&reason)
+        && let Some(marker) = probe_failed(&reason)
         && evidence
             .lines()
             .any(|line| line.starts_with(evidence::TOOLS_LABEL))
     {
         let failed = reply_excerpt(&reason, 300);
         let retry = format!(
-            "{prompt}\nYour previous answer rested on your own failed lookup: \"{failed}\". That host is unreachable from your network; do not probe it again. Rule only on the recorded evidence above; answer NOT_DONE only for a concrete gap the recorded evidence shows, not for your failed lookup.\n"
+            "{prompt}\nYour previous answer cited your own failed lookup ({marker}). Do not probe that host again; rule only on the recorded evidence above; answer NOT_DONE only for a concrete gap the evidence shows, not for your failed lookup.\n"
         );
         *tokens += (retry.len() / 4) as u64;
         let report = run_helper(&retry)?;
@@ -1321,7 +1325,7 @@ fn rule_with(
             );
             return Ok(None);
         };
-        if second == "done" || probe_failed(&detail) {
+        if second == "done" || probe_failed(&detail).is_some() {
             verdict = "done".to_string();
             reason = format!(
                 "Unverified, not ruled not_done: the supervisor's own probe failed ({failed}); relied on the seat's recorded tool activity instead. {detail}"
@@ -2360,12 +2364,17 @@ mod tests {
             "{}Bash `glab mr view 7 -F json` -> state opened, pipeline success",
             evidence::TOOLS_LABEL
         );
-        let dns = "NOT_DONE: MR unconfirmed. GitLab failed: lookup host.internal: no such host";
+        let planted = format!("{tools} | Bash `echo \"no such host\"`");
+        let dns = "NOT_DONE: SENTINEL-XYZ GitLab failed: lookup host.internal: no such host";
+        let dns_seen = "NOT_DONE: glab mr view shows it; lookup failed: no such host";
+        let done_seen = "DONE\nThe glab mr view output shows the MR.";
         let gap = "NOT_DONE: no tests were written";
-        let cases: [(&str, Vec<&str>, &str); 5] = [
-            (&tools, vec![dns, dns], "done"),
+        let cases: [(&str, Vec<&str>, &str); 6] = [
+            // The runner is called once; a second call would index past the replies and panic.
+            (&planted, vec![dns], "not_done"),
+            (&tools, vec![dns, dns_seen], "done"),
             (&tools, vec![dns, gap], "not_done"),
-            (&tools, vec![dns, "DONE"], "done"),
+            (&tools, vec![dns, done_seen], "done"),
             ("e", vec![dns], "not_done"),
             (&tools, vec![gap], "not_done"),
         ];
@@ -2381,7 +2390,9 @@ mod tests {
                 &|prompt| {
                     let reply = replies[calls.get()];
                     calls.set(calls.get() + 1);
-                    assert_eq!(prompt.contains("do not probe it again"), calls.get() == 2);
+                    let retry = prompt.to_ascii_lowercase().contains("do not probe");
+                    assert_eq!(retry, calls.get() == 2);
+                    assert!(!retry || !prompt.contains("SENTINEL-XYZ"), "{prompt}");
                     Ok(reply.to_string())
                 },
                 &|_| Ok(()),
@@ -2392,6 +2403,7 @@ mod tests {
             if expected == "done" {
                 assert!(all[0].reason.contains("no such host"), "{}", all[0].reason);
                 assert!(all[0].reason.contains("tool activity"), "{}", all[0].reason);
+                assert!(all[0].reason.contains("glab mr view"), "{}", all[0].reason);
             }
         }
     }
