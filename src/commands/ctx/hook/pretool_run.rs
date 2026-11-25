@@ -1640,6 +1640,10 @@ mod tests {
     #[test]
     fn run_pretool_bash_never_allows_a_denied_command_even_headlessly() {
         let state_dir = tempfile::tempdir().expect("state dir");
+        // Hermetic: the operator's real ~/.zirv/ctx.toml may allow `rm -rf *`,
+        // which now overrides this built-in ask by design.
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let repo = orchestrator_repo();
         let env: std::collections::HashMap<String, String> = [
             (
