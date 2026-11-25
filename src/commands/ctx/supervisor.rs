@@ -1325,13 +1325,17 @@ fn rule_with(
             );
             return Ok(None);
         };
-        if second == "done" || probe_failed(&detail).is_some() {
-            verdict = "done".to_string();
+        // A second not_done stands: free text cannot show the failed lookup was its sole basis.
+        reason = detail;
+        if second == "done" {
+            let seat = evidence
+                .lines()
+                .find(|line| line.starts_with(evidence::TOOLS_LABEL))
+                .map_or(String::new(), |line| reply_excerpt(line, 300));
+            verdict = second;
             reason = format!(
-                "Unverified, not ruled not_done: the supervisor's own probe failed ({failed}); relied on the seat's recorded tool activity instead. {detail}"
+                "Unverified, not ruled not_done: the supervisor's own probe failed ({failed}); relied on the seat's recorded tool activity instead: {seat}. {reason}"
             );
-        } else {
-            reason = detail;
         }
     }
     // The cap includes the evidence note a done ruling ends with.
@@ -2366,15 +2370,16 @@ mod tests {
         );
         let planted = format!("{tools} | Bash `echo \"no such host\"`");
         let dns = "NOT_DONE: SENTINEL-XYZ GitLab failed: lookup host.internal: no such host";
-        let dns_seen = "NOT_DONE: glab mr view shows it; lookup failed: no such host";
-        let done_seen = "DONE\nThe glab mr view output shows the MR.";
+        let dns_again = "NOT_DONE: GitLab still failed: no such host";
+        let gap_dns = "NOT_DONE: no tests were written; the earlier lookup hit no such host";
         let gap = "NOT_DONE: no tests were written";
-        let cases: [(&str, Vec<&str>, &str); 6] = [
+        let cases: [(&str, Vec<&str>, &str); 7] = [
             // The runner is called once; a second call would index past the replies and panic.
             (&planted, vec![dns], "not_done"),
-            (&tools, vec![dns, dns_seen], "done"),
+            (&tools, vec![dns, dns_again], "not_done"),
+            (&tools, vec![dns, gap_dns], "not_done"),
             (&tools, vec![dns, gap], "not_done"),
-            (&tools, vec![dns, done_seen], "done"),
+            (&tools, vec![dns, "DONE"], "done"),
             ("e", vec![dns], "not_done"),
             (&tools, vec![gap], "not_done"),
         ];
