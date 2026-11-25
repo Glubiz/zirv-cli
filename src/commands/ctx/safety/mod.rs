@@ -6,7 +6,14 @@
 //! `[safety]` layers use a narrowing fold: built-in, home and repo `deny`/`ask`
 //! rules accumulate; only the operator may add `allow` or `escape_allow` or
 //! choose defaults. Environment overrides replace contributions, never built-in
-//! protections. Deny and ask take precedence over allow (#83, #147).
+//! protections. Deny and ask take precedence over allow (#83, #147), with one
+//! exception: an `Origin::Operator` or `Origin::Env` allow matching a candidate
+//! overrides a BUILT-IN ask for that candidate (pattern or classifier ask,
+//! per compound segment, applied last in `evaluate_candidate_outcome`). It
+//! never overrides a deny, an operator/repo/env ask, the operator-config edit
+//! ask, the project-secret-read ask, or the after-fold stages (ambiguous
+//! quoting, worker envelope). `usage tee` denies a child still needing
+//! approval; a child an operator allow overrides runs as it would directly.
 //!
 //! Evaluation is pure; resolution receives environment through an injected
 //! closure. The hook applies denial and repeated-failure breakers after the

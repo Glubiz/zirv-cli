@@ -3613,11 +3613,23 @@ mod tests {
         );
     }
 
-    /// The narrowing direction always applies, including over a broad allow
-    /// rule covering the client, and including over the permissive
-    /// interactive default.
+    /// Without an operator allow the classifier asks for a statement it
+    /// cannot prove read-only; an operator allow naming the client is an
+    /// explicit authorisation and overrides that built-in classifier ask
+    /// (the spec's override rule), so it no longer narrows an operator allow.
     #[test]
-    fn the_sql_classifier_narrows_a_broad_allow_rule() {
+    fn the_sql_classifier_ask_is_overridden_only_by_an_operator_allow() {
+        let unallowed = policy_with(&[], &[], &[], Verdict::Ask);
+        assert_eq!(
+            evaluate(
+                &unallowed,
+                "psql -c 'DROP TABLE users'",
+                LaunchMode::Interactive,
+            )
+            .verdict,
+            Verdict::Ask,
+            "the classifier asks for a statement it cannot prove read-only"
+        );
         let policy = policy_with(&[], &[], &["psql *"], Verdict::Ask);
         assert_eq!(
             evaluate(&policy, "psql -c 'SELECT 1'", LaunchMode::Interactive,).verdict,
@@ -3630,8 +3642,8 @@ mod tests {
                 LaunchMode::Interactive,
             )
             .verdict,
-            Verdict::Ask,
-            "a broad allow must not cover a statement the classifier cannot prove read-only"
+            Verdict::Allow,
+            "an operator allow overrides the built-in sql classifier ask"
         );
     }
 
