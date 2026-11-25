@@ -57,6 +57,8 @@ pub enum ActionId {
     Quit,
     LiteralPrefix,
     Wheel,
+    SelectOff,
+    SelectModifier,
     EscEnter,
 }
 
@@ -641,6 +643,26 @@ pub static ACTIONS: &[ActionDescriptor] = &[
         chord: "wheel",
         label: "scroll",
         description: "scroll the focused pane",
+        section: ActionSection::Pointer,
+        availability: always,
+        menu: None,
+        checks: &[],
+    },
+    ActionDescriptor {
+        id: ActionId::SelectOff,
+        chord: "[dash] mouse = false",
+        label: "native select",
+        description: "turn off mouse capture (or ZIRV_CTX_DASH_MOUSE=false) so the terminal selects text",
+        section: ActionSection::Pointer,
+        availability: always,
+        menu: None,
+        checks: &[],
+    },
+    ActionDescriptor {
+        id: ActionId::SelectModifier,
+        chord: "opt+drag on mac (macOptionClickForcesSelection), else shift+drag",
+        label: "xterm.js select",
+        description: "xterm.js terminals such as VS Code can force native selection with a modifier",
         section: ActionSection::Pointer,
         availability: always,
         menu: None,
@@ -1336,9 +1358,15 @@ mod tests {
             }
         }
         let notes: Vec<&ActionDescriptor> = ACTIONS.iter().filter(|d| d.informational()).collect();
-        assert_eq!(notes.len(), 2, "only the wheel and the Esc/Enter note");
+        assert_eq!(notes.len(), 4, "only the pointer and the Esc/Enter notes");
         for d in notes {
-            assert!(matches!(d.id, ActionId::Wheel | ActionId::EscEnter));
+            assert!(matches!(
+                d.id,
+                ActionId::Wheel
+                    | ActionId::SelectOff
+                    | ActionId::SelectModifier
+                    | ActionId::EscEnter
+            ));
         }
         let rows = palette_rows(&live_row(), "");
         let wheel = rows
@@ -1419,7 +1447,13 @@ mod tests {
     fn every_descriptor_is_reachable_by_a_chord_or_a_menu_entry() {
         for descriptor in ACTIONS {
             let runnable = descriptor.dash_action().is_some() || descriptor.menu.is_some();
-            let informational = matches!(descriptor.id, ActionId::Wheel | ActionId::EscEnter);
+            let informational = matches!(
+                descriptor.id,
+                ActionId::Wheel
+                    | ActionId::SelectOff
+                    | ActionId::SelectModifier
+                    | ActionId::EscEnter
+            );
             assert!(
                 runnable || informational,
                 "{} is in the table but nothing can run it",

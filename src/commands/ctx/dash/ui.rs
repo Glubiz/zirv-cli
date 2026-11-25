@@ -8334,7 +8334,7 @@ mod tests {
     /// filter, same sections -- and it says so in its own pinned footer.
     #[test]
     fn the_help_screen_lists_every_section_and_says_typing_filters() {
-        let text = draw_overlay(120, 40, &Overlay::Palette(palette(PaletteMode::Help, "")));
+        let text = draw_overlay(120, 44, &Overlay::Palette(palette(PaletteMode::Help, "")));
         assert!(text.contains("help"), "{text}");
         for section in ActionSection::ORDER {
             assert!(
@@ -8345,6 +8345,7 @@ mod tests {
         }
         assert!(text.contains("to filter"), "{text}");
         assert!(text.contains("esc"), "{text}");
+        assert!(text.contains("mouse = false"), "{text}");
     }
 
     /// A query filters both faces the same way, and the query itself is

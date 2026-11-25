@@ -428,18 +428,16 @@ fn run_dashboard_inner(
     // on every exit arm below.
     term::set_dash_active(true);
 
-    // Enable drag and wheel mouse reporting without motion-only flood.
-    if cfg.dash.mouse {
-        let mut stdout = io::stdout();
-        if let Err(e) = stdout
-            .write_all(term::dash_mouse_on_bytes())
-            .and_then(|()| stdout.flush())
-        {
-            push_error(
-                &mut errors,
-                format!("dashboard: mouse reporting could not be enabled: {e}"),
-            );
-        }
+    // Enable drag and wheel mouse reporting without motion-only flood; `dash.mouse = false` emits nothing.
+    let mut stdout = io::stdout();
+    if let Err(e) = stdout
+        .write_all(term::dash_mouse_bytes(cfg.dash.mouse, false))
+        .and_then(|()| stdout.flush())
+    {
+        push_error(
+            &mut errors,
+            format!("dashboard: mouse reporting could not be enabled: {e}"),
+        );
     }
 
     // Negotiate keyboard enhancement before the input loop reads stdin.
@@ -2959,7 +2957,7 @@ fn run_dashboard_inner(
             hover_on = want_hover;
             let mut stdout = io::stdout();
             let _ = stdout
-                .write_all(term::dash_hover_bytes(hover_on))
+                .write_all(term::dash_mouse_bytes(cfg.dash.mouse, hover_on))
                 .and_then(|()| stdout.flush());
         }
 

@@ -99,7 +99,7 @@ const EMERGENCY_RESET: &[u8] = b"\x1b[r\x1b[?25h";
 ///
 /// All four mouse modes -- `?1000` (button press/release), `?1002` (drag),
 /// `?1003` (any motion), `?1006` (SGR extended coordinates) -- are disabled
-/// unconditionally, and deliberately more than [`dash_mouse_on_bytes`] ever
+/// unconditionally, and deliberately more than [`dash_mouse_bytes`] ever
 /// enables. Turning off a mode that was never on is a no-op, while *leaving*
 /// one on hands the operator a shell in which every click and every wheel
 /// notch spews escape sequences at the prompt. That is a badly broken
@@ -250,38 +250,22 @@ pub fn dash_reset_bytes() -> &'static [u8] {
     DASH_RESET
 }
 
-/// Mouse reporting, at exactly the level the dashboard needs and no more:
-/// `?1000` (button press/release, which is what a wheel notch is reported
-/// as), `?1002` (button-event tracking -- motion reports only while a button
-/// is held down), and `?1006` (SGR extended coordinates).
+/// The mouse-reporting bytes the dashboard owes the terminal for `dash.mouse` and the hover
+/// state. With `mouse` off nothing is emitted, so the terminal keeps native selection.
 ///
-/// Deliberately not crossterm's `EnableMouseCapture`; do not add `?1003`.
-/// Windows Terminal reports every pointer movement, which
-/// can crowd keystrokes out of the bounded input drain. `?1002` provides
-/// drag selection only while a button is held; `?1006` supports columns
-/// beyond the X10 encoding's 223-column limit.
-pub fn dash_mouse_on_bytes() -> &'static [u8] {
-    DASH_MOUSE_ON
-}
-
-/// Any-motion tracking (`?1003`), for the orchestrator dashboard's hover preview, only while its
-/// FLOW is on screen and never on Windows, where Windows Terminal reports every pointer movement
-/// and floods the input drain (see [`dash_mouse_on_bytes`]). Turning it off re-asserts the default
-/// button and drag tracking, because the tracking modes replace one another.
-pub fn dash_hover_bytes(on: bool) -> &'static [u8] {
-    if cfg!(windows) {
-        return b"";
-    }
-    if on {
-        b"\x1b[?1003h"
-    } else {
-        b"\x1b[?1003l\x1b[?1000h\x1b[?1002h"
+/// On, it is `?1000` (button press/release, which is what a wheel notch is reported as), `?1002`
+/// (button-event tracking, motion only while a button is held) and `?1006` (SGR coordinates).
+/// Deliberately not crossterm's `EnableMouseCapture`: free-running `?1003` is added only for
+/// `hover` (the orchestrator FLOW's hover preview), never on Windows, where Windows Terminal
+/// reports every pointer movement and floods the bounded input drain. Without `hover` it is
+/// switched off again, so the same bytes serve startup and the hover toggle.
+pub fn dash_mouse_bytes(mouse: bool, hover: bool) -> &'static [u8] {
+    match (mouse, hover && !cfg!(windows)) {
+        (false, _) => b"",
+        (true, true) => b"\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1003h",
+        (true, false) => b"\x1b[?1003l\x1b[?1000h\x1b[?1002h\x1b[?1006h",
     }
 }
-
-/// See [`dash_mouse_on_bytes`]. A constant for the same allocation-free
-/// reason every other sequence in this module is one.
-const DASH_MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 
 /// Installed exactly once, however many guards are entered.
 static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -1167,65 +1151,41 @@ mod tests {
         }
     }
 
-    /// Hover tracking is a flow-only toggle: on is `?1003h`, off is `?1003l` followed by the default
-    /// button and drag tracking again, and Windows never turns it on.
+    /// `dash.mouse = false` is the operator's way back to native terminal selection (#980): no
+    /// tracking mode may be enabled, with or without hover. On, the set is button+wheel, drag and
+    /// SGR coordinates, and free-running `?1003` only for hover (never on Windows).
     #[test]
-    fn hover_tracking_is_a_toggle_that_restores_the_default_capture_and_is_off_on_windows() {
-        if cfg!(windows) {
-            assert!(dash_hover_bytes(true).is_empty() && dash_hover_bytes(false).is_empty());
-            return;
+    fn mouse_bytes_follow_the_opt_out_and_only_hover_adds_free_motion() {
+        for hover in [false, true] {
+            assert!(dash_mouse_bytes(false, hover).is_empty());
         }
-        assert_eq!(dash_hover_bytes(true), b"\x1b[?1003h");
-        let off = dash_hover_bytes(false);
-        assert!(off.starts_with(b"\x1b[?1003l"));
-        for mode in [&b"\x1b[?1000h"[..], &b"\x1b[?1002h"[..]] {
-            assert!(off.windows(mode.len()).any(|w| w == mode), "{off:?}");
+        let on = dash_mouse_bytes(true, false);
+        for mode in [
+            &b"\x1b[?1000h"[..],
+            &b"\x1b[?1002h"[..],
+            &b"\x1b[?1006h"[..],
+        ] {
+            assert!(on.windows(mode.len()).any(|w| w == mode), "{on:?}");
         }
-        // The default capture itself still never carries it.
-        assert!(
-            !dash_mouse_on_bytes()
-                .windows(8)
-                .any(|w| w == b"\x1b[?1003h")
-        );
-    }
-
-    /// The enable set is button+wheel reporting, button-drag tracking, and
-    /// SGR coordinates -- `?1000`/`?1002`/`?1006` -- and nothing else. `?1003`
-    /// is the free-running any-motion mode: a probe on a real Windows
-    /// Terminal session showed it reporting every pointer movement with no
-    /// button ever held, which floods the dashboard's bounded per-tick input
-    /// drain and competes with the operator's own keystrokes for it. `?1002`
-    /// only ever reports while a button is down, which is exactly the stream
-    /// the dashboard's own click-drag selection consumes, so it stays on;
-    /// `?1003` still buys nothing over it and stays off.
-    #[test]
-    fn mouse_reporting_is_enabled_for_the_wheel_and_drag_but_never_free_motion() {
-        let on = dash_mouse_on_bytes();
+        assert!(!on.windows(8).any(|w| w == b"\x1b[?1003h"));
+        assert!(on.starts_with(b"\x1b[?1003l"));
+        let hover = dash_mouse_bytes(true, true);
         assert_eq!(
-            on, b"\x1b[?1000h\x1b[?1002h\x1b[?1006h",
-            "button+wheel reporting, button-drag tracking, SGR coordinates -- exactly"
+            hover.windows(8).any(|w| w == b"\x1b[?1003h"),
+            !cfg!(windows)
         );
-        assert!(
-            !on.windows(8).any(|w| w == b"\x1b[?1003h"),
-            "free-running motion tracking must stay off: {}",
-            String::from_utf8_lossy(on)
-        );
-        // SGR coordinates are not optional: the default X10 encoding cannot
-        // express a column past 223, and terminals are routinely wider.
-        assert!(on.windows(8).any(|w| w == b"\x1b[?1006h"));
-
-        // Every mode the enable turns on is turned back off by the shared
-        // reset -- the invariant that actually protects the operator's shell.
+        // Every mode switched on is switched off again by the shared reset.
         for (on_seq, off_seq) in [
             (&b"\x1b[?1000h"[..], &b"\x1b[?1000l"[..]),
             (&b"\x1b[?1002h"[..], &b"\x1b[?1002l"[..]),
+            (&b"\x1b[?1003h"[..], &b"\x1b[?1003l"[..]),
             (&b"\x1b[?1006h"[..], &b"\x1b[?1006l"[..]),
         ] {
-            assert!(on.windows(on_seq.len()).any(|w| w == on_seq));
             assert!(
                 dash_reset_bytes()
                     .windows(off_seq.len())
-                    .any(|w| w == off_seq)
+                    .any(|w| w == off_seq),
+                "{on_seq:?}"
             );
         }
     }

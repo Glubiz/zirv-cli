@@ -380,7 +380,7 @@ pub(super) fn osc52_copy_sequence(text: &str) -> Vec<u8> {
 }
 
 /// Writes an OSC 52 clipboard-set sequence to the host terminal, the same
-/// way `term::dash_mouse_on_bytes` is written at startup: raw to stdout,
+/// way `term::dash_mouse_bytes` is written at startup: raw to stdout,
 /// flushed immediately. Best-effort like that write -- a terminal that
 /// ignores or does not support OSC 52, or a write that simply fails, loses
 /// the copy, not the session.
@@ -659,7 +659,7 @@ mod tests {
     /// This loop never forwards a `Drag` to a child (`Pane::forward_mouse_button`
     /// is only ever called from the `Down`/`Up` arms), so the only button
     /// events that can reach one are still presses and releases even though
-    /// `term::dash_mouse_on_bytes` now enables `?1002` alongside `?1000h`/
+    /// `term::dash_mouse_bytes` now enables `?1002` alongside `?1000h`/
     /// `?1006h` -- and they carry the protocol's own button numbers, which
     /// the wheel's 64/65 extend.
     #[test]
