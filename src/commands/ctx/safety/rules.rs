@@ -443,7 +443,58 @@ pub(super) fn evaluate_candidate_outcome(
     let outcome = apply_distribution_outcome(candidate, outcome);
     let outcome = apply_orchestrator_outcome(candidate, outcome);
     let outcome = apply_pipe_to_shell_outcome(candidate, outcome);
-    apply_find_exec_outcome(candidate, outcome, scratchpad_roots)
+    let outcome = apply_find_exec_outcome(candidate, outcome, scratchpad_roots);
+    apply_operator_allow_override(policy, candidate, outcome)
+}
+
+/// Built-in asks no operator allow may override: the policy-edit gate and
+/// the credential read ask.
+fn operator_allow_cannot_override(pattern: &str) -> bool {
+    pattern == OPERATOR_CONFIG_EDIT_RULE || pattern == "<project secret file read>"
+}
+
+/// The operator or env allow rule that overrides a BUILT-IN ask for this
+/// candidate, if any. Deny, operator/repo/env asks, the policy-edit ask and
+/// the credential ask are never overridden, and only Operator and Env allow
+/// rules qualify as the overriding rule.
+fn operator_allow_override_rule<'a>(
+    policy: &'a SafetyPolicy,
+    candidate: &str,
+    outcome: &Outcome,
+) -> Option<&'a Rule> {
+    if outcome.verdict != Verdict::Ask {
+        return None;
+    }
+    let ask = outcome.matched.as_ref()?;
+    if ask.origin != Origin::BuiltIn || operator_allow_cannot_override(&ask.pattern) {
+        return None;
+    }
+    if policy.ask.iter().any(|rule| {
+        rule.origin != Origin::BuiltIn && narrowing_rule_matches(&rule.pattern, candidate)
+    }) {
+        return None;
+    }
+    policy.allow.iter().find(|rule| {
+        matches!(rule.origin, Origin::Operator | Origin::Env)
+            && glob_match(&rule.pattern, candidate)
+    })
+}
+
+/// An operator or env allow matching this candidate overrides a built-in ask
+/// for it. Runs per candidate, before the compound fold and the after-fold
+/// stages (ambiguous quoting, envelope, usage tee).
+fn apply_operator_allow_override(
+    policy: &SafetyPolicy,
+    candidate: &str,
+    outcome: Outcome,
+) -> Outcome {
+    match operator_allow_override_rule(policy, candidate, &outcome) {
+        Some(rule) => Outcome {
+            verdict: Verdict::Allow,
+            matched: Some(rule.clone()),
+        },
+        None => outcome,
+    }
 }
 
 /// Fold the raw command and normalized executable candidates to the
@@ -2022,5 +2073,193 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- Operator/env allow overrides a built-in ask ------------------------
+
+    fn safety_table(text: &str) -> Option<toml::Value> {
+        table(text).and_then(|v| v.get("safety").cloned())
+    }
+
+    fn policy_resolved(home: &str, repo: &str, allow_env: Option<&str>) -> SafetyPolicy {
+        let allow_env = allow_env.map(str::to_string);
+        resolve(safety_table(home), safety_table(repo), &move |k| {
+            (k == "ZIRV_CTX_SAFETY_ALLOW")
+                .then(|| allow_env.clone())
+                .flatten()
+        })
+        .expect("policy resolves")
+    }
+
+    fn verdict_of(policy: &SafetyPolicy, command: &str) -> Verdict {
+        evaluate(
+            policy,
+            command,
+            super::super::adapters::LaunchMode::Interactive,
+        )
+        .verdict
+    }
+
+    const OVERRIDE_CASES: &[(&str, &str)] = &[
+        ("pkill *", "pkill -f loadgen.exe"),
+        ("docker *", "docker compose -f a.yml down -v"),
+        ("git checkout -- *", "git checkout -- ."),
+    ];
+
+    #[test]
+    fn builtin_asks_stay_ask_without_an_operator_allow() {
+        let policy = policy_resolved("", "", None);
+        for (_, command) in OVERRIDE_CASES {
+            assert_eq!(verdict_of(&policy, command), Verdict::Ask, "{command}");
+        }
+    }
+
+    #[test]
+    fn operator_allow_overrides_a_builtin_ask() {
+        for (allow, command) in OVERRIDE_CASES {
+            let policy = policy_resolved(&format!("[safety]\nallow = [\"{allow}\"]\n"), "", None);
+            let outcome = evaluate(
+                &policy,
+                command,
+                super::super::adapters::LaunchMode::Interactive,
+            );
+            assert_eq!(outcome.verdict, Verdict::Allow, "{command}");
+            assert_eq!(
+                outcome.matched.map(|r| (r.pattern, r.origin)),
+                Some((allow.to_string(), Origin::Operator)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_allow_overrides_a_builtin_ask() {
+        let policy = policy_resolved("", "", Some("pkill *"));
+        assert_eq!(verdict_of(&policy, "pkill -f loadgen.exe"), Verdict::Allow);
+    }
+
+    #[test]
+    fn operator_allow_never_overrides_deny() {
+        let policy = policy_resolved("[safety]\nallow = [\"taskkill *\"]\n", "", None);
+        assert_eq!(
+            verdict_of(&policy, "taskkill /F /IM zirv.exe"),
+            Verdict::Deny
+        );
+    }
+
+    #[test]
+    fn operator_ask_beats_operator_allow() {
+        let policy = policy_resolved(
+            "[safety]\nallow = [\"pkill *\"]\nask = [\"pkill *\"]\n",
+            "",
+            None,
+        );
+        assert_eq!(verdict_of(&policy, "pkill -f loadgen.exe"), Verdict::Ask);
+    }
+
+    #[test]
+    fn repo_ask_beats_operator_allow() {
+        let policy = policy_resolved(
+            "[safety]\nallow = [\"pkill *\"]\n",
+            "[safety]\nask = [\"pkill *\"]\n",
+            None,
+        );
+        assert_eq!(verdict_of(&policy, "pkill -f loadgen.exe"), Verdict::Ask);
+    }
+
+    #[test]
+    fn operator_allow_never_overrides_the_config_edit_or_secret_read_asks() {
+        let policy = policy_resolved("[safety]\nallow = [\"zirv *\", \"cat *\"]\n", "", None);
+        assert_eq!(
+            verdict_of(&policy, "zirv ctx config set safety.default allow"),
+            Verdict::Ask
+        );
+        assert_eq!(verdict_of(&policy, "cat .env"), Verdict::Ask);
+    }
+
+    #[test]
+    fn operator_allow_overrides_only_its_own_compound_segment() {
+        let policy = policy_resolved("[safety]\nallow = [\"pkill *\"]\n", "", None);
+        let compound = evaluate(
+            &policy,
+            "pkill x && rm -rf /",
+            super::super::adapters::LaunchMode::Interactive,
+        );
+        let alone = evaluate(
+            &policy,
+            "rm -rf /",
+            super::super::adapters::LaunchMode::Interactive,
+        );
+        assert_ne!(compound.verdict, Verdict::Allow);
+        assert_eq!(compound.verdict, alone.verdict);
+        assert_eq!(
+            verdict_of(&policy, "pkill x && docker compose down -v"),
+            Verdict::Ask
+        );
+    }
+
+    #[test]
+    fn usage_tee_child_overridden_by_an_operator_allow_runs_as_it_would_directly() {
+        let allowed = policy_resolved("[safety]\nallow = [\"pkill *\"]\n", "", None);
+        assert_eq!(
+            verdict_of(&allowed, "zirv ctx usage tee -- pkill x"),
+            Verdict::Allow
+        );
+        assert_eq!(verdict_of(&allowed, "pkill x"), Verdict::Allow);
+    }
+
+    #[test]
+    fn usage_tee_child_still_needing_approval_is_denied() {
+        let plain = policy_resolved("", "", None);
+        let outcome = evaluate(
+            &plain,
+            "zirv ctx usage tee -- pkill x",
+            super::super::adapters::LaunchMode::Interactive,
+        );
+        assert_eq!(outcome.verdict, Verdict::Deny);
+        assert_eq!(
+            outcome.matched.map(|r| r.pattern).as_deref(),
+            Some("<zirv: usage tee child needs approval>")
+        );
+    }
+
+    #[test]
+    fn operator_allow_star_does_not_turn_the_ambiguous_quoting_ask_into_allow() {
+        let policy = policy_resolved("[safety]\nallow = [\"*\"]\n", "", None);
+        let outcome = evaluate(
+            &policy,
+            "echo $'unterminated",
+            super::super::adapters::LaunchMode::Interactive,
+        );
+        assert_eq!(outcome.verdict, Verdict::Ask);
+        assert_eq!(
+            outcome.matched.map(|r| r.pattern).as_deref(),
+            Some("<shell: ambiguous quoting or comment>")
+        );
+    }
+
+    #[test]
+    fn a_worker_envelope_deny_is_not_overridden_by_an_operator_allow() {
+        let policy = policy_resolved("[safety]\nallow = [\"git checkout -- *\"]\n", "", None);
+        let envelope = safety_test_envelope();
+        let command = "git checkout -- .";
+        assert_eq!(verdict_of(&policy, command), Verdict::Allow);
+        let outcome = evaluate_with_scratchpad_roots(
+            &policy,
+            command,
+            super::super::adapters::LaunchMode::Interactive,
+            &[],
+            Some(&envelope),
+            None,
+            0,
+        );
+        assert_eq!(outcome.verdict, Verdict::Deny);
+    }
+
+    #[test]
+    fn a_repo_layer_allow_is_never_an_overriding_rule() {
+        let policy = policy_resolved("", "[safety]\nallow = [\"pkill *\"]\n", None);
+        assert!(policy.allow.iter().all(|r| r.origin != Origin::Repo));
+        assert_eq!(verdict_of(&policy, "pkill -f loadgen.exe"), Verdict::Ask);
     }
 }

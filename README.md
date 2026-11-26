@@ -8001,9 +8001,23 @@ interactive_default = "allow"    # operator-only, REPO-FORBIDDEN
 sql = "on"                       # operator-only, REPO-FORBIDDEN
 ```
 
+An allow from the operator (`~/.zirv/ctx.toml`) or the environment
+(`ZIRV_CTX_SAFETY_ALLOW`) that matches a command overrides a BUILT-IN ask for
+it, both the built-in ask patterns (`pkill *`, `git reset*--hard*`) and the
+built-in classifier asks (sql, network, recursive delete, vcs, distribution,
+orchestrator, `find -exec`), so a command the operator has authorised never
+prompts. It is applied per compound segment: `pkill x && rm -rf /` with
+`allow = ["pkill *"]` is exactly as strict as `rm -rf /`. It never overrides a
+deny of any origin, an ask the operator, a repo or the environment wrote, the
+`zirv ctx config set|add` ask, the project-secret-read ask, the ambiguous
+quoting ask, or a worker envelope; a built-in or repo rule cannot be the
+overriding allow. `zirv ctx usage tee -- <child>` still denies a child that needs
+approval, while a child an operator allow overrides runs as it would directly.
+`zirv ctx safety explain` prints one `Override:` line per overridden segment.
+
 Rules are glob patterns (`*` matches any run of characters); a command is
 matched deny-first, then ask, then allow, first match wins within a
-category. Unmatched commands use `interactive_default` for an interactive
+category, except for the operator-allow override above. Unmatched commands use `interactive_default` for an interactive
 launch and `default` for a headless one. The Claude hook treats every non-empty
 permission mode except `dontAsk` as interactive, including `auto` and
 `bypassPermissions`; an empty or missing mode is headless.

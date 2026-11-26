@@ -207,6 +207,62 @@ pub fn run_list<W: Write>(args: &ListArgs, w: &mut W, env: EnvLookup<'_>) -> Ctx
     Ok(0)
 }
 
+/// One line per executable candidate (normalised exactly as evaluation does:
+/// wrappers, compound segments) where an operator or env allow rule turned a
+/// built-in ask into allow: evaluate each candidate with and without those
+/// allow rules and name both rules. Verdicts are unaffected.
+fn override_notes(
+    policy: &SafetyPolicy,
+    command: &str,
+    mode: super::adapters::LaunchMode,
+    scratchpad_roots: &[String],
+) -> Vec<String> {
+    let fallback = policy.default_verdict(mode);
+    let mut stripped = policy.clone();
+    stripped
+        .allow
+        .retain(|rule| !matches!(rule.origin, Origin::Operator | Origin::Env));
+    let mut notes: Vec<String> = Vec::new();
+    for candidate in normalize_segments(command) {
+        if unwrap_compact_run_wrapper(&candidate).is_some()
+            || unwrap_zirv_child_command(&candidate).is_some()
+        {
+            continue;
+        }
+        let with =
+            evaluate_candidate_outcome(policy, &candidate, command, fallback, scratchpad_roots);
+        let Some(allow) = with.matched.filter(|rule| {
+            with.verdict == Verdict::Allow && matches!(rule.origin, Origin::Operator | Origin::Env)
+        }) else {
+            continue;
+        };
+        let without =
+            evaluate_candidate_outcome(&stripped, &candidate, command, fallback, scratchpad_roots);
+        let Some(ask) = without
+            .matched
+            .filter(|rule| without.verdict == Verdict::Ask && rule.origin == Origin::BuiltIn)
+        else {
+            continue;
+        };
+        let note = format!(
+            "Override: `{candidate}` is allow because the {} allow rule `{}` ({}) overrides the \
+             built-in ask rule `{}`.",
+            if allow.origin == Origin::Env {
+                "environment"
+            } else {
+                "operator"
+            },
+            allow.pattern,
+            allow.origin.label(),
+            ask.pattern
+        );
+        if !notes.contains(&note) {
+            notes.push(note);
+        }
+    }
+    notes
+}
+
 /// Explain with the same attestation fold as the hook so identical commands
 /// receive identical verdicts; absent attestation uses current policy (#139).
 pub fn run_explain<W: Write>(args: &ExplainArgs, w: &mut W, env: EnvLookup<'_>) -> CtxResult<i32> {
@@ -240,6 +296,9 @@ pub fn run_explain<W: Write>(args: &ExplainArgs, w: &mut W, env: EnvLookup<'_>) 
             envelope.as_ref(),
         )
     )?;
+    for note in override_notes(&cfg.safety, &command, args.mode, &scratchpad_roots) {
+        writeln!(w, "{note}")?;
+    }
     Ok(evidence.outcome.verdict.exit_code())
 }
 
@@ -775,5 +834,84 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("ask"));
         assert!(text.contains("built-in"));
+    }
+
+    #[test]
+    fn explain_names_the_operator_allow_that_overrides_a_builtin_ask() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[safety]\nallow = [\"pkill *\"]\n",
+        )
+        .expect("write");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let args = ExplainArgs {
+            repo: repo.path().to_path_buf(),
+            mode: LaunchMode::Interactive,
+            command: vec![
+                "pkill".to_string(),
+                "-f".to_string(),
+                "loadgen.exe".to_string(),
+            ],
+        };
+        let mut out = Vec::new();
+        let code = run_explain(&args, &mut out, &|k| empty.get(k).cloned()).expect("runs");
+        assert_eq!(code, Verdict::Allow.exit_code());
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(
+                "allow because the operator allow rule `pkill *` (~/.zirv/ctx.toml) overrides \
+                 the built-in ask rule `pkill *`"
+            ),
+            "{text}"
+        );
+    }
+
+    fn explain_with_allow(allow: &str, command: &str) -> String {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            format!("[safety]\nallow = {allow}\n"),
+        )
+        .expect("write");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let args = ExplainArgs {
+            repo: repo.path().to_path_buf(),
+            mode: LaunchMode::Interactive,
+            command: command.split(' ').map(str::to_string).collect(),
+        };
+        let mut out = Vec::new();
+        run_explain(&args, &mut out, &|k| empty.get(k).cloned()).expect("runs");
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn explain_names_the_override_through_a_transparent_wrapper() {
+        for command in ["timeout 5 pkill x", "nohup pkill x", "env FOO=1 pkill x"] {
+            let text = explain_with_allow("[\"pkill *\"]", command);
+            assert!(
+                text.contains(
+                    "allow because the operator allow rule `pkill *` (~/.zirv/ctx.toml) \
+                     overrides the built-in ask rule `pkill *`"
+                ),
+                "{command}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn explain_names_the_override_of_a_later_compound_segment() {
+        let text = explain_with_allow("[\"echo *\", \"pkill *\"]", "echo hi; pkill x");
+        assert!(
+            text.contains("`pkill x` is allow because the operator allow rule `pkill *`"),
+            "{text}"
+        );
+        assert_eq!(text.matches("Override:").count(), 1, "{text}");
     }
 }
