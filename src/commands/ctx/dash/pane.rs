@@ -531,7 +531,7 @@ const MOUSE_WHEEL_DOWN: u8 = 65;
 /// `32 + coordinate` into one byte, so 223 is the end of the line. `?1006`
 /// (SGR) exists precisely because terminals are routinely wider than that,
 /// and it is what the dashboard asks its own terminal for
-/// (`term::dash_mouse_on_bytes`) -- but a *child* picks its own encoding, so
+/// (`term::dash_mouse_bytes`) -- but a *child* picks its own encoding, so
 /// the classic form still has to be encodable.
 const MOUSE_X10_MAX: u16 = 223;
 

@@ -667,7 +667,8 @@ pub struct DashConfig {
     pub roster_max_age_secs: u64,
     /// Pane cap includes the orchestrator and matches selectable slots; enforce it on all non-launch creation to prevent fork bombs.
     pub max_panes: usize,
-    /// Mouse capture enables wheel scrolling but requires Shift for native text selection.
+    /// Mouse capture enables wheel scrolling and in-app drag copy, but displaces the terminal's native selection;
+    /// xterm.js terminals can force native selection with Option on macOS (if `macOptionClickForcesSelection` is on) or Shift elsewhere.
     /// Enabled for discoverability; disabling it leaves keyboard scrollback available.
     pub mouse: bool,
     /// Use output quiescence only for adapters without turn signals, otherwise idle-gated mail and nudges never drain.

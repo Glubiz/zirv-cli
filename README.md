@@ -716,6 +716,18 @@ read-only dialog listing the window's most recent gated-call failures (site,
 reason, age), the same list `zirv ctx jev status` folds from
 `jev-decisions.jsonl`.
 
+The dashboard's drag selection works on a pane's terminal grid (a pane, zoomed or
+not, and an open chat). The orchestrator FLOW and the native conversation view
+are drawn by the dashboard itself, so a drag there selects nothing. To let the
+terminal select instead, set `[dash] mouse = false` (or
+`ZIRV_CTX_DASH_MOUSE=false`): the dashboard then enables no mouse-tracking mode
+and loses wheel scrolling, clicks and in-app copy (keyboard scrollback remains).
+Terminals built on xterm.js, such as VS Code's, can force native selection while
+tracking is on: per xterm.js's `SelectionService.shouldForceSelection`, Option
+on macOS only when `terminal.integrated.macOptionClickForcesSelection` is on,
+Shift elsewhere (read from xterm.js source; not tried inside VS Code). The
+`Ctrl+A ?` help lists both.
+
 Every dashboard control below is repo-forbidden (see [Trust
 boundary](#trust-boundary) below — a checkout cannot switch it on/off or
 change its own limits) with two deliberate exceptions: `idle_quiet_ms` is a
